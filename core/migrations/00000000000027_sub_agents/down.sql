@@ -1,0 +1,7 @@
+-- The columns stay, following 24, 25 and 26. Dropping one means rebuilding both
+-- tables, and an older build simply never selects them.
+--
+-- Reverting would also be worse than useless here: the parent link is the only
+-- thing keeping a sub-agent's conversation out of the sidebar, so removing it
+-- would not restore an earlier state, it would spill every delegated run into
+-- the user's conversation list with no way to tell them apart.

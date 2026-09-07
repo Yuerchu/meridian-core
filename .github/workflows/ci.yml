@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+          - os: ubuntu-latest
+            label: linux-x64
+
+    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.label }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.label }}
+          # `sherpa-onnx-sys` unpacks its prebuilt libraries here and returns
+          # early if the directory exists. Without this the cache restores the
+          # build script's fingerprint but not its output, and the linker is
+          # handed a `-L` for a path that is gone.
+          cache-directories: target/sherpa-onnx-prebuilt
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
+      # Style gates run on the Linux leg only: they are platform-independent,
+      # and a Windows minute costs twice a Linux one.
+      - name: rustfmt check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      - name: Drop a half-restored sherpa-onnx unpack
+        shell: bash
+        run: bash .github/scripts/require-sherpa-libs.sh
+
+      - name: Clippy
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace

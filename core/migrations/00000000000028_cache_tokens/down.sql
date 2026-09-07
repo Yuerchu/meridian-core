@@ -1,0 +1,11 @@
+-- The columns stay, following 19, 24, 25, 26 and 27. Dropping one means
+-- rebuilding the messages table -- which carries two triggers and an index --
+-- and that is a great deal riskier than leaving three nullable columns an older
+-- build will never select.
+--
+-- Reverting would also destroy the only record of something that cannot be
+-- measured again. A row's prompt and completion sizes can be re-estimated from
+-- its own text; a cache hit is a fact about one upstream at one moment, and
+-- once the column is gone the request that got it reads exactly like the
+-- request that missed. The provider name is the same kind of fact -- after the
+-- provider row is deleted there is nothing left to recover it from.

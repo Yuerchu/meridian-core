@@ -1,0 +1,11 @@
+DROP TRIGGER IF EXISTS trg_messages_count_delete;
+DROP TRIGGER IF EXISTS trg_messages_count_insert;
+DROP TRIGGER IF EXISTS trg_messages_sort_order;
+DROP TABLE IF EXISTS preferences;
+DROP TABLE IF EXISTS tool_permissions;
+DROP TABLE IF EXISTS mcp_servers;
+DROP TABLE IF EXISTS attachments;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS conversations;
+DROP TABLE IF EXISTS assistants;
+DROP TABLE IF EXISTS providers;

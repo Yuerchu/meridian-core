@@ -1,0 +1,9 @@
+[workspace]
+members = ["core", "sandbox-types", "sandbox-windows"]
+resolver = "3"
+
+# No `[workspace.package]` inheritance, on purpose. The Meridian desktop app
+# consumes these crates as path dependencies from a workspace of its own that
+# `exclude`s this directory, and cargo resolves `key.workspace = true` against
+# the workspace *doing the build* — so an inherited field would fail there with
+# "workspace.package.<key> was not defined". Every crate states its own fields.

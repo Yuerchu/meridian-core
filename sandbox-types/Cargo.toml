@@ -1,0 +1,16 @@
+# Ported from Codex (Apache-2.0): codex-utils-absolute-path + codex-protocol (permissions subset)
+[package]
+name = "sandbox-types"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+dirs = "6"
+dunce = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"

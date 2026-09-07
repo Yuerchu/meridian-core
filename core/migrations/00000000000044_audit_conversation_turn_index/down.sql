@@ -1,0 +1,1 @@
+DROP INDEX idx_audit_conversation_turn;

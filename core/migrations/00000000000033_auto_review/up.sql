@@ -1,0 +1,15 @@
+-- What an automatic reviewer decided about the tool calls on this row.
+--
+-- Keyed by the provider's call id, because one assistant message can carry
+-- several calls and each is judged on its own:
+--
+--   {"call_abc": {"outcome":"deny","risk":"high","authorization":"low",
+--                 "rationale":"…","stage":"investigate","model":"…",
+--                 "evidence":[…],"usage":{…}}}
+--
+-- Lives here rather than in a table of its own for the same reason
+-- `provider_state` does: it is a fact about one message, it is read exactly
+-- when that message is read, and a verdict outliving the row it explains would
+-- be a record of a decision about nothing. The cost of the review is *not*
+-- here — that goes to `audit_messages`, which is where money is counted.
+ALTER TABLE messages ADD COLUMN auto_review TEXT;

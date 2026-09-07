@@ -1,0 +1,13 @@
+-- The user's standing "yes" to ordinary edits inside the project, so that a
+-- stretch of editing work does not have to be approved a file at a time.
+--
+-- Deliberately not part of `mode`. A mode says which stage of the work the
+-- conversation is in and only ever narrows the tool set; this says how much of
+-- the asking the user wants to skip. Folding the two together would make every
+-- downstream check a compound condition — see the header of `agent::modes`.
+--
+-- 0 for existing rows, which is the current behaviour: every write is asked
+-- about. What this can widen is bounded in `tools::reach`: never outside the
+-- project, never anything irreversible, and never a path that makes code run
+-- later, whatever this column says.
+ALTER TABLE conversations ADD COLUMN accept_edits INTEGER NOT NULL DEFAULT 0;

@@ -1,0 +1,83 @@
+meridian-core
+Copyright 2026 于小丘 Yuerchu <admin@yuxiaoqiu.cn>
+
+This product includes code derived from the following projects:
+
+---
+
+OpenAI Codex CLI (codex-rs)
+Copyright 2025 OpenAI
+Licensed under the Apache License, Version 2.0
+https://github.com/openai/codex
+
+The following modules contain code ported from codex-rs:
+
+  core/src/keyring/                — from codex-rs/keyring-store/
+  core/src/secrets/                — from codex-rs/secrets/
+  core/src/client/                 — from codex-rs/codex-client/
+  sandbox-windows/                 — from codex-rs/windows-sandbox-rs/
+                                     (job.rs from codex-rs/utils/pty/src/win/job.rs)
+  sandbox-types/                   — from codex-rs/utils/absolute-path/ and
+                                     codex-rs/protocol/ (permissions subset)
+  core/src/sandbox.rs              — bounded capture / timeout / cancellation
+                                     logic derived from codex-rs/core/src/exec.rs
+                                     and codex-rs/windows-sandbox-rs/src/lib.rs
+  core/src/agent/truncate.rs       — from codex-rs/utils/string/src/truncate.rs,
+                                     codex-rs/utils/output-truncation/src/lib.rs,
+                                     and TruncationPolicy from codex-rs/protocol/src/protocol.rs
+  core/src/agent/inline_tag.rs     — from codex-rs/utils/stream-parser/src/stream_text.rs
+                                     and inline_hidden_tag.rs
+  core/src/sleep_inhibitor/        — from codex-rs/utils/sleep-inhibitor/
+  core/src/agent/stream.rs         — retry-after parsing derived from
+                                     codex-rs/codex-api/src/sse/responses.rs
+
+Modifications made:
+  - keyring: renamed crate, no functional changes
+  - secrets: removed codex-git-utils dependency, renamed service constant
+    from "codex" to "meridian"
+  - client: removed ChatGPT cookie handling, ChatGPT host allowlist,
+    OpenTelemetry trace propagation, zstd request compression, and
+    custom CA probe binary; simplified HTTP client wrapper
+  - sandbox-windows: restricted-token path only; stripped elevated backend,
+    WFP network filtering, setup system, ConPTY and otel; job.rs rewritten
+    from winapi 0.3 to windows-sys 0.52
+  - sandbox-types: absolute-path + permissions subset only
+  - sandbox.rs: capture cap reduced to 256KB, results carry explicit
+    timed_out/truncated/sandboxed flags
+  - agent/truncate.rs: merged three sources into one module; dropped
+    FunctionCallOutputContentItem/audio helpers, serde/schema derives,
+    and the Mul<f64> impl
+  - agent/inline_tag.rs: added a streaming mode that emits extracted tag
+    content incrementally as deltas (for live reasoning display)
+  - sleep_inhibitor: adapted windows_inhibitor from windows-sys 0.61 to
+    0.52 (HANDLE is isize), added refcounted AppSleepInhibitor + RAII
+    TurnSleepGuard for concurrent turns, renamed reason strings and
+    APP_ID from "codex" to "meridian"
+  - agent/stream.rs: retry-after parsing gates on error-string markers
+    instead of a typed error code and clamps the delay to 60s
+
+The sandbox-types crate additionally contains code derived from
+path-absolutize (MIT), as inherited through codex-rs.
+
+---
+
+Grok Build
+Copyright 2023-2026 SpaceXAI
+Licensed under the Apache License, Version 2.0
+https://github.com/xai-org/grok-build
+
+Meridian's durable plan-document workflow borrows architecture and interaction
+patterns from Grok Build's file-backed plan mode, including treating the plan as
+a document, applying incremental edits before submission, and presenting a
+review boundary after the document has been updated.
+
+
+Modifications made:
+  - scoped each plan document to a Meridian conversation and planning episode
+    instead of placing one shared plan file in the workspace
+  - added immutable SQLite revisions, crash recovery, atomic file
+    materialisation, inline review comments, and editable user suggestions
+  - retained patch-only Native updates while adapting full-snapshot ACP agents
+    to the same review model
+  - integrated the workflow with Meridian's transcript, attention queue,
+    remote client and mobile navigation

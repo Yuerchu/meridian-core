@@ -1,0 +1,6 @@
+# 仓库内一律 LF。没有这条,Windows 的 autocrlf 会在 checkout 时转成 CRLF,
+# rustfmt --check 就会在没人改过的文件上报差异。
+* text=auto eol=lf
+
+*.onnx binary
+*.png binary

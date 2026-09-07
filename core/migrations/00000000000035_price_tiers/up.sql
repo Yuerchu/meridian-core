@@ -1,0 +1,42 @@
+-- What a model costs once the prompt gets large.
+--
+-- Every rate in `model_configs` is a single number per million tokens, which
+-- assumes a model has one price. Three upstreams already disagree: xAI doubles
+-- every rate on `grok-4.6` above a 200k prompt (input 2 -> 4, cached 0.5 -> 1,
+-- output 6 -> 12), Gemini has charged a long-context premium since 1.5, and
+-- OpenAI prices its own long-context tiers separately. A turn past the
+-- threshold is billed here at half what it cost, and the number that is wrong
+-- is the one someone reads to decide whether to keep paying for it.
+--
+-- The threshold is measured against the **whole prompt**, cached part included,
+-- and it re-prices the entire request rather than the excess. That is what all
+-- three upstreams do and it is not the obvious reading: a 201k-token prompt
+-- costs double on all 201k, not double on the last thousand.
+--
+-- One JSON column rather than a `model_price_tiers` table. A tier has no
+-- identity of its own, nothing references one, nobody queries across them, and
+-- a model has two or three at most — so a table would buy joins and a delete
+-- cascade in exchange for nothing anyone needs. The shape is an array of
+-- `{min_prompt_tokens, input, output, cache_read, cache_write}`, ascending;
+-- `agent::pricing::parse_tiers` is the one reader, and it sorts and discards
+-- malformed entries rather than trusting the order it was stored in.
+--
+-- NULL means what it has always meant: one price at every size.
+ALTER TABLE model_configs ADD COLUMN price_tiers TEXT;
+
+-- Deliberately no matching column on `audit_messages`, which is the part worth
+-- writing down.
+--
+-- Migration 30 copies the four rates onto every audit row, and `db::ops::usage`
+-- groups by those four columns precisely so a rate that changed mid-month bills
+-- each half at what it was. A tier is the same kind of fact: which one applied
+-- is decided from that request's own prompt size at the moment the row is
+-- written, and the rates it lands on are what gets snapshotted. So two replies
+-- from one model on opposite sides of the threshold arrive in the reporting
+-- query as two groups with two price sets — which is a thing that query already
+-- knows how to add up.
+--
+-- Storing the tier table on the audit row instead would mean re-deciding the
+-- tier at read time, from a `SUM` over rows that are no longer one request.
+-- There is no prompt size in an aggregate, and inventing one is how a report
+-- comes to disagree with the stop event that was shown at the time.

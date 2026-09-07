@@ -1,0 +1,49 @@
+# Ported from Codex (Apache-2.0): codex-windows-sandbox (restricted-token path only)
+# Stripped: elevated backend, WFP, setup system, ConPTY, otel
+[package]
+name = "sandbox-windows"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lints.clippy]
+# The unsafe FFI surface is ported verbatim; inventing `# Safety` sections here
+# would document contracts we did not author. The upstream source is the
+# reference.
+missing_safety_doc = "allow"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+[dependencies]
+sandbox-types = { path = "../sandbox-types" }
+anyhow = "1"
+dunce = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tracing = "0.1"
+rand = { version = "0.8", default-features = false, features = ["std", "small_rng"] }
+glob = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_Environment",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Kernel",
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_System_StationsAndDesktops",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }

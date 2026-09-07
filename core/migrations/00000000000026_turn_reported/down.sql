@@ -1,0 +1,5 @@
+-- The column stays, following migration 19's precedent for `sender_id` and 25's
+-- for the two message columns: dropping one means rebuilding the table, and an
+-- older build simply never selects it. Reverting would also throw away the
+-- record of which interruptions the model has already been told about, so
+-- rolling forward again would repeat every one of them.

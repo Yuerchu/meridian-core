@@ -1,0 +1,577 @@
+{
+  "version": 1,
+  "_comment": [
+    "Model capability catalog. Entries are matched by longest `prefix` wins, scoped to `provider`.",
+    "Every field is optional: omitted fields inherit the provider default from capabilities.rs.",
+    "`thinking_style` decides the request shape and is the field most likely to cause a hard 400",
+    "if wrong -- see ThinkingStyle in provider/mod.rs.",
+    "`supported_efforts` must stay in ascending order; unsupported explicit tiers are rejected."
+  ],
+  "models": [
+    {
+      "provider": "google",
+      "prefix": "gemini-3.7-flash",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "google",
+      "prefix": "gemini-3.6-flash",
+      "supported_efforts": ["minimal", "low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "google",
+      "prefix": "gemini-3.5-flash-lite",
+      "supported_efforts": ["minimal", "low", "medium", "high"],
+      "default_effort": "minimal"
+    },
+    {
+      "provider": "google",
+      "prefix": "gemini-3.5-flash",
+      "supported_efforts": ["minimal", "low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "google",
+      "prefix": "gemini-3.1-flash-lite",
+      "supported_efforts": ["minimal", "low", "medium", "high"],
+      "default_effort": "minimal"
+    },
+    {
+      "provider": "google",
+      "prefix": "gemini-3.1-pro",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "google",
+      "prefix": "gemini-3-pro-preview",
+      "supported_efforts": ["low", "high"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "google",
+      "prefix": "gemini-3-flash-preview",
+      "supported_efforts": ["minimal", "low", "medium", "high"],
+      "default_effort": "high"
+    },
+
+    {
+      "provider": "anthropic",
+      "prefix": "claude-fable-5",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "always_on",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-opus-4-8",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "high",
+      "supports_fast": true
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-opus-4-7",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "high",
+      "supports_fast": true
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-opus-4-6",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": ["low", "medium", "high", "max"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-opus-4-5",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-sonnet-5",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-sonnet-4-6",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": ["low", "medium", "high", "max"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-haiku-4-5",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget",
+      "supported_efforts": []
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-opus-4",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-sonnet-4",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-3-7-sonnet",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-3-5-sonnet",
+      "supports_thinking": false,
+      "supports_images": true,
+      "supports_pdf": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 8192,
+      "thinking_style": "none"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-3-5-haiku",
+      "supports_thinking": false,
+      "supports_images": true,
+      "supports_pdf": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 8192,
+      "thinking_style": "none"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-3-opus",
+      "supports_thinking": false,
+      "supports_images": true,
+      "supports_pdf": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 4096,
+      "thinking_style": "none"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-3-sonnet",
+      "supports_thinking": false,
+      "supports_images": true,
+      "supports_pdf": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 4096,
+      "thinking_style": "none"
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-3-haiku",
+      "supports_thinking": false,
+      "supports_images": true,
+      "supports_pdf": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 4096,
+      "thinking_style": "none"
+    },
+
+    {
+      "provider": "openai",
+      "prefix": "gpt-5.6-sol",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "low",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-5.6-terra",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-5.6-luna",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-5.6",
+      "_comment": "Bare gpt-5.6 is a server-side alias that routes to Sol.",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "low",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-5.5",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh"],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-5.4-mini",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh"],
+      "default_effort": "medium",
+      "supports_verbosity": true,
+      "default_verbosity": "medium"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-5.4",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh"],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-5.2",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh"],
+      "default_effort": "medium",
+      "supports_verbosity": true,
+      "default_verbosity": "low"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-5",
+      "_comment": "Catch-all for gpt-5 / gpt-5.1 and their mini/nano variants. Context left unset on purpose -- no authoritative figure, so the provider default applies and users can override per model.",
+      "supports_thinking": true,
+      "supports_images": true,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["minimal", "low", "medium", "high"],
+      "default_effort": "medium",
+      "supports_verbosity": true
+    },
+    {
+      "provider": "openai",
+      "prefix": "o3",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "supports_images": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 100000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "openai",
+      "prefix": "o4-mini",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "supports_images": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 100000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "openai",
+      "prefix": "o1",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "supports_images": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 100000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-4.1",
+      "supports_images": true,
+      "max_context_tokens": 1047576,
+      "max_output_tokens": 32768,
+      "thinking_style": "none"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-4o",
+      "supports_images": true,
+      "max_context_tokens": 128000,
+      "max_output_tokens": 16384,
+      "thinking_style": "none"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-4-turbo",
+      "supports_images": true,
+      "max_context_tokens": 128000,
+      "max_output_tokens": 4096,
+      "thinking_style": "none"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-4",
+      "supports_images": false,
+      "max_context_tokens": 8192,
+      "max_output_tokens": 4096,
+      "thinking_style": "none"
+    },
+    {
+      "provider": "openai",
+      "prefix": "gpt-3.5",
+      "supports_images": false,
+      "max_context_tokens": 16385,
+      "max_output_tokens": 4096,
+      "thinking_style": "none"
+    },
+
+    {
+      "provider": "deepseek",
+      "prefix": "deepseek-v4-pro",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 128000,
+      "max_output_tokens": 16000,
+      "thinking_style": "toggle_off",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "deepseek",
+      "prefix": "deepseek-v4-flash",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 128000,
+      "max_output_tokens": 16000,
+      "thinking_style": "toggle_off",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "deepseek",
+      "prefix": "deepseek-reasoner",
+      "_comment": "Deprecated 2026-07-24.",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 64000,
+      "max_output_tokens": 16000,
+      "thinking_style": "toggle_off"
+    },
+    {
+      "provider": "deepseek",
+      "prefix": "deepseek-chat",
+      "supports_thinking": false,
+      "max_context_tokens": 64000,
+      "max_output_tokens": 16000,
+      "thinking_style": "none"
+    },
+
+    {
+      "provider": "xai",
+      "prefix": "grok-4.6",
+      "_comment": [
+        "Context windows here are xAI's own `context_length`, read off /v1/models.",
+        "`max_output_tokens` is ours: xAI publishes no output ceiling and accepted a",
+        "262144 request, so this is a budget reservation rather than a limit they set.",
+        "Pricing steps up above a 200k prompt (input 2 -> 4, cached 0.5 -> 1, output",
+        "6 -> 12 per 1M). That belongs in the model's `pricing_tiers`, which is per",
+        "installation because the rates are -- see migration 35."
+      ],
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 500000,
+      "max_output_tokens": 64000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "xai",
+      "prefix": "grok-4.5",
+      "_comment": "xhigh is accepted but treated as high, so it is not offered.",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 500000,
+      "max_output_tokens": 64000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "xai",
+      "prefix": "grok-4.3",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 64000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "xai",
+      "prefix": "grok-4.20",
+      "_comment": [
+        "Covers every 4.20 variant, and two of them are not quite this. The id carries",
+        "its variant as a *suffix* (`grok-4.20-0309-non-reasoning`), which longest-prefix",
+        "matching cannot reach: the non-reasoning one inherits `supports_thinking` and",
+        "will be sent an effort it has no use for, and on the multi-agent one effort",
+        "selects how many agents collaborate rather than how hard one thinks. Both are",
+        "capability_overrides on the model row, which is what that field is for."
+      ],
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 64000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh"],
+      "default_effort": "high"
+    },
+    {
+      "provider": "xai",
+      "prefix": "grok-code-fast",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 256000,
+      "max_output_tokens": 32000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "xai",
+      "prefix": "grok-build",
+      "_comment": "The id behind the grok-code-fast aliases; same model, same entry.",
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 256000,
+      "max_output_tokens": 32000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    }
+  ]
+}

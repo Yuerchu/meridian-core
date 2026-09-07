@@ -1,0 +1,22 @@
+-- When a cut-off turn was actually told to the model.
+--
+-- The interruption notice was originally cleared by nothing at all: the next
+-- turn to start became the most recent one, so the one before it stopped being
+-- looked at. That only works if the next turn reaches a provider, and plenty of
+-- turns do not — a missing API key, an unreadable config, a context that fails
+-- to build. Such a turn opens its record, reads the notice, dies before sending
+-- anything, and is marked `failed`. The turn after it looks at the most recent
+-- turn, sees that failure, and concludes there is nothing to report. The
+-- warning that a tool may have half-run is then gone for good, and the model
+-- never saw it.
+--
+-- So consumption is written down rather than inferred, and it is written by the
+-- only event that proves the model received it: a reply that came back and was
+-- read to the end. Not a request that was merely sent — a provider will answer
+-- 200 and then refuse over SSE, having processed none of what it was given. A
+-- later turn that got neither consumes nothing.
+--
+-- Nullable and not backfilled: an existing row with no value has not been
+-- reported, which for turns recorded before this migration is either true or
+-- harmless — the worst case is saying once more that something was cut off.
+ALTER TABLE turns ADD COLUMN reported_at BIGINT;

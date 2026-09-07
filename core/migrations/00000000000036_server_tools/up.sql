@@ -1,0 +1,25 @@
+-- Which of the provider's own tools this model may run.
+--
+-- Grok and DeepSeek will both search the web themselves, server-side, if the
+-- request asks them to. That is strictly better than the `web_search` tool in
+-- this app for the providers that offer it: no Tavily or Zhipu key, no approval
+-- card in front of every query, the results never pass through our context
+-- window, and the citations come back attached to the sentences they support.
+--
+-- It has to be a setting rather than a default. It sends the user's questions to
+-- whichever search index the upstream uses, it costs money outside the token
+-- price (xAI bills roughly half a cent per call, on top of usage), and on a
+-- model reached through a relay the tool may not exist at all.
+--
+-- On `model_configs` rather than on the assistant, because that is what it is a
+-- property of: the tools exist only on the Responses API, `grok-4.6` has three
+-- and `grok-code-fast` may have none, and an assistant pointed at a different
+-- provider tomorrow should not carry a switch that silently means nothing. The
+-- capability side (`ProviderCapabilities::server_tools`) says what a model
+-- *can* run; this column says what it *will*, and `resolve_turn_params`
+-- intersects them so a stale row cannot outlive the support it named.
+--
+-- A JSON array of wire type names — `["web_search"]` — for the same reason
+-- `price_tiers` is one: no identity, no cross-row queries, two entries at most.
+-- NULL and `[]` both mean none, which is the default for every existing row.
+ALTER TABLE model_configs ADD COLUMN server_tools TEXT;

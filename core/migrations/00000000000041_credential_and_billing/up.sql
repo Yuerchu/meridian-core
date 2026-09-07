@@ -1,0 +1,55 @@
+-- Where a provider's credential comes from.
+--
+-- Split out from `provider_type` and `api_format` because it answers a different
+-- question, and conflating the three is how authentication ends up welded to the
+-- wire format. Two ways of signing in to ChatGPT — reading the Codex CLI's login
+-- off disk, or logging in inside this app — yield the same token on the same
+-- endpoint, so they must not produce two adapters. Conversely an API key and a
+-- ChatGPT login reach entirely different endpoints while both being "OpenAI".
+--
+-- Deliberately NOT an input to adapter selection. `create_provider` matches on
+-- `provider_type`, `api_format` and `transport_profile`; this column only says
+-- where to fetch the secret from.
+--
+-- 'api_key' is every row that exists today and remains the default, so this
+-- migration changes nothing about how anything behaves.
+ALTER TABLE providers ADD COLUMN credential_kind TEXT NOT NULL DEFAULT 'api_key';
+
+-- How requests are shaped, and what the model can be asked to do.
+--
+-- This is the third input to picking an adapter, and it exists because
+-- `api_format` cannot carry the distinction on its own: OpenAI's own API and
+-- ChatGPT's Codex backend are both `responses`, yet differ in endpoint, in which
+-- request fields are accepted, and in whether sampling parameters mean anything
+-- at all. Reaching for `credential_kind` to tell them apart would be the welding
+-- described above — the reason they differ is the transport, not the login.
+--
+-- 'standard' is what every provider speaks today.
+ALTER TABLE providers ADD COLUMN transport_profile TEXT NOT NULL DEFAULT 'standard';
+
+-- How this request is paid for, and therefore whether a price is owed at all.
+--
+-- Without it, "nobody has priced this model" and "this request is inside a
+-- subscription" are the same state: both have no rate, so both land in
+-- `unpriced_messages` and get reported as cost we failed to account for. The
+-- second is not a gap — there is no per-request price to find — and reporting it
+-- as one produces a warning that can never be cleared.
+--
+--   'metered'      A price is owed. Missing rates are a misconfiguration, and it
+--                  still counts into `unpriced_messages`, exactly as today.
+--   'subscription' Tokens are ours to count, but there is no per-request rate:
+--                  the request is drawn against a plan bought elsewhere.
+--   'external'     The cost lands in someone else's ledger entirely and does not
+--                  enter Meridian's totals. Reserved: nothing writes it yet.
+--                  ACP's `usage_update` is reported but never written here, and
+--                  giving it an audit row is a separate feature with its own
+--                  questions (what `used` means per round, how to split
+--                  input/output, whether it belongs in this table at all).
+--
+-- The default backfills every existing row as 'metered', which is precisely
+-- their current treatment — so this column starts out saying nothing new.
+--
+-- Snapshotted per row rather than joined from the provider, for the reason
+-- migration 30 gives about prices: this table records what happened, and
+-- changing a provider's configuration must not silently rewrite last month.
+ALTER TABLE audit_messages ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'metered';

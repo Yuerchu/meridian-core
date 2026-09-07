@@ -1,0 +1,61 @@
+-- What the upstream served out of its prompt cache, and what it put into it.
+--
+-- The numbers already arrive and are already thrown away. Every
+-- OpenAI-compatible response is parsed into a usage struct that has carried a
+-- cache figure since DeepSeek's fields were first read; the turn loop folds the
+-- prompt and completion counts across rounds and drops the rest, and the
+-- function that fills an assistant row in is handed two numbers. So by the time
+-- a row exists, all that is left of a cache hit is that the prompt happened to
+-- be cheaper than its size suggests.
+--
+-- That is the one figure nobody can reconstruct later. Prompt and completion
+-- sizes can be re-estimated from the row's own text. Whether the upstream still
+-- had the prefix cannot: it depends on what else was sent to that endpoint, and
+-- when, and from which machine. A month of history with no cache column is a
+-- month whose cache behaviour is simply unknown.
+--
+-- Two columns rather than one, because the two are priced in opposite
+-- directions. A read is the discount. A write is a surcharge paid once so that
+-- later reads are cheap -- Anthropic charges 1.25x input for a five-minute
+-- entry and 2x for an hour. Added together they would report a run that built a
+-- large cache and never came back to it as though it had saved money, which is
+-- the exact mistake the numbers exist to prevent.
+--
+-- The contract, which the provider layer normalises to and which every query
+-- over these columns depends on: `input_tokens` counts each prompt token
+-- exactly once, and these two are subsets of it. Not every upstream reports it
+-- that way -- DeepSeek's `prompt_tokens` already includes its cache hits, while
+-- Anthropic's `input_tokens` excludes both of its cache figures -- so the
+-- folding happens where the response is parsed, and what reaches this table has
+-- one shape whoever answered. Without that, a hit rate is comparable only with
+-- itself and a cost per provider is not comparable at all.
+--
+-- Nullable, and not backfilled. NULL and 0 are different answers and both are
+-- worth keeping: NULL is an upstream that said nothing about caching, 0 is one
+-- that said nothing was cached. A hit rate that reads the first as a miss
+-- reports every reply from a silent provider as a total cache failure -- a
+-- claim about the provider rather than about the data. Every row written before
+-- this migration is honestly NULL, and there is nothing to derive a value from.
+ALTER TABLE messages ADD COLUMN cache_read_tokens INTEGER;
+ALTER TABLE messages ADD COLUMN cache_write_tokens INTEGER;
+
+-- Which upstream answered, by name, as it was named at the time.
+--
+-- `provider_id` has been on this table since migration 1 with a foreign key
+-- onto `providers`, and has never been written on an assistant row -- the
+-- placeholder is opened with NULL and the update that fills the row in does not
+-- touch it. From here on the loop writes both, and that is what turns "cache
+-- hit rate per upstream" from a guess into a query.
+--
+-- The name is stored beside the id rather than joined to because that foreign
+-- key is ON DELETE SET NULL: removing a provider silently rewrites the history
+-- of every reply it ever produced, and a report run afterwards would show that
+-- traffic as belonging to nobody. `model_id` has always been a plain text
+-- snapshot with no key behind it for the same reason, so this follows a shape
+-- the table already has rather than introducing one.
+--
+-- The two disagree when a provider is renamed: old rows keep the old name and
+-- new rows carry the new one. That is the intended reading -- each row records
+-- what the thing was called when it was used, which is what an audit of the
+-- past is for.
+ALTER TABLE messages ADD COLUMN provider_name TEXT;

@@ -1,0 +1,1 @@
+DROP TABLE queued_prompt_context_items;

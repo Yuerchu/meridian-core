@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "_comment": [
+    "Vendor catalog: what a provider looks like and what to prefill when creating one.",
+    "It is the display half. `model_catalog.json` is the wire half -- it answers 'how do I",
+    "send a request' by longest-prefix match, and mixing an exact model list into that",
+    "matching is how a catch-all entry ends up rendered as a model nobody can select.",
+    "",
+    "This file never decides behaviour. `registry::create_provider`, `capabilities::resolve`",
+    "and `balance::supports_balance` stay authoritative; `balance` here only keeps a button",
+    "off panels where it could do nothing, so a drift is visible rather than silent.",
+    "",
+    "`auth[]` is a list of objects, not strings, because the endpoint and the dialect belong",
+    "to the login method rather than to the vendor: OpenAI's API and ChatGPT's Codex backend",
+    "are both `responses`, and a flat default_base_url keyed by format cannot hold both.",
+    "",
+    "An entry is a creation preset. It is not consulted again once a provider row exists --",
+    "a relay URL the user typed is theirs to keep, and a catalog update must never make an",
+    "existing configuration illegal.",
+    "",
+    "Adding a vendor should be this file plus an icon. If it ever needs a Rust change too,",
+    "that is the coupling this file exists to remove -- say so in review.",
+    "",
+    "A single-element `api_formats` means the dialect is not a choice, which is what the UI",
+    "reads to omit the selector. Anthropic is the awkward one: its adapter is chosen by",
+    "provider_type alone and never reads the column, but the column is NOT NULL DEFAULT",
+    "'chat_completions' (migration 10), so that is what its rows actually hold. The value is",
+    "inert there rather than descriptive -- do not read it as 'Anthropic speaks OpenAI'."
+  ],
+  "providers": [
+    {
+      "id": "openai",
+      "provider_type": "openai",
+      "name": "OpenAI",
+      "icon": "openai",
+      "balance": false,
+      "websites": {
+        "official": "https://openai.com",
+        "api_key": "https://platform.openai.com/api-keys",
+        "docs": "https://platform.openai.com/docs",
+        "models": "https://platform.openai.com/docs/models"
+      },
+      "auth": [
+        {
+          "id": "api_key",
+          "credential_kind": "api_key",
+          "transport_profile": "standard",
+          "api_formats": ["chat_completions", "responses"],
+          "default_base_url": {
+            "chat_completions": "https://api.openai.com/v1",
+            "responses": "https://api.openai.com/v1"
+          }
+        },
+        {
+          "id": "codex_cli",
+          "credential_kind": "codex_cli",
+          "transport_profile": "chatgpt_codex",
+          "api_formats": ["responses"],
+          "default_base_url": {
+            "responses": "https://chatgpt.com/backend-api/codex"
+          }
+        }
+      ],
+      "models": []
+    },
+    {
+      "id": "anthropic",
+      "provider_type": "anthropic",
+      "name": "Anthropic",
+      "icon": "anthropic",
+      "balance": false,
+      "websites": {
+        "official": "https://anthropic.com",
+        "api_key": "https://console.anthropic.com/settings/keys",
+        "docs": "https://docs.anthropic.com",
+        "models": "https://docs.anthropic.com/en/docs/about-claude/models"
+      },
+      "auth": [
+        {
+          "id": "api_key",
+          "credential_kind": "api_key",
+          "transport_profile": "standard",
+          "api_formats": ["chat_completions"],
+          "default_base_url": {
+            "chat_completions": "https://api.anthropic.com"
+          }
+        }
+      ],
+      "models": []
+    },
+    {
+      "id": "deepseek",
+      "provider_type": "deepseek",
+      "name": "DeepSeek",
+      "icon": "deepseek",
+      "balance": true,
+      "websites": {
+        "official": "https://deepseek.com",
+        "api_key": "https://platform.deepseek.com/api_keys",
+        "docs": "https://api-docs.deepseek.com",
+        "models": "https://api-docs.deepseek.com/quick_start/pricing"
+      },
+      "auth": [
+        {
+          "id": "api_key",
+          "credential_kind": "api_key",
+          "transport_profile": "standard",
+          "api_formats": ["chat_completions", "responses"],
+          "default_base_url": {
+            "chat_completions": "https://api.deepseek.com",
+            "responses": "https://api.deepseek.com"
+          }
+        }
+      ],
+      "models": []
+    },
+    {
+      "id": "xai",
+      "provider_type": "xai",
+      "name": "xAI",
+      "icon": "xai",
+      "balance": false,
+      "websites": {
+        "official": "https://x.ai",
+        "api_key": "https://console.x.ai",
+        "docs": "https://docs.x.ai",
+        "models": "https://docs.x.ai/docs/models"
+      },
+      "auth": [
+        {
+          "id": "api_key",
+          "credential_kind": "api_key",
+          "transport_profile": "standard",
+          "api_formats": ["chat_completions", "responses"],
+          "default_base_url": {
+            "chat_completions": "https://api.x.ai/v1",
+            "responses": "https://api.x.ai/v1"
+          }
+        }
+      ],
+      "models": []
+    },
+    {
+      "id": "google",
+      "provider_type": "google",
+      "name": "Google Gemini",
+      "icon": "google",
+      "balance": false,
+      "websites": {
+        "official": "https://ai.google.dev",
+        "api_key": "https://aistudio.google.com/apikey",
+        "docs": "https://ai.google.dev/gemini-api/docs",
+        "models": "https://ai.google.dev/gemini-api/docs/models"
+      },
+      "auth": [
+        {
+          "id": "api_key",
+          "credential_kind": "api_key",
+          "transport_profile": "standard",
+          "api_formats": ["gemini_generate_content", "chat_completions"],
+          "default_base_url": {
+            "gemini_generate_content": "https://generativelanguage.googleapis.com",
+            "chat_completions": "https://generativelanguage.googleapis.com/v1beta/openai"
+          }
+        }
+      ],
+      "models": []
+    }
+  ]
+}

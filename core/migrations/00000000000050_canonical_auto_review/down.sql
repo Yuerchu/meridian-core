@@ -1,0 +1,3 @@
+-- Irreversible data cleanup.  The removed duplicate `usage` object already
+-- lives in `audit_messages`; whether a nullable key used to be absent or null
+-- cannot be recovered and has no meaning in the current contract.

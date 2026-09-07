@@ -1,0 +1,133 @@
+[package]
+name = "meridian-core"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The framework-free core of Meridian: the agent turn loop, providers, tools, MCP, storage and the headless runners."
+repository = "https://github.com/Yuerchu/meridian-core"
+authors = ["于小丘 Yuerchu <admin@yuxiaoqiu.cn>"]
+
+[lib]
+name = "meridian_core"
+
+[lints.clippy]
+# Provider and OneBot errors are large enums by design — they carry the body of
+# what failed. Boxing every Err to please the lint would spread `Box` through
+# every provider signature for a path that is not hot.
+result_large_err = "allow"
+large_enum_variant = "allow"
+# `run_agent_turn` takes the OneBot event apart into what a turn needs, and
+# every piece of it says where the message came in from; a struct in between
+# would only name the same fields twice.
+too_many_arguments = "allow"
+# Both lints only look at a crate's exported surface, so they had nothing to say
+# while all of this was one binary and started firing the moment it became a
+# library. The boundary exists to keep Tauri out, not to publish an API to
+# anyone — inventing a `Default` or a `FromStr` to satisfy a reader who does not
+# exist would be adding code to answer a question nobody asked.
+new_without_default = "allow"
+should_implement_trait = "allow"
+
+[features]
+# An in-memory, fully migrated database, for tests outside this crate. The
+# shell's own tests need one and `cfg(test)` does not reach across a crate
+# boundary; a feature keeps it out of anything shipped.
+test-support = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Every monetary value crosses Rust, SQLite and IPC as an exact base-10
+# number. SQLite stores the canonical string representation; the wrapper in
+# `decimal.rs` supplies Diesel's Text mapping and strict string-only serde.
+bigdecimal = "0.4.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-webpki-roots"], default-features = false }
+eventsource-stream = "0.2"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+thiserror = "2"
+tracing = "0.1"
+# env-filter is the only addition: registry and reload already arrive with the
+# default features, and the JSONL formatting is ours rather than `json`'s.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Ported from Codex (Apache-2.0)
+keyring = { version = "3.6", default-features = false, features = ["crypto-rust"] }
+age = "0.11"
+anyhow = "1"
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rand = "0.9"
+regex = "1"
+mime_guess = "2"
+bytes = "1"
+http = "1"
+async-trait = "0.1"
+ignore = "0.4"
+glob = "0.3"
+# Line diffs for journal blame: attribution propagates hop by hop along a
+# file's version chain and every hop is one TextDiff. A maintained crate
+# rather than a hand-rolled Myers, because blame's correctness rests entirely
+# on the diff's line identity — and a golden test pins the outputs so an
+# upstream algorithm change cannot silently reassign lines. Apache-2.0.
+similar = "2"
+# OneBot WebSocket server (desktop only)
+tokio-tungstenite = "0.26"
+percent-encoding = "2"
+# Database
+diesel = { version = "2", features = ["sqlite", "r2d2"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+diesel_migrations = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+strum = { version = "0.27", features = ["derive"] }
+dirs = "6"
+tiktoken = "3.5"
+
+# Offline voice input. On Android the prebuilt libraries have to be fetched
+# separately and pointed at with SHERPA_ONNX_LIB_DIR — sherpa-onnx-sys has no
+# android entry in its download table and panics without it. See
+# scripts/fetch-sherpa-android.sh.
+sherpa-onnx = { version = "1.13.4", default-features = false, features = ["shared"] }
+tar = "0.4"
+bzip2 = "0.4"
+
+# Microphone capture, desktop only: Android records inside the WebView.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+cpal = "0.15"
+# The Claude Code hook endpoint. All three already arrive under reqwest, so
+# promoting them to direct dependencies adds exactly one crate to the lock file
+# (`httpdate`, for the server's Date header) rather than a router's worth: axum
+# would have brought `matchit`, `axum-core` and `serde_path_to_error` for a
+# surface of two routes.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+dunce = "1"
+keyring = { version = "3.6", default-features = false, features = ["crypto-rust", "windows-native"] }
+sandbox-windows = { path = "../sandbox-windows" }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Power", "Win32_System_SystemServices", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["crypto-rust", "apple-native"] }
+core-foundation = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["crypto-rust", "linux-native-async-persistent"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+# Process-group termination for command execution (sandbox.rs)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tempfile = "3"
+pretty_assertions = "1"
