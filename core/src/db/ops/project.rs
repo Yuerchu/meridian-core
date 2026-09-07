@@ -114,18 +114,34 @@ mod tests {
 
     /// The two sides are typed by different programs, so they agree on the
     /// directory without agreeing on the string.
+    ///
+    /// The separator and case halves of that only exist on Windows — see
+    /// `normalize_path` on why a backslash is left alone elsewhere — so the
+    /// spellings tried are the platform's own.
     #[test]
     fn a_path_matches_despite_separators_and_trailing_slash() {
         let pool = test_db();
         let mut conn = pool.get().unwrap();
-        project(&mut conn, "p1", Some(r"C:\Users\me\Code\repo"));
+        let (stored, asked): (&str, Vec<&str>) = if cfg!(windows) {
+            (
+                r"C:\Users\me\Code\repo",
+                vec![
+                    r"C:\Users\me\Code\repo",
+                    "C:/Users/me/Code/repo",
+                    "C:/Users/me/Code/repo/",
+                    "  C:/Users/me/Code/repo  ",
+                    "c:/users/me/code/repo",
+                ],
+            )
+        } else {
+            (
+                "/home/me/Code/repo",
+                vec!["/home/me/Code/repo", "/home/me/Code/repo/", "  /home/me/Code/repo  "],
+            )
+        };
+        project(&mut conn, "p1", Some(stored));
 
-        for asked in [
-            r"C:\Users\me\Code\repo",
-            "C:/Users/me/Code/repo",
-            "C:/Users/me/Code/repo/",
-            "  C:/Users/me/Code/repo  ",
-        ] {
+        for asked in asked {
             let found = find_project_by_path(&mut conn, asked).unwrap();
             assert_eq!(found.map(|p| p.id), Some("p1".into()), "asked `{asked}`");
         }

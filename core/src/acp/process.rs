@@ -326,10 +326,15 @@ mod tests {
     fn a_container_launch_is_recognised_and_nothing_else_is() {
         assert!(launches_in_container("docker", &argv(&["run", "-i", "--rm", "img"])));
         assert!(launches_in_container("podman", &argv(&["run", "img"])));
-        assert!(launches_in_container(
-            "C:\\Program Files\\Docker\\docker.exe",
-            &argv(&["run", "img"])
-        ));
+        assert!(launches_in_container("/usr/bin/docker", &argv(&["run", "img"])));
+        // A backslash separates only on Windows; elsewhere `Path` reads this
+        // whole string as one file name and it is, correctly, not a launcher.
+        if cfg!(windows) {
+            assert!(launches_in_container(
+                "C:\\Program Files\\Docker\\docker.exe",
+                &argv(&["run", "img"])
+            ));
+        }
         assert!(!launches_in_container("docker", &argv(&["exec", "some-container"])));
         assert!(!launches_in_container(
             "npx",
@@ -394,13 +399,12 @@ mod tests {
     /// whatever made `docker` reachable on this machine.
     #[test]
     fn a_launcher_is_recognised_however_it_was_written() {
-        for command in [
-            "docker",
-            "docker.exe",
-            "/usr/bin/docker",
-            "C:\\Program Files\\Docker\\docker.exe",
-            "PODMAN",
-        ] {
+        let mut commands = vec!["docker", "docker.exe", "/usr/bin/docker", "PODMAN"];
+        // Only Windows reads the backslash as a separator; see the launch test.
+        if cfg!(windows) {
+            commands.push("C:\\Program Files\\Docker\\docker.exe");
+        }
+        for command in commands {
             let out = forward_marker_into_container(command, &argv(&["run", "alpine"]));
             assert!(out.contains(&"-e".to_string()), "{command} was not recognised: {out:?}");
         }
