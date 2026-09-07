@@ -307,10 +307,8 @@ pub fn parse_request_decision(input: &str) -> Option<RequestDecision> {
     let trimmed = input.trim();
     let (approve, rest) = if let Some(r) = trimmed.strip_prefix("同意") {
         (true, r)
-    } else if let Some(r) = trimmed.strip_prefix("拒绝") {
-        (false, r)
     } else {
-        return None;
+        (false, trimmed.strip_prefix("拒绝")?)
     };
 
     let rest = rest.trim_start();

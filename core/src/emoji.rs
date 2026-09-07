@@ -163,7 +163,7 @@ fn decode_gif_frames(path: &Path) -> Result<Vec<image::RgbaImage>, String> {
         let end = cursor.checked_add(count * 3).ok_or("GIF palette overflow")?;
         let source = bytes.get(*cursor..end).ok_or("truncated GIF palette")?;
         *cursor = end;
-        Ok(source.chunks_exact(3).map(|rgb| [rgb[0], rgb[1], rgb[2]]).collect())
+        Ok(source.as_chunks::<3>().0.to_vec())
     };
     let global_palette = if packed & 0x80 != 0 {
         read_palette(&mut cursor, 2usize << (packed & 0x07))?

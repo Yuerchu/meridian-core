@@ -506,7 +506,12 @@ mod imp {
     }
 
     pub fn open_for_write_untruncated(path: &Path) -> io::Result<File> {
-        OpenOptions::new().read(true).write(true).create(true).open(path)
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -959,6 +959,8 @@ mod tests {
         }
     }
 
+    // Every caller is a restricted-token test, and those only exist on Windows.
+    #[cfg(target_os = "windows")]
     fn policy_for(project_dir: &std::path::Path) -> SandboxPolicy {
         SandboxPolicy {
             allow_network: true,
