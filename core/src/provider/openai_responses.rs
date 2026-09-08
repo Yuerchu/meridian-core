@@ -361,7 +361,6 @@ const IGNORED_EVENTS: &[&str] = &[
     "response.output_text.done",
     "response.output_text.annotation.added",
     "response.refusal.done",
-    "response.reasoning_summary_part.added",
     "response.reasoning_summary_part.done",
     "response.reasoning_summary_text.done",
     "response.reasoning_text.done",
@@ -594,6 +593,24 @@ pub(super) fn parse_responses_event(
         // and produces no summary at all. Handling only one leaves that
         // provider's thinking invisible while it happens — which reads as the
         // model having stalled.
+        // A summary comes as parts, each a paragraph of its own — typically a
+        // bold title with its body — and the text deltas carry no separator.
+        // Without one here the second part runs straight on from the first
+        // (`**one****two**`), which is what the transcript showed.
+        "response.reasoning_summary_part.added" => {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(data);
+            match parsed {
+                Ok(v) => {
+                    if v["summary_index"].as_u64().unwrap_or(0) > 0 {
+                        return vec![Ok(StreamEvent::Reasoning {
+                            content: "\n\n".to_string(),
+                        })];
+                    }
+                    vec![]
+                }
+                Err(e) => vec![Err(ProviderError::Parse(e.to_string()))],
+            }
+        }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(data);
             match parsed {
@@ -904,8 +921,10 @@ impl ChatProvider for OpenAIResponsesProvider {
                                     parts.push(t);
                                 }
                             }
+                            // Paragraphs, for the same reason the streaming
+                            // path separates `reasoning_summary_part`s.
                             if !parts.is_empty() {
-                                reasoning_content = Some(parts.join(""));
+                                reasoning_content = Some(parts.join("\n\n"));
                             }
                         }
                     }
@@ -1283,6 +1302,28 @@ mod tests {
             &mut state,
         );
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A summary arrives as parts and the deltas carry no separator between
+    /// them; the first part opens nothing, every later one opens a paragraph.
+    #[test]
+    fn a_later_summary_part_opens_a_new_paragraph() {
+        let mut state = StreamState::default();
+        let first = parse_responses_event(
+            "response.reasoning_summary_part.added",
+            r#"{"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+            &mut state,
+        );
+        assert!(first.is_empty(), "{first:?}");
+        let second = parse_responses_event(
+            "response.reasoning_summary_part.added",
+            r#"{"summary_index":1,"part":{"type":"summary_text","text":""}}"#,
+            &mut state,
+        );
+        assert!(
+            matches!(second.first(), Some(Ok(StreamEvent::Reasoning { content })) if content == "\n\n"),
+            "{second:?}"
+        );
     }
 
     /// DeepSeek streams its chain of thought under a different event name than
