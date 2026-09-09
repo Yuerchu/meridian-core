@@ -87,6 +87,9 @@ impl Compacting<'_> {
     }
 
     async fn try_remote_compact(&mut self) -> Result<usize, crate::agent::CompactError> {
+        if !self.params.supports_remote_compaction {
+            return Err(crate::agent::CompactError::NotSupported);
+        }
         mid_turn_compact_remote(self.messages, self.budget, self.provider, self.params, self.keep_recent).await
     }
 

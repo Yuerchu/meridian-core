@@ -704,6 +704,7 @@ pub fn filter_params(params: &mut ChatParams, caps: &ProviderCapabilities) -> Re
     {
         params.temperature = Some(max_temp as f64);
     }
+    params.supports_remote_compaction = caps.supports_remote_compaction;
     Ok(())
 }
 

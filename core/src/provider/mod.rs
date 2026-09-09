@@ -189,7 +189,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_error: false,
             provider_state: None,
-            origin: MessageOrigin::SystemContext,
+            origin: MessageOrigin::LegacyUser,
         }
     }
     pub fn tool_result(tool_call_id: &str, content: &str) -> Self {
@@ -592,6 +592,9 @@ pub struct ChatParams {
     /// Copied in by `capabilities::filter_params` so providers can pick the
     /// right request shape without needing the whole capability struct.
     pub thinking_style: ThinkingStyle,
+    /// Whether this provider+model supports server-side compaction via
+    /// `compaction_trigger`. Copied from capabilities by `filter_params`.
+    pub supports_remote_compaction: bool,
 }
 
 #[derive(Debug, Clone)]
