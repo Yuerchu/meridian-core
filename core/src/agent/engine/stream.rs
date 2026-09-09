@@ -151,6 +151,7 @@ pub(crate) async fn consume_stream(
                     Ok(Some(Ok(provider::StreamEvent::Error { ref message }))) => {
                         return Err(message.clone());
                     }
+                    Ok(Some(Ok(provider::StreamEvent::CompactionResult { .. }))) => {}
                     Ok(Some(Ok(provider::StreamEvent::MessageStart { .. }))) => {}
                     Ok(Some(Err(e))) => {
                         return Err(e.to_string());

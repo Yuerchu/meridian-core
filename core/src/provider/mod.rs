@@ -180,6 +180,18 @@ impl ChatMessage {
             origin: MessageOrigin::Assistant,
         }
     }
+    pub fn compaction(encrypted_content: String) -> Self {
+        Self {
+            role: "compaction".into(),
+            content: encrypted_content,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_error: false,
+            provider_state: None,
+            origin: MessageOrigin::SystemContext,
+        }
+    }
     pub fn tool_result(tool_call_id: &str, content: &str) -> Self {
         Self {
             role: "tool".into(),
@@ -609,6 +621,9 @@ pub enum StreamEvent {
         index: usize,
         arguments: String,
     },
+    CompactionResult {
+        encrypted_content: String,
+    },
     /// A tool the *provider* ran, on its own side.
     ///
     /// Deliberately not a `ToolCall`, and the distinction is load-bearing:
@@ -841,6 +856,9 @@ pub struct ProviderCapabilities {
     /// the two. Empty for every model reached over chat-completions, because
     /// that dialect has no such thing.
     pub server_tools: Vec<ServerToolKind>,
+    /// Whether this model supports server-side compaction via `compaction_trigger`.
+    /// Only meaningful for the Responses API; chat-completions has no such thing.
+    pub supports_remote_compaction: bool,
 }
 
 /// Returned by the non-streaming `chat_with_tools` path, which no caller has
@@ -918,6 +936,19 @@ pub trait ChatProvider: Send + Sync {
         tools: Vec<ToolDefinition>,
         params: ChatParams,
     ) -> Result<AgentResponse, ProviderError>;
+
+    async fn compact_remote(
+        &self,
+        _messages: &[ChatMessage],
+        _params: &ChatParams,
+    ) -> Result<RemoteCompactResult, ProviderError> {
+        Err(ProviderError::NotImplemented("remote compaction".into()))
+    }
+}
+
+pub struct RemoteCompactResult {
+    pub compaction_message: ChatMessage,
+    pub usage: TokenUsage,
 }
 
 #[cfg(test)]
@@ -928,7 +959,7 @@ mod capability_contract_tests {
     fn provider_capabilities_are_a_closed_complete_wire_contract() {
         let value = serde_json::to_value(ProviderCapabilities::default()).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 18);
+        assert_eq!(object.len(), 19);
         assert_eq!(object.get("thinking_style"), Some(&serde_json::json!("none")));
         assert!(object.get("supported_efforts").is_some());
 

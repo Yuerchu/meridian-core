@@ -189,6 +189,12 @@ fn serialize_responses_input(
                     }));
                 }
             }
+            "compaction" => {
+                input.push(serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": m.content,
+                }));
+            }
             _ => {}
         }
     }
@@ -413,7 +419,7 @@ const SERVER_TOOL_ITEMS: &[&str] = &[
 
 /// Output item types with a path of their own through the parser, and so not
 /// worth a warning when `server_tool_call` declines them.
-const OWN_PATH_ITEMS: &[&str] = &["message", "reasoning", "function_call"];
+const OWN_PATH_ITEMS: &[&str] = &["message", "reasoning", "function_call", "compaction"];
 
 /// Warn once per process about a wire name this adapter does not know — an
 /// event type, an output item type. Streams repeat a name for every token, so
@@ -669,6 +675,13 @@ pub(super) fn parse_responses_event(
                         if let Some(&index) = state.call_id_to_index.get(call_id) {
                             return vec![Ok(StreamEvent::ToolCallDone { index, arguments })];
                         }
+                    }
+                    if item["type"].as_str() == Some("compaction")
+                        && let Some(encrypted) = item["encrypted_content"].as_str()
+                    {
+                        return vec![Ok(StreamEvent::CompactionResult {
+                            encrypted_content: encrypted.to_string(),
+                        })];
                     }
                     // Where the substance of a server-side call actually is: the
                     // `added` event carries an empty query and no sources.
@@ -941,6 +954,73 @@ impl ChatProvider for OpenAIResponsesProvider {
             tool_calls,
             usage,
             provider_state: None,
+        })
+    }
+
+    async fn compact_remote(
+        &self,
+        messages: &[ChatMessage],
+        params: &ChatParams,
+    ) -> Result<super::RemoteCompactResult, ProviderError> {
+        let (instructions, mut input) = serialize_responses_input(messages)?;
+        input.push(serde_json::json!({ "type": "compaction_trigger" }));
+
+        let mut body = serde_json::json!({
+            "model": params.model,
+            "input": input,
+            "stream": true,
+            "store": false,
+        });
+        if let Some(ref instr) = instructions {
+            body["instructions"] = serde_json::json!(instr);
+        }
+        if let Some(key) = params.cache_key.as_deref() {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+
+        let mut req = Request::new(http::Method::POST, format!("{}/responses", self.base_url));
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            super::auth_header_value(&format!("Bearer {}", self.api_key)),
+        );
+        req.body = Some(RequestBody::Json(body));
+
+        let transport = ReqwestTransport::shared();
+        let resp = transport.stream(req).await?;
+
+        let mut encrypted_content: Option<String> = None;
+        let mut usage: Option<super::TokenUsage> = None;
+        let mut state = StreamState::default();
+
+        let mut event_stream = resp.bytes.map(|r| r.map_err(ProviderError::Transport)).eventsource();
+
+        while let Some(event) = event_stream.next().await {
+            let ev = match event {
+                Ok(ev) => ev,
+                Err(e) => return Err(ProviderError::Parse(e.to_string())),
+            };
+            for result in parse_responses_event(&ev.event, &ev.data, &mut state) {
+                match result {
+                    Ok(StreamEvent::CompactionResult { encrypted_content: ec }) => {
+                        encrypted_content = Some(ec);
+                    }
+                    Ok(StreamEvent::Stop { usage: u, .. }) => {
+                        usage = u;
+                    }
+                    Ok(StreamEvent::Error { message }) => {
+                        return Err(ProviderError::Upstream(message));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let encrypted = encrypted_content
+            .ok_or_else(|| ProviderError::Parse("compaction response contained no compaction item".into()))?;
+
+        Ok(super::RemoteCompactResult {
+            compaction_message: ChatMessage::compaction(encrypted),
+            usage: usage.unwrap_or_default(),
         })
     }
 }
@@ -1294,14 +1374,30 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_item_is_neither_a_call_nor_a_card() {
+    fn a_compaction_item_emits_compaction_result() {
         let mut state = StreamState::default();
         let out = parse_responses_event(
             "response.output_item.done",
-            r#"{"item":{"id":"cp_1","type":"compaction","encrypted_content":"..."}}"#,
+            r#"{"item":{"id":"cp_1","type":"compaction","encrypted_content":"gAAAAB..."}}"#,
             &mut state,
         );
-        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Ok(StreamEvent::CompactionResult { encrypted_content }) => {
+                assert_eq!(encrypted_content, "gAAAAB...");
+            }
+            other => panic!("expected CompactionResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_message_serializes_as_compaction_input_item() {
+        let msgs = [ChatMessage::compaction("gAAAAB_encrypted".into())];
+        let (instructions, input) = serialize_responses_input(&msgs).unwrap();
+        assert!(instructions.is_none());
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "compaction");
+        assert_eq!(input[0]["encrypted_content"], "gAAAAB_encrypted");
     }
 
     /// A summary arrives as parts and the deltas carry no separator between

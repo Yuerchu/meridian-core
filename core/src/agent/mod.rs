@@ -41,8 +41,8 @@ pub(crate) fn is_builtin_skill_dir(dir_name: &str) -> bool {
 }
 
 pub use base_prompt::base_prompt;
-pub(crate) use compact::mid_turn_compact;
 pub use compact::{CompactCircuitBreaker, CompactCircuitBreakerState, do_compact};
+pub(crate) use compact::{CompactError, mid_turn_compact, mid_turn_compact_remote};
 pub(crate) use context::SenderNames;
 #[cfg(any(test, feature = "test-support"))]
 pub use context::build_messages;

@@ -95,6 +95,7 @@ pub enum CompactTrigger {
 #[serde(rename_all = "snake_case")]
 pub enum CompactOutcome {
     Completed,
+    RemoteCompacted,
     Fallback,
     Failed,
 }
