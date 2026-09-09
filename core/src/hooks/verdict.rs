@@ -135,6 +135,12 @@ list_directory —— **diff 只告诉你改了什么，改得对不对要靠读
 diff 是证据，作者的自述只是主张。改动声称做了什么，用工具去仓库里核实：新函数真的
 被调用了吗？改了签名的地方，所有调用方都跟上了吗？删掉的东西真的没人用了吗？
 
+## 仓库自己的规范
+
+仓库根目录若有 `REVIEW-CHECKLIST.md`，先用 read_file 读它：那是这个仓库把"和周围
+不一致"写成了可逐条对照的清单。diff 触及清单覆盖的范围时逐条对照；清单里标了
+严重度的按它标的算，没标的算 major。没有这个文件就跳过这一节。
+
 ## 判据
 
 按这个顺序看：
@@ -143,7 +149,7 @@ diff 是证据，作者的自述只是主张。改动声称做了什么，用工
 2. **改漏了**：接口变了没改调用方、加了字段没写迁移、动了协议没动另一端、
    新分支没有测试
 3. **和周围不一致**：破坏既有契约、绕过项目已有的工具函数自己重写一遍、
-   违反这个仓库明显的既定约定
+   违反这个仓库明显的既定约定（`REVIEW-CHECKLIST.md` 里写明的那些尤其算）
 4. **越界**：做了没被要求的事，或顺手改了无关代码
 5. **自述与 diff 不符**：说做了但 diff 里没有，或 diff 里有但没说
 
@@ -402,6 +408,22 @@ mod tests {
                 "body = {body:?}"
             );
         }
+    }
+
+    /// The brief is generic across repositories; what makes it specific to one
+    /// is a file the reviewer is told to read. Drop the instruction and every
+    /// repository's own conventions silently stop being reviewed.
+    #[test]
+    fn the_implementation_brief_points_at_the_repository_checklist() {
+        let brief = implementation_prompt("C:\\work\\repo", 1, 3, false);
+        // The whole instruction, not the file name: the name also appears under
+        // criterion 3, so a bare `contains` stayed green with the instruction
+        // gone.
+        assert!(
+            brief.contains("仓库根目录若有 `REVIEW-CHECKLIST.md`，先用 read_file 读它"),
+            "{brief}"
+        );
+        assert!(brief.contains("没有这个文件就跳过"), "{brief}");
     }
 
     #[test]

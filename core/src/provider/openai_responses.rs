@@ -189,6 +189,12 @@ fn serialize_responses_input(
                     }));
                 }
             }
+            "compaction" => {
+                input.push(serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": m.content,
+                }));
+            }
             _ => {}
         }
     }
@@ -361,7 +367,6 @@ const IGNORED_EVENTS: &[&str] = &[
     "response.output_text.done",
     "response.output_text.annotation.added",
     "response.refusal.done",
-    "response.reasoning_summary_part.added",
     "response.reasoning_summary_part.done",
     "response.reasoning_summary_text.done",
     "response.reasoning_text.done",
@@ -414,7 +419,7 @@ const SERVER_TOOL_ITEMS: &[&str] = &[
 
 /// Output item types with a path of their own through the parser, and so not
 /// worth a warning when `server_tool_call` declines them.
-const OWN_PATH_ITEMS: &[&str] = &["message", "reasoning", "function_call"];
+const OWN_PATH_ITEMS: &[&str] = &["message", "reasoning", "function_call", "compaction"];
 
 /// Warn once per process about a wire name this adapter does not know — an
 /// event type, an output item type. Streams repeat a name for every token, so
@@ -594,6 +599,24 @@ pub(super) fn parse_responses_event(
         // and produces no summary at all. Handling only one leaves that
         // provider's thinking invisible while it happens — which reads as the
         // model having stalled.
+        // A summary comes as parts, each a paragraph of its own — typically a
+        // bold title with its body — and the text deltas carry no separator.
+        // Without one here the second part runs straight on from the first
+        // (`**one****two**`), which is what the transcript showed.
+        "response.reasoning_summary_part.added" => {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(data);
+            match parsed {
+                Ok(v) => {
+                    if v["summary_index"].as_u64().unwrap_or(0) > 0 {
+                        return vec![Ok(StreamEvent::Reasoning {
+                            content: "\n\n".to_string(),
+                        })];
+                    }
+                    vec![]
+                }
+                Err(e) => vec![Err(ProviderError::Parse(e.to_string()))],
+            }
+        }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(data);
             match parsed {
@@ -652,6 +675,13 @@ pub(super) fn parse_responses_event(
                         if let Some(&index) = state.call_id_to_index.get(call_id) {
                             return vec![Ok(StreamEvent::ToolCallDone { index, arguments })];
                         }
+                    }
+                    if item["type"].as_str() == Some("compaction")
+                        && let Some(encrypted) = item["encrypted_content"].as_str()
+                    {
+                        return vec![Ok(StreamEvent::CompactionResult {
+                            encrypted_content: encrypted.to_string(),
+                        })];
                     }
                     // Where the substance of a server-side call actually is: the
                     // `added` event carries an empty query and no sources.
@@ -904,8 +934,10 @@ impl ChatProvider for OpenAIResponsesProvider {
                                     parts.push(t);
                                 }
                             }
+                            // Paragraphs, for the same reason the streaming
+                            // path separates `reasoning_summary_part`s.
                             if !parts.is_empty() {
-                                reasoning_content = Some(parts.join(""));
+                                reasoning_content = Some(parts.join("\n\n"));
                             }
                         }
                     }
@@ -922,6 +954,73 @@ impl ChatProvider for OpenAIResponsesProvider {
             tool_calls,
             usage,
             provider_state: None,
+        })
+    }
+
+    async fn compact_remote(
+        &self,
+        messages: &[ChatMessage],
+        params: &ChatParams,
+    ) -> Result<super::RemoteCompactResult, ProviderError> {
+        let (instructions, mut input) = serialize_responses_input(messages)?;
+        input.push(serde_json::json!({ "type": "compaction_trigger" }));
+
+        let mut body = serde_json::json!({
+            "model": params.model,
+            "input": input,
+            "stream": true,
+            "store": false,
+        });
+        if let Some(ref instr) = instructions {
+            body["instructions"] = serde_json::json!(instr);
+        }
+        if let Some(key) = params.cache_key.as_deref() {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+
+        let mut req = Request::new(http::Method::POST, format!("{}/responses", self.base_url));
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            super::auth_header_value(&format!("Bearer {}", self.api_key)),
+        );
+        req.body = Some(RequestBody::Json(body));
+
+        let transport = ReqwestTransport::shared();
+        let resp = transport.stream(req).await?;
+
+        let mut encrypted_content: Option<String> = None;
+        let mut usage: Option<super::TokenUsage> = None;
+        let mut state = StreamState::default();
+
+        let mut event_stream = resp.bytes.map(|r| r.map_err(ProviderError::Transport)).eventsource();
+
+        while let Some(event) = event_stream.next().await {
+            let ev = match event {
+                Ok(ev) => ev,
+                Err(e) => return Err(ProviderError::Parse(e.to_string())),
+            };
+            for result in parse_responses_event(&ev.event, &ev.data, &mut state) {
+                match result {
+                    Ok(StreamEvent::CompactionResult { encrypted_content: ec }) => {
+                        encrypted_content = Some(ec);
+                    }
+                    Ok(StreamEvent::Stop { usage: u, .. }) => {
+                        usage = u;
+                    }
+                    Ok(StreamEvent::Error { message }) => {
+                        return Err(ProviderError::Upstream(message));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let encrypted = encrypted_content
+            .ok_or_else(|| ProviderError::Parse("compaction response contained no compaction item".into()))?;
+
+        Ok(super::RemoteCompactResult {
+            compaction_message: ChatMessage::compaction(encrypted),
+            usage: usage.unwrap_or_default(),
         })
     }
 }
@@ -1275,14 +1374,52 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_item_is_neither_a_call_nor_a_card() {
+    fn a_compaction_item_emits_compaction_result() {
         let mut state = StreamState::default();
         let out = parse_responses_event(
             "response.output_item.done",
-            r#"{"item":{"id":"cp_1","type":"compaction","encrypted_content":"..."}}"#,
+            r#"{"item":{"id":"cp_1","type":"compaction","encrypted_content":"gAAAAB..."}}"#,
             &mut state,
         );
-        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Ok(StreamEvent::CompactionResult { encrypted_content }) => {
+                assert_eq!(encrypted_content, "gAAAAB...");
+            }
+            other => panic!("expected CompactionResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_message_serializes_as_compaction_input_item() {
+        let msgs = [ChatMessage::compaction("gAAAAB_encrypted".into())];
+        let (instructions, input) = serialize_responses_input(&msgs).unwrap();
+        assert!(instructions.is_none());
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "compaction");
+        assert_eq!(input[0]["encrypted_content"], "gAAAAB_encrypted");
+    }
+
+    /// A summary arrives as parts and the deltas carry no separator between
+    /// them; the first part opens nothing, every later one opens a paragraph.
+    #[test]
+    fn a_later_summary_part_opens_a_new_paragraph() {
+        let mut state = StreamState::default();
+        let first = parse_responses_event(
+            "response.reasoning_summary_part.added",
+            r#"{"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+            &mut state,
+        );
+        assert!(first.is_empty(), "{first:?}");
+        let second = parse_responses_event(
+            "response.reasoning_summary_part.added",
+            r#"{"summary_index":1,"part":{"type":"summary_text","text":""}}"#,
+            &mut state,
+        );
+        assert!(
+            matches!(second.first(), Some(Ok(StreamEvent::Reasoning { content })) if content == "\n\n"),
+            "{second:?}"
+        );
     }
 
     /// DeepSeek streams its chain of thought under a different event name than

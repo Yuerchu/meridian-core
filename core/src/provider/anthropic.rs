@@ -713,6 +713,10 @@ struct StreamState {
     /// What each server tool was called with, by its id, so the result block
     /// can revise the card without wiping the query off it.
     server_args: BTreeMap<String, String>,
+    /// Whether a thinking block in this response has said anything yet — as
+    /// opposed to the empty ones `display: "omitted"` returns. Kept apart from
+    /// `blocks`, which `content_block_stop` empties as it hands each one over.
+    spoke_thinking: bool,
 }
 
 /// The block types that are reconstructed from the row rather than replayed.
@@ -804,6 +808,18 @@ fn absorb(
                     if !is_documented_block(other) {
                         warn_unknown_event("anthropic_content_block", other);
                     }
+                    // A second thinking block in one response is its own
+                    // paragraph: under `display: "summarized"` a progress
+                    // update between tool calls comes as a thinking block of
+                    // its own right after the reasoning one. The deltas carry
+                    // no separator and the store folds consecutive reasoning
+                    // into one block, so without this the two run together.
+                    // An empty earlier block (`omitted`) opens nothing.
+                    if other == "thinking" && state.spoke_thinking {
+                        out.push(Ok(StreamEvent::Reasoning {
+                            content: "\n\n".to_string(),
+                        }));
+                    }
                     // A result block arrives whole. It closes the card its
                     // call opened, with the pages it looked at.
                     if let Some(name) = other.strip_suffix("_tool_result")
@@ -836,6 +852,7 @@ fn absorb(
                         {
                             acc.push_str(&t);
                         }
+                        state.spoke_thinking = true;
                         out.push(Ok(StreamEvent::Reasoning { content: t }));
                     }
                 }
@@ -1599,6 +1616,43 @@ mod tests {
             .into_iter()
             .map(|r| r.expect("not an error"))
             .collect()
+    }
+
+    /// Two thinking blocks with text in one response — reasoning, then the
+    /// progress update `summarized` also returns — are two paragraphs. An
+    /// empty first block (`omitted`) opens none.
+    #[test]
+    fn a_second_spoken_thinking_block_opens_a_new_paragraph() {
+        let mut state = StreamState::default();
+        feed(
+            &mut state,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        );
+        feed(
+            &mut state,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoned"}}"#,
+        );
+        feed(&mut state, r#"{"type":"content_block_stop","index":0}"#);
+        let events = feed(
+            &mut state,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        );
+        assert!(
+            matches!(&events[0], StreamEvent::Reasoning { content } if content == "\n\n"),
+            "{events:?}"
+        );
+
+        let mut omitted = StreamState::default();
+        feed(
+            &mut omitted,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        );
+        feed(&mut omitted, r#"{"type":"content_block_stop","index":0}"#);
+        let events = feed(
+            &mut omitted,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        );
+        assert!(events.is_empty(), "{events:?}");
     }
 
     /// The documented stream, event by event, with every block that has to go

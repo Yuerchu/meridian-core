@@ -96,6 +96,7 @@ struct CatalogEntry {
     supports_verbosity: Option<bool>,
     default_verbosity: Option<CapabilityVerbosity>,
     server_tools: Option<Vec<ServerToolKind>>,
+    supports_remote_compaction: Option<bool>,
 }
 
 static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
@@ -161,6 +162,9 @@ fn apply(base: &mut ProviderCapabilities, entry: &CatalogEntry) {
     }
     if let Some(ref v) = entry.server_tools {
         base.server_tools = v.clone();
+    }
+    if let Some(v) = entry.supports_remote_compaction {
+        base.supports_remote_compaction = v;
     }
 }
 
@@ -380,6 +384,7 @@ fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> 
         },
     };
     caps.server_tools = server_tools_for(provider_type, api_format);
+    caps.supports_remote_compaction = remote_compaction_for(provider_type, api_format);
     if let Some(entry) = find_longest_prefix_match(catalog_provider, model) {
         apply(&mut caps, entry);
     }
@@ -418,6 +423,13 @@ fn server_tools_for(provider_type: &str, api_format: Option<&str>) -> Vec<Server
         _ => &[],
     };
     tools.to_vec()
+}
+
+fn remote_compaction_for(provider_type: &str, api_format: Option<&str>) -> bool {
+    matches!(
+        (provider_type, api_format),
+        ("openai" | "xai" | "deepseek", Some("responses"))
+    )
 }
 
 #[derive(Debug, Default)]
@@ -499,6 +511,7 @@ pub struct ProviderCapabilityOverrides {
     thinking_style: OverrideField<ThinkingStyle>,
     supported_efforts: OverrideField<Vec<CapabilityEffort>>,
     server_tools: OverrideField<Vec<ServerToolKind>>,
+    supports_remote_compaction: OverrideField<bool>,
     default_effort: OverrideField<Option<CapabilityEffort>>,
     default_verbosity: OverrideField<Option<CapabilityVerbosity>>,
     max_context_tokens: OverrideField<Option<u32>>,
@@ -577,6 +590,7 @@ pub fn apply_overrides(caps: &mut ProviderCapabilities, overrides: Option<&str>)
     apply_value!(supports_verbosity);
     apply_value!(thinking_style);
     apply_value!(server_tools);
+    apply_value!(supports_remote_compaction);
     apply_value!(max_context_tokens);
     apply_value!(max_output_tokens);
     apply_value!(max_temperature);
@@ -690,6 +704,7 @@ pub fn filter_params(params: &mut ChatParams, caps: &ProviderCapabilities) -> Re
     {
         params.temperature = Some(max_temp as f64);
     }
+    params.supports_remote_compaction = caps.supports_remote_compaction;
     Ok(())
 }
 

@@ -129,6 +129,7 @@ fn wrapped_user_context(rendered: &str) -> String {
 pub(crate) enum CompactError {
     NotEnoughMessages,
     Provider(String),
+    NotSupported,
 }
 
 impl std::fmt::Display for CompactError {
@@ -136,6 +137,7 @@ impl std::fmt::Display for CompactError {
         match self {
             Self::NotEnoughMessages => write!(f, "Not enough messages to compact"),
             Self::Provider(e) => write!(f, "Provider error: {e}"),
+            Self::NotSupported => write!(f, "Provider does not support remote compaction"),
         }
     }
 }
@@ -626,6 +628,45 @@ pub(crate) async fn mid_turn_compact(
     new_messages.extend(injected);
     new_messages.extend_from_slice(&messages[boundary..]);
     remove_orphan_tool_messages(&mut new_messages);
+
+    *messages = new_messages;
+
+    let after = budget.counter.count_messages(messages);
+    Ok(before.saturating_sub(after))
+}
+
+pub(crate) async fn mid_turn_compact_remote(
+    messages: &mut Vec<ChatMessage>,
+    budget: &TokenBudget,
+    provider: &dyn ChatProvider,
+    params: &provider::ChatParams,
+    _keep_recent: usize,
+) -> Result<usize, CompactError> {
+    let before = budget.counter.count_messages(messages);
+
+    let injected = super::context::take_injected_context(messages);
+
+    let compact_params = without_thinking(params.clone());
+    let result = match provider.compact_remote(messages, &compact_params).await {
+        Ok(r) => r,
+        Err(crate::provider::ProviderError::NotImplemented(_)) => {
+            messages.extend(injected);
+            return Err(CompactError::NotSupported);
+        }
+        Err(e) => {
+            messages.extend(injected);
+            return Err(CompactError::Provider(e.to_string()));
+        }
+    };
+
+    let has_system = messages.first().is_some_and(|m| m.role == "system");
+
+    let mut new_messages = Vec::new();
+    if has_system {
+        new_messages.push(messages[0].clone());
+    }
+    new_messages.push(result.compaction_message);
+    new_messages.extend(injected);
 
     *messages = new_messages;
 

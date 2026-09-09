@@ -20,7 +20,9 @@
 
 use std::sync::Arc;
 
-use crate::agent::{CompactCircuitBreaker, TokenBudget, microcompact, mid_turn_compact, trim_to_context_limit};
+use crate::agent::{
+    CompactCircuitBreaker, TokenBudget, microcompact, mid_turn_compact, mid_turn_compact_remote, trim_to_context_limit,
+};
 use crate::events::{CompactDoneEvent, CompactOutcome, CompactStartEvent, CompactTrigger};
 use crate::provider::{ChatMessage, ChatParams, ChatProvider};
 
@@ -82,6 +84,13 @@ impl Compacting<'_> {
             limit = self.context_limit,
             "compacted mid-turn"
         );
+    }
+
+    async fn try_remote_compact(&mut self) -> Result<usize, crate::agent::CompactError> {
+        if !self.params.supports_remote_compaction {
+            return Err(crate::agent::CompactError::NotSupported);
+        }
+        mid_turn_compact_remote(self.messages, self.budget, self.provider, self.params, self.keep_recent).await
     }
 
     fn announce_start(&self, trigger: CompactTrigger) {
@@ -154,6 +163,13 @@ impl CompactionPolicy {
                     return;
                 }
                 c.announce_start(CompactTrigger::ApiError);
+                if c.try_remote_compact().await.is_ok() {
+                    breaker.record_success();
+                    c.budget.update_estimate(c.messages);
+                    c.announce_done(CompactTrigger::ApiError, CompactOutcome::RemoteCompacted, None, None);
+                    c.report("api_error", before, "remote");
+                    return;
+                }
                 let (rung, outcome, error) =
                     match mid_turn_compact(c.messages, c.budget, c.provider, c.params, c.keep_recent).await {
                         Ok(_) => {
@@ -185,11 +201,17 @@ impl CompactionPolicy {
                 c.cheap_pass();
                 let mut rung = "microcompact";
                 if c.budget.needs_compact() {
-                    rung = "summary";
-                    if let Err(e) = mid_turn_compact(c.messages, c.budget, c.provider, c.params, c.keep_recent).await {
+                    if c.try_remote_compact().await.is_ok() {
+                        rung = "remote";
+                        c.budget.update_estimate(c.messages);
+                    } else if let Err(e) =
+                        mid_turn_compact(c.messages, c.budget, c.provider, c.params, c.keep_recent).await
+                    {
                         tracing::warn!("OneBot mid-turn compact failed: {e}");
                         rung = "trim";
                         c.trim();
+                    } else {
+                        rung = "summary";
                     }
                     c.budget.update_estimate(c.messages);
                 }
@@ -202,9 +224,6 @@ impl CompactionPolicy {
                 c.announce_start(CompactTrigger::Threshold);
                 let reclaimed = c.cheap_pass();
                 if !c.budget.needs_compact() {
-                    // Said even when the cheap pass freed nothing, because the
-                    // start went out and a window left holding it would show a
-                    // compaction that never ends.
                     c.announce_done(
                         CompactTrigger::Threshold,
                         CompactOutcome::Completed,
@@ -212,6 +231,18 @@ impl CompactionPolicy {
                         None,
                     );
                     c.report("threshold", before, "microcompact");
+                    return;
+                }
+                if let Ok(more) = c.try_remote_compact().await {
+                    breaker.record_success();
+                    c.budget.update_estimate(c.messages);
+                    c.announce_done(
+                        CompactTrigger::Threshold,
+                        CompactOutcome::RemoteCompacted,
+                        Some(reclaimed + more),
+                        None,
+                    );
+                    c.report("threshold", before, "remote");
                     return;
                 }
                 match mid_turn_compact(c.messages, c.budget, c.provider, c.params, c.keep_recent).await {
