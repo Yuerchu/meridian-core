@@ -58,6 +58,10 @@ impl Tool for LoadSkillTool {
         Permission::Always
     }
 
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
         let skill_name = args
             .get("skill_name")

@@ -20,7 +20,9 @@
 
 pub(crate) mod approval;
 pub(crate) mod compaction;
+pub(crate) mod parallel;
 pub(crate) mod ports;
+pub(crate) mod pruning;
 pub(crate) mod stream;
 pub(crate) mod transcript;
 pub(crate) mod transitions;
