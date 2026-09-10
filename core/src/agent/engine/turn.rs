@@ -27,6 +27,7 @@
 
 use std::collections::HashSet;
 
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::modes::ModeSpec;
@@ -509,6 +510,11 @@ async fn run(
             break;
         }
 
+        // Trim old, large tool results before estimating tokens. Cheaper than
+        // compaction and runs every round, so the budget sees a tighter history
+        // and compaction fires less often.
+        super::pruning::prune_tool_results(&mut chat_messages, &super::pruning::PruningConfig::default());
+
         // A caller may already have trimmed the initial history, but request
         // safety cannot depend on that. Re-apply the user-context aggregate cap
         // at the provider boundary on every round, including low-pressure
@@ -859,11 +865,252 @@ async fn run(
         chat_messages.push(assistant_msg);
 
         let ordered_calls = plan_batch_order(&result.tool_calls);
+        let segments = super::parallel::partition_tool_calls(
+            &ordered_calls,
+            services.tools,
+            &offered,
+            &tool_context,
+            &approval_rule,
+            ports.surface_tools,
+            mode,
+            ports.sub_agents,
+        );
         let mut plan_update_failed = false;
-        for tc in ordered_calls {
-            if cancel.is_cancelled() {
+        for segment in &segments {
+            if cancel.is_cancelled() || turn_aborted {
                 break;
             }
+
+            if let super::parallel::Segment::Parallel(parallel_calls) = segment {
+                // --- Parallel dispatch: concurrent execution of read-only, no-approval tools ---
+
+                // Pre-scan loop guard in wire order. If any call triggers a
+                // warning or abort, fall back to serial for the remaining calls
+                // in this segment.
+                let mut parallel_ok = Vec::new();
+                let mut fallback_serial = Vec::new();
+                let mut hit_guard = false;
+                for &tc in parallel_calls {
+                    if hit_guard {
+                        fallback_serial.push(tc);
+                    } else {
+                        let verdict = loop_guard.observe(&tc.name, &tc.arguments);
+                        match verdict {
+                            crate::agent::LoopVerdict::Proceed => parallel_ok.push(tc),
+                            _ => {
+                                hit_guard = true;
+                                fallback_serial.push(tc);
+                            }
+                        }
+                    }
+                }
+
+                if !parallel_ok.is_empty() {
+                    // Emit all ToolCall events upfront.
+                    for tc in &parallel_ok {
+                        announce(ChatStreamEvent::ToolCall {
+                            call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                            message_id: assistant_msg_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                        })?;
+                    }
+
+                    // Phase: mark as running tool for crash safety.
+                    crate::agent::turn_record::note_phase(pool, &turn_id, TurnPhase::RunningTool, None).await;
+
+                    // Spawn all calls concurrently. Each future resolves to
+                    // (output, outcome) — the same shape the serial path produces.
+                    let mut in_flight = futures::stream::FuturesOrdered::new();
+                    for tc in &parallel_ok {
+                        let cancel_inner = cancel.clone();
+
+                        if tc.name == crate::agent::sub_agents::RUN_AGENT_TOOL {
+                            // Sub-agent dispatch.
+                            let msg_id = assistant_msg_id.clone();
+                            let call_id = tc.id.clone();
+                            match parse_sub_agent(&tc.arguments, &msg_id, &call_id) {
+                                Err(e) => {
+                                    in_flight
+                                        .push_back(futures::future::ready((format!("Error: {e}"), "error")).boxed());
+                                }
+                                Ok(spec) => {
+                                    let sub = ports.sub_agents.expect("partition guarantees sub_agents port");
+                                    in_flight.push_back(
+                                        async move {
+                                            if cancel_inner.is_cancelled() {
+                                                return ("Cancelled".to_string(), "error");
+                                            }
+                                            match sub.run(spec).await {
+                                                Ok(report) => {
+                                                    let outcome = report.status.outcome();
+                                                    (sub_agent_result(&report), outcome)
+                                                }
+                                                Err(e) => (format!("Error: {e}"), "error"),
+                                            }
+                                        }
+                                        .boxed(),
+                                    );
+                                }
+                            }
+                        } else {
+                            // Registry tool dispatch.
+                            let tool = services
+                                .tools
+                                .get(&tc.name)
+                                .expect("partition guarantees registry tool");
+                            let args = match parse_tool_arguments(&tc.arguments) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    in_flight
+                                        .push_back(futures::future::ready((format!("Error: {e}"), "error")).boxed());
+                                    continue;
+                                }
+                            };
+                            let ctx = tool_context.clone();
+                            in_flight.push_back(
+                                async move {
+                                    if cancel_inner.is_cancelled() {
+                                        return ("Cancelled".to_string(), "error");
+                                    }
+                                    match tool.execute(args, &ctx).await {
+                                        Ok(o) => (o, "success"),
+                                        Err(e) => (format!("Error: {e}"), "error"),
+                                    }
+                                }
+                                .boxed(),
+                            );
+                        }
+                    }
+
+                    // Collect results in wire order.
+                    use futures::StreamExt;
+                    let mut results: Vec<(String, &str)> = Vec::with_capacity(parallel_ok.len());
+                    while let Some(res) = in_flight.next().await {
+                        results.push(res);
+                    }
+
+                    // Restore phase.
+                    crate::agent::turn_record::note_phase(pool, &turn_id, TurnPhase::Streaming, None).await;
+
+                    // Post-process each result sequentially in wire order.
+                    for (tc, (output, outcome)) in parallel_ok.iter().zip(results) {
+                        let output =
+                            crate::agent::formatted_truncate_text(&output, crate::agent::TOOL_OUTPUT_TRUNCATION);
+
+                        let event_outcome = match outcome {
+                            "success" => ToolOutcome::Success,
+                            _ => ToolOutcome::Error,
+                        };
+                        announce(ChatStreamEvent::ToolResult {
+                            call_id: tc.id.clone(),
+                            result: output.clone(),
+                            outcome: event_outcome,
+                            message_id: assistant_msg_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                        })?;
+
+                        if let Some(id) = append_tool_result(
+                            pool,
+                            &conversation_id,
+                            &turn_id,
+                            &tc.id,
+                            &output,
+                            outcome,
+                            parent_cursor.as_deref(),
+                        )
+                        .await
+                        {
+                            parent_cursor = Some(id);
+                        }
+
+                        chat_messages.push(match event_outcome {
+                            ToolOutcome::Success => ChatMessage::tool_result(&tc.id, &output),
+                            ToolOutcome::Denied | ToolOutcome::Error => ChatMessage::tool_error(&tc.id, &output),
+                        });
+                    }
+                }
+
+                // Fall-through: any calls that hit the loop guard are handled
+                // serially below, inline with the Serial path.
+                for tc in fallback_serial {
+                    if cancel.is_cancelled() || turn_aborted {
+                        break;
+                    }
+                    // Reuse the serial dispatch path (duplicated from the
+                    // Serial branch below to avoid an extraction that would
+                    // touch 400 lines of parameters). The loop guard already
+                    // observed these calls above, so re-observe here to get
+                    // the verdict back.
+                    let verdict = loop_guard.observe(&tc.name, &tc.arguments);
+
+                    announce(ChatStreamEvent::ToolCall {
+                        call_id: tc.id.clone(),
+                        tool_name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                        message_id: assistant_msg_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                    })?;
+
+                    let (output, outcome): (String, &'static str) = if let crate::agent::LoopVerdict::Warn(n) = verdict
+                    {
+                        (crate::agent::loop_warning_message(&tc.name, n), "error")
+                    } else if let crate::agent::LoopVerdict::Abort(n) = verdict {
+                        turn_aborted = true;
+                        (crate::agent::loop_abort_message(&tc.name, n), "error")
+                    } else {
+                        unreachable!("fallback_serial only contains guard-hit calls");
+                    };
+
+                    let output = crate::agent::formatted_truncate_text(&output, crate::agent::TOOL_OUTPUT_TRUNCATION);
+
+                    let event_outcome = match outcome {
+                        "success" => ToolOutcome::Success,
+                        "denied" => ToolOutcome::Denied,
+                        "error" => ToolOutcome::Error,
+                        other => return Err(format!("unknown tool outcome `{other}`")),
+                    };
+                    announce(ChatStreamEvent::ToolResult {
+                        call_id: tc.id.clone(),
+                        result: output.clone(),
+                        outcome: event_outcome,
+                        message_id: assistant_msg_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                    })?;
+
+                    if let Some(id) = append_tool_result(
+                        pool,
+                        &conversation_id,
+                        &turn_id,
+                        &tc.id,
+                        &output,
+                        outcome,
+                        parent_cursor.as_deref(),
+                    )
+                    .await
+                    {
+                        parent_cursor = Some(id);
+                    }
+
+                    chat_messages.push(match event_outcome {
+                        ToolOutcome::Success => ChatMessage::tool_result(&tc.id, &output),
+                        ToolOutcome::Denied | ToolOutcome::Error => ChatMessage::tool_error(&tc.id, &output),
+                    });
+
+                    if turn_aborted {
+                        break;
+                    }
+                }
+
+                continue;
+            }
+
+            // --- Serial dispatch: the original single-call path ---
+            let tc = match segment {
+                super::parallel::Segment::Serial(tc) => tc,
+                super::parallel::Segment::Parallel(_) => unreachable!(),
+            };
 
             announce(ChatStreamEvent::ToolCall {
                 call_id: tc.id.clone(),

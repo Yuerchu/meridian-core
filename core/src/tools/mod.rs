@@ -492,6 +492,14 @@ pub trait Tool: Send + Sync {
         reach::Reach::Outside
     }
 
+    /// Whether this tool is safe to run concurrently with other parallel-safe
+    /// tools in the same batch. Only meaningful when the call also needs no
+    /// approval — a tool that requires a prompt is never dispatched in parallel
+    /// regardless of this flag.
+    fn supports_parallel(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String>;
 }
 

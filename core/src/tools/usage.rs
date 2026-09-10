@@ -132,6 +132,10 @@ impl Tool for ConversationUsageTool {
         Permission::Always
     }
 
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
         let (dimension, days) = parse_request(args)?;
 

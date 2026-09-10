@@ -161,6 +161,10 @@ impl Tool for RecallMemoryTool {
         Permission::Always
     }
 
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
         let (pool, scope, scope_id) = get_pool_and_scope(context)?;
         let key = args
@@ -204,6 +208,10 @@ impl Tool for ListMemoriesTool {
 
     fn default_permission(&self) -> Permission {
         Permission::Always
+    }
+
+    fn supports_parallel(&self) -> bool {
+        true
     }
 
     async fn execute(&self, _args: Value, context: &ToolContext) -> Result<String, String> {

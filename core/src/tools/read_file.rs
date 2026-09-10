@@ -39,6 +39,10 @@ impl Tool for ReadFileTool {
         }
     }
 
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String> {
         let path_str = args["path"].as_str().ok_or("missing 'path' argument")?;
         // Opened rather than merely resolved: reads are the one thing that runs

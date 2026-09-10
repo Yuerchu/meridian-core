@@ -101,6 +101,10 @@ impl Tool for ReadAppLogsTool {
         Permission::Always
     }
 
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
         let level = crate::logging::validate_level(args.get("level").and_then(Value::as_str).unwrap_or("warn"))?;
         let limit = args

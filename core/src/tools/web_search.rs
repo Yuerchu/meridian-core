@@ -89,6 +89,10 @@ impl Tool for WebSearchTool {
         Permission::Ask
     }
 
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String> {
         let query = args["query"].as_str().ok_or("missing 'query' argument")?.to_string();
         let max_results = args["max_results"].as_u64().unwrap_or(5).min(20) as usize;

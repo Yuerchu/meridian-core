@@ -127,6 +127,10 @@ impl Tool for ReadConversationTool {
         Permission::Always
     }
 
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
         let request: ReadConversationRequest =
             serde_json::from_value(args).map_err(|e| format!("invalid read_conversation arguments: {e}"))?;
