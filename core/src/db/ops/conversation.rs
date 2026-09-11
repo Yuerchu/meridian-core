@@ -131,6 +131,18 @@ pub fn archive_conversation(conn: &mut SqliteConnection, id: &str, now: i64) -> 
     Ok(())
 }
 
+pub fn toggle_archive(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<ConversationRow> {
+    let conv = conversations::table.find(id).first::<ConversationRow>(conn)?;
+    let new_archived = if conv.is_archived == 0 { 1 } else { 0 };
+    diesel::update(conversations::table.find(id))
+        .set((
+            conversations::is_archived.eq(new_archived),
+            conversations::updated_at.eq(now),
+        ))
+        .execute(conn)?;
+    conversations::table.find(id).first::<ConversationRow>(conn)
+}
+
 /// Persist the per-conversation reasoning preferences. `thinking_level` of
 /// `None` means "inherit the assistant default".
 pub fn update_reasoning_prefs(
