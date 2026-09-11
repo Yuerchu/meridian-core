@@ -112,16 +112,27 @@ pub fn update_assistant(
     Ok(())
 }
 
+/// Flip the pin and hand back the row as it is after the flip.
+///
+/// `immediate_transaction`, because a read followed by a write on autocommit
+/// is two connections' worth of race: both read `0`, both write `1`, and one
+/// of two presses is lost. `BEGIN IMMEDIATE` takes the write lock *before* the
+/// read, so the second caller waits and then reads the first one's result. The
+/// same lock is what makes the row read back at the end this call's own
+/// outcome rather than whatever a later caller has since written.
+/// `concurrent_toggles_are_each_applied` is the test that goes red without it.
 pub fn toggle_pin(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<ConversationRow> {
-    let conv = conversations::table.find(id).first::<ConversationRow>(conn)?;
-    let new_pinned = if conv.is_pinned == 0 { 1 } else { 0 };
-    diesel::update(conversations::table.find(id))
-        .set((
-            conversations::is_pinned.eq(new_pinned),
-            conversations::updated_at.eq(now),
-        ))
-        .execute(conn)?;
-    conversations::table.find(id).first::<ConversationRow>(conn)
+    conn.immediate_transaction(|conn| {
+        let conv = conversations::table.find(id).first::<ConversationRow>(conn)?;
+        let new_pinned = if conv.is_pinned == 0 { 1 } else { 0 };
+        diesel::update(conversations::table.find(id))
+            .set((
+                conversations::is_pinned.eq(new_pinned),
+                conversations::updated_at.eq(now),
+            ))
+            .execute(conn)?;
+        conversations::table.find(id).first::<ConversationRow>(conn)
+    })
 }
 
 pub fn archive_conversation(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<()> {
@@ -131,16 +142,19 @@ pub fn archive_conversation(conn: &mut SqliteConnection, id: &str, now: i64) -> 
     Ok(())
 }
 
+/// The archive flag's `toggle_pin`, under the same lock for the same reason.
 pub fn toggle_archive(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<ConversationRow> {
-    let conv = conversations::table.find(id).first::<ConversationRow>(conn)?;
-    let new_archived = if conv.is_archived == 0 { 1 } else { 0 };
-    diesel::update(conversations::table.find(id))
-        .set((
-            conversations::is_archived.eq(new_archived),
-            conversations::updated_at.eq(now),
-        ))
-        .execute(conn)?;
-    conversations::table.find(id).first::<ConversationRow>(conn)
+    conn.immediate_transaction(|conn| {
+        let conv = conversations::table.find(id).first::<ConversationRow>(conn)?;
+        let new_archived = if conv.is_archived == 0 { 1 } else { 0 };
+        diesel::update(conversations::table.find(id))
+            .set((
+                conversations::is_archived.eq(new_archived),
+                conversations::updated_at.eq(now),
+            ))
+            .execute(conn)?;
+        conversations::table.find(id).first::<ConversationRow>(conn)
+    })
 }
 
 /// Persist the per-conversation reasoning preferences. `thinking_level` of
@@ -1009,6 +1023,49 @@ mod tests {
         assistant_row(&mut conn, "a3", "child", "t-followup");
 
         assert_eq!(sub_agent_runs(&mut conn, "parent").unwrap()[0].steps, 2);
+    }
+
+    /// Two connections toggling one row at the same time must each land their
+    /// toggle. Read-then-write on autocommit does not: both read the same
+    /// value, both write the same inverse, and one of the two presses is gone.
+    /// Not `test_db()`, whose pool holds one connection to a private in-memory
+    /// database — the race needs two connections to one file, which is what
+    /// the desktop's pool is. This is the test that goes red without the
+    /// `immediate_transaction`.
+    #[test]
+    fn concurrent_toggles_are_each_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.sqlite");
+        let pool = crate::db::init_db(path.to_str().unwrap());
+        create_conversation(&mut pool.get().unwrap(), "c1", None, None, None, 1).unwrap();
+
+        const ROUNDS: i64 = 2000;
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let pool = pool.clone();
+                std::thread::spawn(move || {
+                    let mut conn = pool.get().unwrap();
+                    // Per connection. Durability is not what is under test, and
+                    // an fsync per write would spend the whole run waiting on
+                    // the disk rather than on each other.
+                    diesel::sql_query("PRAGMA synchronous=OFF").execute(&mut conn).unwrap();
+                    for i in 0..ROUNDS {
+                        toggle_archive(&mut conn, "c1", i).unwrap();
+                        toggle_pin(&mut conn, "c1", i).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let conv = get_conversation(&mut pool.get().unwrap(), "c1").unwrap();
+        assert_eq!(
+            (conv.is_archived, conv.is_pinned),
+            (0, 0),
+            "an even number of toggles lands back where it started"
+        );
     }
 
     /// Rows written before this migration have every new column empty, and go on
