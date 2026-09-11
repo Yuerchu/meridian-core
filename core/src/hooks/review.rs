@@ -686,6 +686,8 @@ async fn run_turn(
         pool: &state.services.db,
         tools: &state.services.tools,
         mcp: &state.services.mcp,
+        redaction: &state.services.redaction,
+        redaction_mappings: &state.services.redaction_mappings,
     };
     let deadline = std::time::Duration::from_secs(state.config.timeout_secs.max(1) as u64);
 

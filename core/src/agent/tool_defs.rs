@@ -209,6 +209,7 @@ mod tests {
         ToolRegistry::new(
             std::path::PathBuf::from("/nonexistent"),
             std::path::PathBuf::from("/nonexistent"),
+            std::sync::Arc::new(crate::redaction::RedactionEngine::disabled()),
         )
     }
 
@@ -582,6 +583,7 @@ mod tests {
         let registry = ToolRegistry::new(
             std::path::PathBuf::from("/nonexistent"),
             std::path::PathBuf::from("/nonexistent"),
+            std::sync::Arc::new(crate::redaction::RedactionEngine::disabled()),
         );
         let mcp = vec![ToolDefinition {
             name: "mcp__srv__thing".into(),

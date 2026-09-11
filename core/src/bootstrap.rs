@@ -293,8 +293,14 @@ pub fn bootstrap(data_dir: PathBuf, events: EventBus) -> Result<Services, String
         }
     }
 
+    let redaction = Arc::new(crate::redaction::RedactionEngine::new());
+    {
+        let mut conn = pool.get().expect("db connection");
+        redaction.reload(&mut conn)?;
+    }
+
     // Load custom tools from DB into tool registry
-    let registry = tools::ToolRegistry::new(skills_root.clone(), data_dir.join("logs"));
+    let registry = tools::ToolRegistry::new(skills_root.clone(), data_dir.join("logs"), redaction.clone());
     {
         let mut conn = pool.get().expect("db connection");
         match db::ops::custom_tool::list_enabled_tools(&mut conn) {
@@ -376,6 +382,8 @@ pub fn bootstrap(data_dir: PathBuf, events: EventBus) -> Result<Services, String
         // way for this to be missing.
         turn_starter: std::sync::OnceLock::new(),
         journal_shared: crate::journal::capture::JournalShared::new(),
+        redaction,
+        redaction_mappings: crate::redaction::RedactionMappings::new(),
     }))
 }
 

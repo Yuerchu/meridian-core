@@ -209,6 +209,8 @@ pub struct TurnServices<'a> {
     pub pool: &'a DbPool,
     pub tools: &'a ToolRegistry,
     pub mcp: &'a McpRegistry,
+    pub redaction: &'a crate::redaction::RedactionEngine,
+    pub redaction_mappings: &'a crate::redaction::RedactionMappings,
 }
 
 /// How a registry tool's declared permission becomes a question.
@@ -521,6 +523,21 @@ async fn run(
         // histories that never enter compaction, then estimate exactly what is
         // about to be sent.
         crate::agent::context::cap_user_provided_context(&mut chat_messages, context_limit);
+        let redaction_report = scrub_upstream(
+            services.redaction,
+            &mut chat_messages,
+            tool_context.project_id.as_deref(),
+            &conversation_id,
+            services.redaction_mappings,
+        );
+        if !redaction_report.hits.is_empty() {
+            whisper_chat(ChatStreamEvent::RedactionNotice {
+                conversation_id: conversation_id.clone(),
+                turn_id: turn_id.clone(),
+                redacted_count: redaction_report.hits.iter().map(|h| h.count).sum(),
+                rules: redaction_report.hits.iter().map(|h| h.name.clone()).collect(),
+            });
+        }
         budget.update_estimate(&chat_messages);
 
         // A prompt that already fills the window has nowhere to put an answer,
@@ -960,7 +977,7 @@ async fn run(
                                 .tools
                                 .get(&tc.name)
                                 .expect("partition guarantees registry tool");
-                            let args = match parse_tool_arguments(&tc.arguments) {
+                            let mut args = match parse_tool_arguments(&tc.arguments) {
                                 Ok(a) => a,
                                 Err(e) => {
                                     in_flight
@@ -968,6 +985,7 @@ async fn run(
                                     continue;
                                 }
                             };
+                            services.redaction_mappings.restore_in_json(&conversation_id, &mut args);
                             let ctx = tool_context.clone();
                             in_flight.push_back(
                                 async move {
@@ -1344,7 +1362,8 @@ async fn run(
             } else if let Some(tool) = tool {
                 match parse_tool_arguments(&tc.arguments) {
                     Err(error) => (format!("Error: {error}"), "error"),
-                    Ok(args) => {
+                    Ok(mut args) => {
+                        services.redaction_mappings.restore_in_json(&conversation_id, &mut args);
                         let permission = tool.default_permission();
                         let must_ask = match &approval_rule {
                             // `reach` is advisory: it decides whether to prompt, not
@@ -1518,6 +1537,13 @@ async fn run(
             }
         }
 
+        scrub_upstream(
+            services.redaction,
+            &mut chat_messages,
+            tool_context.project_id.as_deref(),
+            &conversation_id,
+            services.redaction_mappings,
+        );
         compaction
             .between_rounds(Compacting {
                 messages: &mut chat_messages,
@@ -1548,6 +1574,24 @@ async fn run(
 /// Called after every injection, both of them, because either one can be the
 /// point where somebody else joins. Intersects rather than assigns: a port that
 /// answers may only take tools away, never hand back one the turn never had.
+fn scrub_upstream(
+    engine: &crate::redaction::RedactionEngine,
+    messages: &mut [crate::provider::ChatMessage],
+    project_id: Option<&str>,
+    conversation_id: &str,
+    mappings: &crate::redaction::RedactionMappings,
+) -> crate::redaction::RedactionReport {
+    let report = engine.scrub_for_conversation(messages, project_id, conversation_id, mappings);
+    if report.messages_touched > 0 {
+        tracing::info!(
+            messages = report.messages_touched,
+            rules = ?report.hits.iter().map(|h| (&h.name, h.count)).collect::<Vec<_>>(),
+            "redacted before sending upstream"
+        );
+    }
+    report
+}
+
 fn narrow_offered(offered: &mut HashSet<String>, steering: Option<&dyn Steering>) {
     let Some(narrowed) = steering.and_then(|s| s.narrowed()) else {
         return;
@@ -2048,6 +2092,7 @@ mod tests {
         ToolRegistry::new(
             std::path::PathBuf::from("/nonexistent"),
             std::path::PathBuf::from("/nonexistent"),
+            std::sync::Arc::new(crate::redaction::RedactionEngine::disabled()),
         )
     }
 
@@ -2114,8 +2159,19 @@ mod tests {
         }
     }
 
+    static TEST_REDACTION: std::sync::LazyLock<crate::redaction::RedactionEngine> =
+        std::sync::LazyLock::new(crate::redaction::RedactionEngine::new);
+    static TEST_MAPPINGS: std::sync::LazyLock<crate::redaction::RedactionMappings> =
+        std::sync::LazyLock::new(crate::redaction::RedactionMappings::new);
+
     fn services<'a>(pool: &'a DbPool, tools: &'a ToolRegistry, mcp: &'a McpRegistry) -> TurnServices<'a> {
-        TurnServices { pool, tools, mcp }
+        TurnServices {
+            pool,
+            tools,
+            mcp,
+            redaction: &TEST_REDACTION,
+            redaction_mappings: &TEST_MAPPINGS,
+        }
     }
 
     /// A `SubAgents` port that keeps what it was asked for and answers from a

@@ -100,6 +100,8 @@ pub struct ServicesInner {
     /// cannot see an external `.gitignore` rewrite and would keep
     /// snapshotting secrets until restart.
     pub journal_shared: Arc<crate::journal::capture::JournalShared>,
+    pub redaction: Arc<crate::redaction::RedactionEngine>,
+    pub redaction_mappings: crate::redaction::RedactionMappings,
     /// How to start an ordinary turn, once the shell has said.
     ///
     /// The one direction that has to cross the line the other way. Running a
@@ -166,7 +168,11 @@ pub fn bare_services(dir: &std::path::Path) -> Services {
     Services::new(ServicesInner {
         db: crate::db::test_db(),
         secrets: Arc::new(crate::secrets::SecretsManager::new(dir.to_path_buf())),
-        tools: Arc::new(tools::ToolRegistry::new(dir.join("skills"), dir.join("logs"))),
+        tools: Arc::new(tools::ToolRegistry::new(
+            dir.join("skills"),
+            dir.join("logs"),
+            Arc::new(crate::redaction::RedactionEngine::disabled()),
+        )),
         mcp: mcp::McpRegistry::new(),
         turns: Arc::new(TurnCoordinator::new()),
         approvals: ApprovalWaiters::new(),
@@ -188,5 +194,7 @@ pub fn bare_services(dir: &std::path::Path) -> Services {
         containers: crate::container::DockerConnector::new(Default::default()),
         turn_starter: std::sync::OnceLock::new(),
         journal_shared: crate::journal::capture::JournalShared::new(),
+        redaction: Arc::new(crate::redaction::RedactionEngine::disabled()),
+        redaction_mappings: crate::redaction::RedactionMappings::new(),
     })
 }

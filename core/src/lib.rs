@@ -34,6 +34,7 @@ pub mod mcp;
 pub mod onebot;
 pub mod plan_files;
 pub mod provider;
+pub mod redaction;
 #[cfg(not(target_os = "android"))]
 pub mod sandbox;
 pub mod secrets;

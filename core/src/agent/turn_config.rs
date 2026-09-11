@@ -296,6 +296,7 @@ mod tests {
         ToolRegistry::new(
             std::path::PathBuf::from("/nonexistent"),
             std::path::PathBuf::from("/nonexistent"),
+            std::sync::Arc::new(crate::redaction::RedactionEngine::disabled()),
         )
     }
 

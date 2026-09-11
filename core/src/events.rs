@@ -476,6 +476,12 @@ pub enum ChatStreamEvent {
         used: u64,
         size: u64,
     },
+    RedactionNotice {
+        conversation_id: String,
+        turn_id: String,
+        redacted_count: usize,
+        rules: Vec<String>,
+    },
     Stop {
         reason: ChatStopReason,
         #[serde(deserialize_with = "deserialize_required_nullable")]

@@ -737,6 +737,24 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    redaction_rules (id) {
+        id -> Text,
+        scope_type -> Text,
+        scope_id -> Text,
+        name -> Text,
+        description -> Text,
+        pattern -> Text,
+        category -> Text,
+        examples -> Text,
+        origin -> Text,
+        source_conversation_id -> Nullable<Text>,
+        is_enabled -> Integer,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
 diesel::joinable!(assistant_emoji_packs -> assistants (assistant_id));
 diesel::joinable!(acp_context_deliveries -> message_context_items (context_item_id));
 diesel::joinable!(assistant_emoji_packs -> emoji_packs (pack_id));
@@ -810,6 +828,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     providers,
     queued_prompts,
     queued_prompt_context_items,
+    redaction_rules,
     skill_bindings_assistant,
     skill_bindings_global,
     skill_bindings_project,
