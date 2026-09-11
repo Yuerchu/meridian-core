@@ -1039,6 +1039,22 @@ mod tests {
         let pool = crate::db::init_db(path.to_str().unwrap());
         create_conversation(&mut pool.get().unwrap(), "c1", None, None, None, 1).unwrap();
 
+        /// A writer starved past `busy_timeout` answers "database is locked".
+        /// SQLite's busy handler sleeps and retries with no fairness, and four
+        /// threads writing back to back can keep one of them asleep for the
+        /// whole five seconds on a slow CI runner — measured there, not here.
+        /// Availability under that load is not what this test is about; a
+        /// toggle that was refused changed nothing and is simply asked again.
+        fn until_applied(mut op: impl FnMut() -> QueryResult<ConversationRow>) {
+            loop {
+                match op() {
+                    Ok(_) => return,
+                    Err(diesel::result::Error::DatabaseError(_, info)) if info.message() == "database is locked" => {}
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+
         const ROUNDS: i64 = 2000;
         let workers: Vec<_> = (0..4)
             .map(|_| {
@@ -1050,8 +1066,8 @@ mod tests {
                     // the disk rather than on each other.
                     diesel::sql_query("PRAGMA synchronous=OFF").execute(&mut conn).unwrap();
                     for i in 0..ROUNDS {
-                        toggle_archive(&mut conn, "c1", i).unwrap();
-                        toggle_pin(&mut conn, "c1", i).unwrap();
+                        until_applied(|| toggle_archive(&mut conn, "c1", i));
+                        until_applied(|| toggle_pin(&mut conn, "c1", i));
                     }
                 })
             })
@@ -1060,6 +1076,8 @@ mod tests {
             worker.join().unwrap();
         }
 
+        // Every thread applied an even number of each toggle, so both flags
+        // are back where they started — unless a press was lost.
         let conv = get_conversation(&mut pool.get().unwrap(), "c1").unwrap();
         assert_eq!(
             (conv.is_archived, conv.is_pinned),
