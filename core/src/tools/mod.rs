@@ -13,6 +13,7 @@ pub mod plan;
 pub mod reach;
 pub mod read_conversation;
 pub mod read_file;
+pub mod redaction;
 #[cfg(not(target_os = "android"))]
 pub mod run_command;
 pub mod search_files;
@@ -514,7 +515,11 @@ impl ToolRegistry {
     /// are app-global rather than per-request, so the tools hold them instead of
     /// reading them out of `ToolContext` — and both sit outside every
     /// `FileAccess` root, which is why these two tools resolve their own paths.
-    pub fn new(skills_root: std::path::PathBuf, logs_dir: std::path::PathBuf) -> Self {
+    pub fn new(
+        skills_root: std::path::PathBuf,
+        logs_dir: std::path::PathBuf,
+        redaction_engine: Arc<crate::redaction::RedactionEngine>,
+    ) -> Self {
         #[allow(unused_mut)]
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ask_user::AskUserTool),
@@ -555,6 +560,9 @@ impl ToolRegistry {
             // reason. See the module header for why QQ never reaches it.
             Arc::new(read_conversation::ReadConversationTool::new()),
             Arc::new(web_search::WebSearchTool::new()),
+            Arc::new(redaction::AddRedactionRuleTool::new(redaction_engine.clone())),
+            Arc::new(redaction::ListRedactionRulesTool::new(redaction_engine.clone())),
+            Arc::new(redaction::RemoveRedactionRuleTool::new(redaction_engine)),
         ];
         #[cfg(not(target_os = "android"))]
         tools.push(Arc::new(run_command::RunCommandTool));

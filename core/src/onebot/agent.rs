@@ -17,6 +17,11 @@ use crate::secrets::SecretsManager;
 use crate::tools::{self, ToolRegistry};
 use crate::util::{get_conn, now_ms};
 
+static DISABLED_REDACTION: std::sync::LazyLock<crate::redaction::RedactionEngine> =
+    std::sync::LazyLock::new(crate::redaction::RedactionEngine::disabled);
+static DISABLED_MAPPINGS: std::sync::LazyLock<crate::redaction::RedactionMappings> =
+    std::sync::LazyLock::new(crate::redaction::RedactionMappings::new);
+
 /// `(tool_call, sandbox_block_reason)` → what the user typed, or `None` if
 /// nobody answered. The reason is `Some` only for the retry-without-sandbox
 /// escalation ask, so the prompt can say why a second approval for the same
@@ -1045,6 +1050,8 @@ async fn headless_chat_inner(
             pool,
             tools: tool_registry,
             mcp: mcp_registry,
+            redaction: services.map(|s| &*s.redaction).unwrap_or(&DISABLED_REDACTION),
+            redaction_mappings: services.map(|s| &s.redaction_mappings).unwrap_or(&DISABLED_MAPPINGS),
         },
         engine::TurnSetup {
             provider: &*provider,

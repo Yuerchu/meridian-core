@@ -185,7 +185,11 @@ mod tests {
     }
 
     fn registry() -> ToolRegistry {
-        ToolRegistry::new(std::path::PathBuf::from("/skills"), std::path::PathBuf::from("/logs"))
+        ToolRegistry::new(
+            std::path::PathBuf::from("/skills"),
+            std::path::PathBuf::from("/logs"),
+            std::sync::Arc::new(crate::redaction::RedactionEngine::disabled()),
+        )
     }
 
     // Permission::Always tools for parallel testing (no path resolution needed).
