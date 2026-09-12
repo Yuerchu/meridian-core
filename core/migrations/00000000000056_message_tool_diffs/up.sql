@@ -1,0 +1,14 @@
+-- The diff a hosted Claude Code agent reported for an Edit or Write, keyed by
+-- the call that made it.
+--
+-- JSON: `{ "<call_id>": [ { "path", "old_text", "new_text", "line" }, ... ] }`
+-- — one entry per hunk, `old_text` null for a created file, `line` the hunk's
+-- first line after the edit or null when the adapter did not say. Nullable
+-- keys are always present. NULL in the column means the agent reported no
+-- diff for any call on the row; `{}` is never written.
+--
+-- A sibling column rather than a member of `tool_calls`: that column is the
+-- strict OpenAI wire shape, round-tripped into provider requests, and a diff
+-- is not part of what a model is sent. Same reasoning as `auto_review`
+-- (migration 33). Not copied into the audit ledger.
+ALTER TABLE messages ADD COLUMN tool_diffs TEXT;

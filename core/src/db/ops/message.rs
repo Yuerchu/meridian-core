@@ -402,6 +402,79 @@ pub fn record_auto_review(
     Ok(())
 }
 
+/// Keep the diff a hosted agent reported for one call, beside the row that
+/// made the call.
+///
+/// Merged by call id and **replaced** per call: the adapter sends a call's
+/// whole hunk list in one update, so a later one for the same call is a
+/// correction, not an addition. Other calls' entries on the row are kept.
+/// Stored JSON that cannot be read is an error rather than a fresh map —
+/// overwriting it would quietly discard another call's diff.
+pub fn record_tool_diffs(
+    conn: &mut SqliteConnection,
+    message_id: &str,
+    call_id: &str,
+    diffs: &[crate::events::ToolCallDiff],
+) -> QueryResult<()> {
+    if call_id.is_empty() {
+        return Err(diesel::result::Error::SerializationError(Box::new(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "tool diff call id must not be empty"),
+        )));
+    }
+    let existing: Option<String> = messages::table
+        .find(message_id)
+        .select(messages::tool_diffs)
+        .first::<Option<String>>(conn)
+        .optional()?
+        .flatten();
+
+    let mut all = match existing.as_deref() {
+        Some(raw) => serde_json::from_str::<std::collections::BTreeMap<String, Vec<crate::events::ToolCallDiff>>>(raw)
+            .map_err(|error| diesel::result::Error::DeserializationError(Box::new(error)))?,
+        None => std::collections::BTreeMap::new(),
+    };
+    all.insert(call_id.to_string(), diffs.to_vec());
+
+    let encoded =
+        serde_json::to_string(&all).map_err(|error| diesel::result::Error::SerializationError(Box::new(error)))?;
+    diesel::update(messages::table.find(message_id))
+        .set(messages::tool_diffs.eq(Some(encoded)))
+        .execute(conn)?;
+    Ok(())
+}
+
+/// [`record_tool_diffs`] for a call whose row is not known: find it among the
+/// turn's stored rows the way [`revise_tool_call`] does, and say which row it
+/// landed on. `None` when no row of this turn made the call.
+pub fn record_tool_diffs_for_call(
+    conn: &mut SqliteConnection,
+    turn_id: &str,
+    call_id: &str,
+    diffs: &[crate::events::ToolCallDiff],
+) -> QueryResult<Option<String>> {
+    let rows: Vec<(String, Option<String>)> = messages::table
+        .filter(messages::turn_id.eq(turn_id))
+        .filter(messages::tool_calls.is_not_null())
+        .order(messages::sort_order.desc())
+        .select((messages::id, messages::tool_calls))
+        .load(conn)?;
+
+    for (id, json) in rows {
+        let calls = crate::agent::tool_calls::parse_openai_tool_calls(json.as_deref()).map_err(|error| {
+            diesel::result::Error::DeserializationError(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message {id} has invalid persisted tool_calls: {error}"),
+            )))
+        })?;
+        if !calls.iter().any(|c| c.id == call_id) {
+            continue;
+        }
+        record_tool_diffs(conn, &id, call_id, diffs)?;
+        return Ok(Some(id));
+    }
+    Ok(None)
+}
+
 pub fn update_rating(conn: &mut SqliteConnection, id: &str, rating: Option<i32>) -> QueryResult<()> {
     diesel::update(messages::table.find(id))
         .set(messages::rating.eq(rating))
@@ -687,6 +760,85 @@ mod tests {
         }
     }
 
+    fn hunk(old_text: Option<&str>, new_text: &str, line: Option<u32>) -> crate::events::ToolCallDiff {
+        crate::events::ToolCallDiff {
+            path: "src/lib.rs".into(),
+            old_text: old_text.map(str::to_string),
+            new_text: new_text.into(),
+            line,
+        }
+    }
+
+    /// Per call, the list is replaced — the adapter sends the whole hunk list
+    /// each time — while the other calls' entries on the row are kept.
+    #[test]
+    fn record_tool_diffs_replaces_one_call_and_keeps_the_others() {
+        let pool = test_db();
+        let mut conn = pool.get().unwrap();
+        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
+        append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
+
+        record_tool_diffs(&mut conn, "m1", "call-a", &[hunk(None, "created", None)]).unwrap();
+        record_tool_diffs(&mut conn, "m1", "call-b", &[hunk(Some("old"), "new", Some(3))]).unwrap();
+        record_tool_diffs(
+            &mut conn,
+            "m1",
+            "call-a",
+            &[hunk(Some("was there"), "created", Some(1))],
+        )
+        .unwrap();
+
+        let stored: std::collections::BTreeMap<String, Vec<crate::events::ToolCallDiff>> =
+            serde_json::from_str(get_message(&mut conn, "m1").unwrap().tool_diffs.as_deref().unwrap()).unwrap();
+        assert_eq!(stored["call-a"], vec![hunk(Some("was there"), "created", Some(1))]);
+        assert_eq!(stored["call-b"], vec![hunk(Some("old"), "new", Some(3))]);
+        // The nullable keys are written out, never omitted.
+        let raw = get_message(&mut conn, "m1").unwrap().tool_diffs.unwrap();
+        assert!(raw.contains(r#""line":3"#) && raw.contains(r#""old_text""#), "{raw}");
+    }
+
+    /// Stored JSON this build cannot read is an error, not an empty map to
+    /// write over — overwriting would discard another call's diff.
+    #[test]
+    fn record_tool_diffs_rejects_corrupt_stored_json_without_overwriting_it() {
+        let pool = test_db();
+        let mut conn = pool.get().unwrap();
+        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
+        append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
+        diesel::update(messages::table.find("m1"))
+            .set(messages::tool_diffs.eq(Some("not json")))
+            .execute(&mut conn)
+            .unwrap();
+
+        assert!(record_tool_diffs(&mut conn, "m1", "call-a", &[hunk(None, "x", None)]).is_err());
+        assert!(record_tool_diffs(&mut conn, "m1", "", &[hunk(None, "x", None)]).is_err());
+        assert_eq!(
+            get_message(&mut conn, "m1").unwrap().tool_diffs.as_deref(),
+            Some("not json")
+        );
+    }
+
+    /// Finding the row by the call it made, bounded by the turn: a refinement
+    /// for a call in another turn is not this turn's to file.
+    #[test]
+    fn record_tool_diffs_for_call_finds_the_row_within_the_turn() {
+        let pool = test_db();
+        let mut conn = pool.get().unwrap();
+        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
+        let mut with_call = row("m1", "c1", "assistant");
+        with_call.turn_id = Some("t1");
+        with_call.tool_calls =
+            Some(r#"[{"id":"call-a","type":"function","function":{"name":"Write","arguments":"{}"}}]"#);
+        append_message(&mut conn, &with_call, None).unwrap();
+
+        let landed = record_tool_diffs_for_call(&mut conn, "t1", "call-a", &[hunk(None, "x", None)]).unwrap();
+        assert_eq!(landed.as_deref(), Some("m1"));
+        assert!(get_message(&mut conn, "m1").unwrap().tool_diffs.is_some());
+
+        let elsewhere = record_tool_diffs_for_call(&mut conn, "t2", "call-a", &[hunk(None, "x", None)]).unwrap();
+        assert_eq!(elsewhere, None);
+    }
+
     #[test]
     fn record_auto_review_rejects_corrupt_stored_json_without_overwriting_it() {
         let pool = test_db();
@@ -927,9 +1079,11 @@ mod tests {
             provider_name,
             provider_state,
             auto_review,
+            tool_diffs,
         } = stored;
 
         assert_eq!(id, "m1");
+        assert_eq!(tool_diffs, None, "a native row carries no agent-reported diff");
         assert_eq!(conversation_id, "c1");
         assert_eq!(role, "assistant");
         assert_eq!(content, "the answer");

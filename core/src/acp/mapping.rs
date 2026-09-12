@@ -11,7 +11,7 @@
 //! a parallel one for ACP would mean a second renderer.
 
 use super::protocol::{PlanEntry, SessionConfigOption, SessionFailureRecord, SessionUpdate, ToolCall, Usage};
-use crate::events::{AcpNoticeAction, AcpNoticeCategory, AcpNoticeSeverity, ToolOutcome};
+use crate::events::{AcpNoticeAction, AcpNoticeCategory, AcpNoticeSeverity, ToolCallDiff, ToolOutcome};
 
 /// What one `session/update` means here.
 ///
@@ -75,6 +75,11 @@ pub enum Effect {
     /// The agent named the conversation. Arrives once it has generated a
     /// title, and again on later turns only if the title changed.
     SessionTitle(String),
+    /// The agent reported what an Edit or Write actually changed: one hunk
+    /// per block, the whole list for the call, sent after the tool ran and
+    /// before the call is marked complete. Replaces anything held for the
+    /// call — the adapter's `content` is a whole-array replacement.
+    ToolCallDiff { call_id: String, diffs: Vec<ToolCallDiff> },
     /// A call that has been announced but has not finished, and everything this
     /// step does not draw.
     Ignored,
@@ -205,6 +210,15 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
                 result: output_of(&call),
                 outcome: ToolOutcome::Error,
             },
+            // What an Edit or Write actually changed, once it has run: no
+            // status, `content` replaced by one diff block per hunk. Asked
+            // before the revision arm below, because this frame carries
+            // `_meta` too and read as a revision it is one with `{}` for
+            // arguments — which `revise` then ignores, and the diff with it.
+            _ if call.content.iter().any(|b| b.kind == "diff") => Effect::ToolCallDiff {
+                call_id: call.tool_call_id.clone(),
+                diffs: diffs_of(&call),
+            },
             // Still running. Usually there is nothing to say — but this is also
             // how a call announced before its arguments were known gets them,
             // and how the adapter's second source revises one it did not emit.
@@ -297,6 +311,37 @@ pub fn arguments_of(call: &ToolCall) -> String {
 /// described. They are drawn from the tool card's own data in a later step; a
 /// placeholder like `[diff]` in the result text would be indistinguishable from
 /// output a command actually printed.
+/// The diff blocks of a call, as hunks.
+///
+/// `locations` is the adapter's parallel list — one `{path, line}` per hunk,
+/// `line` the hunk's first line after the edit — so block *i* takes location
+/// *i*'s line only when the two lists are the same length and name the same
+/// file. Anything less and the hunk goes unnumbered rather than numbered off
+/// a location that belongs to a different hunk. A block with no `path` or no
+/// `newText` is not a diff this app can draw and is left out.
+pub fn diffs_of(call: &ToolCall) -> Vec<ToolCallDiff> {
+    let blocks: Vec<&super::protocol::ToolCallContent> = call.content.iter().filter(|b| b.kind == "diff").collect();
+    let lined = blocks.len() == call.locations.len();
+    blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, block)| {
+            let path = block.path.clone()?;
+            let new_text = block.new_text.clone()?;
+            let line = lined
+                .then(|| &call.locations[i])
+                .filter(|location| location.path == path)
+                .and_then(|location| location.line);
+            Some(ToolCallDiff {
+                path,
+                old_text: block.old_text.clone(),
+                new_text,
+                line,
+            })
+        })
+        .collect()
+}
+
 fn output_of(call: &ToolCall) -> String {
     let mut out = String::new();
     for block in &call.content {
@@ -523,6 +568,78 @@ mod tests {
                 outcome: ToolOutcome::Error,
             }
         );
+    }
+
+    /// The three frames `claude-agent-acp` 0.76.0 sends for a `Write` over a
+    /// file that exists. The first is the announcement with an optimistic diff
+    /// (no line, `oldText` null); it stays an ordinary call, since the card
+    /// draws that from the arguments already. The second is the PostToolUse
+    /// refinement — no status, one diff block per hunk, a location per hunk —
+    /// and is the one worth keeping. The third completes the call and carries
+    /// no diff, so it must not erase what the second brought.
+    #[test]
+    fn the_adapters_write_frames_yield_one_diff_effect_with_its_line() {
+        let announced = update(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"toolu_w","_meta":{"claudeCode":{"toolName":"Write"}},
+                "title":"Write src/lib.rs","kind":"edit","status":"pending",
+                "rawInput":{"file_path":"/w/src/lib.rs","content":"line1\nNEW line2\nline3"},
+                "content":[{"type":"diff","path":"/w/src/lib.rs","oldText":null,"newText":"line1\nNEW line2\nline3"}],
+                "locations":[{"path":"/w/src/lib.rs"}]}"#,
+        );
+        assert!(matches!(effect_of(announced), Effect::ToolCall { .. }));
+
+        let refined = update(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"toolu_w",
+                "_meta":{"claudeCode":{"toolName":"Write","toolResponse":{"type":"update"}}},
+                "content":[{"type":"diff","path":"/w/src/lib.rs","oldText":"line1\nold line2\nline3","newText":"line1\nNEW line2\nline3"}],
+                "locations":[{"path":"/w/src/lib.rs","line":1}]}"#,
+        );
+        assert_eq!(
+            effect_of(refined),
+            Effect::ToolCallDiff {
+                call_id: "toolu_w".into(),
+                diffs: vec![ToolCallDiff {
+                    path: "/w/src/lib.rs".into(),
+                    old_text: Some("line1\nold line2\nline3".into()),
+                    new_text: "line1\nNEW line2\nline3".into(),
+                    line: Some(1),
+                }],
+            }
+        );
+
+        let completed = update(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"toolu_w",
+                "_meta":{"claudeCode":{"toolName":"Write"}},"status":"completed"}"#,
+        );
+        assert!(matches!(effect_of(completed), Effect::ToolResult { .. }));
+    }
+
+    /// An `Edit` with `replace_all` comes back as several hunks with a
+    /// location each; the lines pair up by position. When the lists disagree
+    /// in length nothing is numbered, since a wrong number is worse than none.
+    #[test]
+    fn hunks_take_their_line_from_the_matching_location_only() {
+        let two = update(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"toolu_e","_meta":{"claudeCode":{"toolName":"Edit"}},
+                "content":[{"type":"diff","path":"/w/f.ts","oldText":"foo","newText":"bar"},
+                           {"type":"diff","path":"/w/f.ts","oldText":"foo","newText":"bar"}],
+                "locations":[{"path":"/w/f.ts","line":3},{"path":"/w/f.ts","line":15}]}"#,
+        );
+        let Effect::ToolCallDiff { diffs, .. } = effect_of(two) else {
+            panic!("expected a diff");
+        };
+        assert_eq!(diffs.iter().map(|d| d.line).collect::<Vec<_>>(), [Some(3), Some(15)]);
+
+        let mismatched = update(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"toolu_e","_meta":{"claudeCode":{"toolName":"Edit"}},
+                "content":[{"type":"diff","path":"/w/f.ts","oldText":"foo","newText":"bar"},
+                           {"type":"diff","path":"/w/f.ts","oldText":"foo","newText":"bar"}],
+                "locations":[{"path":"/w/f.ts","line":3}]}"#,
+        );
+        let Effect::ToolCallDiff { diffs, .. } = effect_of(mismatched) else {
+            panic!("expected a diff");
+        };
+        assert_eq!(diffs.iter().map(|d| d.line).collect::<Vec<_>>(), [None, None]);
     }
 
     /// Several content blocks are one result, joined in order. A diff block in

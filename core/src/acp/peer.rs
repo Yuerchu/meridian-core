@@ -1114,6 +1114,19 @@ mod tests {
                 "the title: {joined}"
             );
 
+            // A Write's three frames: the refinement in the middle is the one
+            // diff effect, carrying the pre-overwrite text and the hunk's line.
+            peer.request("session/prompt", prompt("write-diff"))
+                .await
+                .expect("write-diff");
+            let joined = probe.updates.lock().unwrap().join("\n");
+            let diff_lines: Vec<&str> = joined.lines().filter(|l| l.starts_with("ToolCallDiff")).collect();
+            assert_eq!(diff_lines.len(), 1, "one diff effect for the call: {joined}");
+            assert!(
+                diff_lines[0].contains("old line2") && diff_lines[0].contains("line: Some(1)"),
+                "{joined}"
+            );
+
             peer.stop().await;
         }
 

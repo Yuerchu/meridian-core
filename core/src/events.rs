@@ -516,6 +516,24 @@ impl TryFrom<crate::db::models::acp_session_notice::AcpSessionNoticeRow> for Acp
     }
 }
 
+/// One hunk of the diff a hosted agent reported for an Edit or Write.
+///
+/// The same shape is persisted in `messages.tool_diffs` (a map from call id
+/// to a list of these) and carried on the `tool_call_diff` event, so the
+/// stored form and the live form cannot drift. `old_text` is `None` for a
+/// file that did not exist; `line` is the hunk's first line after the edit,
+/// `None` when the adapter did not say.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCallDiff {
+    pub path: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub old_text: Option<String>,
+    pub new_text: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub line: Option<u32>,
+}
+
 /// Every payload permitted on [`CHAT_STREAM_CHANNEL`].
 ///
 /// Unlike the former `json!` convention, each variant states its required
@@ -635,6 +653,15 @@ pub enum ChatStreamEvent {
     AcpNotice {
         conversation_id: String,
         notice: AcpSessionNoticeEvent,
+    },
+    /// The hosted agent reported what an Edit or Write actually changed. The
+    /// whole hunk list for the call; a later one for the same call replaces it.
+    #[cfg(not(target_os = "android"))]
+    ToolCallDiff {
+        conversation_id: String,
+        message_id: String,
+        call_id: String,
+        diffs: Vec<ToolCallDiff>,
     },
     RedactionNotice {
         conversation_id: String,
@@ -1086,6 +1113,33 @@ mod tests {
         // And the round trip refuses an absent nullable key.
         let mut absent = payload.clone();
         absent["notice"].as_object_mut().unwrap().remove("turn_id");
+        assert!(serde_json::from_value::<ChatStreamEvent>(absent).is_err());
+    }
+
+    /// A created file has `old_text: null` and an unplaced hunk `line: null`,
+    /// both present rather than absent — the frontend's validator reads an
+    /// absence as a broken payload.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tool_call_diff_event_serializes_every_nullable_key() {
+        let payload = serde_json::to_value(ChatStreamEvent::ToolCallDiff {
+            conversation_id: "conversation-1".into(),
+            message_id: "m1".into(),
+            call_id: "toolu_1".into(),
+            diffs: vec![ToolCallDiff {
+                path: "src/lib.rs".into(),
+                old_text: None,
+                new_text: "fn main() {}".into(),
+                line: None,
+            }],
+        })
+        .unwrap();
+        assert_eq!(payload["type"], "tool_call_diff");
+        assert_eq!(payload["diffs"][0]["old_text"], serde_json::Value::Null);
+        assert_eq!(payload["diffs"][0]["line"], serde_json::Value::Null);
+
+        let mut absent = payload.clone();
+        absent["diffs"][0].as_object_mut().unwrap().remove("line");
         assert!(serde_json::from_value::<ChatStreamEvent>(absent).is_err());
     }
 

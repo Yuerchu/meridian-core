@@ -456,6 +456,7 @@ diesel::table! {
         provider_name -> Nullable<Text>,
         provider_state -> Nullable<Text>,
         auto_review -> Nullable<Text>,
+        tool_diffs -> Nullable<Text>,
     }
 }
 

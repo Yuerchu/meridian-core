@@ -19,7 +19,7 @@
 //! `interrupted`, with the whole answer folded away as process. Every finished
 //! hosted turn that called a tool was reported as stopped.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -30,7 +30,9 @@ use crate::db::models::acp_session_notice::AcpSessionNoticeInsert;
 use crate::db::models::message::MessageUsage;
 use crate::db::models::queue::QueuedPromptRow;
 use crate::db::models::turn::{TurnPhase, TurnStatus};
-use crate::events::{AcpNoticeSeverity, AcpSessionNoticeEvent, ChatStopReason, ChatStreamEvent, ToolOutcome};
+use crate::events::{
+    AcpNoticeSeverity, AcpSessionNoticeEvent, ChatStopReason, ChatStreamEvent, ToolCallDiff, ToolOutcome,
+};
 use crate::provider;
 use crate::services::Services;
 use crate::turn::TurnOrigin;
@@ -84,6 +86,10 @@ struct OpenRow {
     /// Only set when opening the next round failed part way — see
     /// [`Shared::open_round_if_settled`].
     written: bool,
+    /// The diff the agent reported for each Edit/Write on this row, by call
+    /// id. Arrives after the tool ran, as a whole hunk list per call, and is
+    /// written beside the row once the row itself has landed.
+    diffs: BTreeMap<String, Vec<ToolCallDiff>>,
 }
 
 impl OpenRow {
@@ -96,6 +102,7 @@ impl OpenRow {
             results: Vec::new(),
             settled: false,
             written: false,
+            diffs: BTreeMap::new(),
         }
     }
 
@@ -575,8 +582,66 @@ impl Shared {
                 self.record_notice(record, turn_id).await;
             }
             Effect::SessionTitle(title) => self.adopt_title(title).await,
+            Effect::ToolCallDiff { call_id, diffs } => self.record_diffs(call_id, diffs).await,
             Effect::Ignored => {}
         }
+    }
+
+    /// Keep what the agent said an Edit or Write changed, beside the call.
+    ///
+    /// Two tiers, for the same reason [`Shared::revise`] has two: the call is
+    /// on the open row if its round is still being written, and in the
+    /// database if the round closed before the refinement arrived — which it
+    /// routinely does, since `Call(A) → Result(A) → Call(B)` rotates the round
+    /// and the refinement for `A` comes after its result. The open row's copy
+    /// is written out with the row by `write_row`; the stored path writes at
+    /// once. Either way the card learns of it through one event naming the
+    /// row it landed on.
+    async fn record_diffs(&self, call_id: String, diffs: Vec<ToolCallDiff>) {
+        let on_open_row = self.with_turn(|t| {
+            let here = !t.row.written && t.row.tool_calls.iter().any(|c| c.id == call_id);
+            here.then(|| {
+                t.row.diffs.insert(call_id.clone(), diffs.clone());
+                t.row.message_id.clone()
+            })
+        });
+        let message_id = match on_open_row {
+            Some(Some(message_id)) => Some(message_id),
+            _ => match self.with_turn(|t| t.turn_id.clone()) {
+                Some(turn_id) => {
+                    let pool = self.services.db.clone();
+                    let (turn_id, call_id, hunks) = (turn_id, call_id.clone(), diffs.clone());
+                    let found = tokio::task::spawn_blocking(move || {
+                        let mut conn = get_conn(&pool)?;
+                        crate::db::ops::message::record_tool_diffs_for_call(&mut conn, &turn_id, &call_id, &hunks)
+                            .map_err(|e| e.to_string())
+                    })
+                    .await;
+                    // Logged, never fatal: what is lost is one card's gutter.
+                    match found {
+                        Ok(Ok(row)) => row,
+                        Ok(Err(e)) => {
+                            tracing::debug!(error = %e, "could not store an ACP tool diff");
+                            None
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "storing an ACP tool diff panicked");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+        };
+        let Some(message_id) = message_id else {
+            return;
+        };
+        self.emit(ChatStreamEvent::ToolCallDiff {
+            conversation_id: self.conversation_id.clone(),
+            message_id,
+            call_id,
+            diffs,
+        });
     }
 
     /// Keep an incident the adapter reported, and say so if it is new.
@@ -737,6 +802,29 @@ impl Shared {
             // turn `Done`, exactly as it does for a dropped update.
             self.unwritten_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return parent.to_string();
+        }
+
+        // Beside the row, once the row exists. A refused write here is one
+        // card's gutter and the pre-overwrite text of a diff — logged, not
+        // counted against the turn, the same class as a stored revision.
+        if !row.diffs.is_empty() {
+            let pool = self.services.db.clone();
+            let message_id = row.message_id.clone();
+            let diffs = row.diffs.clone();
+            let written = tokio::task::spawn_blocking(move || {
+                let mut conn = get_conn(&pool)?;
+                for (call_id, hunks) in &diffs {
+                    crate::db::ops::message::record_tool_diffs(&mut conn, &message_id, call_id, hunks)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok::<(), String>(())
+            })
+            .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "could not store an ACP row's tool diffs"),
+                Err(e) => tracing::warn!(error = %e, "storing an ACP row's tool diffs panicked"),
+            }
         }
 
         let mut last = row.message_id.clone();

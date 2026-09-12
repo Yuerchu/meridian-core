@@ -1042,12 +1042,23 @@ pub struct ClaudeCodeMeta {
     pub tool_name: Option<String>,
 }
 
+/// One block of a call's `content`. `content` blocks carry text; `diff`
+/// blocks carry the three fields below and no `content` at all — Edit and
+/// Write send one per hunk once the tool has run. Other kinds (`terminal`,
+/// images) parse and are ignored.
 #[derive(Debug, Deserialize)]
 pub struct ToolCallContent {
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
     pub content: Option<ContentBlock>,
+    #[serde(default)]
+    pub path: Option<String>,
+    /// `null` for a file that did not exist before the write.
+    #[serde(default, rename = "oldText")]
+    pub old_text: Option<String>,
+    #[serde(default, rename = "newText")]
+    pub new_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

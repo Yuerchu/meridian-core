@@ -538,6 +538,8 @@ struct ImportedRow {
     calls: Vec<provider::ToolCall>,
     /// `(call_id, output, outcome)`, in the order the calls finished.
     results: Vec<(String, String, ToolOutcome)>,
+    /// What the agent said each Edit/Write changed, by call id.
+    diffs: std::collections::BTreeMap<String, Vec<crate::events::ToolCallDiff>>,
 }
 
 impl ImportedRow {
@@ -676,6 +678,13 @@ pub(super) fn plan(recital: Vec<Recital>) -> Imported {
             // window was at some past moment; the option set arrives again in
             // the load's own reply — which is where the model on these rows
             // comes from; and the title was taken from `session/list`.
+            // Onto the row that made the call, like a result — and for the
+            // same reason it can be a turn back.
+            Effect::ToolCallDiff { call_id, diffs } => {
+                if let Some(row) = call_row(&mut turn, &mut out.turns, &call_id) {
+                    row.diffs.insert(call_id, diffs);
+                }
+            }
             Effect::Usage { .. } | Effect::ConfigOptions(_) | Effect::SessionTitle(_) | Effect::Ignored => {}
         }
     }
@@ -971,7 +980,7 @@ fn write(conn: &mut SqliteConnection, w: &Written) -> Result<Counts, diesel::res
 
         for assistant in &turn.rows {
             let calls = (!assistant.calls.is_empty()).then(|| serialize_tool_calls_openai(&assistant.calls));
-            parent = Some(row(
+            let assistant_id = row(
                 conn,
                 &w.conversation_id,
                 &turn_id,
@@ -988,7 +997,11 @@ fn write(conn: &mut SqliteConnection, w: &Written) -> Result<Counts, diesel::res
                     provider_name: Some(PROVIDER_LABEL),
                     ..blank()
                 },
-            )?);
+            )?;
+            for (call_id, hunks) in &assistant.diffs {
+                crate::db::ops::message::record_tool_diffs(conn, &assistant_id, call_id, hunks)?;
+            }
+            parent = Some(assistant_id);
             counts.messages += 1;
 
             for (call_id, output, outcome) in &assistant.results {
@@ -1520,6 +1533,55 @@ mod tests {
             logged.iter().all(|row| row.role == "user"),
             "an imported reply was billed to somebody else and is reported nowhere",
         );
+    }
+
+    /// A recited Write's refinement lands on the row that made the call, and
+    /// is read back as the typed hunk list — with the pre-overwrite text the
+    /// arguments alone could never give.
+    #[test]
+    fn an_import_keeps_the_diff_the_agent_reported_beside_its_call() {
+        use crate::events::ToolCallDiff;
+
+        let pool = crate::db::test_db();
+        let mut conn = pool.get().unwrap();
+        let hunk = ToolCallDiff {
+            path: "/w/src/lib.rs".into(),
+            old_text: Some("line1\nold line2\nline3".into()),
+            new_text: "line1\nNEW line2\nline3".into(),
+            line: Some(1),
+        };
+        let imported = plan(vec![
+            user("u1", "fix it"),
+            agent("m1", "Writing."),
+            call(
+                "toolu_w",
+                "Write",
+                r#"{"file_path":"/w/src/lib.rs","content":"line1\nNEW line2\nline3"}"#,
+            ),
+            Effect::ToolCallDiff {
+                call_id: "toolu_w".into(),
+                diffs: vec![hunk.clone()],
+            },
+            result("toolu_w", ""),
+        ]);
+        let written = Written {
+            conversation_id: "imported-3".into(),
+            acp_session_id: "sess-97".into(),
+            cwd: "/w".into(),
+            title: "Fix".into(),
+            model: "claude-opus-5".into(),
+            last_active: 1_700_000_000_000,
+            imported,
+        };
+        conn.transaction::<_, diesel::result::Error, _>(|conn| write(conn, &written))
+            .unwrap();
+
+        let rows = crate::db::ops::message::list_messages(&mut conn, "imported-3").unwrap();
+        let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
+        let stored: std::collections::BTreeMap<String, Vec<ToolCallDiff>> =
+            serde_json::from_str(assistant.tool_diffs.as_deref().expect("the diff is on the row")).unwrap();
+        assert_eq!(stored.get("toolu_w"), Some(&vec![hunk]));
+        assert!(rows.iter().filter(|m| m.role == "user").all(|m| m.tool_diffs.is_none()));
     }
 
     /// A recital restores typed history errors at the position they happened,
