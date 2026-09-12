@@ -10,8 +10,8 @@
 //! `text`, `tool_call`, `tool_result`; `stream.rs` emits `reasoning`). Inventing
 //! a parallel one for ACP would mean a second renderer.
 
-use super::protocol::{PlanEntry, SessionConfigOption, SessionUpdate, ToolCall, Usage};
-use crate::events::ToolOutcome;
+use super::protocol::{PlanEntry, SessionConfigOption, SessionFailureRecord, SessionUpdate, ToolCall, Usage};
+use crate::events::{AcpNoticeAction, AcpNoticeCategory, AcpNoticeSeverity, ToolOutcome};
 
 /// What one `session/update` means here.
 ///
@@ -69,6 +69,12 @@ pub enum Effect {
     /// model is read back out of this by the session, which is also what keeps
     /// there from being two sources for it.
     ConfigOptions(Vec<SessionConfigOption>),
+    /// The agent reported an incident about itself — a failure, or a warning
+    /// on the way to one — through the AIR `sessionFailure` extension.
+    SessionNotice(SessionNoticeRecord),
+    /// The agent named the conversation. Arrives once it has generated a
+    /// title, and again on later turns only if the title changed.
+    SessionTitle(String),
     /// A call that has been announced but has not finished, and everything this
     /// step does not draw.
     Ignored,
@@ -78,6 +84,86 @@ pub enum Effect {
 pub struct PlanItem {
     pub content: String,
     pub status: String,
+}
+
+/// One incident, in this app's closed vocabulary. The wire form
+/// ([`SessionFailureRecord`]) carries strings; this is what survives
+/// [`notice_of`], so nothing downstream has to re-validate a category.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionNoticeRecord {
+    /// The adapter's own id for the incident, stable across revisions.
+    pub notice_id: String,
+    pub revision: u32,
+    pub category: AcpNoticeCategory,
+    pub severity: AcpNoticeSeverity,
+    pub title: String,
+    pub details: Option<String>,
+    pub reason: Option<String>,
+    pub actions: Vec<AcpNoticeAction>,
+}
+
+/// Read an AIR incident record into the closed form, or refuse it.
+///
+/// Refused rather than defaulted: an unknown `category` stored as `unknown`
+/// would pass the database's own CHECK and then be drawn as something it is
+/// not, and an unknown `severity` has no honest default at all — `warning`
+/// hides a failure, `error` fails a turn that finished. An unknown *action*
+/// is different: the list is advice, and the spec tells a client to drop
+/// what it does not know, so that one is dropped with a warning.
+///
+/// Shared by the two carriers — a `session_info_update` and the reply to
+/// `session/prompt` — so they cannot disagree about what a record means.
+pub fn notice_of(record: &SessionFailureRecord) -> Option<SessionNoticeRecord> {
+    let notice_id = record.id.trim();
+    if notice_id.is_empty() {
+        tracing::warn!("an ACP session failure record has no id; dropped");
+        return None;
+    }
+    let category = match AcpNoticeCategory::parse(&record.category) {
+        Ok(category) => category,
+        Err(error) => {
+            tracing::warn!(%error, notice_id, "an ACP session failure record was dropped");
+            return None;
+        }
+    };
+    let severity = match AcpNoticeSeverity::parse(&record.severity) {
+        Ok(severity) => severity,
+        Err(error) => {
+            tracing::warn!(%error, notice_id, "an ACP session failure record was dropped");
+            return None;
+        }
+    };
+    let actions = record
+        .actions
+        .iter()
+        .filter_map(|action| match AcpNoticeAction::parse(action) {
+            Ok(action) => Some(action),
+            Err(error) => {
+                tracing::warn!(%error, notice_id, "an ACP notice action was dropped");
+                None
+            }
+        })
+        .collect();
+    Some(SessionNoticeRecord {
+        notice_id: notice_id.to_string(),
+        revision: record.revision,
+        category,
+        severity,
+        title: record.title.trim().to_string(),
+        details: record
+            .details
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string),
+        reason: record
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string),
+        actions,
+    })
 }
 
 pub fn effect_of(update: SessionUpdate) -> Effect {
@@ -139,6 +225,24 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
             Effect::ConfigOptions(config_options)
         }
         SessionUpdate::ConfigOptionUpdate { .. } => Effect::Ignored,
+        // An incident outranks a title. The adapter sends them in separate
+        // updates, so this is only a rule about which to keep if that changes;
+        // a title arriving beside a failure record is logged and waits for
+        // the next turn end, when the adapter re-sends it if it changed.
+        SessionUpdate::SessionInfoUpdate { meta, title, .. } => {
+            if let Some(record) = meta.as_ref().and_then(|m| m.session_failure()) {
+                if title.is_some() {
+                    tracing::debug!(
+                        "a session_info_update carried both a title and an incident; the title was skipped"
+                    );
+                }
+                return notice_of(record).map_or(Effect::Ignored, Effect::SessionNotice);
+            }
+            match title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(title) => Effect::SessionTitle(title.to_string()),
+                None => Effect::Ignored,
+            }
+        }
         SessionUpdate::Unhandled => Effect::Ignored,
     }
 }
@@ -552,6 +656,104 @@ mod tests {
     fn an_empty_option_set_is_ignored() {
         assert_eq!(
             effect_of(update(r#"{"sessionUpdate":"config_option_update","configOptions":[]}"#)),
+            Effect::Ignored
+        );
+    }
+
+    /// The adapter's own frame for a warning on the way to a failure (an
+    /// `api_retry`, as `claude-agent-acp` 0.76.0 publishes it): a
+    /// `session_info_update` carrying nothing but `_meta`.
+    #[test]
+    fn a_session_failure_warning_is_a_notice() {
+        let effect = effect_of(update(
+            r#"{"sessionUpdate":"session_info_update","_meta":{"jetbrains":{"air":{"version":1,
+                "sessionFailure":{"id":"prompt-1:error","revision":1,"category":"limit",
+                "severity":"warning","title":"Retrying Claude, attempt 1 of 5.","actions":[]}}}}}"#,
+        ));
+        assert_eq!(
+            effect,
+            Effect::SessionNotice(SessionNoticeRecord {
+                notice_id: "prompt-1:error".into(),
+                revision: 1,
+                category: AcpNoticeCategory::Limit,
+                severity: AcpNoticeSeverity::Warning,
+                title: "Retrying Claude, attempt 1 of 5.".into(),
+                details: None,
+                reason: None,
+                actions: vec![],
+            })
+        );
+    }
+
+    /// The same incident again at a higher revision, now terminal: same id,
+    /// new severity, and the recommended actions this time. The `reason`
+    /// field is on the wire but not in the extension's own table; it travels.
+    #[test]
+    fn a_later_revision_of_an_incident_keeps_its_id() {
+        let effect = effect_of(update(
+            r#"{"sessionUpdate":"session_info_update","_meta":{"jetbrains":{"air":{"version":1,
+                "sessionFailure":{"id":"prompt-1:error","revision":2,"category":"limit",
+                "severity":"error","title":"Rate limit reached.","details":"Try again in a minute.",
+                "reason":"rate_limit","actions":["retry","new_session"]}}}}}"#,
+        ));
+        let Effect::SessionNotice(record) = effect else {
+            panic!("expected a notice, got {effect:?}");
+        };
+        assert_eq!(record.notice_id, "prompt-1:error");
+        assert_eq!(record.revision, 2);
+        assert_eq!(record.severity, AcpNoticeSeverity::Error);
+        assert_eq!(record.details.as_deref(), Some("Try again in a minute."));
+        assert_eq!(record.reason.as_deref(), Some("rate_limit"));
+        assert_eq!(
+            record.actions,
+            vec![AcpNoticeAction::Retry, AcpNoticeAction::NewSession]
+        );
+    }
+
+    /// A category this build has never heard of is not stored under a guessed
+    /// one; an action it has never heard of is dropped from the list, which
+    /// is what the extension tells a client to do with it.
+    #[test]
+    fn an_unknown_category_drops_the_record_and_an_unknown_action_drops_itself() {
+        assert_eq!(
+            effect_of(update(
+                r#"{"sessionUpdate":"session_info_update","_meta":{"jetbrains":{"air":{"version":1,
+                    "sessionFailure":{"id":"x","revision":1,"category":"weather",
+                    "severity":"error","title":"t","actions":[]}}}}}"#
+            )),
+            Effect::Ignored
+        );
+        let effect = effect_of(update(
+            r#"{"sessionUpdate":"session_info_update","_meta":{"jetbrains":{"air":{"version":1,
+                "sessionFailure":{"id":"x","revision":1,"category":"service",
+                "severity":"error","title":"t","actions":["retry","teleport"]}}}}}"#,
+        ));
+        let Effect::SessionNotice(record) = effect else {
+            panic!("expected a notice, got {effect:?}");
+        };
+        assert_eq!(record.actions, vec![AcpNoticeAction::Retry]);
+    }
+
+    /// The adapter's title frame, exactly as `session-titles.ts` sends it.
+    /// A `session_info_update` with neither a title nor an incident — a goal
+    /// snapshot, say — is nothing to draw.
+    #[test]
+    fn a_session_title_travels_and_an_empty_info_update_does_not() {
+        assert_eq!(
+            effect_of(update(
+                r#"{"sessionUpdate":"session_info_update","title":"Fix the flaky title test",
+                    "updatedAt":"2026-09-12T02:00:00.000Z"}"#
+            )),
+            Effect::SessionTitle("Fix the flaky title test".into())
+        );
+        assert_eq!(
+            effect_of(update(r#"{"sessionUpdate":"session_info_update","title":"   "}"#)),
+            Effect::Ignored
+        );
+        assert_eq!(
+            effect_of(update(
+                r#"{"sessionUpdate":"session_info_update","_meta":{"goal":{"objective":"ship","status":"active"}}}"#
+            )),
             Effect::Ignored
         );
     }

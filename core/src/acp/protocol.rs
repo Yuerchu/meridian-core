@@ -215,6 +215,111 @@ pub struct ClientCapabilities {
     pub fs: FsCapabilities,
     pub terminal: bool,
     pub elicitation: ElicitationCapabilities,
+    /// Extensions this client opts into, under the AIR envelope
+    /// (`_meta.jetbrains.air`). See [`ClientCapabilitiesMeta`].
+    #[serde(rename = "_meta")]
+    pub meta: ClientCapabilitiesMeta,
+}
+
+/// The AIR capability list, which is how `claude-agent-acp` gates its
+/// experimental extensions.
+///
+/// **Opting into `sessionFailure` changes what a failed prompt looks like on
+/// the wire**, and that is the reason it is declared beside the code that
+/// reads it. Without it a failure is a JSON-RPC error and the prompt rejects.
+/// With it the adapter answers `stopReason: end_turn` and puts a typed record
+/// in `_meta`, so a client that declares this and then reads only
+/// `stopReason` reports every failure as a finished turn. `AcpSession::finish`
+/// reads the record; this is the other half of one decision.
+#[derive(Debug, Serialize)]
+pub struct ClientCapabilitiesMeta {
+    pub jetbrains: JetbrainsClientMeta,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JetbrainsClientMeta {
+    pub air: AirClientCapabilities,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AirClientCapabilities {
+    pub version: u32,
+    pub capabilities: Vec<&'static str>,
+}
+
+/// The one AIR capability this client declares.
+pub const AIR_SESSION_FAILURE: &str = "sessionFailure";
+
+impl Default for ClientCapabilitiesMeta {
+    fn default() -> Self {
+        Self {
+            jetbrains: JetbrainsClientMeta {
+                air: AirClientCapabilities {
+                    version: 1,
+                    capabilities: vec![AIR_SESSION_FAILURE],
+                },
+            },
+        }
+    }
+}
+
+// ------------------------------------------------------------- AIR inbound
+
+/// The `_meta` envelope the adapter's AIR extensions travel in, on a
+/// `session_info_update` and on the reply to `session/prompt` alike.
+///
+/// Lax on purpose — this is another program's wire format — and every level
+/// optional, because the same envelope carries things this client does not
+/// read (`quota`, `agentFileChangeReport`).
+#[derive(Debug, Default, Deserialize)]
+pub struct AirMetaEnvelope {
+    #[serde(default)]
+    pub jetbrains: Option<JetbrainsMeta>,
+}
+
+impl AirMetaEnvelope {
+    pub fn session_failure(&self) -> Option<&SessionFailureRecord> {
+        self.jetbrains
+            .as_ref()
+            .and_then(|j| j.air.as_ref())
+            .and_then(|a| a.session_failure.as_ref())
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct JetbrainsMeta {
+    #[serde(default)]
+    pub air: Option<AirMeta>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct AirMeta {
+    #[serde(default, rename = "sessionFailure")]
+    pub session_failure: Option<SessionFailureRecord>,
+}
+
+/// One incident, as the adapter spells it. `category`, `severity` and
+/// `actions` are kept as strings here and turned into this app's closed
+/// enums in [`super::mapping::notice_of`], where an unknown value is dropped
+/// with a warning rather than stored under a guessed name.
+#[derive(Debug, Default, Deserialize)]
+pub struct SessionFailureRecord {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub revision: u32,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub details: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub actions: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -681,6 +786,11 @@ pub struct PromptResult {
     /// to tell `cancelled` apart.
     #[serde(default)]
     pub stop_reason: String,
+    /// Where a turn-terminal failure lands once `sessionFailure` is declared:
+    /// `stopReason` says `end_turn` and this says what actually happened. Also
+    /// carries `quota`, which this client does not read.
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<AirMetaEnvelope>,
 }
 
 // ------------------------------------------------------------------ steering
@@ -871,6 +981,19 @@ pub enum SessionUpdate {
     ConfigOptionUpdate {
         #[serde(default)]
         config_options: Vec<SessionConfigOption>,
+    },
+    /// Facts about the session rather than the turn. Two of them are read:
+    /// the title the agent gave the conversation, and an AIR incident record
+    /// in `_meta`. The adapter never sends both in one update; other `_meta`
+    /// payloads (`goal`, `agentFileChangeReport`) fall through the envelope.
+    #[serde(rename_all = "camelCase")]
+    SessionInfoUpdate {
+        #[serde(default, rename = "_meta")]
+        meta: Option<AirMetaEnvelope>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        updated_at: Option<String>,
     },
     /// Everything this step does not draw — `available_commands_update`,
     /// `current_mode_update`, and whatever the adapter adds next.

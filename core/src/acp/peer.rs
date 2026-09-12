@@ -1008,6 +1008,115 @@ mod tests {
             assert!(!peer.is_alive());
         }
 
+        /// The AIR `sessionFailure` extension on the wire, both carriers.
+        ///
+        /// Declaring it is what changes the shape of a failed prompt: with the
+        /// capability in `initialize`, a failure comes back as a *resolved*
+        /// `end_turn` with the record in `_meta`, where without it the same
+        /// failure is a JSON-RPC rejection. A client that declares and then
+        /// reads only `stopReason` has turned every failure into success —
+        /// this test is the one that would catch the declaration going in
+        /// without its reader.
+        #[tokio::test]
+        async fn a_typed_failure_resolves_the_prompt_and_a_warning_is_a_notice() {
+            let Some(args) = adapter() else {
+                eprintln!("skipping: node is not available");
+                return;
+            };
+
+            let process = AdapterProcess::spawn("node", &args).await.expect("spawn the adapter");
+            let probe = Arc::new(Probe::default());
+            let peer = Peer::start(process, probe.clone() as Arc<dyn Handler>);
+
+            // The capabilities this app actually sends, AIR opt-in included.
+            peer.request(
+                "initialize",
+                serde_json::to_value(protocol::InitializeParams {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    client_capabilities: protocol::ClientCapabilities::default(),
+                    client_info: protocol::Implementation {
+                        name: "meridian".into(),
+                        title: None,
+                        version: "test".into(),
+                    },
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("initialize");
+            let session = peer
+                .request("session/new", serde_json::json!({ "cwd": ".", "mcpServers": [] }))
+                .await
+                .expect("session/new");
+            let session: protocol::NewSessionResult = serde_json::from_value(session).unwrap();
+            let prompt = |text: &str| {
+                serde_json::json!({
+                    "sessionId": session.session_id,
+                    "prompt": [{ "type": "text", "text": text }],
+                })
+            };
+
+            // A warning mid-turn: a `session_info_update` carrying only `_meta`.
+            let reply = peer
+                .request("session/prompt", prompt("air-warn"))
+                .await
+                .expect("air-warn");
+            let reply: protocol::PromptResult = serde_json::from_value(reply).unwrap();
+            assert_eq!(reply.stop_reason, "end_turn");
+            assert!(reply.meta.as_ref().and_then(|m| m.session_failure()).is_none());
+            let joined = probe.updates.lock().unwrap().join("\n");
+            assert!(
+                joined
+                    .lines()
+                    .any(|l| l.starts_with("SessionNotice") && l.contains("Retrying Claude")),
+                "the warning is a notice: {joined}"
+            );
+
+            // A terminal failure: resolved, not rejected, and the record is on
+            // the reply.
+            let reply = peer
+                .request("session/prompt", prompt("air-fail"))
+                .await
+                .expect("air-fail resolves");
+            let reply: protocol::PromptResult = serde_json::from_value(reply).unwrap();
+            assert_eq!(reply.stop_reason, "end_turn", "the stop reason says nothing went wrong");
+            let record = reply
+                .meta
+                .as_ref()
+                .and_then(|m| m.session_failure())
+                .expect("the failure travels in _meta");
+            assert_eq!(record.severity, "error");
+            assert_eq!(record.revision, 2);
+            assert_eq!(record.title, "Claude could not complete the request.");
+
+            // Authentication still rejects — and reports beside the rejection.
+            let err = peer
+                .request("session/prompt", prompt("air-auth"))
+                .await
+                .expect_err("authentication is the one failure that still rejects");
+            assert!(err.to_string().contains("Authentication required"), "{err}");
+            let joined = probe.updates.lock().unwrap().join("\n");
+            assert!(
+                joined
+                    .lines()
+                    .any(|l| l.starts_with("SessionNotice") && l.contains("Sign in")),
+                "the session-scoped record: {joined}"
+            );
+
+            // And the title frame, which is the other thing a
+            // `session_info_update` carries.
+            peer.request("session/prompt", prompt("title")).await.expect("title");
+            let joined = probe.updates.lock().unwrap().join("\n");
+            assert!(
+                joined
+                    .lines()
+                    .any(|l| l.starts_with("SessionTitle") && l.contains("Fix the flaky title test")),
+                "the title: {joined}"
+            );
+
+            peer.stop().await;
+        }
+
         /// A caller parked on a request when the adapter dies has to hear about
         /// it. Left waiting, the session simply never answers — the failure
         /// that reads as a hang rather than as an error.

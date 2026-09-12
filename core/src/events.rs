@@ -363,6 +363,159 @@ impl From<crate::acp::protocol::SessionConfigOption> for AcpConfigOptionEvent {
     }
 }
 
+/// The broad group a hosted session's incident belongs to, as the adapter
+/// files it. Drives iconography and nothing else; the text is the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpNoticeCategory {
+    Connection,
+    Access,
+    Limit,
+    Request,
+    Service,
+    Unknown,
+}
+
+impl AcpNoticeCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::Access => "access",
+            Self::Limit => "limit",
+            Self::Request => "request",
+            Self::Service => "service",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "connection" => Ok(Self::Connection),
+            "access" => Ok(Self::Access),
+            "limit" => Ok(Self::Limit),
+            "request" => Ok(Self::Request),
+            "service" => Ok(Self::Service),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(format!("unknown notice category `{value}`")),
+        }
+    }
+}
+
+/// Whether an incident ended something or merely reported on it. A `warning`
+/// never ends a turn; an `error` needs a person or another request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpNoticeSeverity {
+    Warning,
+    Error,
+}
+
+impl AcpNoticeSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "warning" => Ok(Self::Warning),
+            "error" => Ok(Self::Error),
+            _ => Err(format!("unknown notice severity `{value}`")),
+        }
+    }
+}
+
+/// What the adapter recommends doing about an incident. The app decides which
+/// of these it can actually offer; the list is never a promise of a button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpNoticeAction {
+    Retry,
+    Login,
+    NewSession,
+}
+
+impl AcpNoticeAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Login => "login",
+            Self::NewSession => "new_session",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "retry" => Ok(Self::Retry),
+            "login" => Ok(Self::Login),
+            "new_session" => Ok(Self::NewSession),
+            _ => Err(format!("unknown notice action `{value}`")),
+        }
+    }
+}
+
+/// One incident a hosted Claude Code session reported, at its latest revision.
+///
+/// The persisted row (`acp_session_notices`) and this projection carry the
+/// same fields; the row stores `actions` as JSON text and this decodes it
+/// strictly, so a row that cannot be read is an error rather than an incident
+/// with no recommendations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpSessionNoticeEvent {
+    pub id: String,
+    pub conversation_id: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub turn_id: Option<String>,
+    pub notice_id: String,
+    pub revision: u32,
+    pub category: AcpNoticeCategory,
+    pub severity: AcpNoticeSeverity,
+    pub title: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub details: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub reason: Option<String>,
+    pub actions: Vec<AcpNoticeAction>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl TryFrom<crate::db::models::acp_session_notice::AcpSessionNoticeRow> for AcpSessionNoticeEvent {
+    type Error = String;
+
+    fn try_from(row: crate::db::models::acp_session_notice::AcpSessionNoticeRow) -> Result<Self, String> {
+        let actions: Vec<String> = serde_json::from_str(&row.actions).map_err(|e| {
+            format!(
+                "acp_session_notices.actions for `{}` is not a JSON array of strings: {e}",
+                row.id
+            )
+        })?;
+        let actions = actions
+            .iter()
+            .map(|a| AcpNoticeAction::parse(a))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            id: row.id,
+            conversation_id: row.conversation_id,
+            turn_id: row.turn_id,
+            notice_id: row.notice_id,
+            revision: u32::try_from(row.revision)
+                .map_err(|_| "acp_session_notices.revision is negative".to_string())?,
+            category: AcpNoticeCategory::parse(&row.category)?,
+            severity: AcpNoticeSeverity::parse(&row.severity)?,
+            title: row.title,
+            details: row.details,
+            reason: row.reason,
+            actions,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
 /// Every payload permitted on [`CHAT_STREAM_CHANNEL`].
 ///
 /// Unlike the former `json!` convention, each variant states its required
@@ -475,6 +628,13 @@ pub enum ChatStreamEvent {
         conversation_id: String,
         used: u64,
         size: u64,
+    },
+    /// A hosted session reported an incident, or a new revision of one. The
+    /// frontend keeps the latest revision per `notice_id`.
+    #[cfg(not(target_os = "android"))]
+    AcpNotice {
+        conversation_id: String,
+        notice: AcpSessionNoticeEvent,
     },
     RedactionNotice {
         conversation_id: String,
@@ -887,6 +1047,68 @@ mod tests {
         assert_eq!(option["type"], serde_json::Value::Null);
         assert_eq!(option["currentValue"], serde_json::Value::Null);
         assert_eq!(option["options"][0]["description"], serde_json::Value::Null);
+    }
+
+    /// Nullable keys are still keys: a session-scoped notice has `turn_id`,
+    /// `details` and `reason` as explicit nulls, never as absences.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn acp_notice_event_serializes_every_nullable_key() {
+        let payload = serde_json::to_value(ChatStreamEvent::AcpNotice {
+            conversation_id: "conversation-1".into(),
+            notice: AcpSessionNoticeEvent {
+                id: "n1".into(),
+                conversation_id: "conversation-1".into(),
+                turn_id: None,
+                notice_id: "sess:notice:1:1".into(),
+                revision: 1,
+                category: AcpNoticeCategory::Unknown,
+                severity: AcpNoticeSeverity::Warning,
+                title: "Model fallback".into(),
+                details: None,
+                reason: None,
+                actions: vec![AcpNoticeAction::Retry, AcpNoticeAction::NewSession],
+                created_at: 1,
+                updated_at: 1,
+            },
+        })
+        .unwrap();
+
+        assert_eq!(payload["type"], "acp_notice");
+        let notice = &payload["notice"];
+        assert_eq!(notice["turn_id"], serde_json::Value::Null);
+        assert_eq!(notice["details"], serde_json::Value::Null);
+        assert_eq!(notice["reason"], serde_json::Value::Null);
+        assert_eq!(notice["category"], "unknown");
+        assert_eq!(notice["severity"], "warning");
+        assert_eq!(notice["actions"], serde_json::json!(["retry", "new_session"]));
+
+        // And the round trip refuses an absent nullable key.
+        let mut absent = payload.clone();
+        absent["notice"].as_object_mut().unwrap().remove("turn_id");
+        assert!(serde_json::from_value::<ChatStreamEvent>(absent).is_err());
+    }
+
+    /// A stored row with an unreadable action list is an error, not an
+    /// incident that recommends nothing.
+    #[test]
+    fn a_notice_row_with_bad_actions_does_not_become_an_event() {
+        let row = crate::db::models::acp_session_notice::AcpSessionNoticeRow {
+            id: "n1".into(),
+            conversation_id: "c1".into(),
+            turn_id: None,
+            notice_id: "x".into(),
+            revision: 1,
+            category: "limit".into(),
+            severity: "error".into(),
+            title: "t".into(),
+            details: None,
+            reason: None,
+            actions: r#"["retry", "teleport"]"#.into(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        assert!(AcpSessionNoticeEvent::try_from(row).is_err());
     }
 
     #[test]

@@ -8,6 +8,24 @@ diesel::table! {
 }
 
 diesel::table! {
+    acp_session_notices (id) {
+        id -> Text,
+        conversation_id -> Text,
+        turn_id -> Nullable<Text>,
+        notice_id -> Text,
+        revision -> Integer,
+        category -> Text,
+        severity -> Text,
+        title -> Text,
+        details -> Nullable<Text>,
+        reason -> Nullable<Text>,
+        actions -> Text,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
     acp_sessions (conversation_id) {
         conversation_id -> Text,
         acp_session_id -> Nullable<Text>,
@@ -790,11 +808,13 @@ diesel::joinable!(todo_lists -> conversations (conversation_id));
 diesel::joinable!(todo_items -> todo_lists (list_id));
 diesel::joinable!(turns -> conversations (conversation_id));
 diesel::joinable!(acp_sessions -> conversations (conversation_id));
+diesel::joinable!(acp_session_notices -> conversations (conversation_id));
 diesel::joinable!(voice_clips -> voice_blobs (blob_id));
 diesel::joinable!(journal_versions -> journal_files (file_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     acp_context_deliveries,
+    acp_session_notices,
     acp_sessions,
     assistant_emoji_packs,
     assistants,

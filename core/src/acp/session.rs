@@ -26,10 +26,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::engine::transcript::{append_tool_result, begin_assistant, complete_assistant, write_steering};
 use crate::agent::tool_calls::serialize_tool_calls_openai;
+use crate::db::models::acp_session_notice::AcpSessionNoticeInsert;
 use crate::db::models::message::MessageUsage;
 use crate::db::models::queue::QueuedPromptRow;
 use crate::db::models::turn::{TurnPhase, TurnStatus};
-use crate::events::{ChatStopReason, ChatStreamEvent, ToolOutcome};
+use crate::events::{AcpNoticeSeverity, AcpSessionNoticeEvent, ChatStopReason, ChatStreamEvent, ToolOutcome};
 use crate::provider;
 use crate::services::Services;
 use crate::turn::TurnOrigin;
@@ -170,6 +171,11 @@ struct TurnState {
     /// after the round that was running when they were sent, before the round
     /// that answers them.
     interjected: Vec<Interjection>,
+    /// The title of an `error`-severity incident the adapter reported while
+    /// this turn ran, if any. Read by `finish`: the adapter answers the prompt
+    /// with a plain `end_turn` once `sessionFailure` is declared, and this is
+    /// what says the turn nevertheless failed.
+    error_notice: Option<String>,
 }
 
 /// The half of a session the protocol handler needs.
@@ -244,6 +250,18 @@ struct Shared {
     /// decision live in SQLite; this only connects a still-running adapter to
     /// that state and may disappear on restart without retiring the review.
     plan_reviews: Arc<super::plan_review::ReviewControl>,
+    /// The last title the agent gave this conversation, in this process.
+    ///
+    /// The agent's title is adopted only over a title nobody chose: the
+    /// placeholder the conversation was created with, or the agent's own
+    /// previous one. A title the user typed in the sidebar is theirs, and the
+    /// adapter republishing its own at the next turn end must not take it
+    /// back.
+    agent_title: Mutex<Option<String>>,
+    /// What the conversation was called before anybody named it — see
+    /// [`super::title_for`]. Held here so `absorb` can tell a placeholder
+    /// from a choice without a second lookup.
+    placeholder_title: String,
 }
 
 impl Shared {
@@ -544,7 +562,145 @@ impl Shared {
             }
             // Nothing to do beyond merging: `merge_config` announces.
             Effect::ConfigOptions(options) => self.merge_config(options),
+            // Not gated on a running turn: an incident noticed between turns
+            // (a login that expired, a worker that died) is still one to keep,
+            // filed against no turn.
+            Effect::SessionNotice(record) => {
+                let turn_id = self.with_turn(|t| {
+                    if record.severity == AcpNoticeSeverity::Error {
+                        t.error_notice = Some(record.title.clone());
+                    }
+                    t.turn_id.clone()
+                });
+                self.record_notice(record, turn_id).await;
+            }
+            Effect::SessionTitle(title) => self.adopt_title(title).await,
             Effect::Ignored => {}
+        }
+    }
+
+    /// Keep an incident the adapter reported, and say so if it is new.
+    ///
+    /// `turn_id` is passed rather than read off the turn because one caller —
+    /// `finish`, reading the record off the prompt's own reply — runs after
+    /// the turn state has been taken, while the turn it belongs to is still
+    /// known. `None` files a session-scoped incident.
+    ///
+    /// Announced only when the write changed something: a replayed revision
+    /// is the adapter repeating itself, and the frontend already holds it.
+    /// Held back during an import, where the conversation does not exist yet.
+    async fn record_notice(&self, record: mapping::SessionNoticeRecord, turn_id: Option<String>) {
+        let pool = self.services.db.clone();
+        let conversation_id = self.conversation_id.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            let mut conn = get_conn(&pool)?;
+            let actions = serde_json::to_string(&record.actions).map_err(|e| e.to_string())?;
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = now_ms();
+            crate::db::ops::acp_session_notice::upsert_if_newer(
+                &mut conn,
+                AcpSessionNoticeInsert {
+                    id: &id,
+                    conversation_id: &conversation_id,
+                    turn_id: turn_id.as_deref(),
+                    notice_id: &record.notice_id,
+                    revision: i32::try_from(record.revision).unwrap_or(i32::MAX),
+                    category: record.category.as_str(),
+                    severity: record.severity.as_str(),
+                    title: &record.title,
+                    details: record.details.as_deref(),
+                    reason: record.reason.as_deref(),
+                    actions: &actions,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await;
+        let row = match written {
+            Ok(Ok(Some(row))) => row,
+            Ok(Ok(None)) => return,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not record an ACP notice");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "recording an ACP notice panicked");
+                return;
+            }
+        };
+        match AcpSessionNoticeEvent::try_from(row) {
+            Ok(notice) => {
+                tracing::info!(
+                    conversation_id = %self.conversation_id,
+                    notice_id = %notice.notice_id,
+                    revision = notice.revision,
+                    category = notice.category.as_str(),
+                    severity = notice.severity.as_str(),
+                    "ACP session notice"
+                );
+                if !self.importing() {
+                    self.emit(ChatStreamEvent::AcpNotice {
+                        conversation_id: self.conversation_id.clone(),
+                        notice,
+                    });
+                }
+            }
+            Err(error) => tracing::warn!(%error, "an ACP notice was written but could not be read back"),
+        }
+    }
+
+    /// Take the agent's name for this conversation — over a placeholder, or
+    /// over its own earlier name, and over nothing else.
+    ///
+    /// The sidebar refetches on `conversation-updated`, which `finish` emits
+    /// unconditionally at the end of every turn; the title lands before that
+    /// because the adapter publishes it before it answers the prompt. Emitted
+    /// here as well for the case where it does not.
+    async fn adopt_title(&self, title: String) {
+        // An import already took the title `session/list` reported, and the
+        // conversation it would name does not exist yet.
+        if self.importing() {
+            return;
+        }
+        let previous = self
+            .agent_title
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.replace(title.clone()));
+        let placeholder = self.placeholder_title.clone();
+        let pool = self.services.db.clone();
+        let conversation_id = self.conversation_id.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            let mut conn = get_conn(&pool)?;
+            let current = crate::db::ops::conversation::get_conversation(&mut conn, &conversation_id)
+                .map_err(|e| e.to_string())?
+                .title;
+            let nobodys = match current.as_deref() {
+                None => true,
+                Some(current) => current == placeholder || Some(current) == previous.as_deref(),
+            };
+            if !nobodys || current.as_deref() == Some(title.as_str()) {
+                return Ok::<bool, String>(false);
+            }
+            crate::db::ops::conversation::update_title(&mut conn, &conversation_id, &title, now_ms())
+                .map_err(|e| e.to_string())?;
+            Ok(true)
+        })
+        .await;
+        match written {
+            Ok(Ok(true)) => {
+                tracing::info!(conversation_id = %self.conversation_id, "adopted the agent's title");
+                let _ = self.services.events.emit_conversation_updated(&self.conversation_id);
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not adopt the agent's title")
+            }
+            Err(error) => {
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "adopting the agent's title panicked")
+            }
         }
     }
 
@@ -1373,6 +1529,8 @@ impl AcpSession {
             memory_lost: Mutex::new(false),
             tools_lost: Mutex::new(tools_lost),
             plan_reviews: Arc::new(crate::acp::plan_review::ReviewControl::default()),
+            agent_title: Mutex::new(None),
+            placeholder_title: super::title_for(opening.cwd),
         });
         let peer = Peer::start(process, shared.clone() as Arc<dyn Handler>);
 
@@ -2214,6 +2372,7 @@ impl AcpSession {
                 // The question. Every row this turn writes chains from it.
                 parent: user_message_id.clone(),
                 interjected: Vec::new(),
+                error_notice: None,
             });
         }
 
@@ -2607,24 +2766,32 @@ impl AcpSession {
             .write_interjections(turn_id, &last, &state.interjected)
             .await;
 
-        let (status, reason, error) = match &outcome {
-            Ok(value) => match value.get("stopReason").and_then(|v| v.as_str()) {
-                Some(raw) => match ChatStopReason::try_from(raw) {
-                    Ok(reason @ ChatStopReason::Cancelled) => (TurnStatus::Cancelled, reason, None),
-                    Ok(reason @ (ChatStopReason::Error | ChatStopReason::LoopDetected)) => {
-                        (TurnStatus::Failed, reason, None)
-                    }
-                    Ok(reason) => (TurnStatus::Done, reason, None),
-                    Err(error) => (TurnStatus::Failed, ChatStopReason::Error, Some(error)),
-                },
-                None => (
-                    TurnStatus::Failed,
-                    ChatStopReason::Error,
-                    Some("ACP prompt response is missing `stopReason`".to_string()),
-                ),
-            },
-            Err(e) => (TurnStatus::Failed, ChatStopReason::Error, Some(e.to_string())),
+        // What the reply says about itself, before `stopReason` is believed.
+        // Declaring `sessionFailure` at `initialize` changed the shape of a
+        // failed prompt: the adapter answers `end_turn` and puts a typed
+        // record in `_meta` instead of rejecting the request. Read only
+        // `stopReason` and every such failure is a finished turn.
+        let air_record = match &outcome {
+            Ok(value) => value
+                .get("_meta")
+                .and_then(|m| serde_json::from_value::<protocol::AirMetaEnvelope>(m.clone()).ok())
+                .and_then(|m| m.session_failure().and_then(mapping::notice_of)),
+            Err(_) => None,
         };
+        // Either the reply's own record, or one that arrived as a
+        // `session_info_update` while the turn ran — the `auth_required` case,
+        // which the adapter still rejects with a JSON-RPC error and reports
+        // beside it. The reply's record wins when both exist: it is the later
+        // word.
+        let mut notice_error = state.error_notice.clone();
+        if let Some(record) = air_record {
+            if record.severity == AcpNoticeSeverity::Error {
+                notice_error = Some(record.title.clone());
+            }
+            self.shared.record_notice(record, Some(turn_id.to_string())).await;
+        }
+        let carried_by_notice = notice_error.is_some();
+        let (status, reason, error) = classify(&outcome, notice_error.as_deref());
 
         // An update the reader could not queue is a piece of this answer that
         // was never written down, and the rows above have already been saved
@@ -2714,14 +2881,19 @@ impl AcpSession {
             });
         }
 
+        // A failure the adapter reported as a typed record is already in the
+        // transcript, durably, with its category and what to do about it. The
+        // composer's rejection path draws a transient bubble from the same
+        // text, so that one is told the turn ended and nothing more.
         match outcome {
             // The caller hears about lost updates too. `acp_send` is awaited by
             // the composer, and a rejection is what unlocks it with an error
             // rather than with a tick.
             Ok(_) => match error {
-                Some(e) => Err(e),
-                None => Ok(()),
+                Some(e) if !carried_by_notice => Err(e),
+                _ => Ok(()),
             },
+            Err(_) if carried_by_notice => Ok(()),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -2898,6 +3070,92 @@ fn merge_options(held: &mut Vec<protocol::SessionConfigOption>, incoming: Vec<pr
             // model changes, so this is ordinary rather than exceptional.
             None => held.push(option),
         }
+    }
+}
+
+/// How a turn ended, from the reply to `session/prompt` and from what the
+/// adapter said about the turn while it ran.
+///
+/// `notice_error` is the title of an `error`-severity AIR incident recorded
+/// for this turn — off the reply's own `_meta`, or off a `session_info_update`
+/// that arrived mid-turn — and it wins over the reply: with `sessionFailure`
+/// declared, the adapter reports a failed prompt as `stopReason: end_turn`
+/// with the record beside it, so the stop reason alone reads a failure as a
+/// finished turn. A warning is not passed here; it changes nothing.
+///
+/// Pure, and separate from `finish`, so the four cases can be pinned without a
+/// database: a typed failure on a clean reply, a warning on one, a cancel with
+/// a warning, and a JSON-RPC rejection with a session-scoped record beside it.
+fn classify(
+    outcome: &Result<serde_json::Value, PeerError>,
+    notice_error: Option<&str>,
+) -> (TurnStatus, ChatStopReason, Option<String>) {
+    if let Some(title) = notice_error {
+        return (TurnStatus::Failed, ChatStopReason::Error, Some(title.to_string()));
+    }
+    match outcome {
+        Ok(value) => match value.get("stopReason").and_then(|v| v.as_str()) {
+            Some(raw) => match ChatStopReason::try_from(raw) {
+                Ok(reason @ ChatStopReason::Cancelled) => (TurnStatus::Cancelled, reason, None),
+                Ok(reason @ (ChatStopReason::Error | ChatStopReason::LoopDetected)) => {
+                    (TurnStatus::Failed, reason, None)
+                }
+                Ok(reason) => (TurnStatus::Done, reason, None),
+                Err(error) => (TurnStatus::Failed, ChatStopReason::Error, Some(error)),
+            },
+            None => (
+                TurnStatus::Failed,
+                ChatStopReason::Error,
+                Some("ACP prompt response is missing `stopReason`".to_string()),
+            ),
+        },
+        Err(e) => (TurnStatus::Failed, ChatStopReason::Error, Some(e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn ended(stop: &str) -> Result<serde_json::Value, PeerError> {
+        Ok(serde_json::json!({ "stopReason": stop }))
+    }
+
+    /// The whole reason `sessionFailure` had to be read and not merely
+    /// declared: a typed failure arrives on an `end_turn`.
+    #[test]
+    fn a_typed_failure_on_a_clean_reply_fails_the_turn_with_its_title() {
+        let (status, reason, error) = classify(&ended("end_turn"), Some("Rate limit reached."));
+        assert_eq!(status, TurnStatus::Failed);
+        assert_eq!(reason, ChatStopReason::Error);
+        assert_eq!(error.as_deref(), Some("Rate limit reached."));
+    }
+
+    /// A warning is not an error and never reaches `classify`; the reply
+    /// stands on its own.
+    #[test]
+    fn a_reply_with_no_error_notice_is_read_off_its_stop_reason() {
+        assert_eq!(classify(&ended("end_turn"), None).0, TurnStatus::Done);
+        assert_eq!(classify(&ended("cancelled"), None).0, TurnStatus::Cancelled);
+        assert_eq!(classify(&ended("max_tokens"), None).0, TurnStatus::Done);
+        let (status, _, error) = classify(&Ok(serde_json::json!({})), None);
+        assert_eq!(status, TurnStatus::Failed);
+        assert!(error.unwrap().contains("stopReason"));
+    }
+
+    /// The `auth_required` shape: the adapter still rejects, and the typed
+    /// record that arrived beside the rejection is the better message.
+    #[test]
+    fn a_rejection_with_a_session_scoped_record_reports_the_record() {
+        let outcome = Err(PeerError::Rpc("Authentication required".into()));
+        let (status, reason, error) = classify(&outcome, Some("Sign in to continue using Claude."));
+        assert_eq!(status, TurnStatus::Failed);
+        assert_eq!(reason, ChatStopReason::Error);
+        assert_eq!(error.as_deref(), Some("Sign in to continue using Claude."));
+
+        let (status, _, error) = classify(&outcome, None);
+        assert_eq!(status, TurnStatus::Failed);
+        assert!(error.unwrap().contains("Authentication required"));
     }
 }
 
@@ -3491,6 +3749,7 @@ mod tests {
                 row: OpenRow::new(first.clone()),
                 parent: first.clone(),
                 interjected: Vec::new(),
+                error_notice: None,
             })),
             model: Mutex::new(None),
             config: Mutex::new(Vec::new()),
@@ -3500,6 +3759,8 @@ mod tests {
             memory_lost: Mutex::new(false),
             tools_lost: Mutex::new(false),
             plan_reviews: Arc::new(crate::acp::plan_review::ReviewControl::default()),
+            agent_title: Mutex::new(None),
+            placeholder_title: String::new(),
         };
 
         // The first announcement is the placeholder one: the adapter knows a
@@ -3600,6 +3861,7 @@ mod tests {
                 row: OpenRow::new(first.clone()),
                 parent: first.clone(),
                 interjected: Vec::new(),
+                error_notice: None,
             })),
             model: Mutex::new(None),
             config: Mutex::new(Vec::new()),
@@ -3609,6 +3871,8 @@ mod tests {
             memory_lost: Mutex::new(false),
             tools_lost: Mutex::new(false),
             plan_reviews: Arc::new(crate::acp::plan_review::ReviewControl::default()),
+            agent_title: Mutex::new(None),
+            placeholder_title: String::new(),
         };
 
         shared.absorb(update(call("A", "Bash", serde_json::json!({})))).await;
