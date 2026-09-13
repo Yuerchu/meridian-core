@@ -75,6 +75,7 @@ pub async fn fetch_models_on(
         super::registry::ProviderType::Openai | super::registry::ProviderType::Deepseek => {
             fetch_openai_models(base_url, api_key).await
         }
+        super::registry::ProviderType::LitertLm => Ok(litert_lm_models()),
     }
 }
 
@@ -422,4 +423,17 @@ async fn fetch_anthropic_models(base_url: &str, api_key: &str) -> Result<Vec<Mod
 
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
+}
+
+fn litert_lm_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo {
+            id: "gemma-4-E4B-it".into(),
+            name: "Gemma 4 E4B".into(),
+        },
+        ModelInfo {
+            id: "gemma-4-E2B-it".into(),
+            name: "Gemma 4 E2B".into(),
+        },
+    ]
 }

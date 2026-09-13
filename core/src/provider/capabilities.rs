@@ -293,6 +293,21 @@ fn gemma_default() -> ProviderCapabilities {
     }
 }
 
+fn litert_lm_default() -> ProviderCapabilities {
+    ProviderCapabilities {
+        supports_tools: true,
+        supports_streaming_tools: true,
+        supports_thinking: true,
+        supports_thinking_off: true,
+        supports_temperature: true,
+        supports_top_p: true,
+        max_temperature: Some(2.0),
+        max_context_tokens: Some(8192),
+        max_output_tokens: Some(4096),
+        ..Default::default()
+    }
+}
+
 fn google_default() -> ProviderCapabilities {
     ProviderCapabilities {
         supports_tools: true,
@@ -377,9 +392,11 @@ fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> 
         }
         "xai" => (xai_default(), "xai"),
         "google" => (google_default(), "google"),
+        "litert_lm" => (litert_lm_default(), "litert_lm"),
         _ => match api_format {
             Some("responses") => (openai_responses_default(), "openai"),
             Some("gemma_tool") => (gemma_default(), "gemma"),
+            Some("litert_lm") => (litert_lm_default(), "litert_lm"),
             _ => (generic_default(), "openai"),
         },
     };

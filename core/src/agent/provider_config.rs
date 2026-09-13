@@ -172,6 +172,7 @@ fn resolve_credential(
                 slot: "default".into(),
             },
         ))),
+        "none" => Ok(provider::Credential::None),
         other => Err(format!("unknown provider credential kind `{other}`")),
     }
 }
@@ -408,6 +409,7 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
         thinking_effort,
         fast,
         server_tools,
+        context_limit: Some(context_limit as i32),
         // thinking_style and verbosity are derived from the catalog by
         // filter_params below, not supplied by the caller.
         ..Default::default()

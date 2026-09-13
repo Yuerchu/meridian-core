@@ -7,6 +7,7 @@ pub mod deepseek;
 mod dto;
 pub mod gemma_tool;
 pub mod google_generate_content;
+pub mod litert_lm_provider;
 pub mod models;
 pub mod openai_compat;
 pub mod openai_responses;
@@ -279,6 +280,8 @@ pub enum Credential {
     /// this app owns — so both logins arrive here as the same variant. That is
     /// the point: they produce the same token against the same endpoint.
     ChatGpt(std::sync::Arc<crate::codex_auth::Manager>),
+    /// No credential needed (local on-device inference).
+    None,
 }
 
 impl Credential {
@@ -291,7 +294,7 @@ impl Credential {
     pub fn api_key(&self) -> &str {
         match self {
             Self::ApiKey(key) => key,
-            Self::ChatGpt(_) => "",
+            Self::ChatGpt(_) | Self::None => "",
         }
     }
 }
@@ -303,6 +306,7 @@ impl std::fmt::Debug for Credential {
         match self {
             Self::ApiKey(_) => f.write_str("Credential::ApiKey(<redacted>)"),
             Self::ChatGpt(_) => f.write_str("Credential::ChatGpt"),
+            Self::None => f.write_str("Credential::None"),
         }
     }
 }
@@ -595,6 +599,9 @@ pub struct ChatParams {
     /// Whether this provider+model supports server-side compaction via
     /// `compaction_trigger`. Copied from capabilities by `filter_params`.
     pub supports_remote_compaction: bool,
+    /// The full context window (input + output) this model is configured for.
+    /// Used by local inference providers to size the KV cache.
+    pub context_limit: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
