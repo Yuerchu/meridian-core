@@ -35,6 +35,8 @@ should_implement_trait = "allow"
 test-support = []
 
 [dependencies]
+async-stream = "0.3"
+litert-lm = { path = "../litert-lm" }
 serde = { version = "1", features = ["derive"] }
 # `raw_value` is for money arriving as a JSON *number*. serde_json parses one
 # into an f64 the moment it sees it, so by the time a visitor is called the

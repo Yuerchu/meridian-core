@@ -28,6 +28,7 @@ pub enum ApiFormat {
     GeminiGenerateContent,
     GeminiInteractions,
     GemmaTool,
+    LitertLm,
 }
 
 impl ApiFormat {
@@ -62,6 +63,7 @@ pub enum ProviderType {
     Deepseek,
     Xai,
     Google,
+    LitertLm,
 }
 
 impl ProviderType {
@@ -91,6 +93,7 @@ impl ProviderType {
 pub enum TransportProfile {
     Standard,
     ChatgptCodex,
+    LocalNative,
 }
 
 impl TransportProfile {
@@ -124,6 +127,7 @@ pub enum CredentialKind {
     GoogleVertexServiceAccount,
     CodexCli,
     ChatgptOauth,
+    None,
 }
 
 impl CredentialKind {
@@ -145,10 +149,9 @@ fn validate_transport_profile(value: &str) -> Result<(), String> {
 fn validate_wire_pair(api_format: ApiFormat, transport_profile: &str) -> Result<(), String> {
     match (api_format, transport_profile) {
         (ApiFormat::Responses, "chatgpt_codex") | (_, "standard") => Ok(()),
+        (ApiFormat::LitertLm, "local_native") => Ok(()),
+        (_, "local_native") => Err("the local_native transport requires the `litert_lm` API format".into()),
         (_, "chatgpt_codex") => Err("the ChatGPT Codex transport requires the `responses` API format".into()),
-        // `validate_transport_profile` owns this error. Keeping this arm total
-        // prevents a later caller from accidentally treating a new profile as
-        // valid before its combinations have been decided.
         (_, other) => Err(format!("unknown provider transport profile `{other}`")),
     }
 }
@@ -182,7 +185,8 @@ pub fn validate_stored_contract(
     match (transport_profile, credential_kind) {
         (TransportProfile::Standard, CredentialKind::ApiKey)
         | (TransportProfile::Standard, CredentialKind::GoogleVertexServiceAccount)
-        | (TransportProfile::ChatgptCodex, CredentialKind::CodexCli | CredentialKind::ChatgptOauth) => {}
+        | (TransportProfile::ChatgptCodex, CredentialKind::CodexCli | CredentialKind::ChatgptOauth)
+        | (TransportProfile::LocalNative, CredentialKind::None) => {}
         _ => {
             return Err(format!(
                 "credential kind `{}` is not valid with transport profile `{}`",
@@ -222,6 +226,7 @@ pub fn validate_stored_contract(
                 ApiFormat::ChatCompletions | ApiFormat::Responses | ApiFormat::GemmaTool
             )
         }
+        ProviderType::LitertLm => api_format == ApiFormat::LitertLm,
     };
     if supported {
         Ok(())
@@ -241,7 +246,9 @@ fn validate_runtime_credential(
     credential: &super::Credential,
 ) -> Result<(), String> {
     match (transport_profile, credential) {
-        ("standard", super::Credential::ApiKey(_)) | ("chatgpt_codex", super::Credential::ChatGpt(_)) => Ok(()),
+        ("standard", super::Credential::ApiKey(_))
+        | ("chatgpt_codex", super::Credential::ChatGpt(_))
+        | ("local_native", super::Credential::None) => Ok(()),
         ("standard", super::Credential::GoogleVertexServiceAccount(_))
             if provider_type == ProviderType::Google && api_format == ApiFormat::GeminiInteractions =>
         {
@@ -256,6 +263,7 @@ fn validate_runtime_credential(
         ("chatgpt_codex", super::Credential::ApiKey(_)) => {
             Err("the ChatGPT Codex transport requires a ChatGPT login credential".into())
         }
+        ("local_native", _) => Err("the local_native transport does not use credentials".into()),
         (other, _) => Err(format!("unknown provider transport profile `{other}`")),
     }
 }
@@ -331,7 +339,9 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
                 return Ok(Box::new(super::codex::CodexProvider::new(base_url, auth.clone())));
             }
             // `validate_runtime_credential` already made this impossible.
-            super::Credential::ApiKey(_) | super::Credential::GoogleVertexServiceAccount(_) => unreachable!(),
+            super::Credential::ApiKey(_)
+            | super::Credential::GoogleVertexServiceAccount(_)
+            | super::Credential::None => unreachable!(),
         }
     }
 
@@ -375,7 +385,7 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
                 super::Credential::GoogleVertexServiceAccount(json) => {
                     Box::new(GoogleInteractionsProvider::new_vertex(base_url, json)?)
                 }
-                super::Credential::ChatGpt(_) => unreachable!(),
+                super::Credential::ChatGpt(_) | super::Credential::None => unreachable!(),
             },
             ApiFormat::ChatCompletions => Box::new(OpenAICompatProvider::new_google(base_url, api_key)),
             other => {
@@ -395,7 +405,14 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
                     provider_type.as_str()
                 ));
             }
+            ApiFormat::LitertLm => {
+                return Err("the litert_lm API format is not supported by provider type `openai`".into());
+            }
         },
+        ProviderType::LitertLm => {
+            let provider = super::litert_lm_provider::LiteRtLmProvider::from_model_path(base_url)?;
+            return Ok(Box::new(provider));
+        }
     };
     Ok(provider)
 }
