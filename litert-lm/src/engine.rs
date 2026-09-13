@@ -1,7 +1,7 @@
+use crate::LiteRtError;
 use crate::conversation::{Conversation, ConversationConfig};
 use crate::runtime::Runtime;
 use crate::sys::{self, LiteRtLmEngine};
-use crate::LiteRtError;
 use std::ptr;
 
 /// Backend selection for the LiteRT-LM engine.
@@ -63,14 +63,8 @@ impl Engine {
         let model_path = sys::cstr(&config.model_path);
         let backend = sys::cstr(config.backend.as_cstr());
 
-        let settings = unsafe {
-            (sym.engine_settings_create)(
-                model_path.as_ptr(),
-                backend.as_ptr(),
-                ptr::null(),
-                ptr::null(),
-            )
-        };
+        let settings =
+            unsafe { (sym.engine_settings_create)(model_path.as_ptr(), backend.as_ptr(), ptr::null(), ptr::null()) };
         if settings.is_null() {
             return Err(LiteRtError::EngineCreate {
                 backend: config.backend.as_cstr().into(),
@@ -115,10 +109,7 @@ impl Engine {
     }
 
     /// Create a new conversation on this engine.
-    pub fn create_conversation(
-        &self,
-        config: ConversationConfig,
-    ) -> Result<Conversation, LiteRtError> {
+    pub fn create_conversation(&self, config: ConversationConfig) -> Result<Conversation, LiteRtError> {
         Conversation::new(&self.rt, self.ptr, config)
     }
 

@@ -24,21 +24,16 @@ pub struct StreamChunk {
 /// copy the strings and send them through an `mpsc` channel.
 pub(crate) struct CallbackContext {
     pub tx: mpsc::Sender<StreamChunk>,
-    pub get_text:
-        unsafe extern "C" fn(*const LiteRtLmStreamChunk) -> *const std::os::raw::c_char,
+    pub get_text: unsafe extern "C" fn(*const LiteRtLmStreamChunk) -> *const std::os::raw::c_char,
     pub is_final: unsafe extern "C" fn(*const LiteRtLmStreamChunk) -> bool,
-    pub get_error:
-        unsafe extern "C" fn(*const LiteRtLmStreamChunk) -> *const std::os::raw::c_char,
+    pub get_error: unsafe extern "C" fn(*const LiteRtLmStreamChunk) -> *const std::os::raw::c_char,
 }
 
 /// The C-ABI trampoline that LiteRT-LM calls on its background thread.
 ///
 /// # Safety
 /// `user_data` must point to a live `CallbackContext`.
-pub(crate) unsafe extern "C" fn stream_trampoline(
-    user_data: *mut c_void,
-    chunk: *const LiteRtLmStreamChunk,
-) {
+pub(crate) unsafe extern "C" fn stream_trampoline(user_data: *mut c_void, chunk: *const LiteRtLmStreamChunk) {
     unsafe {
         let ctx = &*(user_data as *const CallbackContext);
         let text = sys::read_cstr((ctx.get_text)(chunk));
@@ -47,15 +42,9 @@ pub(crate) unsafe extern "C" fn stream_trampoline(
         let error = if err_ptr.is_null() {
             None
         } else {
-            let s = std::ffi::CStr::from_ptr(err_ptr)
-                .to_string_lossy()
-                .into_owned();
+            let s = std::ffi::CStr::from_ptr(err_ptr).to_string_lossy().into_owned();
             if s.is_empty() { None } else { Some(s) }
         };
-        let _ = ctx.tx.send(StreamChunk {
-            text,
-            is_final,
-            error,
-        });
+        let _ = ctx.tx.send(StreamChunk { text, is_final, error });
     }
 }

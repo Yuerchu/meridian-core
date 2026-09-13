@@ -1,6 +1,6 @@
 use super::{
-    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent,
-    TokenUsage, ToolCall, ToolDefinition,
+    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 use async_trait::async_trait;
 use litert_lm::conversation::ConversationConfig;
@@ -35,7 +35,9 @@ fn discover_dll() -> Result<PathBuf, String> {
         if is_real_dll(&p) {
             return Ok(p);
         }
-        return Err(format!("LITERT_LM_LIB_PATH set to `{path}` but file does not exist or is a placeholder"));
+        return Err(format!(
+            "LITERT_LM_LIB_PATH set to `{path}` but file does not exist or is a placeholder"
+        ));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -113,10 +115,8 @@ fn messages_to_litert_json(messages: &[ChatMessage]) -> serde_json::Value {
             let calls: Vec<serde_json::Value> = tool_calls
                 .iter()
                 .map(|tc| {
-                    let args: serde_json::Value =
-                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Object(
-                            serde_json::Map::new(),
-                        ));
+                    let args: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     serde_json::json!({
                         "type": "function",
                         "function": {
@@ -168,9 +168,7 @@ fn parse_chunk_to_events(chunk: &StreamChunk) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
     if let Some(ref err) = chunk.error {
-        events.push(StreamEvent::Error {
-            message: err.clone(),
-        });
+        events.push(StreamEvent::Error { message: err.clone() });
         return events;
     }
 
@@ -264,15 +262,12 @@ impl ChatProvider for LiteRtLmProvider {
                 let engine = {
                     let mut cache = ENGINE_CACHE.lock().unwrap();
                     let reuse = cache.as_ref().is_some_and(|c| {
-                        c.model_path == shared.model_path
-                            && c.backend == shared.backend
-                            && c.max_tokens == max_tokens
+                        c.model_path == shared.model_path && c.backend == shared.backend && c.max_tokens == max_tokens
                     });
                     if reuse {
                         cache.as_ref().unwrap().engine.clone()
                     } else {
-                        let mut config =
-                            EngineConfig::new(&shared.model_path, shared.backend);
+                        let mut config = EngineConfig::new(&shared.model_path, shared.backend);
                         config.max_tokens = max_tokens;
                         let engine = Arc::new(
                             Engine::new(&shared.runtime, &config)
@@ -328,19 +323,15 @@ impl ChatProvider for LiteRtLmProvider {
 
                 let tokens_before = conv.token_count();
 
-                conv.send_message_stream(
-                    &last_msg_str,
-                    extra_context,
-                    |chunk| {
-                        let events = parse_chunk_to_events(&chunk);
-                        for event in events {
-                            if tx.blocking_send(Ok(event)).is_err() {
-                                return false;
-                            }
+                conv.send_message_stream(&last_msg_str, extra_context, |chunk| {
+                    let events = parse_chunk_to_events(&chunk);
+                    for event in events {
+                        if tx.blocking_send(Ok(event)).is_err() {
+                            return false;
                         }
-                        true
-                    },
-                )
+                    }
+                    true
+                })
                 .map_err(|e| ProviderError::Upstream(e.to_string()))?;
 
                 let tokens_after = conv.token_count();
@@ -375,14 +366,8 @@ impl ChatProvider for LiteRtLmProvider {
         Ok(Box::pin(stream))
     }
 
-    async fn chat(
-        &self,
-        messages: Vec<ChatMessage>,
-        params: ChatParams,
-    ) -> Result<String, ProviderError> {
-        let rx = self
-            .stream_chat_with_tools(messages, vec![], params)
-            .await?;
+    async fn chat(&self, messages: Vec<ChatMessage>, params: ChatParams) -> Result<String, ProviderError> {
+        let rx = self.stream_chat_with_tools(messages, vec![], params).await?;
         use futures::StreamExt;
         let mut rx = rx;
         let mut text = String::new();
@@ -400,9 +385,7 @@ impl ChatProvider for LiteRtLmProvider {
         tools: Vec<ToolDefinition>,
         params: ChatParams,
     ) -> Result<AgentResponse, ProviderError> {
-        let rx = self
-            .stream_chat_with_tools(messages, tools, params)
-            .await?;
+        let rx = self.stream_chat_with_tools(messages, tools, params).await?;
         use futures::StreamExt;
         let mut rx = rx;
         let mut text = String::new();

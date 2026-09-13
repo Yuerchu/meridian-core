@@ -1,7 +1,7 @@
+use crate::LiteRtError;
 use crate::runtime::Runtime;
 use crate::stream::{CallbackContext, StreamChunk, stream_trampoline};
 use crate::sys::{self, LiteRtLmConversation, LiteRtLmEngine};
-use crate::LiteRtError;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::mpsc;
@@ -58,24 +58,16 @@ impl Conversation {
 
         if let Some(ref sys_msg) = config.system_message_json {
             let c = sys::cstr(sys_msg);
-            unsafe {
-                (sym.conversation_config_set_system_message)(cfg, c.as_ptr())
-            };
+            unsafe { (sym.conversation_config_set_system_message)(cfg, c.as_ptr()) };
         }
 
         if let Some(ref msgs) = config.messages_json {
             let c = sys::cstr(msgs);
-            unsafe {
-                (sym.conversation_config_set_messages)(cfg, c.as_ptr())
-            };
+            unsafe { (sym.conversation_config_set_messages)(cfg, c.as_ptr()) };
         }
 
         if config.constrained_decoding {
-            unsafe {
-                (sym.conversation_config_set_enable_constrained_decoding)(
-                    cfg, true,
-                )
-            };
+            unsafe { (sym.conversation_config_set_enable_constrained_decoding)(cfg, true) };
         }
 
         let conv = unsafe { (sym.conversation_create)(engine, cfg) };
@@ -132,10 +124,7 @@ impl Conversation {
             (sym.conversation_send_message_stream)(
                 self.ptr,
                 msg.as_ptr(),
-                extra
-                    .as_ref()
-                    .map(|c| c.as_ptr())
-                    .unwrap_or(ptr::null()),
+                extra.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
                 ptr::null(),
                 stream_trampoline,
                 &ctx as *const CallbackContext as *mut c_void,
@@ -185,9 +174,7 @@ impl Conversation {
     pub fn try_clone(&self) -> Result<Self, LiteRtError> {
         let cloned = unsafe { (self.rt.sym().conversation_clone)(self.ptr) };
         if cloned.is_null() {
-            return Err(LiteRtError::OperationFailed(
-                "conversation_clone returned null".into(),
-            ));
+            return Err(LiteRtError::OperationFailed("conversation_clone returned null".into()));
         }
         Ok(Self {
             rt: self.rt.clone(),

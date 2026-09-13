@@ -1,5 +1,5 @@
-use crate::sys::Symbols;
 use crate::LiteRtError;
+use crate::sys::Symbols;
 use libloading::Library;
 use std::path::Path;
 use std::sync::Arc;

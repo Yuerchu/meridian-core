@@ -111,9 +111,7 @@ fn validate_wire_pair(api_format: ApiFormat, transport_profile: &str) -> Result<
     match (api_format, transport_profile) {
         (ApiFormat::Responses, "chatgpt_codex") | (_, "standard") => Ok(()),
         (ApiFormat::LitertLm, "local_native") => Ok(()),
-        (_, "local_native") => {
-            Err("the local_native transport requires the `litert_lm` API format".into())
-        }
+        (_, "local_native") => Err("the local_native transport requires the `litert_lm` API format".into()),
         (_, "chatgpt_codex") => Err("the ChatGPT Codex transport requires the `responses` API format".into()),
         (_, other) => Err(format!("unknown provider transport profile `{other}`")),
     }
@@ -203,9 +201,7 @@ fn validate_runtime_credential(transport_profile: &str, credential: &super::Cred
         ("chatgpt_codex", super::Credential::ApiKey(_)) => {
             Err("the ChatGPT Codex transport requires a ChatGPT login credential".into())
         }
-        ("local_native", _) => {
-            Err("the local_native transport does not use credentials".into())
-        }
+        ("local_native", _) => Err("the local_native transport does not use credentials".into()),
         (other, _) => Err(format!("unknown provider transport profile `{other}`")),
     }
 }
