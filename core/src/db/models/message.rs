@@ -99,6 +99,11 @@ pub struct MessageRow {
     /// the fast paths in `tools::reach` never reach a reviewer at all. See
     /// migration 33.
     pub auto_review: Option<String>,
+    /// The diff a hosted agent reported for each Edit/Write on this row, keyed
+    /// by call id: `{ call_id: [ToolCallDiff, ...] }`. `None` on every row the
+    /// agent reported nothing for, which is every native row. See migration
+    /// 56. Written after the row by `record_tool_diffs`, never at insert.
+    pub tool_diffs: Option<String>,
 }
 
 /// The four token counts one message row records.

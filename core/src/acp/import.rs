@@ -43,7 +43,7 @@ use crate::services::Services;
 use crate::turn::TurnOrigin;
 use crate::util::{get_conn, now_ms};
 
-use super::mapping::{Effect, PlanItem};
+use super::mapping::{Effect, PlanItem, SessionNoticeRecord};
 use super::peer::{Handler, Peer};
 use super::process::AdapterProcess;
 use super::session::{PROVIDER_LABEL, Recital};
@@ -505,6 +505,10 @@ pub(super) struct Imported {
     /// snapshot: a plan is a state, not a log, and the earlier ones are the
     /// same list part-way done.
     plan: Vec<PlanItem>,
+    /// Incidents recited before any turn — the adapter restores typed
+    /// history errors on `session/load`, and one can precede the first
+    /// question this app gets to see. Filed against no turn.
+    session_notices: Vec<SessionNoticeRecord>,
 }
 
 /// One question and everything said in answer to it.
@@ -518,6 +522,8 @@ struct ImportedTurn {
     /// something a person typed. See [`CONTINUATION_PREFIX`].
     question_is_summary: bool,
     rows: Vec<ImportedRow>,
+    /// Incidents recited while this turn was the open one.
+    notices: Vec<SessionNoticeRecord>,
 }
 
 /// One assistant row: the prose of a single API message, the calls it made, and
@@ -532,6 +538,8 @@ struct ImportedRow {
     calls: Vec<provider::ToolCall>,
     /// `(call_id, output, outcome)`, in the order the calls finished.
     results: Vec<(String, String, ToolOutcome)>,
+    /// What the agent said each Edit/Write changed, by call id.
+    diffs: std::collections::BTreeMap<String, Vec<crate::events::ToolCallDiff>>,
 }
 
 impl ImportedRow {
@@ -599,6 +607,7 @@ pub(super) fn plan(recital: Vec<Recital>) -> Imported {
                     question_is_summary: text.trim_start().starts_with(CONTINUATION_PREFIX),
                     question: text,
                     rows: Vec::new(),
+                    notices: Vec::new(),
                 });
             }
             Effect::Text { message_id, text } => {
@@ -658,11 +667,25 @@ pub(super) fn plan(recital: Vec<Recital>) -> Imported {
                 }
             }
             Effect::Plan(items) => out.plan = items,
-            // Neither belongs to the transcript. Usage is how full the window
-            // was at some past moment, and the option set arrives again in the
-            // load's own reply — which is where the model on these rows comes
-            // from.
-            Effect::Usage { .. } | Effect::ConfigOptions(_) | Effect::Ignored => {}
+            // A typed failure the adapter restored from the session's own
+            // history, at the position it happened. Kept with the turn that
+            // was open, which is where the transcript will draw it.
+            Effect::SessionNotice(record) => match turn.as_mut() {
+                Some(open) => open.notices.push(record),
+                None => out.session_notices.push(record),
+            },
+            // None of these belongs to the transcript. Usage is how full the
+            // window was at some past moment; the option set arrives again in
+            // the load's own reply — which is where the model on these rows
+            // comes from; and the title was taken from `session/list`.
+            // Onto the row that made the call, like a result — and for the
+            // same reason it can be a turn back.
+            Effect::ToolCallDiff { call_id, diffs } => {
+                if let Some(row) = call_row(&mut turn, &mut out.turns, &call_id) {
+                    row.diffs.insert(call_id, diffs);
+                }
+            }
+            Effect::Usage { .. } | Effect::ConfigOptions(_) | Effect::SessionTitle(_) | Effect::Ignored => {}
         }
     }
     if let Some(finished) = turn.take() {
@@ -813,6 +836,41 @@ struct Counts {
 /// top of the list in the order they happened to be clicked.
 struct Clock(i64);
 
+/// One recited incident, through the same conditional write the live path
+/// uses — a recital can carry several revisions of one incident, and only the
+/// newest should be left standing.
+fn write_notice(
+    conn: &mut SqliteConnection,
+    conversation_id: &str,
+    turn_id: Option<&str>,
+    record: &SessionNoticeRecord,
+    now: i64,
+) -> Result<(), diesel::result::Error> {
+    // A list of closed enum values cannot fail to serialise; the map is so a
+    // transaction is rolled back rather than unwound if it ever does.
+    let actions = serde_json::to_string(&record.actions).map_err(|_| diesel::result::Error::RollbackTransaction)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    crate::db::ops::acp_session_notice::upsert_if_newer_in_transaction(
+        conn,
+        crate::db::models::acp_session_notice::AcpSessionNoticeInsert {
+            id: &id,
+            conversation_id,
+            turn_id,
+            notice_id: &record.notice_id,
+            revision: i32::try_from(record.revision).unwrap_or(i32::MAX),
+            category: record.category.as_str(),
+            severity: record.severity.as_str(),
+            title: &record.title,
+            details: record.details.as_deref(),
+            reason: record.reason.as_deref(),
+            actions: &actions,
+            created_at: now,
+            updated_at: now,
+        },
+    )?;
+    Ok(())
+}
+
 impl Clock {
     fn tick(&mut self) -> i64 {
         self.0 += 1;
@@ -871,6 +929,10 @@ fn write(conn: &mut SqliteConnection, w: &Written) -> Result<Counts, diesel::res
     let mut parent: Option<String> = None;
     let mut counts = Counts { turns: 0, messages: 0 };
 
+    for record in &w.imported.session_notices {
+        write_notice(conn, &w.conversation_id, None, record, clock.at())?;
+    }
+
     for turn in &w.imported.turns {
         let turn_id = uuid::Uuid::new_v4().to_string();
         crate::db::ops::turn::begin(
@@ -881,6 +943,9 @@ fn write(conn: &mut SqliteConnection, w: &Written) -> Result<Counts, diesel::res
             None,
             clock.at(),
         )?;
+        for record in &turn.notices {
+            write_notice(conn, &w.conversation_id, Some(&turn_id), record, clock.at())?;
+        }
 
         if !turn.question.trim().is_empty() {
             parent = Some(row(
@@ -915,7 +980,7 @@ fn write(conn: &mut SqliteConnection, w: &Written) -> Result<Counts, diesel::res
 
         for assistant in &turn.rows {
             let calls = (!assistant.calls.is_empty()).then(|| serialize_tool_calls_openai(&assistant.calls));
-            parent = Some(row(
+            let assistant_id = row(
                 conn,
                 &w.conversation_id,
                 &turn_id,
@@ -932,7 +997,11 @@ fn write(conn: &mut SqliteConnection, w: &Written) -> Result<Counts, diesel::res
                     provider_name: Some(PROVIDER_LABEL),
                     ..blank()
                 },
-            )?);
+            )?;
+            for (call_id, hunks) in &assistant.diffs {
+                crate::db::ops::message::record_tool_diffs(conn, &assistant_id, call_id, hunks)?;
+            }
+            parent = Some(assistant_id);
             counts.messages += 1;
 
             for (call_id, output, outcome) in &assistant.results {
@@ -1464,6 +1533,126 @@ mod tests {
             logged.iter().all(|row| row.role == "user"),
             "an imported reply was billed to somebody else and is reported nowhere",
         );
+    }
+
+    /// A recited Write's refinement lands on the row that made the call, and
+    /// is read back as the typed hunk list — with the pre-overwrite text the
+    /// arguments alone could never give.
+    #[test]
+    fn an_import_keeps_the_diff_the_agent_reported_beside_its_call() {
+        use crate::events::ToolCallDiff;
+
+        let pool = crate::db::test_db();
+        let mut conn = pool.get().unwrap();
+        let hunk = ToolCallDiff {
+            path: "/w/src/lib.rs".into(),
+            old_text: Some("line1\nold line2\nline3".into()),
+            new_text: "line1\nNEW line2\nline3".into(),
+            line: Some(1),
+        };
+        let imported = plan(vec![
+            user("u1", "fix it"),
+            agent("m1", "Writing."),
+            call(
+                "toolu_w",
+                "Write",
+                r#"{"file_path":"/w/src/lib.rs","content":"line1\nNEW line2\nline3"}"#,
+            ),
+            Effect::ToolCallDiff {
+                call_id: "toolu_w".into(),
+                diffs: vec![hunk.clone()],
+            },
+            result("toolu_w", ""),
+        ]);
+        let written = Written {
+            conversation_id: "imported-3".into(),
+            acp_session_id: "sess-97".into(),
+            cwd: "/w".into(),
+            title: "Fix".into(),
+            model: "claude-opus-5".into(),
+            last_active: 1_700_000_000_000,
+            imported,
+        };
+        conn.transaction::<_, diesel::result::Error, _>(|conn| write(conn, &written))
+            .unwrap();
+
+        let rows = crate::db::ops::message::list_messages(&mut conn, "imported-3").unwrap();
+        let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
+        let stored: std::collections::BTreeMap<String, Vec<ToolCallDiff>> =
+            serde_json::from_str(assistant.tool_diffs.as_deref().expect("the diff is on the row")).unwrap();
+        assert_eq!(stored.get("toolu_w"), Some(&vec![hunk]));
+        assert!(rows.iter().filter(|m| m.role == "user").all(|m| m.tool_diffs.is_none()));
+    }
+
+    /// A recital restores typed history errors at the position they happened,
+    /// and can recite one incident more than once. One row per incident, at
+    /// its newest revision, on the turn that was open when it was said — and
+    /// one from before any question this app can see, on no turn at all.
+    #[test]
+    fn an_import_keeps_each_recited_incident_once_at_its_newest_revision() {
+        use crate::events::{AcpNoticeAction, AcpNoticeCategory, AcpNoticeSeverity};
+
+        let notice = |revision: u32, severity: AcpNoticeSeverity, title: &str| {
+            Effect::SessionNotice(SessionNoticeRecord {
+                notice_id: "prompt-1:error".into(),
+                revision,
+                category: AcpNoticeCategory::Limit,
+                severity,
+                title: title.into(),
+                details: None,
+                reason: None,
+                actions: vec![AcpNoticeAction::Retry],
+            })
+        };
+        let orphan = Effect::SessionNotice(SessionNoticeRecord {
+            notice_id: "sess:history-error:0".into(),
+            revision: 1,
+            category: AcpNoticeCategory::Access,
+            severity: AcpNoticeSeverity::Error,
+            title: "Sign in to continue using Claude.".into(),
+            details: None,
+            reason: None,
+            actions: vec![AcpNoticeAction::Login],
+        });
+
+        let pool = crate::db::test_db();
+        let mut conn = pool.get().unwrap();
+        let imported = plan(vec![
+            orphan,
+            user("u1", "run the tests"),
+            agent("m1", "Let me look."),
+            notice(1, AcpNoticeSeverity::Warning, "Retrying Claude, attempt 1 of 5."),
+            notice(2, AcpNoticeSeverity::Error, "Rate limit reached."),
+            user("u2", "thanks"),
+            agent("m3", "Any time."),
+        ]);
+        let written = Written {
+            conversation_id: "imported-2".into(),
+            acp_session_id: "sess-98".into(),
+            cwd: "/work/meridian".into(),
+            title: "Fix the queue".into(),
+            model: "claude-opus-5".into(),
+            last_active: 1_700_000_000_000,
+            imported,
+        };
+        conn.transaction::<_, diesel::result::Error, _>(|conn| write(conn, &written))
+            .unwrap();
+
+        let notices = crate::db::ops::acp_session_notice::list_for_conversation(&mut conn, "imported-2").unwrap();
+        assert_eq!(notices.len(), 2, "one row per incident: {notices:?}");
+        let session_scoped = notices.iter().find(|n| n.notice_id == "sess:history-error:0").unwrap();
+        assert_eq!(session_scoped.turn_id, None, "recited before any turn");
+        let turn_scoped = notices.iter().find(|n| n.notice_id == "prompt-1:error").unwrap();
+        assert_eq!(turn_scoped.revision, 2, "the newest revision wins");
+        assert_eq!(turn_scoped.severity, "error");
+        assert_eq!(turn_scoped.title, "Rate limit reached.");
+        let turn_id = turn_scoped.turn_id.as_deref().expect("filed on the turn that was open");
+        let first_turn_question = crate::db::ops::message::list_messages(&mut conn, "imported-2")
+            .unwrap()
+            .into_iter()
+            .find(|m| m.content == "run the tests")
+            .unwrap();
+        assert_eq!(first_turn_question.turn_id.as_deref(), Some(turn_id));
     }
 
     /// What attaching refuses, which is the whole of what it does beyond one

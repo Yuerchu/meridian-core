@@ -1159,6 +1159,7 @@ mod tests {
             provider_name: None,
             provider_state: None,
             auto_review: None,
+            tool_diffs: None,
         };
         let result = render_compact_sections(&prepare_compact_input(&[&msg], &HashMap::new()).unwrap());
         assert!(result.contains("truncated"));
@@ -1196,6 +1197,7 @@ mod tests {
             provider_name: None,
             provider_state: None,
             auto_review: None,
+            tool_diffs: None,
         };
         let item = MessageContextItemRow {
             id: "ctx1".into(),
@@ -1303,6 +1305,7 @@ mod tests {
             provider_name: None,
             provider_state: None,
             auto_review: None,
+            tool_diffs: None,
         };
         assert!(prepare_compact_input(&[&row], &HashMap::new()).unwrap().is_empty());
 

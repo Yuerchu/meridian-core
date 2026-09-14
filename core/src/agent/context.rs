@@ -667,6 +667,7 @@ mod tests {
             provider_name: None,
             provider_state: None,
             auto_review: None,
+            tool_diffs: None,
         }
     }
 
@@ -1129,6 +1130,7 @@ mod injected_context_tests {
             provider_name: None,
             provider_state: None,
             auto_review: None,
+            tool_diffs: None,
         }
     }
 
@@ -1380,6 +1382,7 @@ mod injected_context_tests {
             provider_name: None,
             provider_state: None,
             auto_review: None,
+            tool_diffs: None,
         }];
         let context = crate::db::ops::message::ActiveContext {
             path: Vec::new(),
