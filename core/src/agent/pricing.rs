@@ -71,6 +71,7 @@ impl BillingMode {
         match transport_profile {
             "standard" => Ok(Self::Metered),
             "chatgpt_codex" => Ok(Self::Subscription),
+            "local_native" => Ok(Self::External),
             unknown => Err(PricingError::UnknownTransportProfile(unknown.to_owned())),
         }
     }

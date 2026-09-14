@@ -165,6 +165,31 @@
         }
       ],
       "models": []
+    },
+    {
+      "id": "litert_lm",
+      "provider_type": "litert_lm",
+      "name": "LiteRT-LM (On-Device)",
+      "icon": "litert",
+      "balance": false,
+      "websites": {
+        "official": "https://ai.google.dev/edge/litert-lm",
+        "api_key": null,
+        "docs": "https://ai.google.dev/edge/litert-lm/overview",
+        "models": null
+      },
+      "auth": [
+        {
+          "id": "local",
+          "credential_kind": "none",
+          "transport_profile": "local_native",
+          "api_formats": ["litert_lm"],
+          "default_base_url": {
+            "litert_lm": "local://"
+          }
+        }
+      ],
+      "models": []
     }
   ]
 }
