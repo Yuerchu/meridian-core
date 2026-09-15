@@ -10,7 +10,8 @@ runners (a OneBot/QQ bot, the Claude Code hook gates) and the ACP host.
 
 | Crate | What it is |
 |-------|------------|
-| `core` (`meridian-core`) | The agent turn loop and the ports its runners plug into; providers (OpenAI-compatible, Anthropic, Codex transport); the tool set, MCP client and sandboxed command execution; SQLite persistence with embedded migrations; secrets and keyring storage; the OneBot and hook runners; ACP hosting of another coding agent; offline speech-to-text and TTS. |
+| `core` (`meridian-core`) | The agent turn loop and the ports its runners plug into; providers (OpenAI-compatible, Anthropic, Codex transport); the tool set, MCP client and sandboxed command execution; SQLite persistence with embedded migrations; secrets and keyring storage; the OneBot and hook runners; ACP hosting of another coding agent; offline speech-to-text and TTS; the balance and spending watcher. |
+| `meridiand` | The watcher as a daemon, for a machine with no display server: it polls provider balances and this install's own spending, and posts to a webhook. Configuration is a declarative file and the secrets-file passphrase is supplied from outside, so it needs neither a window nor a keychain. See its [README](meridiand/README.md). |
 | `sandbox-types` | Absolute-path and permission types shared by the sandbox backends. Ported from Codex. |
 | `sandbox-windows` | The Windows restricted-token sandbox. Ported from Codex. |
 

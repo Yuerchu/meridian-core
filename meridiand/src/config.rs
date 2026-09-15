@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use meridian_core::db::models::notification::{NotificationEventKind, NotificationFormat};
+use meridian_core::db::models::notification::{MAX_WEBHOOKS, NotificationEventKind, NotificationFormat};
 use meridian_core::decimal::Decimal;
 use serde::Deserialize;
 
@@ -166,6 +166,17 @@ impl DaemonConfig {
             validate_env_name("provider", &provider.id, &provider.api_key_env)?;
             meridian_core::notify::validate_webhook_url(&provider.base_url)
                 .map_err(|error| format!("provider `{}`: base_url {error}", provider.id))?;
+        }
+
+        // The same ceiling the desktop's create command enforces. It is not a
+        // storage limit: it is what stops one alert from becoming a hundred
+        // outbound requests, and that reason does not care which path the row
+        // was written through. Without this the file was the way around it.
+        if self.webhook.len() > MAX_WEBHOOKS {
+            return Err(format!(
+                "at most {MAX_WEBHOOKS} webhooks are supported; this file names {}",
+                self.webhook.len()
+            ));
         }
 
         let mut webhook_ids = HashSet::new();
@@ -360,6 +371,26 @@ mod tests {
             .notify_config()
             .unwrap_err();
         assert!(error.contains("multiplier"), "{error}");
+    }
+
+    /// The ceiling exists so one alert cannot become a hundred requests, which
+    /// is a reason that does not care whether the row came from this file or
+    /// from the desktop's create command. Enforced only there, the file was the
+    /// documented way around it.
+    #[test]
+    fn the_endpoint_ceiling_is_the_same_one_the_desktop_enforces() {
+        let entry = |n: usize| {
+            format!(
+                "[[webhook]]\nid = \"w{n}\"\nname = \"w\"\nurl = \"https://a.invalid/h\"\n\
+                 format = \"generic\"\nevents = [\"test\"]\n"
+            )
+        };
+        let at_limit: String = (0..MAX_WEBHOOKS).map(entry).collect();
+        assert!(DaemonConfig::parse(&at_limit).is_ok(), "{MAX_WEBHOOKS} is the limit");
+
+        let over: String = (0..MAX_WEBHOOKS + 1).map(entry).collect();
+        let error = DaemonConfig::parse(&over).unwrap_err();
+        assert!(error.contains(&(MAX_WEBHOOKS + 1).to_string()), "{error}");
     }
 
     #[test]
