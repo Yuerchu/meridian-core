@@ -35,10 +35,32 @@ fn parse_tool_preset_names(preset_id: &str, json: &str) -> Result<Vec<String>, S
 }
 
 /// Open everything the app runs on, in the order it has to happen.
+///
+/// The secrets manager is the OS keychain one, which is right wherever there is
+/// a login session to hold it. [`bootstrap_with_secrets`] is the same startup
+/// for a machine that has none.
 pub fn bootstrap(data_dir: PathBuf, events: EventBus) -> Result<Services, String> {
+    let secrets = Arc::new(SecretsManager::new(data_dir.clone()));
+    bootstrap_with_secrets(data_dir, events, secrets)
+}
+
+/// The same startup, told where the secrets come from.
+///
+/// One parameter rather than a second copy of this function: every line below
+/// is the same work whether or not a window follows, and a headless build that
+/// forked it would drift — the migrations, the seeds and the skill index are
+/// exactly the things that must not differ between the two.
+///
+/// What differs is only where the secrets-file passphrase comes from, and only
+/// because a server has no keychain to keep it in. See
+/// [`crate::keyring::SuppliedPassphraseStore`].
+pub fn bootstrap_with_secrets(
+    data_dir: PathBuf,
+    events: EventBus,
+    mgr: Arc<SecretsManager>,
+) -> Result<Services, String> {
     std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
     crate::logging::attach_file_sink(&data_dir);
-    let mgr = Arc::new(SecretsManager::new(data_dir.clone()));
 
     // Skills live in app-private storage, so unlike project instructions
     // this path stays usable on Android without a SAF grant.
@@ -371,6 +393,7 @@ pub fn bootstrap(data_dir: PathBuf, events: EventBus) -> Result<Services, String
         voice_limiter: Arc::new(crate::tts::limiter::VoiceLimiter::default()),
         sleep: AppSleepInhibitor::new(),
         events,
+        alert_sinks: crate::notify::AlertSinks::new(),
         paths: Paths { data_dir, skills_root },
         plan_files,
         #[cfg(not(target_os = "android"))]

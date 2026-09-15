@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "sandbox-types", "sandbox-windows"]
+members = ["core", "meridiand", "sandbox-types", "sandbox-windows"]
 resolver = "3"
 
 # No `[workspace.package]` inheritance, on purpose. The Meridian desktop app

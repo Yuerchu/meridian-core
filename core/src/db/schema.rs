@@ -774,6 +774,33 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    notification_webhooks (id) {
+        id -> Text,
+        name -> Text,
+        url -> Text,
+        format -> Text,
+        events -> Text,
+        is_enabled -> Integer,
+        last_attempt_at -> Nullable<BigInt>,
+        last_success_at -> Nullable<BigInt>,
+        last_error -> Nullable<Text>,
+        consecutive_failures -> Integer,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    notification_alert_state (alert_key) {
+        alert_key -> Text,
+        first_raised_at -> BigInt,
+        last_raised_at -> BigInt,
+        last_notified_at -> Nullable<BigInt>,
+        fingerprint -> Text,
+    }
+}
+
 diesel::joinable!(assistant_emoji_packs -> assistants (assistant_id));
 diesel::joinable!(acp_context_deliveries -> message_context_items (context_item_id));
 diesel::joinable!(assistant_emoji_packs -> emoji_packs (pack_id));
@@ -835,6 +862,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     messages,
     message_stickers,
     mode_artifacts,
+    notification_alert_state,
+    notification_webhooks,
     plan_documents,
     plan_revisions,
     plan_review_sessions,

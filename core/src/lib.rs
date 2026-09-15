@@ -30,6 +30,10 @@ pub mod keyring;
 pub mod listen_guard;
 pub mod logging;
 pub mod mcp;
+/// Watching the account balance and this install's own spending, and telling
+/// somebody over a webhook. Not desktop-only: it is an HTTP client, not a
+/// server.
+pub mod notify;
 #[cfg(not(target_os = "android"))]
 pub mod onebot;
 pub mod plan_files;
