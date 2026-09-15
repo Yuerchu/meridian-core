@@ -1,0 +1,31 @@
+[package]
+name = "meridiand"
+version = "0.3.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Meridian as a daemon: watches provider balances and this install's own spending, and says so over a webhook."
+repository = "https://github.com/Yuerchu/meridian-core"
+authors = ["于小丘 Yuerchu <admin@yuxiaoqiu.cn>"]
+
+[[bin]]
+name = "meridiand"
+path = "src/main.rs"
+
+[dependencies]
+meridian-core = { path = "../core" }
+# Only what a daemon needs of it: no `full`, because this process never opens a
+# socket of its own. `signal` is what makes a container stop cleanly rather than
+# being killed mid-delivery.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# `--help` is the whole interface here; hand-rolled argument parsing is exactly
+# the kind of thing that is subtly wrong for a year.
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+
+[dev-dependencies]
+# `test_db` is behind a feature rather than `cfg(test)`: this is a different
+# crate, so the core's own test configuration is invisible to it.
+meridian-core = { path = "../core", features = ["test-support"] }
+tempfile = "3"

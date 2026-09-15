@@ -592,6 +592,19 @@ impl UsageAccumulator {
     }
 }
 
+/// When this install's ledger starts.
+///
+/// The one question a *relative* comparison has to ask before it trusts a
+/// baseline: a window average taken over a span the ledger does not cover is an
+/// artefact of the install date rather than a fact about spending. `None` means
+/// there is no ledger at all.
+pub fn oldest_audit_created_at(conn: &mut SqliteConnection) -> QueryResult<Option<i64>> {
+    use crate::db::schema::audit_messages;
+    audit_messages::table
+        .select(diesel::dsl::min(audit_messages::created_at))
+        .first::<Option<i64>>(conn)
+}
+
 /// Group the log, price each group, and add the groups up.
 pub fn report(
     conn: &mut SqliteConnection,

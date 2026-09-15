@@ -76,6 +76,14 @@ pub struct SharedState {
     /// be exercised — or tested — without a websocket server and a provider
     /// standing behind it.
     pub session_states: Arc<SessionStates>,
+    /// This generation's registration on `services.alert_sinks`, so `stop()`
+    /// can take it back out.
+    ///
+    /// The registry outlives the server — it is on `Services` — which is the
+    /// whole reason the id has to be remembered: a sink left behind would keep
+    /// receiving balance alerts and trying to deliver them to the outgoing
+    /// generation's admins.
+    pub alert_sink: Mutex<Option<crate::notify::AlertSinkId>>,
     pub config: OneBotConfig,
     /// (session, user) → the memory ids their last listing showed, in the order
     /// it showed them. Numbers only mean something against the listing they came
@@ -991,17 +999,10 @@ pub struct OneBotConfig {
     pub admin_users: Vec<i64>,
     /// QQ emoji id used to acknowledge group messages; empty or "0" disables.
     pub ack_emoji_id: String,
-    /// Tell the admins when a provider's credit falls below this.
-    ///
-    /// `None` switches the watcher off entirely, which is the default: it makes
-    /// periodic requests with the user's API keys, so it should exist because
-    /// somebody asked for it rather than because they installed the app. `0`
-    /// keeps the watcher but drops the early warning — the admins are told only
-    /// when the upstream itself reports the account unusable.
-    ///
-    /// Compared per currency rather than against a sum; see
-    /// `ProviderBalance::is_low`.
-    pub balance_alert_threshold: Option<crate::decimal::Decimal>,
+    // The balance threshold used to live here, read by a watcher inside this
+    // server. It is `notify.balance.threshold` now — see migration 55 for why
+    // there is one threshold rather than two, and `balance_watch.rs` for what
+    // is left of the QQ half.
     /// 要留存入站语音的 `(bot 账号, 会话)`，写作 `<bot>@group:123`。
     ///
     /// 空是默认，意思是一个都不留。存的是真人声纹，所以这是**许可名单而不是
@@ -1042,7 +1043,6 @@ impl Default for OneBotConfig {
             assistant_id: None,
             admin_users: vec![],
             ack_emoji_id: default_ack_emoji(),
-            balance_alert_threshold: None,
             voice_capture_sessions: vec![],
             voice_send_enabled: false,
             voice_send_groups: vec![],
@@ -1120,27 +1120,6 @@ fn validate_scope_list(key: &str, values: &[String], groups_only: bool) -> Resul
     Ok(())
 }
 
-fn parse_stored_decimal(key: &str, raw: Option<String>) -> Result<Option<crate::decimal::Decimal>, String> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    if raw.is_empty() {
-        return Err(format!(
-            "preference {key} must be absent or contain a canonical decimal"
-        ));
-    }
-    let value = raw
-        .parse::<crate::decimal::Decimal>()
-        .map_err(|error| format!("preference {key} has invalid decimal {raw:?}: {error}"))?;
-    if value.to_string() != raw {
-        return Err(format!("preference {key} has non-canonical decimal {raw:?}"));
-    }
-    value
-        .require_non_negative(key)
-        .map(Some)
-        .map_err(|error| error.to_string())
-}
-
 pub fn load_config(pool: &DbPool) -> Result<OneBotConfig, String> {
     let mut conn = get_conn(pool)?;
     let mut get = |key: &str| -> Result<Option<String>, String> {
@@ -1163,13 +1142,6 @@ pub fn load_config(pool: &DbPool) -> Result<OneBotConfig, String> {
         assistant_id: get("onebot.assistant_id")?.filter(|s| !s.is_empty()),
         admin_users: parse_stored_json("onebot.admin_users", get("onebot.admin_users")?)?,
         ack_emoji_id: get("onebot.ack_emoji_id")?.unwrap_or_else(default_ack_emoji),
-        // Empty means off, which is why this is not `unwrap_or(0.0)`: zero is a
-        // meaningful setting here — watch, but only alert when the upstream says
-        // the account has stopped working.
-        balance_alert_threshold: parse_stored_decimal(
-            "onebot.balance_alert_threshold",
-            get("onebot.balance_alert_threshold")?,
-        )?,
         voice_capture_sessions,
         voice_send_enabled: parse_stored_bool("onebot.voice_send_enabled", get("onebot.voice_send_enabled")?, false)?,
         voice_send_groups,
@@ -1188,13 +1160,6 @@ pub fn save_config(pool: &DbPool, config: &OneBotConfig) -> Result<(), String> {
 
     validate_scope_list("onebot.voice_capture_sessions", &config.voice_capture_sessions, false)?;
     validate_scope_list("onebot.voice_send_groups", &config.voice_send_groups, true)?;
-    if config
-        .balance_alert_threshold
-        .as_ref()
-        .is_some_and(|value| value.is_negative())
-    {
-        return Err("onebot.balance_alert_threshold must be non-negative".into());
-    }
     let mut conn = get_conn(pool)?;
     let now = now_ms();
     let admin_users = serde_json::to_string(&config.admin_users)
@@ -1205,16 +1170,6 @@ pub fn save_config(pool: &DbPool, config: &OneBotConfig) -> Result<(), String> {
         .map_err(|error| format!("could not serialize onebot.voice_send_groups: {error}"))?;
 
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
-        match config.balance_alert_threshold.as_ref() {
-            Some(value) => crate::db::ops::preference::set_preference(
-                conn,
-                "onebot.balance_alert_threshold",
-                &value.to_string(),
-                now,
-            )?,
-            None => crate::db::ops::preference::delete_preference(conn, "onebot.balance_alert_threshold")?,
-        }
-
         let mut set =
             |key: &str, val: &str| crate::db::ops::preference::set_preference(conn, key, val, now).map(|_| ());
 
@@ -1383,6 +1338,7 @@ impl OneBotServer {
                 shutdown: shutdown_tx,
                 conn_closed,
                 session_states: Arc::new(SessionStates::default()),
+                alert_sink: Mutex::new(None),
                 memory_listings: Mutex::new(HashMap::new()),
                 config,
                 services,
@@ -1421,11 +1377,6 @@ impl OneBotServer {
         let state = self.state.clone();
         let running = self.running.clone();
         let mut shutdown_rx = self.state.shutdown.subscribe();
-
-        // Started below, once the port is actually bound. Spawning it here would
-        // leave a watcher polling every six hours behind a server that never came
-        // up — asking the provider for a balance it has nowhere to report.
-        let watcher = (self.state.clone(), self.state.shutdown.subscribe());
 
         running.store(true, Ordering::Relaxed);
 
@@ -1487,11 +1438,16 @@ impl OneBotServer {
                 }
             };
 
-            // Its own task on the same shutdown signal: a six-hour timer has no
-            // business inside the accept loop, and it has to stop when the
-            // server does — a replaced server would otherwise leave a watcher
-            // behind holding the outgoing generation's admin list.
-            balance_watch::spawn(watcher.0, watcher.1);
+            // Registered once the port is actually bound, so a server that
+            // never came up does not leave an outlet behind claiming it can
+            // reach the admins. Taken back out in `stop()`, which is what stops
+            // a replaced generation from delivering with its old admin list
+            // over connections it no longer owns.
+            let sink_id = state
+                .services
+                .alert_sinks
+                .register(Arc::new(balance_watch::OneBotAlertSink::new(state.clone())));
+            *state.alert_sink.lock().await = Some(sink_id);
 
             let mut conn_id_counter: u64 = 0;
 
@@ -1600,6 +1556,14 @@ impl OneBotServer {
     pub async fn stop(&self) {
         let _ = self.state.shutdown.send(true);
         self.running.store(false, Ordering::Relaxed);
+        // Before the connections are torn down, because what this outlet needs
+        // in order to say anything is exactly those connections: left
+        // registered it would answer every later alert with "nothing is
+        // connected", which is a failed delivery rather than the silence it
+        // should be.
+        if let Some(sink_id) = self.state.alert_sink.lock().await.take() {
+            self.state.services.alert_sinks.unregister(sink_id);
+        }
         {
             let mut sinks = self.state.ws_sinks.lock().await;
             sinks.clear();
@@ -1854,25 +1818,6 @@ mod tests {
     fn stored_onebot_scalars_use_exact_wire_spellings() {
         assert!(parse_stored_bool("onebot.enabled", Some("1".into()), false).is_err());
         assert!(parse_stored_port("onebot.port", Some("06700".into()), 6700).is_err());
-        assert!(parse_stored_decimal("onebot.balance_alert_threshold", Some("1.0".into()),).is_err());
-        assert!(parse_stored_decimal("onebot.balance_alert_threshold", Some("-1".into()),).is_err());
-        assert!(parse_stored_decimal("onebot.balance_alert_threshold", Some(String::new()),).is_err());
-
-        let mut config = OneBotConfig {
-            balance_alert_threshold: Some("-1".parse().unwrap()),
-            ..Default::default()
-        };
-        let pool = test_db();
-        assert!(save_config(&pool, &config).is_err());
-        config.balance_alert_threshold = Some("0".parse().unwrap());
-        assert!(save_config(&pool, &config).is_ok());
-        config.balance_alert_threshold = None;
-        assert!(save_config(&pool, &config).is_ok());
-        let mut conn = pool.get().unwrap();
-        assert_eq!(
-            crate::db::ops::preference::get_preference(&mut conn, "onebot.balance_alert_threshold").unwrap(),
-            None
-        );
 
         assert!(validate_scope_list("onebot.voice_capture_sessions", &["7@group:8".into()], false).is_ok());
         assert!(validate_scope_list("onebot.voice_capture_sessions", &["7@room:8".into()], false).is_err());

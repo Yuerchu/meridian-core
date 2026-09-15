@@ -72,6 +72,15 @@ pub struct ServicesInner {
     pub voice_limiter: Arc<crate::tts::limiter::VoiceLimiter>,
     pub sleep: AppSleepInhibitor,
     pub events: EventBus,
+    /// Where a balance or usage alert comes out, beyond the configured webhook
+    /// endpoints.
+    ///
+    /// Here rather than on the watcher for the reason `corpus` is here rather
+    /// than in OneBot's `SharedState`: `start_onebot` rebuilds that whole
+    /// value, and a registry rebuilt with it would lose whichever sinks were
+    /// registered by anything else. What registers is an outlet that only
+    /// exists while something is running, so it unregisters too.
+    pub alert_sinks: crate::notify::AlertSinks,
     pub paths: Paths,
     /// Crash-safe app-private `plan.md` materialisation shared by every runner.
     /// The shared value owns the per-document locks; constructing one per turn
@@ -183,6 +192,7 @@ pub fn bare_services(dir: &std::path::Path) -> Services {
         voice_limiter: Arc::new(crate::tts::limiter::VoiceLimiter::default()),
         sleep: AppSleepInhibitor::new(),
         events: EventBus::new(),
+        alert_sinks: crate::notify::AlertSinks::new(),
         paths: Paths {
             data_dir: dir.to_path_buf(),
             skills_root: dir.join("skills"),

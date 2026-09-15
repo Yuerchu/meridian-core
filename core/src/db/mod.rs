@@ -1020,6 +1020,97 @@ mod migration_tests {
         }
     }
 
+    /// The balance threshold moves out of OneBot, and the move has to carry the
+    /// switch with it.
+    ///
+    /// Setting `onebot.balance_alert_threshold` is what turned the old watcher
+    /// on — there was no separate enable — so migrating the number alone would
+    /// silently stop warning somebody who had asked to be warned, and they
+    /// would find out from the balance rather than from the app.
+    #[test]
+    fn the_balance_threshold_moves_out_of_onebot_and_brings_its_switch() {
+        let mut conn = conn_before("00000000000057");
+        conn.batch_execute(
+            "INSERT INTO preferences (key, value, updated_at)
+             VALUES ('onebot.balance_alert_threshold', '12.5', 17),
+                    ('onebot.enabled', 'true', 23);",
+        )
+        .unwrap();
+
+        run_migration(&mut conn, "00000000000057");
+
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "notify.balance.threshold")
+                .unwrap()
+                .as_deref(),
+            Some("12.5")
+        );
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "notify.enabled")
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+            "the old key was its own on switch"
+        );
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "onebot.balance_alert_threshold").unwrap(),
+            None,
+            "two keys meaning one thing is where they start to disagree"
+        );
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "onebot.enabled")
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+            "nothing else about OneBot is touched"
+        );
+    }
+
+    /// An install that never set the old key must not come out of the migration
+    /// with a notification watcher switched on that nobody asked for — it makes
+    /// periodic requests with the user's API keys.
+    #[test]
+    fn an_install_without_the_old_key_gets_no_notifications_switched_on() {
+        let mut conn = conn_before("00000000000057");
+        run_migration(&mut conn, "00000000000057");
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "notify.enabled").unwrap(),
+            None
+        );
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "notify.balance.threshold").unwrap(),
+            None
+        );
+    }
+
+    /// The old loader treated an empty string as absent, so an install that had
+    /// the field cleared must not come out of this with a threshold that will
+    /// not parse — and `notify::load_config` refuses an empty decimal.
+    #[test]
+    fn an_emptied_threshold_migrates_to_nothing_at_all() {
+        let mut conn = conn_before("00000000000057");
+        conn.batch_execute(
+            "INSERT INTO preferences (key, value, updated_at)
+             VALUES ('onebot.balance_alert_threshold', '', 17);",
+        )
+        .unwrap();
+
+        run_migration(&mut conn, "00000000000057");
+
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "notify.balance.threshold").unwrap(),
+            None
+        );
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "notify.enabled").unwrap(),
+            None
+        );
+        assert_eq!(
+            ops::preference::get_preference(&mut conn, "onebot.balance_alert_threshold").unwrap(),
+            None
+        );
+    }
+
     fn ids_of(candidates: Vec<ops::turn::InterruptedCandidate>) -> Vec<String> {
         candidates.into_iter().map(|c| c.turn.id).collect()
     }
