@@ -34,20 +34,37 @@ environments needs an upstream usage API, which this does not have.
 ## Running it
 
 ```bash
-meridiand --config /etc/meridiand.toml --data-dir /var/lib/meridiand
+meridiand --config /etc/meridiand.toml
 ```
 
 | Flag | |
 |---|---|
-| `--config <PATH>` | The configuration file. Required. |
-| `--data-dir <PATH>` | Database, secrets file and logs. Required; also `MERIDIAN_DATA_DIR`. |
-| `--check` | Parse and validate, print a summary, exit. Touches no database. |
+| `--config <PATH>` | The configuration file. **Required.** |
+| `--data-dir <PATH>` | Database, secrets file and logs. Defaults to the platform location below; also `MERIDIAN_DATA_DIR`. |
+| `--check` | Parse and validate, print a summary and the data directory, exit. Touches no database. |
 
-Both paths are required rather than defaulted: a daemon that guessed either
-would write somewhere nobody meant.
+`--config` is required because no location is conventional for a configuration
+file, and picking one silently would be worse than saying so. A data directory
+is the opposite — every daemon has a conventional home — so it defaults to
+`<platform data dir>/cn.yuxiaoqiu.meridiand`:
 
-Run `--check` before restarting the real one. It answers without needing the
-data directory to exist, so it works in CI.
+| | |
+|---|---|
+| Windows | `%APPDATA%\cn.yuxiaoqiu.meridiand` |
+| macOS | `~/Library/Application Support/cn.yuxiaoqiu.meridiand` |
+| Linux | `$XDG_DATA_HOME/cn.yuxiaoqiu.meridiand`, or `~/.local/share/…` |
+
+Deliberately **beside** the desktop app's `cn.yuxiaoqiu.meridian` rather than
+inside it. Sharing that directory would meet the ownership guard below and
+refuse to start — correct, and a baffling way to be greeted on a first run.
+
+The resolved path is printed by `--check` and logged at every start, so a
+default never becomes a mystery. A platform with no data directory at all — a
+service with no `HOME` and no `XDG_DATA_HOME` — is an error naming the flag
+rather than a guess.
+
+Run `--check` before restarting the real one. It answers without the data
+directory existing, so it works in CI.
 
 ### The passphrase
 
@@ -71,13 +88,15 @@ Set neither and it uses the machine's keychain, which is correct on a laptop —
 > **Keep it.** Lose the passphrase and every stored key becomes unreadable; the
 > encrypted file is preserved but nothing can open it.
 
-### The data directory
+### The ownership guard
 
-Give it one of its own. The configuration file is a *desired state*, so
-applying it to a directory a desktop install configured would switch off every
-provider and endpoint the file does not name. `meridiand` refuses to start in a
-directory that already holds providers and is not marked as its own, and says
-so.
+The default above is already the daemon's own, so this normally never comes up.
+It matters when you point `--data-dir` somewhere by hand.
+
+The configuration file is a *desired state*, so applying it to a directory a
+desktop install configured would switch off every provider and endpoint the
+file does not name. `meridiand` refuses to start in a directory that already
+holds providers and is not marked as its own, and names the flag to change.
 
 ## Configuration
 

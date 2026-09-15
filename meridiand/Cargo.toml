@@ -23,6 +23,8 @@ toml = "0.8"
 # the kind of thing that is subtly wrong for a year.
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
+# The platform's application data directory, for the `--data-dir` default.
+dirs = "6"
 
 [dev-dependencies]
 # `test_db` is behind a feature rather than `cfg(test)`: this is a different
