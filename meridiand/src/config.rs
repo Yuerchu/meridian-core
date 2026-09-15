@@ -124,6 +124,17 @@ fn validate_id(kind: &str, id: &str) -> Result<(), String> {
 /// An environment variable name, checked for the shape a shell can actually
 /// export. A lowercase or punctuated name is almost always a key pasted in by
 /// mistake, which is the case worth catching loudly.
+///
+/// **The offending value is never echoed.** By construction the most likely
+/// reason this fails is that somebody pasted the credential itself into the
+/// field that names its variable — so repeating it back puts the credential on
+/// stdout, which for a daemon is whatever the supervisor collects. Log the
+/// length instead is the standing rule, and the note beside it says not to lean
+/// on the log redactor either: it matches four shapes, and the provider keys
+/// this field attracts are not all of them.
+///
+/// The entry's own id is enough to find the line — it is right there in the
+/// message, and nothing about an id is a secret.
 fn validate_env_name(kind: &str, owner: &str, name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{kind} `{owner}` names an empty environment variable"));
@@ -132,9 +143,17 @@ fn validate_env_name(kind: &str, owner: &str, name: &str) -> Result<(), String> 
         .chars()
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
     {
+        // No shell syntax here: this runs on Windows too, where `export` is
+        // wrong and the difference between a shell variable and an environment
+        // variable is exactly what people get caught by. Both spellings are in
+        // the README, which is where a worked example belongs.
         return Err(format!(
-            "{kind} `{owner}`: `{name}` is not an environment variable name (A-Z, 0-9, _). \
-             This field names the variable holding the secret — it is never the secret itself."
+            "{kind} `{owner}`: this field takes the *name* of an environment variable \
+             (A-Z, 0-9, _), not its value — the {} characters given are not one. \
+             Name a variable here, e.g. `api_key_env = \"DEEPSEEK_DEV_KEY\"`, and put the \
+             credential in that variable in the environment this process runs under. \
+             The value is not repeated here in case it is the credential.",
+            name.chars().count()
         ));
     }
     Ok(())
@@ -294,7 +313,42 @@ mod tests {
     fn a_pasted_secret_is_refused_rather_than_warned_about() {
         let pasted = MINIMAL.replace("\"DEEPSEEK_PROD_KEY\"", "\"sk-abc123def456\"");
         let error = DaemonConfig::parse(&pasted).unwrap_err();
-        assert!(error.contains("never the secret itself"), "{error}");
+        assert!(error.contains("not its value"), "{error}");
+    }
+
+    /// The refusal must not repeat what it refused.
+    ///
+    /// By construction the likeliest reason this field is wrong is that the
+    /// credential itself was pasted into it — so echoing it back puts the
+    /// credential on stdout, which for a daemon is whatever the supervisor
+    /// collects. The log redactor is not a defence to lean on here: it matches
+    /// four shapes, and the keys this field attracts are not all of them.
+    #[test]
+    fn the_refusal_never_repeats_the_value_it_refused() {
+        // Deliberately shaped like a credential the log redactor would *not*
+        // catch — no `sk-` prefix, no `AKIA`, no `Bearer`, no assignment — since
+        // that is the case which makes echoing indefensible. Deliberately *not*
+        // shaped like any real vendor's token either: a convincing fake in a
+        // test file is a push blocked by secret scanning, which is how this
+        // test was first written.
+        let secret = "this-value-stands-in-for-a-pasted-credential";
+        let pasted = MINIMAL.replace("\"DEEPSEEK_PROD_KEY\"", &format!("\"{secret}\""));
+        let error = DaemonConfig::parse(&pasted).unwrap_err();
+
+        assert!(!error.contains(secret), "the credential is in the message: {error}");
+        assert!(!error.contains("stands-in"), "even a fragment of it: {error}");
+        // Still findable: the entry is named, and the length says which value.
+        assert!(error.contains("deepseek-prod"), "{error}");
+        assert!(
+            error.contains(&secret.chars().count().to_string()),
+            "the length stands in for the value: {error}"
+        );
+
+        // The same for a webhook's signing secret.
+        let pasted = MINIMAL.replace("\"OPS_DINGTALK_SECRET\"", &format!("\"{secret}\""));
+        let error = DaemonConfig::parse(&pasted).unwrap_err();
+        assert!(!error.contains(secret), "{error}");
+        assert!(error.contains("ops"), "{error}");
     }
 
     /// An id that cannot become a keyring entry name fails now, rather than at
