@@ -75,6 +75,17 @@ struct Args {
     /// What a deployment runs before restarting the real one.
     #[arg(long)]
     check: bool,
+
+    /// Apply the configuration, send one test alert to this endpoint, and exit.
+    ///
+    /// The only way to find out whether a receiver's authentication and schema
+    /// are right without waiting for a real condition to occur.
+    #[arg(long, value_name = "WEBHOOK_ID")]
+    test: Option<String>,
+
+    /// Print each endpoint's delivery health and exit.
+    #[arg(long)]
+    status: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -138,7 +149,103 @@ fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|error| format!("could not start the runtime: {error}"))?;
+
+    // Both run *after* the configuration has been applied, so what they exercise
+    // is the endpoint as configured rather than whatever a previous run left in
+    // the database.
+    if let Some(id) = args.test {
+        return runtime.block_on(send_test(&services, &id));
+    }
+    if args.status {
+        return print_status(&services);
+    }
+
     runtime.block_on(serve(services, notify_config))
+}
+
+/// Send one test alert and report what the receiver did with it.
+///
+/// Exits non-zero on a refusal, so a deployment script can gate on it.
+async fn send_test(services: &meridian_core::services::Services, id: &str) -> Result<(), String> {
+    let report = meridian_core::notify::send_test(services, id).await?;
+    let status = report
+        .status
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "no response".into());
+    if report.is_success() {
+        println!(
+            "meridiand: {id} accepted the test — HTTP {status} in {}ms, {} attempt(s)",
+            report.duration_ms, report.attempts
+        );
+        if let Some(excerpt) = report.response_excerpt {
+            println!("  it answered: {excerpt}");
+        }
+        return Ok(());
+    }
+    // The excerpt is the useful half of a refusal — it is where a receiver says
+    // *why* — so it is printed rather than folded into the one-line error.
+    if let Some(excerpt) = &report.response_excerpt {
+        eprintln!("  it answered: {excerpt}");
+    }
+    Err(format!(
+        "{id} refused the test — HTTP {status} after {} attempt(s): {}",
+        report.attempts,
+        report.error.as_deref().unwrap_or("no reason given"),
+    ))
+}
+
+/// What each endpoint's last delivery did.
+///
+/// The database has recorded this since the feature existed; until now nothing
+/// could read it without opening the file by hand, which is a diagnosis nobody
+/// makes at three in the morning.
+fn print_status(services: &meridian_core::services::Services) -> Result<(), String> {
+    let mut conn = services.db.get().map_err(|error| format!("db connection: {error}"))?;
+    let rows = meridian_core::db::ops::notification::list_webhooks(&mut conn).map_err(|error| error.to_string())?;
+    if rows.is_empty() {
+        println!("meridiand: no endpoints are configured");
+        return Ok(());
+    }
+    for row in rows {
+        let events = row
+            .events()
+            .map(|events| events.iter().map(|event| event.as_str()).collect::<Vec<_>>().join(","))
+            // Shown rather than swallowed: a subscription that will not decode
+            // is why an endpoint is silent, and it is invisible everywhere else.
+            .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+        println!(
+            "{}  {}  [{}]  {}",
+            if row.is_enabled() { "on " } else { "off" },
+            row.id,
+            events,
+            row.url,
+        );
+        match (row.last_success_at, row.last_attempt_at) {
+            (None, None) => println!("     never attempted"),
+            _ => {
+                println!(
+                    "     last attempt {}   last success {}",
+                    stamp(row.last_attempt_at),
+                    stamp(row.last_success_at),
+                );
+            }
+        }
+        if row.consecutive_failures > 0 {
+            println!(
+                "     {} consecutive failure(s): {}",
+                row.consecutive_failures,
+                row.last_error.as_deref().unwrap_or("no reason recorded"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn stamp(ms: Option<i64>) -> String {
+    match ms {
+        None => "never".into(),
+        Some(ms) => meridian_core::notify::template::format_timestamp(ms),
+    }
 }
 
 /// Where this daemon keeps its database, secrets and logs.

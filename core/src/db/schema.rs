@@ -782,6 +782,7 @@ diesel::table! {
         format -> Text,
         events -> Text,
         is_enabled -> Integer,
+        body_template -> Nullable<Text>,
         last_attempt_at -> Nullable<BigInt>,
         last_success_at -> Nullable<BigInt>,
         last_error -> Nullable<Text>,

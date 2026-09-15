@@ -88,12 +88,33 @@ pub struct WebhookEntry {
     pub url: String,
     pub format: NotificationFormat,
     pub events: Vec<NotificationEventKind>,
-    /// The name of the environment variable holding the signing secret, if the
-    /// format has one. Absent means unsigned — which for DingTalk and Feishu
-    /// means the robot must be configured without a signature check.
+    /// The name of the environment variable holding this endpoint's secret.
+    ///
+    /// **What the secret is depends on the format** — a signing key for
+    /// `generic`/`dingtalk`/`feishu`, a bearer token for `custom`, nothing at
+    /// all for `wecom`/`slack`, whose key is already in the URL. See
+    /// `NotificationFormat::secret_meaning`.
     pub secret_env: Option<String>,
+    /// The JSON document to post, for `format = "custom"` only.
+    ///
+    /// A TOML table, so the receiver's schema is written in the shape it
+    /// actually has rather than as an escaped string. Placeholders are
+    /// substituted structurally — see `notify::template`.
+    pub body: Option<toml::Value>,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+}
+
+impl WebhookEntry {
+    /// The body template as JSON, which is how it is stored and rendered.
+    pub fn body_template(&self) -> Result<Option<serde_json::Value>, String> {
+        let Some(body) = &self.body else {
+            return Ok(None);
+        };
+        let json = serde_json::to_value(body)
+            .map_err(|error| format!("webhook `{}`: the body is not representable as JSON: {error}", self.id))?;
+        Ok(Some(json))
+    }
 }
 
 fn enabled_by_default() -> bool {
@@ -208,6 +229,33 @@ impl DaemonConfig {
                 .map_err(|error| format!("webhook `{}`: {error}", webhook.id))?;
             if let Some(env) = &webhook.secret_env {
                 validate_env_name("webhook", &webhook.id, env)?;
+            }
+
+            // The template is checked here, not at delivery. A typo caught at
+            // delivery time is caught by nobody: the delivery it breaks is the
+            // one nobody is watching for.
+            let template = webhook.body_template()?;
+            match (webhook.format.needs_body_template(), &template) {
+                (true, None) => {
+                    return Err(format!(
+                        "webhook `{}` is `custom` but has no `body`; there would be nothing to post. \
+                         Give it the JSON document the receiver expects, as a `[webhook.body]` table.",
+                        webhook.id
+                    ));
+                }
+                (false, Some(_)) => {
+                    return Err(format!(
+                        "webhook `{}` has a `body` but its format is `{}`, which sends that vendor's own \
+                         shape. A body template only applies to `custom`.",
+                        webhook.id,
+                        webhook.format.as_str()
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(template) = &template {
+                meridian_core::notify::template::validate(template)
+                    .map_err(|error| format!("webhook `{}`: {error}", webhook.id))?;
             }
         }
 
@@ -445,6 +493,71 @@ mod tests {
         let over: String = (0..MAX_WEBHOOKS + 1).map(entry).collect();
         let error = DaemonConfig::parse(&over).unwrap_err();
         assert!(error.contains(&(MAX_WEBHOOKS + 1).to_string()), "{error}");
+    }
+
+    /// A real deployment's alert pipe: its own schema, its own bearer token.
+    const CUSTOM: &str = r#"
+        [[webhook]]
+        id = "alertpipe"
+        name = "foxline alertpipe"
+        url = "http://alertpipe.internal.example/webhooks/balance"
+        format = "custom"
+        events = ["balance_low", "balance_unavailable", "test"]
+        secret_env = "WEBHOOK_KEY"
+
+        [webhook.body]
+        title = "{{title}}"
+        message = "{{summary}}"
+        service = "billing"
+        environment = "prod"
+        requestId = "{{delivery_id}}"
+        timestamp = "{{raised_at_iso}}"
+
+        [webhook.body.data]
+        account = "{{balance.provider_name}}"
+        balance = "{{balance.total:number}}"
+        threshold = "{{balance.threshold:number}}"
+        currency = "{{balance.currency}}"
+    "#;
+
+    #[test]
+    fn a_custom_endpoint_carries_the_receivers_own_schema() {
+        let config = DaemonConfig::parse(CUSTOM).unwrap();
+        let template = config.webhook[0].body_template().unwrap().expect("a body");
+        assert_eq!(template["service"], "billing");
+        assert_eq!(template["data"]["currency"], "{{balance.currency}}");
+        assert_eq!(config.webhook[0].format, NotificationFormat::Custom);
+    }
+
+    /// Both halves of the pairing, because either alone is an endpoint that
+    /// looks configured and posts the wrong thing — an empty document one way,
+    /// a vendor's shape the other.
+    #[test]
+    fn a_body_and_the_custom_format_require_each_other() {
+        let no_body = CUSTOM
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("[webhook.body]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = DaemonConfig::parse(&no_body).unwrap_err();
+        assert!(error.contains("nothing to post"), "{error}");
+
+        let vendor = CUSTOM.replace(r#"format = "custom""#, r#"format = "feishu""#);
+        let error = DaemonConfig::parse(&vendor).unwrap_err();
+        assert!(error.contains("only applies to `custom`"), "{error}");
+    }
+
+    /// A typo caught at delivery time is caught by nobody: the delivery it
+    /// breaks is the one nobody is watching for.
+    #[test]
+    fn a_placeholder_typo_is_refused_when_the_file_is_read() {
+        let typo = CUSTOM.replace("{{balance.total:number}}", "{{balance.totl:number}}");
+        let error = DaemonConfig::parse(&typo).unwrap_err();
+        assert!(error.contains("balance.totl"), "{error}");
+        assert!(error.contains("alertpipe"), "the endpoint is named: {error}");
+
+        let bad_number = CUSTOM.replace("{{balance.currency}}", "{{balance.currency:number}}");
+        assert!(DaemonConfig::parse(&bad_number).is_err());
     }
 
     #[test]

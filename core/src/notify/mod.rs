@@ -21,6 +21,7 @@
 pub mod alert;
 pub mod balance;
 pub mod sink;
+pub mod template;
 pub mod usage;
 pub mod webhook;
 

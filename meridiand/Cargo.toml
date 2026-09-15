@@ -18,6 +18,7 @@ meridian-core = { path = "../core" }
 # being killed mid-delivery.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 # `--help` is the whole interface here; hand-rolled argument parsing is exactly
 # the kind of thing that is subtly wrong for a year.

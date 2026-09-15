@@ -20,10 +20,12 @@ pub const MAX_WEBHOOKS: usize = 32;
 
 /// What an endpoint speaks.
 ///
-/// Only [`NotificationFormat::Generic`] is our own contract. The other four are
-/// somebody else's and follow their upstream — including their signing schemes,
-/// which are all different from ours and from each other, and their habit of
-/// reporting failure inside an HTTP 200.
+/// Only [`NotificationFormat::Generic`] is our own contract. Four of the rest
+/// are somebody else's published product and follow their upstream — including
+/// their signing schemes, which are all different from ours and from each
+/// other, and their habit of reporting failure inside an HTTP 200.
+/// [`NotificationFormat::Custom`] is the case none of those cover: a company's
+/// own alert pipe, whose schema is whatever its operations team wrote down.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, Serialize, Deserialize, strum::IntoStaticStr, strum::EnumString,
 )]
@@ -35,11 +37,38 @@ pub enum NotificationFormat {
     Feishu,
     Wecom,
     Slack,
+    /// The body comes from `body_template` and the stored secret is a bearer
+    /// token. See [`NotificationFormat::secret_meaning`].
+    Custom,
 }
 
 impl NotificationFormat {
     pub fn as_str(&self) -> &'static str {
         self.into()
+    }
+
+    /// What this format does with the endpoint's stored secret.
+    ///
+    /// **The format has always decided this**, which is why `custom` needs no
+    /// second keyring entry: DingTalk signs a URL with it, Feishu signs a body,
+    /// `generic` computes an HMAC header, and `custom` sends it as a bearer
+    /// token. Written down as one function because a settings page and a
+    /// configuration file both have to explain it, and two explanations drift.
+    pub fn secret_meaning(self) -> SecretMeaning {
+        match self {
+            NotificationFormat::Generic => SecretMeaning::HmacSignature,
+            NotificationFormat::Dingtalk => SecretMeaning::SignsTheUrl,
+            NotificationFormat::Feishu => SecretMeaning::SignsTheBody,
+            // Both authenticate with a key already in the URL, so a secret
+            // configured here would sign nothing.
+            NotificationFormat::Wecom | NotificationFormat::Slack => SecretMeaning::Unused,
+            NotificationFormat::Custom => SecretMeaning::BearerToken,
+        }
+    }
+
+    /// Whether this format needs a body template, which only `custom` does.
+    pub fn needs_body_template(self) -> bool {
+        matches!(self, NotificationFormat::Custom)
     }
 
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -51,6 +80,22 @@ impl NotificationFormat {
     pub fn all() -> Vec<&'static str> {
         Self::iter().map(|v| v.as_str()).collect()
     }
+}
+
+/// What a format does with the endpoint's stored secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretMeaning {
+    /// Ours: an HMAC over the timestamp and body, in a header.
+    HmacSignature,
+    /// DingTalk: query parameters on the URL.
+    SignsTheUrl,
+    /// Feishu: two fields inside the body.
+    SignsTheBody,
+    /// `Authorization: Bearer <secret>`.
+    BearerToken,
+    /// The endpoint authenticates by its URL alone.
+    Unused,
 }
 
 /// What an endpoint is subscribed to.
@@ -128,6 +173,7 @@ pub struct NotificationWebhookRow {
     pub format: String,
     pub events: String,
     pub is_enabled: i32,
+    pub body_template: Option<String>,
     pub last_attempt_at: Option<i64>,
     pub last_success_at: Option<i64>,
     pub last_error: Option<String>,
@@ -139,6 +185,30 @@ pub struct NotificationWebhookRow {
 impl NotificationWebhookRow {
     pub fn format(&self) -> Result<NotificationFormat, String> {
         NotificationFormat::parse(&self.format)
+    }
+
+    /// The stored template, as JSON.
+    ///
+    /// `TEXT` is storage, not a public string contract — the same rule `events`
+    /// follows. A template that will not parse fails the read rather than
+    /// becoming `{}`, which would post an empty document and be recorded as
+    /// delivered.
+    ///
+    /// `None` for every format but `custom`, and its absence *on* `custom` is
+    /// an error rather than an empty body, for the same reason.
+    pub fn body_template(&self) -> Result<Option<serde_json::Value>, String> {
+        let Some(raw) = self.body_template.as_deref() else {
+            if self.format()?.needs_body_template() {
+                return Err(format!(
+                    "webhook `{}` is `custom` but has no body template; there is nothing to post",
+                    self.id
+                ));
+            }
+            return Ok(None);
+        };
+        serde_json::from_str(raw)
+            .map(Some)
+            .map_err(|error| format!("webhook `{}` has a malformed body template: {error}", self.id))
     }
 
     pub fn events(&self) -> Result<Vec<NotificationEventKind>, String> {
@@ -168,6 +238,7 @@ pub struct NotificationWebhookInsert<'a> {
     pub format: &'a str,
     pub events: &'a str,
     pub is_enabled: i32,
+    pub body_template: Option<&'a str>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -180,6 +251,11 @@ pub struct NotificationWebhookChangeset {
     pub format: Option<String>,
     pub events: Option<String>,
     pub is_enabled: Option<i32>,
+    /// Doubly wrapped: the outer `None` leaves the column alone, and
+    /// `Some(None)` clears it. Switching an endpoint from `custom` to a vendor
+    /// format has to be able to drop the template, and a single `Option` cannot
+    /// say that.
+    pub body_template: Option<Option<String>>,
     pub updated_at: Option<i64>,
 }
 
@@ -252,12 +328,67 @@ mod tests {
     fn formats_and_events_use_the_spelling_the_check_constraint_names() {
         assert_eq!(
             NotificationFormat::all(),
-            ["generic", "dingtalk", "feishu", "wecom", "slack"]
+            ["generic", "dingtalk", "feishu", "wecom", "slack", "custom"]
         );
         assert_eq!(
             NotificationEventKind::all(),
             ["balance_low", "balance_unavailable", "usage_surge", "test"]
         );
         assert!(NotificationFormat::parse("teams").is_err());
+    }
+
+    /// Every format has to answer both questions, because a settings page and a
+    /// configuration file both ask them and a format added without an answer
+    /// would silently inherit somebody else's.
+    #[test]
+    fn every_format_says_what_it_does_with_a_secret_and_a_body() {
+        use NotificationFormat as F;
+        assert_eq!(F::Generic.secret_meaning(), SecretMeaning::HmacSignature);
+        assert_eq!(F::Dingtalk.secret_meaning(), SecretMeaning::SignsTheUrl);
+        assert_eq!(F::Feishu.secret_meaning(), SecretMeaning::SignsTheBody);
+        assert_eq!(F::Wecom.secret_meaning(), SecretMeaning::Unused);
+        assert_eq!(F::Slack.secret_meaning(), SecretMeaning::Unused);
+        assert_eq!(F::Custom.secret_meaning(), SecretMeaning::BearerToken);
+
+        // Only `custom` posts a document the operator wrote; every other format
+        // sends a shape this app or a vendor defines.
+        for format in NotificationFormat::iter() {
+            assert_eq!(format.needs_body_template(), format == F::Custom, "{}", format.as_str());
+        }
+    }
+
+    /// `custom` without a template would post nothing and be recorded as
+    /// delivered — the worst outcome available, because it looks like it worked.
+    #[test]
+    fn a_body_template_is_required_by_custom_and_refused_elsewhere() {
+        let row = |format: &str, template: Option<&str>| NotificationWebhookRow {
+            id: "w1".into(),
+            name: "w".into(),
+            url: "https://a.invalid/h".into(),
+            format: format.into(),
+            events: r#"["test"]"#.into(),
+            is_enabled: 1,
+            body_template: template.map(str::to_string),
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error: None,
+            consecutive_failures: 0,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        let error = row("custom", None).body_template().unwrap_err();
+        assert!(error.contains("nothing to post"), "{error}");
+
+        // A template that will not parse fails the read rather than becoming
+        // `{}`, which would post an empty document.
+        let error = row("custom", Some("{not json")).body_template().unwrap_err();
+        assert!(error.contains("malformed"), "{error}");
+
+        assert_eq!(
+            row("custom", Some(r#"{"a":1}"#)).body_template().unwrap(),
+            Some(serde_json::json!({"a": 1}))
+        );
+        assert_eq!(row("generic", None).body_template().unwrap(), None);
     }
 }
