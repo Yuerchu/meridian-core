@@ -40,6 +40,16 @@ const PASSPHRASE_VAR: &str = "MERIDIAN_SECRETS_PASSPHRASE";
 /// environment of everything this spawns.
 const PASSPHRASE_FILE_VAR: &str = "MERIDIAN_SECRETS_PASSPHRASE_FILE";
 
+/// The default data directory, under the platform's application data location.
+///
+/// Deliberately **not** the desktop app's `cn.yuxiaoqiu.meridian`. A daemon
+/// landing in that directory would meet the ownership guard and refuse to
+/// start, which is correct and a baffling way to be greeted on a first run; and
+/// if it somehow did not, it would switch off every provider the desktop had
+/// configured, because the configuration file is a desired state. Adjacent, not
+/// shared.
+const DEFAULT_DIR_NAME: &str = "cn.yuxiaoqiu.meridiand";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "meridiand",
@@ -53,8 +63,12 @@ struct Args {
     config: PathBuf,
 
     /// Where the database, the secrets file and the logs live.
+    ///
+    /// Defaults to `<platform data dir>/cn.yuxiaoqiu.meridiand`, which is
+    /// beside the desktop app's directory rather than inside it. The resolved
+    /// path is always logged, so it is never a mystery.
     #[arg(short, long, value_name = "PATH", env = "MERIDIAN_DATA_DIR")]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
 
     /// Parse and validate everything, then exit without touching the database.
     ///
@@ -87,6 +101,8 @@ fn run() -> Result<(), String> {
     // directory still answers the question it was asked.
     let notify_config = config.notify_config()?;
 
+    let data_dir = resolve_data_dir(args.data_dir)?;
+
     if args.check {
         println!(
             "meridiand: {} is valid — {} provider(s), {} webhook(s), watcher {}",
@@ -95,15 +111,19 @@ fn run() -> Result<(), String> {
             config.webhook.len(),
             if notify_config.enabled { "on" } else { "off" },
         );
+        // Where it *would* write, which is the other half of "is this
+        // configuration what I think it is" and the reason a default has to be
+        // visible without starting anything.
+        println!("meridiand: data directory {}", data_dir.display());
         return Ok(());
     }
 
-    let secrets = Arc::new(open_secrets(&args.data_dir)?);
+    tracing::info!(data_dir = %data_dir.display(), "meridiand starting");
+    let secrets = Arc::new(open_secrets(&data_dir)?);
     // No sinks, and that is correct rather than tolerated: `EventBus::emit`
     // treats an empty registry as success, precisely so a headless run is not
     // failed by having no window to miss anything.
-    let services =
-        meridian_core::bootstrap::bootstrap_with_secrets(args.data_dir.clone(), EventBus::new(), secrets.clone())?;
+    let services = meridian_core::bootstrap::bootstrap_with_secrets(data_dir, EventBus::new(), secrets.clone())?;
 
     let report = apply::apply(&services.db, &services.secrets, &config)?;
     tracing::info!(
@@ -119,6 +139,30 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|error| format!("could not start the runtime: {error}"))?;
     runtime.block_on(serve(services, notify_config))
+}
+
+/// Where this daemon keeps its database, secrets and logs.
+///
+/// `--config` stays required because there is no location a configuration file
+/// conventionally lives at, and picking one silently would be worse than
+/// saying so. A data directory is the opposite: every daemon has a
+/// conventional home, and the platform's application data directory is the one
+/// people mean. Requiring it too was one rule applied to two different
+/// questions.
+///
+/// Guessing is still refused where guessing is impossible: a platform with no
+/// data directory at all — a Linux service with no `HOME` and no
+/// `XDG_DATA_HOME` — gets an error naming the flag rather than a path under
+/// `/`.
+fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit);
+    }
+    dirs::data_dir().map(|base| base.join(DEFAULT_DIR_NAME)).ok_or_else(|| {
+        "no platform data directory is available (no HOME or XDG_DATA_HOME?); \
+         pass --data-dir or set $MERIDIAN_DATA_DIR"
+            .to_string()
+    })
 }
 
 /// The keychain, or the passphrase the deployment supplied instead.
@@ -235,11 +279,35 @@ mod tests {
 
         let args = Args::try_parse_from(["meridiand", "--config", "/etc/m.toml", "--data-dir", "/var/lib/m"]).unwrap();
         assert_eq!(args.config, PathBuf::from("/etc/m.toml"));
+        assert_eq!(args.data_dir, Some(PathBuf::from("/var/lib/m")));
         assert!(!args.check);
 
-        // Both are required: a daemon that guessed either would write somewhere
-        // nobody meant.
-        assert!(Args::try_parse_from(["meridiand", "--config", "/etc/m.toml"]).is_err());
+        // `--config` is required because no location is conventional for one,
+        // and picking one silently would be worse than saying so.
+        assert!(Args::try_parse_from(["meridiand"]).is_err());
         assert!(Args::try_parse_from(["meridiand", "--data-dir", "/var/lib/m"]).is_err());
+    }
+
+    /// A data directory is the opposite question: every daemon has a
+    /// conventional home, and requiring it too was one rule applied to two
+    /// different things.
+    #[test]
+    fn the_data_directory_falls_back_to_the_platform_location() {
+        let args = Args::try_parse_from(["meridiand", "--config", "/etc/m.toml"]).unwrap();
+        assert_eq!(args.data_dir, None);
+
+        let explicit = resolve_data_dir(Some(PathBuf::from("/var/lib/m"))).unwrap();
+        assert_eq!(explicit, PathBuf::from("/var/lib/m"));
+
+        // On any machine a test runs on there is one; what matters is that it
+        // is the daemon's own and not the desktop app's, which the ownership
+        // guard would refuse and which would be a baffling first run.
+        let fallback = resolve_data_dir(None).unwrap();
+        assert!(fallback.ends_with(DEFAULT_DIR_NAME), "{}", fallback.display());
+        assert_ne!(
+            fallback.file_name().and_then(|name| name.to_str()),
+            Some("cn.yuxiaoqiu.meridian"),
+            "the daemon must not default into the desktop app's directory"
+        );
     }
 }

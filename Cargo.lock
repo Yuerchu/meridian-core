@@ -2203,6 +2203,7 @@ name = "meridiand"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "dirs",
  "meridian-core",
  "serde",
  "tempfile",
