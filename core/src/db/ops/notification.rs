@@ -195,6 +195,7 @@ mod tests {
                 format: "generic",
                 events: r#"["balance_low"]"#,
                 is_enabled: 1,
+                body_template: None,
                 created_at: 1,
                 updated_at: 1,
             },

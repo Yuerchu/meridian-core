@@ -120,6 +120,7 @@ pub fn prepare(
     format: NotificationFormat,
     url: &str,
     secret: Option<&str>,
+    template: Option<&serde_json::Value>,
     alert: &Alert,
     delivery_id: &str,
     now_ms: i64,
@@ -224,6 +225,29 @@ pub fn prepare(
                 reads_body_for_errors: false,
             })
         }
+        NotificationFormat::Custom => {
+            let template = template
+                .ok_or_else(|| "a `custom` endpoint has no body template; there is nothing to post".to_string())?;
+            let body = to_bytes(&super::template::render(template, alert, delivery_id))?;
+            let mut headers = vec![("content-type".into(), "application/json".into())];
+            // The stored secret is a bearer token for this format. No secret is
+            // an unauthenticated POST rather than an empty `Bearer `, which a
+            // receiver would reject with a message about the token being
+            // malformed rather than about there being none.
+            if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+                headers.push(("authorization".into(), format!("Bearer {secret}")));
+            }
+            Ok(PreparedDelivery {
+                url: url.to_string(),
+                body,
+                headers,
+                // Whatever this endpoint is, it is not one of the three that
+                // report failure inside a 200 — and guessing at an error shape
+                // we have never seen would turn a delivered alert into a
+                // duplicate on the next tick.
+                reads_body_for_errors: false,
+            })
+        }
     }
 }
 
@@ -285,10 +309,17 @@ pub async fn deliver(endpoint: &NotificationWebhookRow, secret: Option<&str>, al
         Ok(format) => format,
         Err(error) => return failed(started, 1, None, error, None),
     };
+    // Decoded here rather than at render time so a malformed template fails the
+    // delivery with its own message, instead of posting a document nobody meant.
+    let template = match endpoint.body_template() {
+        Ok(template) => template,
+        Err(error) => return failed(started, 1, None, error, None),
+    };
     let prepared = match prepare(
         format,
         &endpoint.url,
         secret,
+        template.as_ref(),
         alert,
         &delivery_id,
         crate::util::now_ms(),
@@ -513,6 +544,7 @@ mod wire_tests {
             format: format.as_str().into(),
             events: r#"["test"]"#.into(),
             is_enabled: 1,
+            body_template: None,
             last_attempt_at: None,
             last_success_at: None,
             last_error: None,
@@ -613,6 +645,83 @@ mod wire_tests {
         assert_eq!(server.seen.lock().unwrap().len(), 1);
     }
 
+    /// A company's own alert pipe, end to end: its schema in the body, its
+    /// bearer token in the header, and neither of ours anywhere.
+    #[tokio::test]
+    async fn a_custom_endpoint_sends_its_own_schema_with_a_bearer_token() {
+        let server = recorder(vec![(200, "{}")]).await;
+        let mut row = endpoint(&server.url, NotificationFormat::Custom);
+        row.body_template = Some(
+            r#"{
+                "title": "{{title}}",
+                "message": "{{summary}}",
+                "service": "billing",
+                "requestId": "{{delivery_id}}",
+                "timestamp": "{{raised_at_iso}}"
+            }"#
+            .into(),
+        );
+
+        let report = deliver(&row, Some("pipe-token"), &test_alert()).await;
+        assert!(report.is_success(), "{report:?}");
+
+        let seen = server.seen.lock().unwrap();
+        let header = |name: &str| {
+            seen[0]
+                .headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(header("authorization").as_deref(), Some("Bearer pipe-token"));
+        // Ours must not leak into somebody else's contract.
+        assert!(
+            !seen[0].headers.iter().any(|(key, _)| key.starts_with("x-meridian")),
+            "our headers sign nothing this endpoint checks"
+        );
+
+        let body: serde_json::Value = serde_json::from_str(&seen[0].body).expect("a JSON body");
+        assert_eq!(body["service"], "billing");
+        assert_eq!(body["title"], "Meridian 通知测试");
+        assert!(body["timestamp"].as_str().unwrap().ends_with('Z'), "{body}");
+        assert!(body.get("spec_version").is_none(), "not our envelope: {body}");
+    }
+
+    /// Without a token it is an unauthenticated POST, not an empty `Bearer `,
+    /// which a receiver rejects with a message about a malformed token rather
+    /// than about there being none.
+    #[tokio::test]
+    async fn a_custom_endpoint_with_no_token_sends_no_authorization_header() {
+        let server = recorder(vec![(200, "{}")]).await;
+        let mut row = endpoint(&server.url, NotificationFormat::Custom);
+        row.body_template = Some(r#"{"title": "{{title}}"}"#.into());
+
+        assert!(deliver(&row, None, &test_alert()).await.is_success());
+        let seen = server.seen.lock().unwrap();
+        assert!(!seen[0].headers.iter().any(|(key, _)| key == "authorization"));
+    }
+
+    /// A `custom` row with no template would post nothing and be recorded as
+    /// delivered — the worst outcome available, because it looks like it worked.
+    #[tokio::test]
+    async fn a_custom_endpoint_without_a_template_never_reaches_the_wire() {
+        let server = recorder(vec![(200, "{}")]).await;
+        let row = endpoint(&server.url, NotificationFormat::Custom);
+        let report = deliver(&row, Some("t"), &test_alert()).await;
+
+        assert!(!report.is_success());
+        assert!(report.error.as_deref().unwrap().contains("body template"), "{report:?}");
+        assert!(server.seen.lock().unwrap().is_empty());
+
+        // The same for a template that will not parse: it fails rather than
+        // becoming `{}`.
+        let mut broken = endpoint(&server.url, NotificationFormat::Custom);
+        broken.body_template = Some("{not json".into());
+        let report = deliver(&broken, Some("t"), &test_alert()).await;
+        assert!(!report.is_success());
+        assert!(server.seen.lock().unwrap().is_empty());
+    }
+
     /// A row whose stored format is not one of the five never reaches the wire.
     #[tokio::test]
     async fn an_unreadable_format_fails_before_any_request() {
@@ -657,6 +766,7 @@ mod tests {
             NotificationFormat::Generic,
             "https://example.invalid/hook",
             Some("s3cret"),
+            None,
             &test_alert(),
             "delivery-1",
             1_700_000_000_000,
@@ -694,6 +804,7 @@ mod tests {
                 NotificationFormat::Generic,
                 "https://example.invalid/hook",
                 secret,
+                None,
                 &test_alert(),
                 "d",
                 1,
@@ -711,6 +822,7 @@ mod tests {
         let prepared = prepare(
             NotificationFormat::Generic,
             "https://example.invalid/hook",
+            None,
             None,
             &test_alert(),
             "d",
@@ -811,6 +923,7 @@ mod tests {
                 NotificationFormat::Generic,
                 "https://example.invalid/hook",
                 None,
+                None,
                 &alert,
                 "d",
                 1,
@@ -828,6 +941,7 @@ mod tests {
             NotificationFormat::Dingtalk,
             "https://oapi.dingtalk.com/robot/send?access_token=abc",
             Some("SECdead"),
+            None,
             &test_alert(),
             "d",
             1_700_000_000_000,
@@ -855,6 +969,7 @@ mod tests {
             NotificationFormat::Dingtalk,
             "https://oapi.dingtalk.com/robot/send",
             Some("k"),
+            None,
             &test_alert(),
             "d",
             7,
@@ -871,6 +986,7 @@ mod tests {
             NotificationFormat::Feishu,
             "https://open.feishu.cn/open-apis/bot/v2/hook/x",
             Some("SEC1"),
+            None,
             &test_alert(),
             "d",
             1_700_000_000_999,
@@ -888,6 +1004,7 @@ mod tests {
             NotificationFormat::Feishu,
             "https://open.feishu.cn/open-apis/bot/v2/hook/x",
             None,
+            None,
             &test_alert(),
             "d",
             1,
@@ -904,6 +1021,7 @@ mod tests {
             NotificationFormat::Wecom,
             "https://qyapi.weixin.qq.com/x?key=k",
             Some("ignored"),
+            None,
             &test_alert(),
             "d",
             1,
@@ -921,6 +1039,7 @@ mod tests {
         let slack = prepare(
             NotificationFormat::Slack,
             "https://hooks.slack.com/services/x",
+            None,
             None,
             &test_alert(),
             "d",

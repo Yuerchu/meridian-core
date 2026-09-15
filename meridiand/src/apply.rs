@@ -185,6 +185,13 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
     for (webhook, secret) in config.webhook.iter().zip(&webhook_secrets) {
         let events = encode_events(&webhook.events)?;
         let enabled = i32::from(webhook.enabled);
+        // Stored as the canonical JSON text, which is what the row holds and
+        // what the renderer parses back. Already validated at config parse.
+        let template = webhook
+            .body_template()?
+            .map(|value| serde_json::to_string(&value))
+            .transpose()
+            .map_err(|error| format!("webhook `{}`: could not encode the body: {error}", webhook.id))?;
         let exists = ops::notification::get_webhook(&mut conn, &webhook.id).is_ok();
         if exists {
             ops::notification::update_webhook(
@@ -196,6 +203,7 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
                     format: Some(webhook.format.as_str().to_string()),
                     events: Some(events),
                     is_enabled: Some(enabled),
+                    body_template: Some(template.clone()),
                     updated_at: Some(now),
                 },
             )
@@ -210,6 +218,7 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
                     format: webhook.format.as_str(),
                     events: &events,
                     is_enabled: enabled,
+                    body_template: template.as_deref(),
                     created_at: now,
                     updated_at: now,
                 },
@@ -230,6 +239,7 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
             &row.id,
             &NotificationWebhookChangeset {
                 is_enabled: Some(0),
+                body_template: None,
                 updated_at: Some(now),
                 ..Default::default()
             },

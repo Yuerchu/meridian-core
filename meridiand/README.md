@@ -42,6 +42,28 @@ meridiand --config /etc/meridiand.toml
 | `--config <PATH>` | The configuration file. **Required.** |
 | `--data-dir <PATH>` | Database, secrets file and logs. Defaults to the platform location below; also `MERIDIAN_DATA_DIR`. |
 | `--check` | Parse and validate, print a summary and the data directory, exit. Touches no database. |
+| `--test <WEBHOOK_ID>` | Apply the configuration, send one test alert to that endpoint, exit. Non-zero if the receiver refuses it. |
+| `--status` | Print each endpoint's delivery health and exit. |
+
+`--test` is how you find out whether a receiver's authentication and schema are
+right without waiting for a real condition to occur:
+
+```
+$ meridiand --config m.toml --test alertpipe
+meridiand: alertpipe accepted the test — HTTP 200 in 13ms, 1 attempt(s)
+  it answered: {"ok":true}
+```
+
+`--status` reads what the deliveries recorded. `last_success_at` is kept across
+failures on purpose — "it worked at 09:00 and has failed since" is the useful
+sentence, and clearing it would leave only "it is failing":
+
+```
+$ meridiand --config m.toml --status
+on   alertpipe  [balance_low,balance_unavailable]  http://alertpipe.internal/webhooks/balance
+     last attempt 2026-09-15T18:57:37.699Z   last success 2026-09-15T18:56:53.001Z
+     1 consecutive failure(s): network error: error sending request
+```
 
 `--config` is required because no location is conventional for a configuration
 file, and picking one silently would be worse than saying so. A data directory
@@ -179,15 +201,30 @@ already been through a binary double by the time it is parsed, and is refused.
 | Webhook | |
 |---|---|
 | `id`, `name`, `url` | `http` and `https` only. |
-| `format` | `generic`, `dingtalk`, `feishu`, `wecom`, `slack`. |
+| `format` | `generic`, `dingtalk`, `feishu`, `wecom`, `slack`, `custom`. |
 | `events` | At least one. An endpoint subscribed to nothing is refused. |
-| `secret_env` | Optional; absent means unsigned. |
+| `secret_env` | Optional. **What the secret is depends on the format** — see below. |
+| `body` | The JSON document to post. Required for `custom`, refused for every other format. |
 | `enabled` | Default `true`. |
 
 Events: `balance_low`, `balance_unavailable`, `usage_surge`, `test`.
 
 At most 32 endpoints — a single alert should not become a hundred outbound
 requests.
+
+### What the secret is
+
+There is one secret per endpoint and the format decides what it does with it.
+That is why `custom` needs no second field: a bearer token *is* this endpoint's
+secret.
+
+| `format` | `secret_env` holds | and it becomes |
+|---|---|---|
+| `generic` | a signing key | `X-Meridian-Signature: sha256=…` |
+| `dingtalk` | its signing secret | `?timestamp=&sign=` on the URL |
+| `feishu` | its signing secret | `timestamp`/`sign` inside the body |
+| `wecom`, `slack` | — | nothing; the key is already in the URL |
+| `custom` | a bearer token | `Authorization: Bearer …` |
 
 ### What the file stops naming
 
@@ -202,6 +239,115 @@ If any named variable is unset or empty, **nothing is written at all**. A
 half-applied configuration leaves a provider with no key, which reports as an
 upstream failure and reads like an outage. An empty variable counts as missing:
 that is the usual shape of a secret that failed to inject.
+
+## Your own alert pipe: `format = "custom"`
+
+The five other formats are either Meridian's contract or a vendor's published
+product. Neither covers the common case of a company's own alert pipe, which
+has a schema its operations team wrote down and authenticates with a bearer
+token. `custom` is that: you give the JSON document, with placeholders where the
+alert's values go.
+
+```toml
+[[webhook]]
+id = "alertpipe"
+name = "ops alert pipe"
+url = "http://alertpipe.internal.example/webhooks/balance"
+format = "custom"
+events = ["balance_low", "balance_unavailable", "test"]
+secret_env = "ALERTPIPE_TOKEN"        # becomes Authorization: Bearer …
+
+[webhook.body]
+title = "账户余额告警"                  # a constant
+message = "{{summary}}"
+service = "billing"
+environment = "prod"
+requestId = "{{delivery_id}}"
+timestamp = "{{raised_at_iso}}"
+
+[webhook.body.data]
+account = "{{balance.provider_name}}"
+balance = "{{balance.total:number}}"   # a JSON number, not a string
+threshold = "{{balance.threshold:number}}"
+currency = "{{balance.currency}}"
+```
+
+produces
+
+```json
+{
+  "title": "账户余额告警",
+  "message": "DeepSeek dev 余额偏低（阈值 100）\nCNY 12.5（充值 12.5 / 赠送 0）…",
+  "service": "billing",
+  "environment": "prod",
+  "requestId": "df112bb0-a0ac-4f77-b1a7-77066677888f",
+  "timestamp": "2026-09-15T18:56:52.983Z",
+  "data": { "account": "DeepSeek dev", "balance": 12.5, "threshold": 100, "currency": "CNY" }
+}
+```
+
+### How substitution works
+
+**Structurally, not textually.** The template is parsed as JSON first and
+placeholders are replaced at the *value* level, so a provider name or an
+upstream error message containing a quote or a brace cannot change the
+document's shape. String interpolation — the obvious implementation — would make
+every one of those values an injection into your parser.
+
+Three forms follow:
+
+| in the template | becomes |
+|---|---|
+| `"{{name}}"` — the whole string | that value, with its own type |
+| `"{{name:number}}"` | a JSON **number** |
+| `"cost is {{name}}"` | text, always |
+
+Anything that is not a string — a number, a bool, a nested table — is a constant
+and passes through untouched.
+
+`:number` is the one place Meridian emits money as a number rather than an exact
+decimal string. Inside the app that rule is not negotiable; outbound, your
+receiver's schema wins — the same concession the vendor formats already make.
+You are choosing it, and choosing whatever precision your receiver's JSON parser
+imposes.
+
+### Placeholders
+
+Every alert: `event`, `alert_key`, `title`, `summary`, `delivery_id`,
+`raised_at_ms`, `raised_at_iso`.
+
+Balance alerts: `balance.provider_id`, `balance.provider_name`,
+`balance.is_available`, `balance.threshold`, `balance.currency`,
+`balance.total`, `balance.granted`, `balance.topped_up`, `balance.accounts`.
+
+Usage alerts: `usage.window_hours`, `usage.baseline_days`, `usage.multiplier`,
+`usage.window_cost`, `usage.baseline_cost`, `usage.baseline_windows`,
+`usage.is_lower_bound`, `usage.top_provider`, `usage.top_conversation`.
+
+`:number` applies to `raised_at_ms`, the four `balance.*` amounts, and the
+numeric `usage.*` ones.
+
+Two things to know about the balance fields. **`balance.currency` and the
+amounts beside it describe the account that triggered the alert** — the first
+one under the floor — because a balance alert can carry several currencies and a
+receiving schema usually has room for one; `balance.accounts` is the whole list
+if you want it. And a placeholder that is valid but **does not apply to this
+alert renders `null`** (empty, inside a larger string) rather than failing:
+losing an alert over a field your receiver may not even read is the worse
+outcome.
+
+An unknown placeholder, or `:number` on something that is not a number, is
+refused when the file is read — not at delivery. A typo caught at delivery time
+is caught by nobody, because the delivery it breaks is the one nobody is
+watching for.
+
+### What it does not do
+
+`custom` reports failure on the HTTP status alone. DingTalk, Feishu and WeCom
+answer a rejected message with 200 and an error code in the body, and those are
+handled; guessing at an error shape for an endpoint nobody here has seen would
+turn a delivered alert into a duplicate on the next tick. Use `--test` to see
+what your receiver actually answers.
 
 ## The alert payload
 
@@ -316,6 +462,10 @@ the same alert again.
 | `notify.enabled is true but no webhook is enabled` | Refused at parse: it would watch and have nowhere to report. |
 | `takes the *name* of an environment variable … not its value` | The credential was pasted where its variable's name belongs. The value is not echoed back, in case it is the credential. |
 | `needs $X, which is unset or empty` | The variable did not reach the process. In PowerShell, check you used `$env:X = '…'` and not `$X = '…'`. |
+| `is `custom` but has no `body`` | A `custom` endpoint needs the document it posts; see above. |
+| `a `body_template` only applies to `custom`` | The other formats send their own shape; drop the `body` or change the format. |
+| `is not a placeholder this app substitutes` | A typo, refused at parse. The list is above. |
+| Delivered but the receiver ignores it | Probably the wrong `format`. A vendor format sends *that vendor's* shape and signs the way that vendor signs — pointing one at your own pipe posts a document it will not recognise, unauthenticated. `--test` shows what comes back. |
 | Starts, logs `is watching`, says nothing | Expected if nothing crossed a threshold. Balance alerting needs `balance_threshold` set *and* a provider whose upstream publishes one — today, DeepSeek. Usage alerting needs a ledger this install produced. |
 | `this upstream publishes no balance` | That provider can never produce a balance alert. |
 
