@@ -130,6 +130,20 @@ events = ["balance_low", "balance_unavailable"]
 secret_env = "OPS_DINGTALK_SECRET"
 ```
 
+The file names `DEEPSEEK_PROD_KEY`; the credential goes in that variable, in the
+environment this process runs under:
+
+```bash
+export DEEPSEEK_PROD_KEY='sk-…'          # sh, bash, zsh
+```
+```powershell
+$env:DEEPSEEK_PROD_KEY = 'sk-…'          # PowerShell
+```
+
+> PowerShell's `$DEEPSEEK_PROD_KEY = '…'` makes a *shell* variable, which the
+> process never sees. The `$env:` prefix is what puts it in the environment, and
+> the daemon will otherwise report the variable as unset — correctly.
+
 Unknown keys are refused. A misspelled key is you believing you configured
 something, and the symptom of accepting it is an alert that never fires.
 
@@ -298,10 +312,10 @@ the same alert again.
 | What you see | |
 |---|---|
 | `error while loading shared libraries` / exit `0xC0000135` | The `.dll`/`.so` files are not beside the binary. |
-| `needs $X, which is unset or empty` | A named variable did not reach the process. Nothing was written. |
 | `already holds N provider(s) and is not marked as the daemon's` | `--data-dir` points at another install's directory. |
 | `notify.enabled is true but no webhook is enabled` | Refused at parse: it would watch and have nowhere to report. |
-| `is not an environment variable name` | A secret was pasted where its variable's name belongs. |
+| `takes the *name* of an environment variable … not its value` | The credential was pasted where its variable's name belongs. The value is not echoed back, in case it is the credential. |
+| `needs $X, which is unset or empty` | The variable did not reach the process. In PowerShell, check you used `$env:X = '…'` and not `$X = '…'`. |
 | Starts, logs `is watching`, says nothing | Expected if nothing crossed a threshold. Balance alerting needs `balance_threshold` set *and* a provider whose upstream publishes one — today, DeepSeek. Usage alerting needs a ledger this install produced. |
 | `this upstream publishes no balance` | That provider can never produce a balance alert. |
 
