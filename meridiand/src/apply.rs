@@ -109,18 +109,27 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
 
     for (provider, api_key) in config.provider.iter().zip(&provider_keys) {
         let existing = ops::provider::get_provider(&mut conn, &provider.id).ok();
-        // Three sources, in the order the row itself would be read: what the
-        // file says, what the row already holds, and failing both the vendor's
-        // own address. Resolving it here rather than at the insert is what lets
-        // the warning below be about the row that will actually exist.
-        let catalog_id = provider
-            .vendor
-            .clone()
-            .or_else(|| existing.as_ref().and_then(|row| row.catalog_id.clone()))
-            .or_else(|| {
-                meridian_core::provider::catalog::identify(&provider.provider_type, &provider.base_url)
-                    .map(str::to_string)
-            });
+        // Two sources and no third: what the file says, then what the address
+        // says. **Never what the row already holds.**
+        //
+        // The row looks like a reasonable fallback and is a hole. This file is
+        // a desired state applied on every start — every other column is
+        // restated unconditionally — so a `vendor` carried over from a previous
+        // apply outranks the address the operator just changed. Point a
+        // Moonshot entry at a relay and drop its `vendor`, and the stale
+        // `moonshot` survives: the watcher asks a relay for
+        // `/v1/users/me/balance` with that provider's key, and `--status`
+        // reports `balance read as moonshot` — the one diagnostic meant to
+        // catch this says the wrong thing with confidence. Changing one vendor
+        // to another is the same failure with a different endpoint.
+        //
+        // Dropping it costs nothing: a previous apply resolved by this same
+        // rule, so re-deriving reaches the same answer and the pass stays
+        // idempotent. It also makes the code agree with what `ProviderEntry`
+        // and the README have both said all along — omitted means derived.
+        let catalog_id = provider.vendor.clone().or_else(|| {
+            meridian_core::provider::catalog::identify(&provider.provider_type, &provider.base_url).map(str::to_string)
+        });
         let identity = meridian_core::provider::balance::ProviderIdentity::new(
             catalog_id.as_deref(),
             &provider.provider_type,
@@ -148,10 +157,11 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
                     name: Some(provider.name.clone()),
                     provider_type: Some(provider.provider_type.clone()),
                     base_url: Some(provider.base_url.clone()),
-                    // Written every time so that adding `vendor` to an entry
-                    // takes effect on the next apply. It can only ever be
-                    // cleared here when the row had none to begin with — the
-                    // resolution above keeps whatever was already there.
+                    // Written every time, cleared included. Adding `vendor` to
+                    // an entry has to take effect on the next apply, and so
+                    // does moving its address somewhere the catalog cannot
+                    // name — leaving the old identity in place there is how a
+                    // relay comes to be asked for a vendor's balance.
                     catalog_id: Some(catalog_id.clone()),
                     is_enabled: Some(enabled),
                     updated_at: Some(now),
@@ -375,6 +385,68 @@ mod tests {
         }
         // And a second pass does not count it again.
         assert_eq!(apply(&pool, &secrets, &narrowed).unwrap().webhooks_disabled, 0);
+    }
+
+    /// Moving an entry's address re-derives its vendor, and a vendor carried
+    /// over from the previous apply must not outrank it.
+    ///
+    /// The file is a desired state, so a stale `catalog_id` is not a default —
+    /// it is an identity the operator has just stopped asserting. Kept, it
+    /// makes the watcher ask a *relay* for `/v1/users/me/balance` with that
+    /// provider's key, while `--status` reports `balance read as moonshot`:
+    /// the one diagnostic meant to catch this saying the wrong thing with
+    /// confidence.
+    ///
+    /// Mutation check: putting `.or_else(|| existing…catalog_id.clone())` back
+    /// between the two sources turns both halves of this red.
+    #[test]
+    fn a_moved_address_re_derives_the_vendor_instead_of_keeping_the_old_one() {
+        use meridian_core::provider::balance::{ProviderIdentity, balance_vendor};
+
+        unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
+        let dir = tempfile::tempdir().unwrap();
+        let pool = test_db();
+        let secrets = secrets(dir.path());
+
+        let entry = |vendor: &str, url: &str| {
+            DaemonConfig::parse(&format!(
+                "[notify]\nenabled = false\n\n[[provider]]\nid = \"p1\"\nname = \"Kimi\"\n\
+                 type = \"openai\"\n{vendor}base_url = \"{url}\"\napi_key_env = \"TEST_DS_KEY\"\n"
+            ))
+            .unwrap()
+        };
+        let vendor_of = |pool: &DbPool| {
+            let mut conn = pool.get().unwrap();
+            let row = ops::provider::get_provider(&mut conn, "p1").unwrap();
+            balance_vendor(ProviderIdentity::new(
+                row.catalog_id.as_deref(),
+                &row.provider_type,
+                &row.base_url,
+            ))
+            .map(|vendor| vendor.catalog_id().to_string())
+        };
+
+        apply(
+            &pool,
+            &secrets,
+            &entry("vendor = \"moonshot\"\n", "https://api.moonshot.cn/v1"),
+        )
+        .unwrap();
+        assert_eq!(vendor_of(&pool).as_deref(), Some("moonshot"));
+
+        // Pointed at a relay with no `vendor`: the address names nobody, so the
+        // row must name nobody either.
+        apply(&pool, &secrets, &entry("", "https://codex-api.example/v1")).unwrap();
+        assert_eq!(
+            vendor_of(&pool),
+            None,
+            "a relay inherited the previous entry's identity"
+        );
+
+        // And moved to a different vendor's own address, it becomes that one
+        // rather than staying unresolved or reverting to the first.
+        apply(&pool, &secrets, &entry("", "https://api.siliconflow.cn/v1")).unwrap();
+        assert_eq!(vendor_of(&pool).as_deref(), Some("siliconflow"));
     }
 
     /// A half-applied configuration leaves a provider with no key, which
