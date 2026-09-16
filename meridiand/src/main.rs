@@ -194,13 +194,15 @@ async fn send_test(services: &meridian_core::services::Services, id: &str) -> Re
     ))
 }
 
-/// What each endpoint's last delivery did.
+/// Which providers are actually being watched, and what each endpoint's last
+/// delivery did.
 ///
-/// The database has recorded this since the feature existed; until now nothing
-/// could read it without opening the file by hand, which is a diagnosis nobody
-/// makes at three in the morning.
+/// The database has recorded all of it since the feature existed; until now
+/// nothing could read it without opening the file by hand, which is a diagnosis
+/// nobody makes at three in the morning.
 fn print_status(services: &meridian_core::services::Services) -> Result<(), String> {
     let mut conn = services.db.get().map_err(|error| format!("db connection: {error}"))?;
+    print_provider_status(&mut conn)?;
     let rows = meridian_core::db::ops::notification::list_webhooks(&mut conn).map_err(|error| error.to_string())?;
     if rows.is_empty() {
         println!("meridiand: no endpoints are configured");
@@ -237,6 +239,46 @@ fn print_status(services: &meridian_core::services::Services) -> Result<(), Stri
                 row.last_error.as_deref().unwrap_or("no reason recorded"),
             );
         }
+    }
+    Ok(())
+}
+
+/// Which providers a balance can actually be read for.
+///
+/// This is the half of `--status` that answers "why have I never heard from
+/// it", and the commonest reason is now resolution rather than delivery: an
+/// upstream added after the original five is reached over the OpenAI dialect,
+/// so `type` cannot name it and an entry without `vendor` at an address the
+/// catalog does not recognise is watched for nothing. That failure is
+/// completely silent otherwise — the daemon runs, the endpoints are healthy,
+/// and no alert was ever going to be raised.
+fn print_provider_status(conn: &mut meridian_core::db::PooledConn) -> Result<(), String> {
+    use meridian_core::provider::balance::{ProviderIdentity, balance_vendor};
+
+    let providers = meridian_core::db::ops::provider::list_providers(conn).map_err(|error| error.to_string())?;
+    if providers.is_empty() {
+        println!("meridiand: no providers are configured");
+    }
+    for provider in &providers {
+        let vendor = balance_vendor(ProviderIdentity::new(
+            provider.catalog_id.as_deref(),
+            &provider.provider_type,
+            &provider.base_url,
+        ));
+        println!(
+            "{}  {}  {}  {}",
+            if provider.is_enabled != 0 { "on " } else { "off" },
+            provider.id,
+            provider.provider_type,
+            provider.base_url,
+        );
+        match vendor {
+            Some(vendor) => println!("     balance read as `{}`", vendor.catalog_id()),
+            None => println!("     no balance: this upstream publishes none, or `vendor` is unset"),
+        }
+    }
+    if !providers.is_empty() {
+        println!();
     }
     Ok(())
 }

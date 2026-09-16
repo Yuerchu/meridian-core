@@ -11,7 +11,7 @@
 
 use crate::db::models::notification::NotificationEventKind;
 use crate::decimal::Decimal;
-use crate::provider::balance::{ProviderBalance, fetch_balance, supports_balance};
+use crate::provider::balance::{ProviderBalance, ProviderIdentity, fetch_balance, supports_balance};
 use crate::services::Services;
 
 use super::alert::{Alert, AlertDetail, BalanceAlert};
@@ -57,13 +57,18 @@ pub async fn check_all(services: &Services, threshold: &Decimal) -> Vec<(String,
 
     let mut out = Vec::new();
     for provider in providers {
-        if provider.is_enabled == 0 || !supports_balance(&provider.provider_type) {
+        let identity = ProviderIdentity::new(
+            provider.catalog_id.as_deref(),
+            &provider.provider_type,
+            &provider.base_url,
+        );
+        if provider.is_enabled == 0 || !supports_balance(identity) {
             continue;
         }
         let Some(api_key) = crate::agent::get_provider_api_key(&services.secrets, &provider.id) else {
             continue;
         };
-        let outcome = match fetch_balance(&provider.provider_type, &provider.base_url, &api_key).await {
+        let outcome = match fetch_balance(identity, &api_key).await {
             Ok(balance) => {
                 if balance.is_low(threshold) {
                     BalanceOutcome::Alert(Box::new(build(&provider.id, &provider.name, &balance, threshold)))

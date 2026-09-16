@@ -266,18 +266,34 @@ mod tests {
         }
     }
 
-    /// `balance` mirrors the frontend's old `BALANCE_TYPES`, which listed
-    /// DeepSeek alone: Anthropic and xAI publish nothing and OpenAI withdrew the
-    /// endpoint. `provider::balance` stays the authority — this only decides
-    /// whether a button is drawn.
+    /// `balance` only decides whether a button is drawn; `provider::balance`
+    /// stays the authority on whether asking would work. The two are held to
+    /// each other here rather than to a hardcoded list, so adding a vendor
+    /// cannot leave a button that errors or hide one that would have worked.
     #[test]
-    fn only_deepseek_advertises_a_balance() {
+    fn the_balance_flag_agrees_with_the_vendor_that_implements_it() {
         for entry in entries() {
             assert_eq!(
                 entry.balance,
-                entry.id == "deepseek",
-                "{} disagrees with supports_balance",
+                super::super::balance::BalanceVendor::from_catalog_id(&entry.id).is_some(),
+                "{} disagrees with provider::balance",
                 entry.id
+            );
+        }
+    }
+
+    /// The vendors that publish one, as of this catalog. A vendor losing its
+    /// flag by accident would otherwise pass the agreement test above by
+    /// dragging the enum with it.
+    #[test]
+    fn the_upstreams_that_publish_a_balance_still_do() {
+        for id in ["deepseek", "moonshot", "siliconflow"] {
+            assert!(find(id).is_some_and(|entry| entry.balance), "{id} lost its balance");
+        }
+        for id in ["openai", "anthropic", "xai", "google"] {
+            assert!(
+                find(id).is_some_and(|entry| !entry.balance),
+                "{id} publishes no balance"
             );
         }
     }
