@@ -7,8 +7,17 @@
     "matching is how a catch-all entry ends up rendered as a model nobody can select.",
     "",
     "This file never decides behaviour. `registry::create_provider`, `capabilities::resolve`",
-    "and `balance::supports_balance` stay authoritative; `balance` here only keeps a button",
-    "off panels where it could do nothing, so a drift is visible rather than silent.",
+    "and `balance::balance_vendor` stay authoritative; `balance` here only keeps a button",
+    "off panels where it could do nothing. A test holds the flag to `BalanceVendor`, so the",
+    "two cannot drift apart at all.",
+    "",
+    "`id` is what an account endpoint is keyed on -- `provider_type` cannot be, since every",
+    "vendor added after the original five is OpenAI-compatible and they would all be `openai`.",
+    "",
+    "Moonshot and SiliconFlow each run a mainland site and an international one on separate",
+    "accounts whose keys their own docs say are not interchangeable. Only the mainland URL is",
+    "prefilled; the other is reached by editing the base URL, and the balance code reads the",
+    "host to label the currency because neither reply carries one.",
     "",
     "`auth[]` is a list of objects, not strings, because the endpoint and the dialect belong",
     "to the login method rather than to the vendor: OpenAI's API and ChatGPT's Codex backend",
@@ -109,6 +118,56 @@
           "default_base_url": {
             "chat_completions": "https://api.deepseek.com",
             "responses": "https://api.deepseek.com"
+          }
+        }
+      ],
+      "models": []
+    },
+    {
+      "id": "moonshot",
+      "provider_type": "openai",
+      "name": "Moonshot (Kimi)",
+      "icon": "moonshot",
+      "balance": true,
+      "websites": {
+        "official": "https://www.moonshot.cn",
+        "api_key": "https://platform.moonshot.cn/console/api-keys",
+        "docs": "https://platform.moonshot.cn/docs",
+        "models": "https://platform.moonshot.cn/docs/pricing"
+      },
+      "auth": [
+        {
+          "id": "api_key",
+          "credential_kind": "api_key",
+          "transport_profile": "standard",
+          "api_formats": ["chat_completions"],
+          "default_base_url": {
+            "chat_completions": "https://api.moonshot.cn/v1"
+          }
+        }
+      ],
+      "models": []
+    },
+    {
+      "id": "siliconflow",
+      "provider_type": "openai",
+      "name": "SiliconFlow",
+      "icon": "siliconcloud",
+      "balance": true,
+      "websites": {
+        "official": "https://www.siliconflow.cn",
+        "api_key": "https://cloud.siliconflow.cn/account/ak",
+        "docs": "https://docs.siliconflow.cn",
+        "models": "https://cloud.siliconflow.cn/models"
+      },
+      "auth": [
+        {
+          "id": "api_key",
+          "credential_kind": "api_key",
+          "transport_profile": "standard",
+          "api_formats": ["chat_completions"],
+          "default_base_url": {
+            "chat_completions": "https://api.siliconflow.cn/v1"
           }
         }
       ],

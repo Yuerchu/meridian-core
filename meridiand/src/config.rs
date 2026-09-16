@@ -68,11 +68,21 @@ pub struct ProviderEntry {
     /// key's keyring entry is named after, so it may not change casually.
     pub id: String,
     pub name: String,
-    /// Matched against `provider::balance::supports_balance`, which today is
-    /// only `deepseek`. Validated at apply time rather than here, so the error
-    /// can name what is supported.
+    /// Which adapter family sends the requests — one of the five
+    /// `registry::ProviderType` values. It does *not* decide whether a balance
+    /// can be read; `vendor` does, because every upstream added since those
+    /// five is OpenAI-compatible.
     #[serde(rename = "type")]
     pub provider_type: String,
+    /// Which vendor in the shipped catalog this is, which is what an account
+    /// endpoint belongs to.
+    ///
+    /// Optional, and left out it is derived from `base_url` by the same rule
+    /// the desktop uses — which answers only for a vendor's own address,
+    /// verbatim. Naming it is how an operator reaches a vendor's *other* site:
+    /// Moonshot and SiliconFlow each run a mainland and an international one,
+    /// only the first of which is in the catalog's prefills.
+    pub vendor: Option<String>,
     pub base_url: String,
     /// The *name* of the environment variable holding the key, never the key.
     pub api_key_env: String,
@@ -206,6 +216,22 @@ impl DaemonConfig {
             validate_env_name("provider", &provider.id, &provider.api_key_env)?;
             meridian_core::notify::validate_webhook_url(&provider.base_url)
                 .map_err(|error| format!("provider `{}`: base_url {error}", provider.id))?;
+            // A vendor the catalog does not know is refused here rather than
+            // stored: it would reach the database as a row nothing can resolve,
+            // and the only symptom would be a balance that is never read.
+            if let Some(vendor) = &provider.vendor
+                && meridian_core::provider::catalog::find(vendor).is_none()
+            {
+                return Err(format!(
+                    "provider `{}`: `{vendor}` is not a vendor in the catalog ({})",
+                    provider.id,
+                    meridian_core::provider::catalog::entries()
+                        .iter()
+                        .map(|entry| entry.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
 
         // The same ceiling the desktop's create command enforces. It is not a
@@ -411,6 +437,42 @@ mod tests {
             let fine = MINIMAL.replace("\"deepseek-prod\"", &format!("\"{good}\""));
             assert!(DaemonConfig::parse(&fine).is_ok(), "id {good:?} must be accepted");
         }
+    }
+
+    /// `vendor` is the only thing that can name an upstream added since the
+    /// original five, since they are all reached over the OpenAI dialect and
+    /// so all carry `type = "openai"`.
+    #[test]
+    fn a_vendor_is_what_names_an_openai_compatible_upstream() {
+        let kimi = format!(
+            "{MINIMAL}\n[[provider]]\nid = \"kimi\"\nname = \"Kimi\"\ntype = \"openai\"\n\
+             vendor = \"moonshot\"\nbase_url = \"https://api.moonshot.ai/v1\"\napi_key_env = \"KIMI_KEY\"\n"
+        );
+        let config = DaemonConfig::parse(&kimi).unwrap();
+        assert_eq!(config.provider[1].vendor.as_deref(), Some("moonshot"));
+        assert_eq!(config.provider[1].provider_type, "openai");
+
+        // Omitting it is legal: the address is read the same way the desktop
+        // reads it, which answers for a vendor's own URL and nothing else.
+        assert_eq!(config.provider[0].vendor, None);
+    }
+
+    /// A vendor the catalog does not know is refused at parse rather than
+    /// stored. Stored, it would reach the database as a row nothing can
+    /// resolve, and the only symptom would be a balance never read — which is
+    /// indistinguishable from an account that is simply healthy.
+    #[test]
+    fn an_unknown_vendor_is_refused_and_the_error_lists_the_real_ones() {
+        let typo = format!(
+            "{MINIMAL}\n[[provider]]\nid = \"kimi\"\nname = \"Kimi\"\ntype = \"openai\"\n\
+             vendor = \"kimi\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key_env = \"KIMI_KEY\"\n"
+        );
+        let error = DaemonConfig::parse(&typo).unwrap_err();
+        assert!(error.contains("is not a vendor in the catalog"), "{error}");
+        assert!(
+            error.contains("moonshot"),
+            "the message names what is available: {error}"
+        );
     }
 
     #[test]

@@ -19,11 +19,13 @@ need `meridiand`.
 
 ## What it can actually watch
 
-**Balances — DeepSeek only.** Almost no vendor publishes one: Anthropic and xAI
-publish nothing, and OpenAI withdrew the endpoint that used to. This is a fact
-about the vendors rather than a gap here, and a provider whose upstream
-publishes no balance is logged as unwatchable at startup rather than silently
-polled for nothing.
+**Balances — DeepSeek, Moonshot (Kimi) and SiliconFlow.** Most vendors publish
+nothing: Anthropic and xAI never did, OpenAI withdrew the endpoint that used to,
+and OpenRouter's account credits need a *management* key rather than the
+inference key a provider row holds. This is a fact about the vendors rather than
+a gap here, and a provider no balance can be read for is logged as unwatchable
+at startup rather than silently polled for nothing. `--status` says which is
+which per provider.
 
 **Spending — only what this install spent.** The usage-surge watcher reads
 `audit_messages`, which holds the turns *this* process ran. If your keys are
@@ -54,16 +56,29 @@ meridiand: alertpipe accepted the test — HTTP 200 in 13ms, 1 attempt(s)
   it answered: {"ok":true}
 ```
 
-`--status` reads what the deliveries recorded. `last_success_at` is kept across
-failures on purpose — "it worked at 09:00 and has failed since" is the useful
-sentence, and clearing it would leave only "it is failing":
+`--status` reads what the database holds, in two halves: which providers a
+balance can actually be read for, and what each endpoint's last delivery did.
+`last_success_at` is kept across failures on purpose — "it worked at 09:00 and
+has failed since" is the useful sentence, and clearing it would leave only "it
+is failing":
 
 ```
 $ meridiand --config m.toml --status
+on   deepseek-prod  deepseek  https://api.deepseek.com
+     balance read as `deepseek`
+on   kimi-prod  openai  https://api.moonshot.cn/v1
+     balance read as `moonshot`
+on   relay  openai  https://codex-api.example/v1
+     no balance: this upstream publishes none, or `vendor` is unset
+
 on   alertpipe  [balance_low,balance_unavailable]  http://alertpipe.internal/webhooks/balance
      last attempt 2026-09-15T18:57:37.699Z   last success 2026-09-15T18:56:53.001Z
      1 consecutive failure(s): network error: error sending request
 ```
+
+The provider half is worth reading first, because the failure it shows is
+otherwise completely silent: the daemon runs, the endpoints are healthy, and no
+alert was ever going to be raised.
 
 `--config` is required because no location is conventional for a configuration
 file, and picking one silently would be worse than saying so. A data directory
@@ -194,9 +209,48 @@ already been through a binary double by the time it is parsed, and is refused.
 | Provider | |
 |---|---|
 | `id` | Letters, digits, `-`, `_`. Changing it orphans the stored key. |
-| `name`, `type`, `base_url` | |
+| `name`, `base_url` | |
+| `type` | The adapter family: `openai`, `anthropic`, `deepseek`, `xai`, `google`. It says how requests are *sent*; it does not decide whether a balance can be read. |
+| `vendor` | Which upstream this actually is — see below. Optional. |
 | `api_key_env` | The variable's **name**. |
 | `enabled` | Default `true`. |
+
+#### Which upstreams publish a balance
+
+Three, and `vendor` is what names them: **`deepseek`**, **`moonshot`**
+(Moonshot AI, whose platform is branded Kimi) and **`siliconflow`**. Everyone
+else publishes nothing — Anthropic and xAI never did, OpenAI withdrew the
+endpoint, and OpenRouter's account credits need a *management* key rather than
+the inference key a provider row holds.
+
+`type` cannot answer this. Moonshot and SiliconFlow are both reached over the
+OpenAI dialect, so both are `type = "openai"` and only `vendor` tells them
+apart. Left out, `vendor` is inferred from `base_url` when that is a vendor's
+own address verbatim — a relay address identifies nobody and is never probed,
+which is deliberate: the alternative is posting your API key to an account
+endpoint whose operator never published one.
+
+```toml
+[[provider]]
+id = "kimi-prod"
+name = "Kimi prod"
+type = "openai"                  # the dialect
+vendor = "moonshot"              # whose account endpoint to ask
+base_url = "https://api.moonshot.cn/v1"
+api_key_env = "KIMI_PROD_KEY"
+```
+
+Moonshot and SiliconFlow each run a mainland site and an international one, on
+separate accounts whose keys their own documentation says are not
+interchangeable. Both are supported; set `base_url` to the one your key belongs
+to (`api.moonshot.cn` / `api.moonshot.ai`, `api.siliconflow.cn` /
+`api.siliconflow.com`) and name `vendor` explicitly, since only the mainland
+addresses are recognised by inference. The currency in an alert is taken from
+the host, because neither upstream says which one its figures are in.
+
+A provider no balance can be read for is logged at startup rather than refused —
+it is a legitimate row to have, and the commonest cause of an unexpected one is
+a missing `vendor`.
 
 | Webhook | |
 |---|---|
@@ -466,7 +520,8 @@ the same alert again.
 | `a `body_template` only applies to `custom`` | The other formats send their own shape; drop the `body` or change the format. |
 | `is not a placeholder this app substitutes` | A typo, refused at parse. The list is above. |
 | Delivered but the receiver ignores it | Probably the wrong `format`. A vendor format sends *that vendor's* shape and signs the way that vendor signs — pointing one at your own pipe posts a document it will not recognise, unauthenticated. `--test` shows what comes back. |
-| Starts, logs `is watching`, says nothing | Expected if nothing crossed a threshold. Balance alerting needs `balance_threshold` set *and* a provider whose upstream publishes one — today, DeepSeek. Usage alerting needs a ledger this install produced. |
+| Starts, logs `is watching`, says nothing | Expected if nothing crossed a threshold. Balance alerting needs `balance_threshold` set *and* a provider a balance can be read for — run `--status`, which says so per provider. Usage alerting needs a ledger this install produced. |
+| `--status` says `no balance` for an upstream that has one | Its `vendor` is unset and its address is not one the catalog recognises — a relay, or a vendor's other site. Name `vendor` and re-run. |
 | `this upstream publishes no balance` | That provider can never produce a balance alert. |
 
 Logs go to stdout and to `<data-dir>/logs/meridian.log` as JSONL.

@@ -108,17 +108,37 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
     };
 
     for (provider, api_key) in config.provider.iter().zip(&provider_keys) {
-        if !meridian_core::provider::balance::supports_balance(&provider.provider_type) {
+        let existing = ops::provider::get_provider(&mut conn, &provider.id).ok();
+        // Three sources, in the order the row itself would be read: what the
+        // file says, what the row already holds, and failing both the vendor's
+        // own address. Resolving it here rather than at the insert is what lets
+        // the warning below be about the row that will actually exist.
+        let catalog_id = provider
+            .vendor
+            .clone()
+            .or_else(|| existing.as_ref().and_then(|row| row.catalog_id.clone()))
+            .or_else(|| {
+                meridian_core::provider::catalog::identify(&provider.provider_type, &provider.base_url)
+                    .map(str::to_string)
+            });
+        let identity = meridian_core::provider::balance::ProviderIdentity::new(
+            catalog_id.as_deref(),
+            &provider.provider_type,
+            &provider.base_url,
+        );
+        if !meridian_core::provider::balance::supports_balance(identity) {
             // Not a refusal: a provider whose upstream publishes no balance is
             // a legitimate row to have. But it is worth saying, because the
-            // reason nothing is ever reported about it is not otherwise visible.
+            // reason nothing is ever reported about it is not otherwise visible
+            // — and the commonest cause is now a missing `vendor`, since a
+            // relay address identifies nobody and must not be probed.
             tracing::warn!(
                 provider = %provider.id,
                 provider_type = %provider.provider_type,
-                "this upstream publishes no balance; the daemon can watch it for nothing"
+                vendor = catalog_id.as_deref().unwrap_or("<unidentified>"),
+                "no balance can be read for this provider; the daemon can watch it for nothing"
             );
         }
-        let existing = ops::provider::get_provider(&mut conn, &provider.id).ok();
         let enabled = i32::from(provider.enabled);
         if existing.is_some() {
             ops::provider::update_provider(
@@ -128,6 +148,11 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
                     name: Some(provider.name.clone()),
                     provider_type: Some(provider.provider_type.clone()),
                     base_url: Some(provider.base_url.clone()),
+                    // Written every time so that adding `vendor` to an entry
+                    // takes effect on the next apply. It can only ever be
+                    // cleared here when the row had none to begin with — the
+                    // resolution above keeps whatever was already there.
+                    catalog_id: Some(catalog_id.clone()),
                     is_enabled: Some(enabled),
                     updated_at: Some(now),
                     ..Default::default()
@@ -147,7 +172,7 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
                     created_at: now,
                     updated_at: now,
                     api_format: "chat_completions",
-                    catalog_id: meridian_core::provider::catalog::identify(&provider.provider_type, &provider.base_url),
+                    catalog_id: catalog_id.as_deref(),
                     credential_kind: "api_key",
                     transport_profile: "standard",
                 },
