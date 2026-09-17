@@ -340,10 +340,15 @@ struct ResponseError {
 /// The top-level `error` stream event. Not `ResponseError`: this one carries
 /// the event's own envelope (`type`, `param`, `sequence_number`), which would
 /// otherwise trip the unknown-field warning on every error.
+///
+/// Two wire shapes exist: the standard Responses API puts `code` and `message`
+/// at the top level, while the Codex backend nests them inside an `error`
+/// object. Both are accepted; the nested form wins when both are present.
 #[derive(Deserialize)]
 struct StreamErrorEvent {
     code: Option<String>,
     message: Option<String>,
+    error: Option<StreamErrorInner>,
     #[serde(default, rename = "type")]
     _type: IgnoredAny,
     #[serde(default, rename = "param")]
@@ -352,6 +357,28 @@ struct StreamErrorEvent {
     _sequence_number: IgnoredAny,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
+}
+
+#[derive(Deserialize)]
+struct StreamErrorInner {
+    code: Option<String>,
+    message: Option<String>,
+}
+
+impl StreamErrorEvent {
+    fn code(&self) -> Option<&str> {
+        self.error
+            .as_ref()
+            .and_then(|e| e.code.as_deref())
+            .or(self.code.as_deref())
+    }
+
+    fn message(&self) -> Option<&str> {
+        self.error
+            .as_ref()
+            .and_then(|e| e.message.as_deref())
+            .or(self.message.as_deref())
+    }
 }
 
 /// Every `ResponseStreamEvent` type the specification lists that this adapter
@@ -799,8 +826,8 @@ pub(super) fn parse_responses_event(
             match parsed {
                 Ok(error) => {
                     warn_extra_fields("responses_stream_error", &error.extra);
-                    let code = error.code.as_deref().unwrap_or("unknown");
-                    let message = error.message.as_deref().unwrap_or("Unknown error");
+                    let code = error.code().unwrap_or("unknown");
+                    let message = error.message().unwrap_or("Unknown error");
                     let status = if code.contains("rate_limit") { 429 } else { 400 };
                     vec![Err(ProviderError::Api {
                         status,
@@ -1345,6 +1372,24 @@ mod tests {
             &mut state,
         );
         assert!(matches!(out.first(), Some(Err(ProviderError::Api { status: 400, .. }))));
+    }
+
+    #[test]
+    fn a_nested_stream_error_is_read_from_the_error_object() {
+        let mut state = StreamState::default();
+        let out = parse_responses_event(
+            "error",
+            r#"{"type":"error","error":{"code":"invalid_request","message":"Unsupported parameter: max_output_tokens"},"sequence_number":0}"#,
+            &mut state,
+        );
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Err(ProviderError::Api { status, body }) => {
+                assert_eq!(*status, 400);
+                assert!(body.contains("Unsupported parameter"), "{body}");
+            }
+            other => panic!("expected an API error, got {other:?}"),
+        }
     }
 
     #[test]

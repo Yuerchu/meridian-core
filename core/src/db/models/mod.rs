@@ -21,7 +21,6 @@ pub mod plan;
 pub mod plan_review;
 pub mod preference;
 pub mod project;
-pub mod prompt_template;
 pub mod provider;
 pub mod queue;
 pub mod queued_prompt_context_item;

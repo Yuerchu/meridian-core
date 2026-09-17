@@ -190,11 +190,6 @@ pub fn bootstrap_with_secrets(
         }
     }
 
-    // `prompt_templates` is user-owned storage for reusable persona
-    // prompts; nothing is seeded into it. The built-in agent baseline
-    // lives in `agent::base_prompt` instead, so it can be revised on
-    // upgrade rather than frozen into a first-run seed.
-
     // Seed built-in tool categories and presets
     {
         let mut conn = pool.get().expect("db connection");
