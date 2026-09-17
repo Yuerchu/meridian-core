@@ -483,20 +483,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    prompt_templates (id) {
-        id -> Text,
-        name -> Text,
-        description -> Nullable<Text>,
-        category -> Text,
-        template_text -> Text,
-        is_builtin -> Integer,
-        sort_order -> Integer,
-        created_at -> BigInt,
-        updated_at -> BigInt,
-    }
-}
-
-diesel::table! {
     skills (dir_name) {
         dir_name -> Text,
         llm_name -> Text,
@@ -875,7 +861,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     model_configs,
     preferences,
     projects,
-    prompt_templates,
     providers,
     queued_prompts,
     queued_prompt_context_items,

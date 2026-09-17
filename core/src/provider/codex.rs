@@ -85,12 +85,11 @@ impl CodexProvider {
             body["instructions"] = serde_json::Value::String(instructions);
         }
 
-        // Deliberately absent: temperature, top_p, service_tier. The first two
-        // are not honoured on this backend, and `service_tier` prices a request
-        // against an API account that a subscription does not have.
-        if let Some(max) = params.max_tokens {
-            body["max_output_tokens"] = serde_json::json!(max);
-        }
+        // Deliberately absent: temperature, top_p, service_tier,
+        // max_output_tokens. The first two are not honoured on this backend,
+        // `service_tier` prices a request against an API account that a
+        // subscription does not have, and `max_output_tokens` is rejected
+        // outright — the Codex backend does not accept it.
         if let Some(effort) = params.thinking_effort.as_deref() {
             body["reasoning"] = serde_json::json!({ "effort": effort, "summary": "auto" });
         }
@@ -545,6 +544,7 @@ mod tests {
             model: "gpt-5.6".into(),
             temperature: Some(0.7),
             top_p: Some(0.9),
+            max_tokens: Some(16384),
             fast: true,
             ..Default::default()
         };
@@ -563,6 +563,7 @@ mod tests {
             body.get("service_tier").is_none(),
             "priority pricing belongs to an API account"
         );
+        assert!(body.get("max_output_tokens").is_none(), "rejected by the Codex backend");
     }
 
     /// The headers the backend requires, and the one that is ours to choose.
