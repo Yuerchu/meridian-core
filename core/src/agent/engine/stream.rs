@@ -44,6 +44,7 @@ pub(crate) async fn consume_stream(
     let mut tool_acc: Vec<(String, String, String)> = Vec::new();
     let mut usage = None;
     let mut finish_reason = None;
+    let mut response_model: Option<String> = None;
     // Some OpenAI-compatible providers inline reasoning as <think> tags in the
     // text stream instead of a separate reasoning field; route it accordingly.
     let mut think_parser = InlineHiddenTagParser::new_streaming(vec![InlineTagSpec {
@@ -151,6 +152,11 @@ pub(crate) async fn consume_stream(
                     Ok(Some(Ok(provider::StreamEvent::Error { ref message }))) => {
                         return Err(message.clone());
                     }
+                    Ok(Some(Ok(provider::StreamEvent::ResponseModel { ref model }))) => {
+                        if response_model.is_none() {
+                            response_model = Some(model.clone());
+                        }
+                    }
                     Ok(Some(Ok(provider::StreamEvent::CompactionResult { .. }))) => {}
                     Ok(Some(Ok(provider::StreamEvent::MessageStart { .. }))) => {}
                     Ok(Some(Err(e))) => {
@@ -211,6 +217,7 @@ pub(crate) async fn consume_stream(
         tool_calls,
         usage,
         finish_reason,
+        response_model,
         ran_to_completion,
     })
 }

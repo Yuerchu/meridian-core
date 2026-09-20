@@ -104,6 +104,11 @@ pub struct MessageRow {
     /// agent reported nothing for, which is every native row. See migration
     /// 56. Written after the row by `record_tool_diffs`, never at insert.
     pub tool_diffs: Option<String>,
+    /// The model the upstream actually used, as reported in the response.
+    /// `None` when the provider did not say, or for rows written before
+    /// migration 60. Compared against `model_id` to detect silent
+    /// substitutions.
+    pub response_model_id: Option<String>,
 }
 
 /// The four token counts one message row records.
@@ -168,4 +173,5 @@ pub struct MessageInsert<'a> {
     pub cache_write_tokens: Option<i32>,
     pub server_tool_calls: Option<i32>,
     pub provider_name: Option<&'a str>,
+    pub response_model_id: Option<&'a str>,
 }

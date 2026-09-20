@@ -1035,6 +1035,7 @@ mod tests {
                 server_tool_price: None,
                 billing_mode: "metered",
                 self_id: Some(10001),
+                response_model_id: None,
             })
             .execute(conn)
             .unwrap();
@@ -1122,6 +1123,7 @@ mod tests {
                 server_tool_price: None,
                 billing_mode: mode,
                 self_id: None,
+                response_model_id: None,
             })
             .execute(conn)
             .unwrap();
@@ -1169,6 +1171,7 @@ mod tests {
                 server_tool_price: None,
                 billing_mode: "metered",
                 self_id: None,
+                response_model_id: None,
             })
             .execute(conn)
             .unwrap();
@@ -1699,6 +1702,7 @@ mod tests {
                 server_tool_price: None,
                 billing_mode: "metered",
                 self_id: None,
+                response_model_id: None,
             })
             .execute(conn)
             .unwrap();
@@ -2355,6 +2359,7 @@ mod decimal_tests {
                 server_tool_calls: Some(1),
                 server_tool_price: Some(decimal("5")),
                 billing_mode,
+                response_model_id: None,
             })
             .execute(conn)?;
         Ok(())

@@ -329,6 +329,7 @@ pub fn record(conn: &mut SqliteConnection, msg: &MessageRow) -> QueryResult<()> 
             server_tool_price: snap.prices.server_tool_price,
             self_id: snap.self_id,
             billing_mode: snap.billing_mode.as_str(),
+            response_model_id: msg.response_model_id.as_deref(),
         })
         .execute(conn)?;
     Ok(())
@@ -430,6 +431,7 @@ pub fn record_side_request(conn: &mut SqliteConnection, cost: SideRequestCost<'_
             server_tool_price: snap.prices.server_tool_price,
             self_id: snap.self_id,
             billing_mode: snap.billing_mode.as_str(),
+            response_model_id: None,
         })
         .execute(conn)?;
     Ok(())
@@ -489,6 +491,7 @@ mod tests {
             cache_write_tokens: None,
             server_tool_calls: None,
             provider_name: None,
+            response_model_id: None,
         }
     }
 

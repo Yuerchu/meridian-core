@@ -61,6 +61,7 @@ pub struct AuditMessageRow {
     /// a subscription". Without it both are unpriced, and the second gets
     /// reported as cost we failed to account for.
     pub billing_mode: String,
+    pub response_model_id: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -98,4 +99,5 @@ pub struct AuditMessageInsert<'a> {
     /// Defaults to `metered` at the database level, so a caller that says
     /// nothing gets exactly today's behaviour.
     pub billing_mode: &'a str,
+    pub response_model_id: Option<&'a str>,
 }

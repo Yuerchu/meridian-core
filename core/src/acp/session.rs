@@ -791,6 +791,7 @@ impl Shared {
             // usage struct does not have to be echoed by a module that has no
             // opinion about any of them.
             MessageUsage::default(),
+            None,
         )
         .await
         {
@@ -2713,6 +2714,7 @@ impl AcpSession {
                         cache_write_tokens: None,
                         server_tool_calls: None,
                         provider_name: None,
+                        response_model_id: None,
                     },
                     head.as_deref(),
                 )?;

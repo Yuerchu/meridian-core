@@ -1105,6 +1105,7 @@ fn blank<'a>() -> MessageInsert<'a> {
         cache_write_tokens: None,
         server_tool_calls: None,
         provider_name: None,
+        response_model_id: None,
     }
 }
 

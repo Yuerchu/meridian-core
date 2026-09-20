@@ -360,6 +360,7 @@ mod ledger_tests {
                 server_tool_price: None,
                 billing_mode: "metered",
                 self_id: None,
+                response_model_id: None,
             })
             .execute(conn)
             .unwrap();

@@ -77,6 +77,7 @@ mod tests {
             provider_state: None,
             auto_review: None,
             tool_diffs: None,
+            response_model_id: None,
         }
     }
 

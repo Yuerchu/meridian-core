@@ -641,6 +641,12 @@ pub enum StreamEvent {
     /// what the reader sees, which without it is a minute of silence followed
     /// by an answer from nowhere.
     ServerToolCall(ServerToolCall),
+    /// The model the upstream says it used, as reported in the response
+    /// envelope. Emitted once per stream — the first chunk that carries it.
+    /// `consume_stream` keeps the first and ignores the rest.
+    ResponseModel {
+        model: String,
+    },
     UsageUpdate {
         usage: TokenUsage,
     },

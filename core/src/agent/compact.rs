@@ -381,6 +381,7 @@ pub async fn do_compact(
                     cache_write_tokens: None,
                     server_tool_calls: None,
                     provider_name: None,
+                    response_model_id: None,
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -1160,6 +1161,7 @@ mod tests {
             provider_state: None,
             auto_review: None,
             tool_diffs: None,
+            response_model_id: None,
         };
         let result = render_compact_sections(&prepare_compact_input(&[&msg], &HashMap::new()).unwrap());
         assert!(result.contains("truncated"));
@@ -1198,6 +1200,7 @@ mod tests {
             provider_state: None,
             auto_review: None,
             tool_diffs: None,
+            response_model_id: None,
         };
         let item = MessageContextItemRow {
             id: "ctx1".into(),
@@ -1306,6 +1309,7 @@ mod tests {
             provider_state: None,
             auto_review: None,
             tool_diffs: None,
+            response_model_id: None,
         };
         assert!(prepare_compact_input(&[&row], &HashMap::new()).unwrap().is_empty());
 

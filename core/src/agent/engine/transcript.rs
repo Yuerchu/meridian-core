@@ -100,6 +100,7 @@ pub(crate) async fn begin_assistant(
                 cache_write_tokens: None,
                 server_tool_calls: None,
                 provider_name: provider_name.as_deref(),
+                response_model_id: None,
             },
             parent.as_deref(),
         )
@@ -123,6 +124,7 @@ pub(crate) async fn complete_assistant(
     tool_calls_json: Option<&str>,
     provider_state: Option<&str>,
     usage: MessageUsage,
+    response_model_id: Option<&str>,
 ) -> Result<(), String> {
     let pool = pool.clone();
     let msg_id = message_id.to_string();
@@ -130,6 +132,7 @@ pub(crate) async fn complete_assistant(
     let reasoning = reasoning.map(str::to_string);
     let tool_calls_json = tool_calls_json.map(str::to_string);
     let provider_state = provider_state.map(str::to_string);
+    let response_model = response_model_id.map(str::to_string);
     tokio::task::spawn_blocking(move || {
         let mut conn = pool.get().map_err(|e| e.to_string())?;
         crate::db::ops::message::update_assistant_message(
@@ -140,6 +143,7 @@ pub(crate) async fn complete_assistant(
             tool_calls_json.as_deref(),
             provider_state.as_deref(),
             &usage,
+            response_model.as_deref(),
         )
         .map_err(|e| e.to_string())?;
         // Recorded here rather than when the row was opened: this is the
@@ -233,6 +237,7 @@ pub(crate) async fn append_tool_result(
                 cache_write_tokens: None,
                 server_tool_calls: None,
                 provider_name: None,
+                response_model_id: None,
             },
             parent.as_deref(),
         )
@@ -333,6 +338,7 @@ pub async fn write_steering(
                 cache_write_tokens: None,
                 server_tool_calls: None,
                 provider_name: None,
+                response_model_id: None,
             },
             parent.as_deref(),
         )
@@ -431,6 +437,7 @@ mod tests {
                 cache_write_tokens: Some(43),
                 server_tool_calls: Some(47),
             },
+            None,
         )
         .await
         .unwrap();
@@ -484,6 +491,7 @@ mod tests {
                 cache_write_tokens: None,
                 server_tool_calls: Some(2),
             },
+            None,
         )
         .await
         .unwrap();
@@ -555,6 +563,7 @@ mod tests {
                     None,
                     None,
                     &MessageUsage::default(),
+                    None,
                 )
                 .is_err(),
                 "query_only must make this a real failure",
@@ -562,9 +571,18 @@ mod tests {
         }
 
         assert!(
-            complete_assistant(&pool, &id, "the answer", None, None, None, MessageUsage::default())
-                .await
-                .is_err()
+            complete_assistant(
+                &pool,
+                &id,
+                "the answer",
+                None,
+                None,
+                None,
+                MessageUsage::default(),
+                None
+            )
+            .await
+            .is_err()
         );
 
         {

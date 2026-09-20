@@ -229,6 +229,7 @@ fn take_one(
             cache_write_tokens: None,
             server_tool_calls: None,
             provider_name: None,
+            response_model_id: None,
         };
 
         let taken = crate::db::ops::queue::take_next(

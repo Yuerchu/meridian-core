@@ -400,8 +400,8 @@ pub struct ChatChunk {
     _object: IgnoredAny,
     #[serde(default, rename = "created")]
     _created: IgnoredAny,
-    #[serde(default, rename = "model")]
-    _model: IgnoredAny,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default, rename = "service_tier")]
     _service_tier: IgnoredAny,
     #[serde(default, rename = "system_fingerprint")]
@@ -628,8 +628,9 @@ struct ChatResponseDto {
     _object: IgnoredAny,
     #[serde(default, rename = "created")]
     _created: IgnoredAny,
-    #[serde(default, rename = "model")]
-    _model: IgnoredAny,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub model: Option<String>,
     #[serde(default, rename = "service_tier")]
     _service_tier: IgnoredAny,
     #[serde(default, rename = "system_fingerprint")]
@@ -976,6 +977,7 @@ impl ChatProvider for OpenAICompatProvider {
         let resp = transport.stream(req).await?;
         let google_model = (self.flavor == OpenAICompatFlavor::Google).then(|| params.model.clone());
 
+        let mut response_model_emitted = false;
         let stream = resp
             .bytes
             .map(|r| r.map_err(ProviderError::Transport))
@@ -991,6 +993,10 @@ impl ChatProvider for OpenAICompatProvider {
                                 chunk.warn_ignored_fields();
                                 let (mut stream_events, finish_reason, usage) =
                                     parse_openai_sse_events_for(&chunk, google_model.as_deref());
+                                if !response_model_emitted && let Some(ref model) = chunk.model {
+                                    stream_events.push(StreamEvent::ResponseModel { model: model.clone() });
+                                    response_model_emitted = true;
+                                }
                                 if let Some(u) = usage {
                                     stream_events.push(StreamEvent::UsageUpdate { usage: u });
                                 }
