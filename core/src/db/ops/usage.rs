@@ -28,7 +28,7 @@ use diesel::sqlite::SqliteConnection;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::pricing::{BilledTokens, BillingMode, Prices, cost_of};
-use crate::db::schema::{conversations, model_configs, projects};
+use crate::db::schema::{conversations, projects};
 use crate::decimal::Decimal;
 use crate::turn::TurnOrigin;
 
@@ -739,42 +739,32 @@ fn billing_mode_of(group: &GroupRow) -> QueryResult<BillingMode> {
         .map_err(|error| diesel::result::Error::DeserializationError(Box::new(error)))
 }
 
+/// Today's rates for every configured model, for rows that were written before
+/// prices were snapshotted.
+///
+/// Resolved through `agent::model_config::effective` rather than read straight
+/// off the table, because since migration 61 the columns alone do not say what
+/// a model costs: a row that does not override is priced by its profile, and a
+/// row that does carries rates the profile never saw. Reading the columns here
+/// would report every non-overriding model as unpriced.
+///
+/// Base rates only, as before: a tier needs a prompt size, and this fallback is
+/// reached from a `SUM` over rows that are no longer one request.
 fn current_prices(conn: &mut SqliteConnection) -> QueryResult<HashMap<(String, String), Prices>> {
-    let rows = model_configs::table
-        .select((
-            model_configs::provider_id,
-            model_configs::model_id,
-            model_configs::input_price,
-            model_configs::output_price,
-            model_configs::cache_read_price,
-            model_configs::cache_write_price,
-            model_configs::server_tool_price,
-        ))
-        .load::<(
-            String,
-            String,
-            Option<Decimal>,
-            Option<Decimal>,
-            Option<Decimal>,
-            Option<Decimal>,
-            Option<Decimal>,
-        )>(conn)?;
-    Ok(rows
+    Ok(crate::agent::model_config::load_all(conn)?
         .into_iter()
-        .map(
-            |(provider, model, input, output, cache_read, cache_write, server_tool)| {
-                (
-                    (provider, model),
-                    Prices {
-                        input_price: input,
-                        output_price: output,
-                        cache_read_price: cache_read,
-                        cache_write_price: cache_write,
-                        server_tool_price: server_tool,
-                    },
-                )
-            },
-        )
+        .map(|config| {
+            (
+                (config.provider_id.clone(), config.model_id.clone()),
+                Prices {
+                    input_price: config.input_price,
+                    output_price: config.output_price,
+                    cache_read_price: config.cache_read_price,
+                    cache_write_price: config.cache_write_price,
+                    server_tool_price: config.server_tool_price,
+                },
+            )
+        })
         .collect())
 }
 
@@ -984,7 +974,7 @@ fn label(conn: &mut SqliteConnection, dimension: UsageDimension, buckets: &mut [
 mod tests {
     use super::*;
     use crate::db::models::audit::AuditMessageInsert;
-    use crate::db::schema::audit_messages;
+    use crate::db::schema::{audit_messages, model_configs};
     use crate::db::test_db;
 
     fn decimal(raw: &str) -> Decimal {
@@ -1045,8 +1035,8 @@ mod tests {
     /// to find. Without this the tests below could not tell "refused to price"
     /// from "had no price to use".
     fn seed_model(conn: &mut SqliteConnection, model: &str, input: &str, output: &str) {
-        use crate::db::models::model_config::ModelConfigInsert;
         use crate::db::models::provider::ProviderInsert;
+        use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
         diesel::insert_into(crate::db::schema::providers::table)
             .values(&ProviderInsert {
@@ -1065,9 +1055,9 @@ mod tests {
             })
             .execute(conn)
             .unwrap();
-        crate::db::ops::model_config::upsert(
+        seed_flat(
             conn,
-            &ModelConfigInsert {
+            &FlatModelConfig {
                 id: "mc1",
                 provider_id: "p1",
                 model_id: model,
@@ -2046,8 +2036,8 @@ mod tests {
     /// would be a worse answer than a retroactive one.
     #[test]
     fn a_row_recorded_before_prices_were_kept_falls_back_to_the_current_one() {
-        use crate::db::models::model_config::ModelConfigInsert;
         use crate::db::models::provider::ProviderInsert;
+        use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
         let pool = test_db();
         let mut conn = pool.get().unwrap();
@@ -2068,9 +2058,9 @@ mod tests {
             })
             .execute(&mut conn)
             .unwrap();
-        crate::db::ops::model_config::upsert(
+        seed_flat(
             &mut conn,
-            &ModelConfigInsert {
+            &FlatModelConfig {
                 id: "mc1",
                 provider_id: "p1",
                 model_id: "m",

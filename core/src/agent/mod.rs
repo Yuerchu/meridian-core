@@ -13,6 +13,7 @@ pub mod interrupted;
 mod loop_guard;
 pub(crate) mod manual;
 pub(crate) mod memory_context;
+pub mod model_config;
 pub mod modes;
 pub mod pricing;
 mod project_instructions;

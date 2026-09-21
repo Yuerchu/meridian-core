@@ -141,7 +141,14 @@ pub fn catalog(conn: &mut SqliteConnection) -> Result<SubAgentCatalog, String> {
 
     for p in providers.into_iter().filter(|p| p.is_enabled != 0) {
         let cached = crate::db::ops::cached_model::list_by_provider(conn, &p.id).map_err(|error| error.to_string())?;
-        let configs = crate::db::ops::model_config::list_by_provider(conn, &p.id).map_err(|error| error.to_string())?;
+        // With the profiles joined on: a model's window, capability patch and
+        // — unless this provider overrides them — its prices are the profile's.
+        let configs: Vec<crate::agent::model_config::EffectiveModelConfig> =
+            crate::db::ops::model_config::list_by_provider_with_profiles(conn, &p.id)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .map(|(config, profile)| crate::agent::model_config::effective(config, profile))
+                .collect();
 
         for c in cached {
             let cfg = configs.iter().find(|m| m.model_id == c.model_id);
@@ -159,7 +166,7 @@ pub fn catalog(conn: &mut SqliteConnection) -> Result<SubAgentCatalog, String> {
                 provider_id: p.id.clone(),
                 provider_name: p.name.clone(),
                 model_id: c.model_id,
-                display_name: cfg.and_then(|m| m.display_name.clone()),
+                display_name: cfg.map(|m| m.name.clone()),
                 context_window: cfg
                     .map(|m| m.context_window as u32)
                     .filter(|w| *w > 0)

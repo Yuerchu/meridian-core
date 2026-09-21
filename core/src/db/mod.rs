@@ -870,6 +870,110 @@ mod migration_tests {
             .unwrap();
     }
 
+    #[derive(QueryableByName)]
+    struct ProfileMigrationRow {
+        #[diesel(sql_type = Text)]
+        name: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        context_window: i32,
+        #[diesel(sql_type = Nullable<Text>)]
+        input_price: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        capability_overrides: Option<String>,
+    }
+
+    #[derive(QueryableByName)]
+    struct ProfiledConfigRow {
+        #[diesel(sql_type = Text)]
+        profile_id: String,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        overrides_pricing: bool,
+        #[diesel(sql_type = Nullable<Text>)]
+        input_price: Option<String>,
+        #[diesel(sql_type = Nullable<Text>)]
+        server_tools: Option<String>,
+    }
+
+    /// Migration 61 splits one row into two, and what it must *not* do is leave
+    /// the prices in both: a number kept in two places is a number that comes
+    /// to disagree, and the resolver would then have to guess which is current.
+    /// Every existing row starts unoverridden, priced by the profile it just
+    /// created, with the provider-side tools left where they belong.
+    #[test]
+    fn model_profile_migration_gives_every_row_its_own_profile() {
+        let mut conn = conn_before("00000000000061");
+        conn.batch_execute(
+            r#"
+            INSERT INTO providers (id, name, base_url, created_at, updated_at)
+            VALUES ('p1', 'Provider', 'https://example.invalid', 1, 1),
+                   ('p2', 'Relay', 'https://relay.invalid', 1, 1);
+
+            INSERT INTO model_configs (
+                id, provider_id, model_id, display_name, context_window,
+                compact_threshold, max_output_tokens, input_price, output_price,
+                cache_read_price, created_at, updated_at, capability_overrides,
+                cache_write_price, pricing_tiers, server_tools, server_tool_price
+            ) VALUES (
+                'mc1', 'p1', 'claude-sonnet-5', 'Claude Sonnet 5', 200000,
+                150000, 64000, '3', '15', '0.3', 1, 1, '{"supports_fast":true}',
+                '3.75', NULL, '["web_search"]', '5'
+            ), (
+                'mc2', 'p2', 'anthropic/claude-sonnet-5', NULL, 200000,
+                150000, NULL, '4', '20', NULL, 1, 1, NULL, NULL, NULL, NULL, NULL
+            );"#,
+        )
+        .unwrap();
+        run_migration(&mut conn, "00000000000061");
+
+        // A row that named itself keeps that name; one that did not is named by
+        // the only other thing it has, its wire id.
+        let named: ProfileMigrationRow = diesel::sql_query(
+            "SELECT name, context_window, input_price, capability_overrides FROM model_profiles WHERE id = 'mc1'",
+        )
+        .get_result(&mut conn)
+        .unwrap();
+        assert_eq!(named.name, "Claude Sonnet 5");
+        assert_eq!(named.context_window, 200000);
+        assert_eq!(named.input_price.as_deref(), Some("3"));
+        assert_eq!(named.capability_overrides.as_deref(), Some(r#"{"supports_fast":true}"#));
+
+        let unnamed: ProfileMigrationRow = diesel::sql_query(
+            "SELECT name, context_window, input_price, capability_overrides FROM model_profiles WHERE id = 'mc2'",
+        )
+        .get_result(&mut conn)
+        .unwrap();
+        assert_eq!(unnamed.name, "anthropic/claude-sonnet-5");
+        assert_eq!(unnamed.input_price.as_deref(), Some("4"));
+
+        // The config keeps the provider's own facts and nothing else.
+        let config: ProfiledConfigRow = diesel::sql_query(
+            "SELECT profile_id, overrides_pricing, input_price, server_tools FROM model_configs WHERE id = 'mc1'",
+        )
+        .get_result(&mut conn)
+        .unwrap();
+        assert_eq!(config.profile_id, "mc1");
+        assert!(!config.overrides_pricing);
+        assert_eq!(config.input_price, None);
+        assert_eq!(config.server_tools.as_deref(), Some(r#"["web_search"]"#));
+
+        // One profile per row, not one shared by name: two providers may serve
+        // genuinely different deployments, and merging them is the user's call.
+        let profiles: CountRow = diesel::sql_query("SELECT COUNT(*) AS n FROM model_profiles")
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(profiles.n, 2);
+
+        // The override columns keep migration 49's contract.
+        assert!(
+            conn.batch_execute("UPDATE model_configs SET input_price = '01.25' WHERE id = 'mc1'")
+                .is_err()
+        );
+        assert!(
+            conn.batch_execute("UPDATE model_profiles SET output_price = '1.250' WHERE id = 'mc1'")
+                .is_err()
+        );
+    }
+
     #[test]
     fn auto_review_migration_rewrites_legacy_rows_to_the_only_public_shape() {
         let mut conn = conn_before("00000000000050");

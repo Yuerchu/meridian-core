@@ -4,7 +4,7 @@ use diesel::sqlite::SqliteConnection;
 use crate::agent::pricing::BillingMode;
 use crate::db::models::audit::AuditMessageInsert;
 use crate::db::models::message::MessageRow;
-use crate::db::schema::{audit_messages, conversations, memory_subjects, model_configs, projects, providers, turns};
+use crate::db::schema::{audit_messages, conversations, memory_subjects, projects, providers, turns};
 use crate::decimal::Decimal;
 use crate::util::now_ms;
 
@@ -113,13 +113,7 @@ fn prices_for(
     let (Some(provider), Some(model)) = (provider_id, model_id) else {
         return Ok(Prices::default());
     };
-    let config = model_configs::table
-        .filter(model_configs::provider_id.eq(provider))
-        .filter(model_configs::model_id.eq(model))
-        .select(crate::db::models::model_config::ModelConfigRow::as_select())
-        .first(conn)
-        .optional()?;
-    let Some(config) = config else {
+    let Some(config) = crate::agent::model_config::load(conn, provider, model)? else {
         return Ok(Prices::default());
     };
     let effective = crate::agent::pricing::Prices::for_prompt(&config, prompt_tokens.unwrap_or(0) as i64)
@@ -528,8 +522,8 @@ mod tests {
     /// nothing that has already happened.
     #[test]
     fn a_reply_carries_away_the_price_it_was_charged() {
-        use crate::db::models::model_config::ModelConfigInsert;
         use crate::db::models::provider::ProviderInsert;
+        use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
         let pool = test_db();
         let mut conn = pool.get().unwrap();
@@ -551,9 +545,9 @@ mod tests {
             })
             .execute(&mut conn)
             .unwrap();
-        crate::db::ops::model_config::upsert(
+        seed_flat(
             &mut conn,
-            &ModelConfigInsert {
+            &FlatModelConfig {
                 id: "mc1",
                 provider_id: "p1",
                 model_id: "m1",
@@ -589,9 +583,9 @@ mod tests {
         assert_eq!(logged.cache_write_price, Some(decimal("3.75")));
 
         // The price moves; the record does not.
-        crate::db::ops::model_config::upsert(
+        seed_flat(
             &mut conn,
-            &ModelConfigInsert {
+            &FlatModelConfig {
                 id: "mc1",
                 provider_id: "p1",
                 model_id: "m1",
@@ -621,8 +615,8 @@ mod tests {
     /// price filled in later, leaving a known model permanently unpriced.
     #[test]
     fn an_unpriced_model_does_not_snapshot_the_editors_zero_defaults() {
-        use crate::db::models::model_config::ModelConfigInsert;
         use crate::db::models::provider::ProviderInsert;
+        use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
         let pool = test_db();
         let mut conn = pool.get().unwrap();
@@ -644,9 +638,9 @@ mod tests {
             })
             .execute(&mut conn)
             .unwrap();
-        crate::db::ops::model_config::upsert(
+        seed_flat(
             &mut conn,
-            &ModelConfigInsert {
+            &FlatModelConfig {
                 id: "mc1",
                 provider_id: "p1",
                 model_id: "m1",
@@ -803,8 +797,8 @@ mod tests {
     /// two price sets, which is a thing it already knows how to add up.
     #[test]
     fn a_long_prompt_is_snapshotted_at_its_tier_rate() {
-        use crate::db::models::model_config::ModelConfigInsert;
         use crate::db::models::provider::ProviderInsert;
+        use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
         let pool = test_db();
         let mut conn = pool.get().unwrap();
@@ -826,9 +820,9 @@ mod tests {
             })
             .execute(&mut conn)
             .unwrap();
-        crate::db::ops::model_config::upsert(
+        seed_flat(
             &mut conn,
-            &ModelConfigInsert {
+            &FlatModelConfig {
                 id: "mc1",
                 provider_id: "p1",
                 model_id: "grok-4.6",
@@ -907,8 +901,8 @@ mod tests {
     #[test]
     fn a_review_is_priced_like_everything_else() {
         use crate::db::models::message::MessageUsage;
-        use crate::db::models::model_config::ModelConfigInsert;
         use crate::db::models::provider::ProviderInsert;
+        use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
         let pool = test_db();
         let mut conn = pool.get().unwrap();
@@ -930,9 +924,9 @@ mod tests {
             })
             .execute(&mut conn)
             .unwrap();
-        crate::db::ops::model_config::upsert(
+        seed_flat(
             &mut conn,
-            &ModelConfigInsert {
+            &FlatModelConfig {
                 id: "mc1",
                 provider_id: "p1",
                 model_id: "cheap",

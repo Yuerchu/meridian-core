@@ -563,24 +563,39 @@ diesel::table! {
 }
 
 diesel::table! {
-    model_configs (id) {
+    model_profiles (id) {
         id -> Text,
-        provider_id -> Text,
-        model_id -> Text,
-        display_name -> Nullable<Text>,
+        name -> Text,
         context_window -> Integer,
         compact_threshold -> Integer,
         max_output_tokens -> Nullable<Integer>,
         input_price -> Nullable<Text>,
         output_price -> Nullable<Text>,
         cache_read_price -> Nullable<Text>,
+        cache_write_price -> Nullable<Text>,
+        pricing_tiers -> Nullable<Text>,
+        capability_overrides -> Nullable<Text>,
         created_at -> BigInt,
         updated_at -> BigInt,
-        capability_overrides -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    model_configs (id) {
+        id -> Text,
+        provider_id -> Text,
+        model_id -> Text,
+        profile_id -> Text,
+        overrides_pricing -> Bool,
+        input_price -> Nullable<Text>,
+        output_price -> Nullable<Text>,
+        cache_read_price -> Nullable<Text>,
         cache_write_price -> Nullable<Text>,
         pricing_tiers -> Nullable<Text>,
         server_tools -> Nullable<Text>,
         server_tool_price -> Nullable<Text>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
     }
 }
 
@@ -797,6 +812,7 @@ diesel::joinable!(assistants -> providers (provider_id));
 diesel::joinable!(assistants -> tool_presets (tool_preset_id));
 diesel::joinable!(cached_models -> providers (provider_id));
 diesel::joinable!(model_configs -> providers (provider_id));
+diesel::joinable!(model_configs -> model_profiles (profile_id));
 diesel::joinable!(conversations -> assistants (assistant_id));
 diesel::joinable!(conversations -> projects (project_id));
 diesel::joinable!(custom_tools -> tool_categories (category_id));
@@ -861,6 +877,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     plan_review_deliveries,
     plan_materializations,
     model_configs,
+    model_profiles,
     preferences,
     projects,
     providers,
