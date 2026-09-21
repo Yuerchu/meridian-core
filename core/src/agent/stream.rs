@@ -11,6 +11,9 @@ pub(crate) struct StreamResult {
     pub(crate) tool_calls: Vec<provider::ToolCall>,
     pub(crate) usage: Option<provider::TokenUsage>,
     pub(crate) finish_reason: Option<String>,
+    /// The model the upstream reported it used. `None` when the provider did
+    /// not say.
+    pub(crate) response_model: Option<String>,
     /// Whether the stream ran out on its own rather than being abandoned.
     ///
     /// `Ok` is not the same as finished. A cancelled read stops mid-answer and

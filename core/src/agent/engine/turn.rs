@@ -804,6 +804,7 @@ async fn run(
             tool_calls_json.as_deref(),
             provider_state_json.as_deref(),
             row_usage(result.usage.as_ref()),
+            result.response_model.as_deref(),
         )
         .await?;
 

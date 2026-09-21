@@ -317,6 +317,7 @@ struct GenerateContentChunk {
     candidates: Vec<GeminiCandidate>,
     usage_metadata: Option<GeminiUsage>,
     response_id: Option<String>,
+    model_version: Option<String>,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
 }
@@ -435,6 +436,7 @@ impl GeminiUsage {
 #[derive(Default)]
 struct GeminiParseState {
     message_started: bool,
+    response_model_emitted: bool,
     next_part_index: usize,
     next_tool_index: usize,
 }
@@ -450,6 +452,12 @@ fn parse_chunk_with_state(chunk: &GenerateContentChunk, model: &str, state: &mut
     {
         events.push(StreamEvent::MessageStart { message_id: id.clone() });
         state.message_started = true;
+    }
+    if !state.response_model_emitted
+        && let Some(ref model) = chunk.model_version
+    {
+        events.push(StreamEvent::ResponseModel { model: model.clone() });
+        state.response_model_emitted = true;
     }
     for candidate in &chunk.candidates {
         if let Some(content) = &candidate.content {

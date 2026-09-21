@@ -423,6 +423,7 @@ diesel::table! {
         server_tool_calls -> Nullable<Integer>,
         server_tool_price -> Nullable<Text>,
         billing_mode -> Text,
+        response_model_id -> Nullable<Text>,
     }
 }
 
@@ -457,6 +458,7 @@ diesel::table! {
         provider_state -> Nullable<Text>,
         auto_review -> Nullable<Text>,
         tool_diffs -> Nullable<Text>,
+        response_model_id -> Nullable<Text>,
     }
 }
 

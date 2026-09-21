@@ -1171,6 +1171,7 @@ pub async fn persist_injection(
                 cache_write_tokens: None,
                 server_tool_calls: None,
                 provider_name: None,
+                response_model_id: None,
             },
             hang_on.as_deref(),
         )
@@ -1368,6 +1369,7 @@ mod tests {
             provider_state: None,
             auto_review: None,
             tool_diffs: None,
+            response_model_id: None,
         }
     }
 

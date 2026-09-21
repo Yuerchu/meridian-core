@@ -225,6 +225,7 @@ fn copy_of<'a>(n: &MessageInsert<'a>) -> MessageInsert<'a> {
         cache_write_tokens: n.cache_write_tokens,
         server_tool_calls: n.server_tool_calls,
         provider_name: n.provider_name,
+        response_model_id: n.response_model_id,
     }
 }
 
@@ -268,6 +269,7 @@ pub fn update_assistant_message(
     tool_calls: Option<&str>,
     provider_state: Option<&str>,
     usage: &MessageUsage,
+    response_model_id: Option<&str>,
 ) -> QueryResult<()> {
     let affected = diesel::update(messages::table.find(id))
         .set((
@@ -280,6 +282,7 @@ pub fn update_assistant_message(
             messages::cache_read_tokens.eq(usage.cache_read_tokens),
             messages::cache_write_tokens.eq(usage.cache_write_tokens),
             messages::server_tool_calls.eq(usage.server_tool_calls),
+            messages::response_model_id.eq(response_model_id),
         ))
         .execute(conn)?;
     if affected != 1 {
@@ -745,6 +748,7 @@ mod tests {
             cache_write_tokens: None,
             server_tool_calls: None,
             provider_name: None,
+            response_model_id: None,
         }
     }
 
@@ -1041,6 +1045,7 @@ mod tests {
             source: Some("voice"),
             turn_id: Some("t1"),
             tool_outcome: Some("success"),
+            response_model_id: None,
         };
         append_message(&mut conn, &full, Some(&root.id)).unwrap();
 
@@ -1080,6 +1085,7 @@ mod tests {
             provider_state,
             auto_review,
             tool_diffs,
+            response_model_id: _,
         } = stored;
 
         assert_eq!(id, "m1");

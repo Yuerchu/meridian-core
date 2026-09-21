@@ -398,8 +398,8 @@ struct AnthropicMessageStart {
     _type: IgnoredAny,
     #[serde(default, rename = "role")]
     _role: IgnoredAny,
-    #[serde(default, rename = "model")]
-    _model: IgnoredAny,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default, rename = "content")]
     _content: IgnoredAny,
     #[serde(default, rename = "stop_reason")]
@@ -570,8 +570,9 @@ struct AnthropicMessageResponse {
     _type: IgnoredAny,
     #[serde(default, rename = "role")]
     _role: IgnoredAny,
-    #[serde(default, rename = "model")]
-    _model: IgnoredAny,
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
     #[serde(default, rename = "stop_sequence")]
     _stop_sequence: IgnoredAny,
     #[serde(default, rename = "container")]
@@ -774,6 +775,9 @@ fn absorb(
                 }
                 if let Some(id) = message.id.clone() {
                     out.push(Ok(StreamEvent::MessageStart { message_id: id }));
+                }
+                if let Some(ref model) = message.model {
+                    out.push(Ok(StreamEvent::ResponseModel { model: model.clone() }));
                 }
             }
         }
