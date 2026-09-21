@@ -534,6 +534,7 @@ diesel::table! {
         catalog_id -> Nullable<Text>,
         credential_kind -> Text,
         transport_profile -> Text,
+        icon -> Nullable<Text>,
     }
 }
 

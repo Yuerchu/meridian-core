@@ -1052,6 +1052,7 @@ mod tests {
                 catalog_id: None,
                 credential_kind: "api_key",
                 transport_profile: "standard",
+                icon: None,
             })
             .execute(conn)
             .unwrap();
@@ -2055,6 +2056,7 @@ mod tests {
                 catalog_id: None,
                 credential_kind: "api_key",
                 transport_profile: "standard",
+                icon: None,
             })
             .execute(&mut conn)
             .unwrap();

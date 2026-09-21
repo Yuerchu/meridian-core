@@ -35,6 +35,13 @@ pub struct ProviderRow {
     /// `api_format`. It exists because the format cannot carry the distinction
     /// alone: OpenAI's API and ChatGPT's Codex backend are both `responses`.
     pub transport_profile: String,
+    /// Which logo to draw, or `None` to derive one from `catalog_id`.
+    ///
+    /// A logo's name in the front end's icon set, which is a third-party list
+    /// that changes between releases — so this is free text, checked nowhere,
+    /// read by nothing but the renderer. A name the set no longer knows draws
+    /// a generic mark; it cannot make a row stop working.
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -52,6 +59,7 @@ pub struct ProviderInsert<'a> {
     pub catalog_id: Option<&'a str>,
     pub credential_kind: &'a str,
     pub transport_profile: &'a str,
+    pub icon: Option<&'a str>,
 }
 
 /// Pointing a row at a relay does not stop it being the vendor the user picked
@@ -81,4 +89,8 @@ pub struct ProviderChangeset {
     /// Two layers because the honest recomputed answer is often "no identity"
     /// (`Some(None)`), which one layer cannot say without meaning "leave it".
     pub catalog_id: Option<Option<String>>,
+    /// Two layers for the reason `catalog_id` above has them: clearing the
+    /// choice back to "follow the catalog" is `Some(None)`, and one layer
+    /// cannot tell that from "leave it alone".
+    pub icon: Option<Option<String>>,
 }

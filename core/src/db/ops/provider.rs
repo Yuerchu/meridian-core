@@ -58,6 +58,7 @@ mod tests {
                 catalog_id: Some("openai"),
                 credential_kind: "api_key",
                 transport_profile: "standard",
+                icon: None,
             },
         )
         .unwrap()
@@ -111,5 +112,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rewritten.catalog_id.as_deref(), Some("anthropic"));
+    }
+
+    /// The chosen logo needs the same two layers, and for a sharper reason
+    /// than `catalog_id`: clearing it is a thing the user does by hand — it is
+    /// the "follow the catalog again" entry in the picker — rather than
+    /// something recomputed behind them. Collapsed to one layer that entry
+    /// would silently do nothing, leaving the old mark on the row while the
+    /// picker showed the default as selected.
+    #[test]
+    fn the_chosen_logo_can_be_set_changed_and_put_back_to_the_default() {
+        let pool = crate::db::test_db();
+        let mut conn = pool.get().unwrap();
+        let seed = seeded(&mut conn);
+        assert_eq!(seed.icon, None, "a new row follows the catalog");
+
+        let chosen = update_provider(
+            &mut conn,
+            "p1",
+            &ProviderChangeset {
+                icon: Some(Some("vertexai".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(chosen.icon.as_deref(), Some("vertexai"));
+
+        let renamed = update_provider(
+            &mut conn,
+            "p1",
+            &ProviderChangeset {
+                name: Some("Claude on Vertex".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(renamed.icon.as_deref(), Some("vertexai"), "an ordinary edit keeps it");
+
+        let defaulted = update_provider(
+            &mut conn,
+            "p1",
+            &ProviderChangeset {
+                icon: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted.icon, None,
+            "back to the catalog is a written answer, not a skip"
+        );
     }
 }

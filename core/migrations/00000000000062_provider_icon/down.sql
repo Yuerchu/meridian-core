@@ -1,0 +1,3 @@
+-- SQLite does not support DROP COLUMN before 3.35.0; `providers` is recreated
+-- by the migration that defines it, so a full rollback is the only supported
+-- downgrade path.

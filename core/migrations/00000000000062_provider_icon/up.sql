@@ -1,0 +1,14 @@
+-- Which logo a provider row draws.
+--
+-- NULL is what every row had before this column and what a row naming a vendor
+-- still wants: the mark is derived from `catalog_id`, falling back to
+-- `provider_type`. A relay, or a second Anthropic row for Vertex, names no
+-- vendor the catalog knows and so drew a generic cloud with no way to say
+-- otherwise — which is the case this exists for.
+--
+-- Free-form TEXT rather than a closed set, and deliberately so. The value is a
+-- logo's name in `@lobehub/icons`, a third-party set of 150-odd marks that
+-- gains and loses entries between releases; a name it no longer knows falls
+-- back to a generic mark rather than making the row unreadable. It decides
+-- nothing but what is drawn — no adapter, no address, no credential reads it.
+ALTER TABLE providers ADD COLUMN icon TEXT;
