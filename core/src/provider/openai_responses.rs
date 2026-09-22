@@ -84,7 +84,34 @@ impl OpenAIResponsesProvider {
         params: &ChatParams,
         stream: bool,
     ) -> Result<Request, ProviderError> {
+        self.build_responses_request(messages, tools, params, stream, Compaction::No)
+    }
+
+    /// The one body builder, because a second one does not stay in step.
+    ///
+    /// `compact_remote` used to write its own, carrying over only `include` —
+    /// so a lite model reached under the switch sent
+    /// `x-openai-internal-codex-responses-lite: true` beside a body with no
+    /// `reasoning.context`, which is the 400 the backend spells out in as many
+    /// words. Every remote compaction on `gpt-6-astra` was rejected, and the
+    /// comment above that call already said the shape had to match: the intent
+    /// was right and the second copy is what was wrong. Codex has no second
+    /// copy either — its compaction goes through the ordinary `Prompt` and
+    /// `stream()` (`core/src/compact.rs`).
+    fn build_responses_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolDefinition]>,
+        params: &ChatParams,
+        stream: bool,
+        compaction: Compaction,
+    ) -> Result<Request, ProviderError> {
         let (instructions, mut input) = serialize_responses_input(messages, self.reasoning_replay(params))?;
+        if compaction == Compaction::Yes {
+            // "Must be the final input item" — pushed before the lite prefix is
+            // spliced in, which goes to the front and cannot displace it.
+            input.push(serde_json::json!({ "type": "compaction_trigger" }));
+        }
         // Only the Codex shape knows how to send the lite form, and a plain
         // OpenAI-compatible endpoint has never heard of an `additional_tools`
         // item — so the model's own flag is not enough to turn it on.
@@ -134,7 +161,14 @@ impl OpenAIResponsesProvider {
             if let Some(p) = params.top_p {
                 body["top_p"] = serde_json::json!(p);
             }
-            if let Some(m) = params.max_tokens {
+            // Not on a compaction, which is the one request whose output is not
+            // a reply: it is a summary of the whole history, and under
+            // `store: false` it is what *replaces* that history. A ceiling
+            // sized for chat answers would cut it off, and the truncation
+            // would be permanent.
+            if let Some(m) = params.max_tokens
+                && compaction == Compaction::No
+            {
                 body["max_output_tokens"] = serde_json::json!(m);
             }
         }
@@ -987,6 +1021,16 @@ fn server_tool_call(item: &serde_json::Value, completed: bool) -> Option<super::
     })
 }
 
+/// Whether the request being built is a remote compaction.
+///
+/// A bool would have been a third argument spelled `true` at one call site and
+/// `false` at the other, which is how the two came apart the first time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compaction {
+    Yes,
+    No,
+}
+
 /// One assistant message going back into `input`, carrying the phase the
 /// upstream gave it.
 ///
@@ -1545,38 +1589,11 @@ impl ChatProvider for OpenAIResponsesProvider {
         messages: &[ChatMessage],
         params: &ChatParams,
     ) -> Result<super::RemoteCompactResult, ProviderError> {
-        let (instructions, mut input) = serialize_responses_input(messages, self.reasoning_replay(params))?;
-        input.push(serde_json::json!({ "type": "compaction_trigger" }));
-
-        let mut body = serde_json::json!({
-            "model": params.model,
-            "input": input,
-            "stream": true,
-            "store": false,
-        });
-        if let Some(ref instr) = instructions {
-            body["instructions"] = serde_json::json!(instr);
-        }
-        if let Some(key) = params.cache_key.as_deref() {
-            body["prompt_cache_key"] = serde_json::json!(key);
-        }
-        if self.codex_shape {
-            // The history being compacted is the same history a turn sends, so
-            // the request carrying it has to be the same shape -- a compaction
-            // that replayed reasoning items without asking for `include` would
-            // send input the upstream refuses.
-            body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
-        }
-
-        let mut req = Request::new(http::Method::POST, format!("{}/responses", self.base_url));
-        req.headers.insert(
-            http::header::AUTHORIZATION,
-            super::auth_header_value(&format!("Bearer {}", self.api_key)),
-        );
-        if self.codex_shape {
-            self.insert_codex_headers(&mut req, params, true);
-        }
-        req.body = Some(RequestBody::Json(body));
+        // The history being compacted is the same history a turn sends, so the
+        // request carrying it is built by the same function -- see
+        // [`Self::build_responses_request`] for what a second copy of it cost.
+        // No tools: a compaction asks for a summary, not for work.
+        let req = self.build_responses_request(messages, None, params, true, Compaction::Yes)?;
 
         let transport = ReqwestTransport::shared();
         let resp = transport.stream(req).await?;
@@ -2263,6 +2280,104 @@ mod tests {
             additional_tools_item(&other, Some(&defs)).unwrap()["id"],
             "a different conversation is a different prefix"
         );
+    }
+
+    /// **The lite header and the lite body are one contract**, and the backend
+    /// says so in as many words: measured, `unsupported_value` /
+    /// `X-OpenAI-Internal-Codex-Responses-Lite requires reasoning.context to
+    /// be all_turns`.
+    ///
+    /// Asserted over *every* request this adapter builds rather than over the
+    /// one that happened to be written first. `compact_remote` used to write
+    /// its own body and carried over only `include`, so it sent the header
+    /// beside a body with no `reasoning.context` — every remote compaction on
+    /// a lite model was a 400, and nothing in the suite was looking at the
+    /// second builder at all.
+    #[test]
+    fn the_lite_header_never_travels_without_the_lite_body() {
+        let provider = OpenAIResponsesProvider::new(
+            "https://relay.invalid/v1",
+            "k",
+            CodexShape {
+                enabled: true,
+                client_version: None,
+            },
+        );
+        let params = ChatParams {
+            model: "gpt-6-astra".into(),
+            responses_lite: true,
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+        let built = |compaction| {
+            let req = provider
+                .build_responses_request(&[ChatMessage::user("hi")], None, &params, true, compaction)
+                .unwrap();
+            let lite_header = req
+                .headers
+                .get("x-openai-internal-codex-responses-lite")
+                .map(|v| v.to_str().unwrap().to_string());
+            match req.body {
+                Some(RequestBody::Json(body)) => (lite_header, body),
+                _ => panic!("JSON body"),
+            }
+        };
+
+        for compaction in [Compaction::No, Compaction::Yes] {
+            let (lite_header, body) = built(compaction);
+            assert_eq!(lite_header.as_deref(), Some("true"), "{compaction:?}");
+            assert_eq!(body["reasoning"]["context"], "all_turns", "{compaction:?}");
+            assert_eq!(
+                body["input"][0]["type"], "additional_tools",
+                "{compaction:?}: the lite prefix leads the input"
+            );
+            assert!(
+                body.get("instructions").is_none(),
+                "{compaction:?}: lite moves them into input"
+            );
+            assert_eq!(body["parallel_tool_calls"], false, "{compaction:?}");
+        }
+    }
+
+    /// The trigger has to be the last input item and the lite prefix has to
+    /// lead, so the two are pushed from opposite ends and cannot displace each
+    /// other.
+    #[test]
+    fn a_compaction_trigger_ends_the_input_under_the_lite_prefix() {
+        let provider = OpenAIResponsesProvider::new(
+            "https://relay.invalid/v1",
+            "k",
+            CodexShape {
+                enabled: true,
+                client_version: None,
+            },
+        );
+        let params = ChatParams {
+            model: "gpt-6-astra".into(),
+            responses_lite: true,
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+        let req = provider
+            .build_responses_request(
+                &[ChatMessage::user("one"), ChatMessage::assistant("two")],
+                None,
+                &params,
+                true,
+                Compaction::Yes,
+            )
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "additional_tools");
+        assert_eq!(input.last().unwrap()["type"], "compaction_trigger");
+        assert_eq!(input.iter().filter(|i| i["type"] == "compaction_trigger").count(), 1);
+        // A summary of the whole history is not a chat reply: a ceiling sized
+        // for one would cut it off, and under `store: false` the truncation
+        // replaces the history permanently.
+        assert!(body.get("max_output_tokens").is_none());
     }
 
     /// The flag is the model's, but only the Codex shape can send it: an
