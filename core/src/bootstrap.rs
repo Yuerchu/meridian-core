@@ -172,6 +172,9 @@ pub fn bootstrap_with_secrets(
                     // an API key against an ordinary endpoint.
                     credential_kind: "api_key",
                     transport_profile: "standard",
+                    // No choice was made, so the mark follows whatever
+                    // `identify` decided this row is.
+                    icon: None,
                 },
             ) {
                 let key_name = provider_secret_name(&provider.id);

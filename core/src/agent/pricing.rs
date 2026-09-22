@@ -1,4 +1,4 @@
-use crate::db::models::model_config::ModelConfigRow;
+use crate::agent::model_config::EffectiveModelConfig;
 use crate::decimal::Decimal;
 use crate::provider::TokenUsage;
 
@@ -145,7 +145,7 @@ impl TurnPricing {
     /// `None` when no part of a model's cost is known. A provider-tool rate is
     /// useful on its own: live progress can still show that known lower bound
     /// while the usage report flags the missing token rates.
-    pub fn of(config: &ModelConfigRow) -> Result<Option<Self>, PricingError> {
+    pub fn of(config: &EffectiveModelConfig) -> Result<Option<Self>, PricingError> {
         let base = Prices::of(config);
         if !base.known() && base.server_tool_price.is_none() {
             return Ok(None);
@@ -205,7 +205,7 @@ fn tier_for(tiers: &[PriceTier], prompt_tokens: i64) -> Option<Prices> {
 /// A turn takes them off the model's configuration. A report takes them off the
 /// audit row, where they were copied at the time — and those two disagree by
 /// design, because a price edited last week must not reprice last month. Making
-/// this a type rather than passing `&ModelConfigRow` around is what lets both feed
+/// this a type rather than passing `&EffectiveModelConfig` around is what lets both feed
 /// the same formula instead of growing a second one.
 ///
 /// `None` on either cache rate means "priced like ordinary input", which is what
@@ -361,7 +361,7 @@ pub fn validate_tiers(mut tiers: Vec<PriceTier>) -> Result<Vec<PriceTier>, Prici
 }
 
 impl Prices {
-    pub fn of(config: &ModelConfigRow) -> Self {
+    pub fn of(config: &EffectiveModelConfig) -> Self {
         Self {
             input_price: config.input_price.clone(),
             output_price: config.output_price.clone(),
@@ -387,7 +387,7 @@ impl Prices {
     /// is the row that surprises people — otherwise made one model report as two
     /// things at once: its short requests counted into `unpriced_messages` while
     /// its long ones were billed, and the turn showed no cost either way.
-    pub fn for_prompt(config: &ModelConfigRow, prompt_tokens: i64) -> Result<Self, PricingError> {
+    pub fn for_prompt(config: &EffectiveModelConfig, prompt_tokens: i64) -> Result<Self, PricingError> {
         let base = Self::of(config);
         if !base.known() {
             return Ok(base);
@@ -516,7 +516,7 @@ pub fn cost_of(tokens: &BilledTokens, prices: &Prices) -> RequestCost {
     }
 }
 
-pub fn has_pricing(config: &ModelConfigRow) -> bool {
+pub fn has_pricing(config: &EffectiveModelConfig) -> bool {
     Prices::of(config).known()
 }
 
@@ -528,7 +528,7 @@ mod pricing_tests {
         raw.parse().unwrap()
     }
 
-    fn mock_config(input: Option<&str>, output: Option<&str>, cache: Option<&str>) -> ModelConfigRow {
+    fn mock_config(input: Option<&str>, output: Option<&str>, cache: Option<&str>) -> EffectiveModelConfig {
         priced(input, output, cache, None)
     }
 
@@ -537,22 +537,21 @@ mod pricing_tests {
         output: Option<&str>,
         cache: Option<&str>,
         cache_write: Option<&str>,
-    ) -> ModelConfigRow {
-        ModelConfigRow {
-            id: "test".into(),
+    ) -> EffectiveModelConfig {
+        EffectiveModelConfig {
+            config_id: "test".into(),
             provider_id: "p".into(),
             model_id: "m".into(),
-            display_name: None,
+            profile_id: "prof".into(),
+            name: "m".into(),
             context_window: 128000,
             compact_threshold: 100000,
             max_output_tokens: None,
+            capability_overrides: None,
             input_price: input.map(decimal),
             output_price: output.map(decimal),
             cache_read_price: cache.map(decimal),
             cache_write_price: cache_write.map(decimal),
-            created_at: 0,
-            updated_at: 0,
-            capability_overrides: None,
             pricing_tiers: None,
             server_tools: None,
             server_tool_price: None,
@@ -668,7 +667,7 @@ mod pricing_tests {
     // --- tiered pricing ---
 
     /// xAI's actual `grok-4.6` table: everything doubles above a 200k prompt.
-    fn grok() -> ModelConfigRow {
+    fn grok() -> EffectiveModelConfig {
         let mut config = priced(Some("2"), Some("6"), Some("0.5"), None);
         config.pricing_tiers = Some(
             r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":"1","cache_write_price":null}]"#.into(),

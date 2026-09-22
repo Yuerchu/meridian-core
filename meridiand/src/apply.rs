@@ -185,6 +185,9 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
                     catalog_id: catalog_id.as_deref(),
                     credential_kind: "api_key",
                     transport_profile: "standard",
+                    // A declarative provider names no logo; the mark
+                    // follows whichever vendor the catalog identified.
+                    icon: None,
                 },
             )
             .map_err(|error| format!("could not create provider `{}`: {error}", provider.id))?;
@@ -508,6 +511,9 @@ mod tests {
                     catalog_id: None,
                     credential_kind: "api_key",
                     transport_profile: "standard",
+                    // A declarative provider names no logo; the mark
+                    // follows whichever vendor the catalog identified.
+                    icon: None,
                 },
             )
             .unwrap();

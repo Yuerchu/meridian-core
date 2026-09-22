@@ -1,5 +1,5 @@
+use crate::agent::model_config::EffectiveModelConfig;
 use crate::db::models::assistant::AssistantRow;
-use crate::db::models::model_config::ModelConfigRow;
 use crate::db::{self, DbPool};
 use crate::provider::{self, ChatParams, ProviderCapabilities, ServerToolKind};
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
@@ -289,7 +289,10 @@ pub struct TurnParams {
     /// `None` leaves the budget free to derive its own threshold.
     pub compact_threshold: Option<usize>,
     /// Handed back so callers that also need pricing don't query it twice.
-    pub model_config: Option<ModelConfigRow>,
+    /// Already resolved against the model's profile — see
+    /// `agent::model_config::effective`, which is the only place the override
+    /// switch is read.
+    pub model_config: Option<EffectiveModelConfig>,
 }
 
 pub struct TurnParamsResolveRequest<'a> {
@@ -316,7 +319,7 @@ pub struct TurnParamsResolveRequest<'a> {
 /// was deliberately switched off, so stale names and malformed JSON fail the
 /// turn and point back to the damaged setting.
 fn enabled_server_tools(
-    model_config: Option<&ModelConfigRow>,
+    model_config: Option<&EffectiveModelConfig>,
     caps: &ProviderCapabilities,
 ) -> Result<Vec<ServerToolKind>, String> {
     let Some(raw) = model_config.and_then(|mc| mc.server_tools.as_deref()) else {
@@ -362,7 +365,7 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
     let model_config = match provider_id {
         Some(pid) => {
             let mut conn = get_conn(pool)?;
-            db::ops::model_config::get_by_provider_and_model(&mut conn, pid, model)
+            crate::agent::model_config::load(&mut conn, pid, model)
                 .map_err(|e| format!("could not read the stored config for '{model}': {e}"))?
         }
         None => None,
@@ -531,12 +534,13 @@ mod tests {
                     catalog_id: None,
                     credential_kind: "api_key",
                     transport_profile: "standard",
+                    icon: None,
                 },
             )
             .unwrap();
-            db::ops::model_config::upsert(
+            db::ops::model_config::seed_flat(
                 &mut conn,
-                &db::models::model_config::ModelConfigInsert {
+                &db::ops::model_config::FlatModelConfig {
                     id: "mc1",
                     provider_id: "p1",
                     model_id: "gpt-4o",
@@ -632,12 +636,13 @@ mod tests {
                     catalog_id: None,
                     credential_kind: "api_key",
                     transport_profile: "standard",
+                    icon: None,
                 },
             )
             .unwrap();
-            db::ops::model_config::upsert(
+            db::ops::model_config::seed_flat(
                 &mut conn,
-                &db::models::model_config::ModelConfigInsert {
+                &db::ops::model_config::FlatModelConfig {
                     id: "mc1",
                     provider_id: "p1",
                     model_id: "grok-4.6",
@@ -737,6 +742,7 @@ mod tests {
                 catalog_id: None,
                 credential_kind,
                 transport_profile,
+                icon: None,
             },
         )
         .unwrap();
@@ -822,22 +828,21 @@ mod tests {
         assert!(!err.contains("No model configured"), "{err}");
     }
 
-    fn configured_with(server_tools: Option<&str>) -> ModelConfigRow {
-        ModelConfigRow {
-            id: "mc".into(),
+    fn configured_with(server_tools: Option<&str>) -> EffectiveModelConfig {
+        EffectiveModelConfig {
+            config_id: "mc".into(),
             provider_id: "p".into(),
             model_id: "grok-4.6".into(),
-            display_name: None,
+            profile_id: "prof".into(),
+            name: "Grok 4.6".into(),
             context_window: 500_000,
             compact_threshold: 400_000,
             max_output_tokens: None,
+            capability_overrides: None,
             input_price: Some(decimal("2")),
             output_price: Some(decimal("6")),
             cache_read_price: None,
             cache_write_price: None,
-            created_at: 0,
-            updated_at: 0,
-            capability_overrides: None,
             pricing_tiers: None,
             server_tools: server_tools.map(str::to_string),
             server_tool_price: None,
