@@ -92,29 +92,6 @@ pub fn upsert(conn: &mut SqliteConnection, new: &ModelConfigInsert) -> QueryResu
     }
 }
 
-/// Points one model at a different profile, collecting the one it left.
-///
-/// Both halves in one call because they are one decision: a caller that moves
-/// the pointer and forgets to collect leaves a profile nothing describes in
-/// front of everybody choosing one, and a caller that collects first has
-/// nothing left to move.
-pub fn replace_profile(conn: &mut SqliteConnection, config_id: &str, profile_id: &str, now: i64) -> QueryResult<bool> {
-    let Some(existing) = get(conn, config_id)? else {
-        return Ok(false);
-    };
-    if existing.profile_id == profile_id {
-        return Ok(false);
-    }
-    diesel::update(model_configs::table.find(config_id))
-        .set((
-            model_configs::profile_id.eq(profile_id),
-            model_configs::updated_at.eq(now),
-        ))
-        .execute(conn)?;
-    model_profile::delete_if_unreferenced(conn, &existing.profile_id)?;
-    Ok(true)
-}
-
 pub fn delete(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
     let profile_id = get(conn, id)?.map(|row| row.profile_id);
     let deleted = diesel::delete(model_configs::table.find(id)).execute(conn)?;
@@ -410,8 +387,14 @@ mod tests {
         assert_eq!(cleared.cache_read_price, None);
     }
 
-    /// Moving the last model off a profile collects it; moving one off a shared
-    /// profile leaves it standing for the others.
+    /// Moving the last model off a profile collects it; moving one off a
+    /// shared profile leaves it standing for the others.
+    ///
+    /// Asserted through `upsert`, which is the only path a pointer move takes:
+    /// the settings page saves the whole row and the profile id is one of its
+    /// columns. There was a `replace_profile` beside it doing the same two
+    /// things for no caller, which is how the collection rule comes to be
+    /// stated twice and then to disagree.
     #[test]
     fn moving_a_model_collects_the_profile_it_emptied() {
         let pool = test_db();
@@ -432,12 +415,30 @@ mod tests {
         .unwrap();
 
         // prof2 still describes mc2, so it survives mc1 arriving and leaving.
-        assert!(replace_profile(&mut conn, "mc1", "prof2", 300).unwrap());
+        upsert(
+            &mut conn,
+            &ModelConfigInsert {
+                profile_id: "prof2",
+                updated_at: 300,
+                ..blank()
+            },
+        )
+        .unwrap();
+        assert_eq!(get(&mut conn, "mc1").unwrap().unwrap().profile_id, "prof2");
         assert!(model_profile::get(&mut conn, "prof1").unwrap().is_none());
         assert!(model_profile::get(&mut conn, "prof2").unwrap().is_some());
-        // Nothing moved, nothing collected.
-        assert!(!replace_profile(&mut conn, "mc1", "prof2", 400).unwrap());
-        assert_eq!(get(&mut conn, "mc1").unwrap().unwrap().profile_id, "prof2");
+
+        // Saving again without moving the pointer collects nothing.
+        upsert(
+            &mut conn,
+            &ModelConfigInsert {
+                profile_id: "prof2",
+                updated_at: 400,
+                ..blank()
+            },
+        )
+        .unwrap();
+        assert!(model_profile::get(&mut conn, "prof2").unwrap().is_some());
     }
 
     /// The join every reader actually wants.
