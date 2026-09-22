@@ -1,3 +1,4 @@
+use crate::client::retry::RetryPolicy;
 use bytes::Bytes;
 use http::Method;
 use reqwest::header::HeaderMap;
@@ -21,6 +22,20 @@ pub struct Request {
     pub headers: HeaderMap,
     pub body: Option<RequestBody>,
     pub timeout: Option<Duration>,
+    /// Whether the transport may ask again on its own, and how hard.
+    ///
+    /// `Some` by default, because the useful answer is the common one: almost
+    /// every caller here wants a dropped connection retried and has nowhere of
+    /// its own to do it. An opt-in default fails the other way and fails
+    /// silently — a request that never retries, with nothing anywhere saying so.
+    ///
+    /// `None` is for a caller that owns a retry loop already. `notify::webhook`
+    /// is the one, and all three of its differences matter: a budget of its own,
+    /// a 429 arm this policy deliberately lacks, and an attempt count it puts in
+    /// a delivery report the user reads. A transport retry underneath that loop
+    /// swallows the failure it is counting, so the report says one attempt where
+    /// the server saw two.
+    pub retry: Option<RetryPolicy>,
 }
 
 impl Request {
@@ -31,6 +46,7 @@ impl Request {
             headers: HeaderMap::new(),
             body: None,
             timeout: None,
+            retry: Some(RetryPolicy::default()),
         }
     }
 

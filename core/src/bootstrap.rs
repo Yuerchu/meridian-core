@@ -175,6 +175,9 @@ pub fn bootstrap_with_secrets(
                     // No choice was made, so the mark follows whatever
                     // `identify` decided this row is.
                     icon: None,
+                    // `chat_completions` above has no Codex shape to follow,
+                    // and nothing here has said the address is a relay for one.
+                    codex_request_shape: 0,
                 },
             ) {
                 let key_name = provider_secret_name(&provider.id);

@@ -72,6 +72,8 @@ pub fn resolve_provider_config(
             model,
             api_format: provider.api_format,
             transport_profile: provider.transport_profile,
+            codex_request_shape: provider.codex_request_shape != 0,
+            codex_client_version: codex_client_version(&mut conn, provider.codex_request_shape != 0),
         });
     }
 
@@ -101,6 +103,8 @@ pub fn resolve_provider_config(
         model,
         api_format: p.api_format,
         transport_profile: p.transport_profile,
+        codex_request_shape: p.codex_request_shape != 0,
+        codex_client_version: codex_client_version(&mut conn, p.codex_request_shape != 0),
     })
 }
 
@@ -129,6 +133,53 @@ pub struct ResolvedProvider {
     /// together pick the adapter — the format alone cannot separate OpenAI's
     /// Responses API from ChatGPT's Codex backend, which are both `responses`.
     pub transport_profile: String,
+    /// Whether this row's requests are shaped exactly the way Codex shapes its
+    /// own. Picks no adapter — see `registry::ProviderWire` and migration 63.
+    pub codex_request_shape: bool,
+    /// The user's `codex.client_version` override.
+    ///
+    /// Global rather than per-row, and read here because this is the one place
+    /// that already holds a connection when a provider is resolved. `None` is
+    /// the ordinary case and takes `codex_identity::DEFAULT_CODEX_CLIENT_VERSION`.
+    pub codex_client_version: Option<String>,
+}
+
+impl ResolvedProvider {
+    /// Everything `create_provider` needs, borrowed from the resolution.
+    ///
+    /// One place rather than six literals: the five call sites that build a
+    /// provider from a resolved row were the exact set that would otherwise
+    /// each have to remember the new field.
+    pub fn wire(&self) -> provider::registry::ProviderWire<'_> {
+        provider::registry::ProviderWire {
+            provider_type: &self.provider_type,
+            base_url: &self.base_url,
+            credential: &self.credential,
+            api_format: &self.api_format,
+            transport_profile: &self.transport_profile,
+            codex_request_shape: self.codex_request_shape,
+            codex_client_version: self.codex_client_version.as_deref(),
+        }
+    }
+}
+
+/// The Codex release the user told us to claim, if they told us anything.
+///
+/// Read only when a row asks for the Codex shape: an install that never turns
+/// the switch on pays no query for it. A read that *fails* is treated as no
+/// override rather than as an error — the default is a working value, and
+/// refusing the turn over an unreadable cosmetic preference would be worse than
+/// sending the version we shipped with.
+fn codex_client_version(conn: &mut diesel::sqlite::SqliteConnection, wanted: bool) -> Option<String> {
+    if !wanted {
+        return None;
+    }
+    db::ops::preference::get_preference(conn, provider::codex_identity::CODEX_CLIENT_VERSION_PREF).unwrap_or_else(
+        |error| {
+            tracing::warn!(error = %error, "could not read the Codex client version override");
+            None
+        },
+    )
 }
 
 /// The credential for a provider row, by whatever route its login uses.
@@ -240,6 +291,8 @@ fn resolve_named(
         model,
         api_format: p.api_format,
         transport_profile: p.transport_profile,
+        codex_request_shape: p.codex_request_shape != 0,
+        codex_client_version: codex_client_version(&mut conn, p.codex_request_shape != 0),
     })
 }
 
@@ -305,6 +358,17 @@ pub struct TurnParamsResolveRequest<'a> {
     /// Which wire this turn will really go out on, so the capabilities reflect
     /// what can actually be sent rather than what the family supports in general.
     pub transport_profile: &'a str,
+    /// And what shape the body takes once it is there. Same reason as the line
+    /// above: under the Codex shape the adapter sends no sampling parameters,
+    /// so a resolution that still reported them as available would let
+    /// `filter_params` pass a temperature nothing puts on the wire.
+    pub codex_request_shape: bool,
+    /// Why this request is being made, for the Codex turn metadata. Ignored
+    /// unless `codex_request_shape` is on, and never invented: a summariser
+    /// says `Compaction` rather than borrowing the turn's own word.
+    pub codex_request_kind: provider::codex_metadata::CodexRequestKind,
+    /// Where the conversation came from, likewise.
+    pub codex_thread_source: provider::codex_metadata::CodexThreadSource,
     pub model: &'a str,
     pub thinking_level: Option<&'a str>,
     pub fast: bool,
@@ -352,6 +416,9 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
         provider_type,
         api_format,
         transport_profile,
+        codex_request_shape,
+        codex_request_kind,
+        codex_thread_source,
         model,
         thinking_level,
         fast,
@@ -376,6 +443,11 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
         &mut caps,
         model_config.as_ref().and_then(|mc| mc.capability_overrides.as_deref()),
     )?;
+    // After the patch: no per-model correction can hand back a field the
+    // adapter will not put on the wire.
+    if codex_request_shape {
+        provider::capabilities::narrow_to_codex_shape(&mut caps);
+    }
 
     let context_limit = assistant
         .filter(|a| a.context_limit > 0)
@@ -411,6 +483,22 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
         thinking_effort,
         fast,
         server_tools,
+        // Assembled only for a row that asked for the Codex shape: an ordinary
+        // OpenAI request must not grow a header describing this app's sandbox,
+        // and an install that never turns the switch on never mints an
+        // installation id. The turn's own ids are added by the caller, which is
+        // the layer that has them.
+        codex_turn: codex_request_shape
+            .then(|| {
+                let mut conn = get_conn(pool)?;
+                Ok::<_, String>(provider::codex_metadata::CodexTurnMetadata::for_install(
+                    &mut conn,
+                    codex_request_kind,
+                    codex_thread_source,
+                ))
+            })
+            .transpose()?
+            .flatten(),
         // thinking_style and verbosity are derived from the catalog by
         // filter_params below, not supplied by the caller.
         ..Default::default()
@@ -475,6 +563,9 @@ mod tests {
                 provider_type: "openai",
                 api_format: "responses",
                 transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
                 model,
                 thinking_level: None,
                 fast: false,
@@ -535,6 +626,7 @@ mod tests {
                     credential_kind: "api_key",
                     transport_profile: "standard",
                     icon: None,
+                    codex_request_shape: 0,
                 },
             )
             .unwrap();
@@ -572,6 +664,9 @@ mod tests {
                 provider_type: "openai",
                 api_format: "chat_completions",
                 transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
                 model: "gpt-4o",
                 thinking_level: None,
                 fast: false,
@@ -637,6 +732,7 @@ mod tests {
                     credential_kind: "api_key",
                     transport_profile: "standard",
                     icon: None,
+                    codex_request_shape: 0,
                 },
             )
             .unwrap();
@@ -674,6 +770,9 @@ mod tests {
                 provider_type: "xai",
                 api_format: "responses",
                 transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
                 model: "grok-4.6",
                 thinking_level: None,
                 fast: false,
@@ -691,6 +790,9 @@ mod tests {
                 provider_type: "xai",
                 api_format: "chat_completions",
                 transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
                 model: "grok-4.6",
                 thinking_level: None,
                 fast: false,
@@ -743,6 +845,7 @@ mod tests {
                 credential_kind,
                 transport_profile,
                 icon: None,
+                codex_request_shape: 0,
             },
         )
         .unwrap();
@@ -862,6 +965,9 @@ mod tests {
                 provider_type: "openai",
                 api_format: "chat_completions",
                 transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
                 model: "some-model-nobody-catalogued",
                 thinking_level: None,
                 fast: false,

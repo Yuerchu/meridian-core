@@ -3,8 +3,8 @@
 //! Its own adapter rather than a flavour of [`super::openai_responses`], because
 //! the differences are not cosmetic: the endpoint is different, `store` is off
 //! so reasoning has to travel back with the next request, sampling parameters
-//! mean nothing, four extra headers are required, and the credential is a
-//! session that expires rather than a key that does not.
+//! mean nothing, a handful of extra headers are required, and the credential is
+//! a session that expires rather than a key that does not.
 //!
 //! **The parsing is shared, the building is not.** `parse_responses_event` is a
 //! pure function over the same event grammar and is reused as-is; the request
@@ -32,7 +32,7 @@ use crate::codex_auth::{AuthError, Bearer, Manager};
 /// accepted. If a future refusal names the originator, that is a decision to
 /// revisit deliberately rather than a value to quietly change — see
 /// `tests/codex_smoke.rs`, which exists to answer exactly this.
-const ORIGINATOR: &str = "meridian";
+pub(super) const ORIGINATOR: &str = "meridian";
 
 pub struct CodexProvider {
     base_url: String,
@@ -127,9 +127,33 @@ impl CodexProvider {
         insert_header(
             &mut req,
             "user-agent",
-            &format!("{ORIGINATOR}/{}", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "{ORIGINATOR}/{} ({}; {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            ),
         );
-        insert_header(&mut req, "session_id", &self.session_id);
+        // `session-id`, not `session_id`. The underscore spelling was right for
+        // the Codex this adapter was written against and appears nowhere in the
+        // Codex tree now — `codex-api/src/requests/headers.rs` sends `session-id`
+        // and `thread-id`, and `endpoint/responses.rs` adds `x-client-request-id`.
+        // The old name was never *rejected*, because an unknown header is
+        // ignored; it simply stopped being read, which is the quiet half of
+        // getting a header wrong.
+        insert_header(&mut req, "session-id", &self.session_id);
+        // The conversation. Absent on the background passes that clear the cache
+        // key, exactly as Codex sends neither when it has no thread.
+        if let Some(thread) = params.cache_key.as_deref() {
+            insert_header(&mut req, "thread-id", thread);
+            insert_header(&mut req, "x-client-request-id", thread);
+        }
+        if stream {
+            req.headers.insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("text/event-stream"),
+            );
+        }
         if bearer.is_fedramp {
             // Not an endpoint change — the same URL, routed differently.
             insert_header(&mut req, "x-openai-fedramp", "true");
@@ -212,71 +236,7 @@ fn serialize_codex_input(
                     "content": [{"type": "input_text", "text": rendered.content}],
                 }));
             }
-            "assistant" => {
-                // The reasoning goes back interleaved where it originally
-                // stood, not merely sorted among itself. `position` is the
-                // item's index in the original output, and the sequence the
-                // model emitted was reasoning *adjacent to the item it
-                // produced* — `[reasoning, call, reasoning, call]`, routinely.
-                // Replaying all reasoning first, which this used to do, kept
-                // the reasoning items ordered and moved every one of them away
-                // from its call: exactly the reordering the position field was
-                // stored to prevent. Items whose stored JSON no longer parses
-                // are skipped rather than failing the turn: losing the
-                // reasoning costs continuity, sending malformed input costs
-                // the whole request.
-                let mut replayed: Vec<_> = m
-                    .provider_state
-                    .as_ref()
-                    .and_then(|state| state.codex_reasoning_for(model))
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|item| {
-                        serde_json::from_str::<serde_json::Value>(&item.item_json)
-                            .ok()
-                            .map(|value| (item.position, value))
-                    })
-                    .collect();
-                replayed.sort_by_key(|(position, _)| *position);
-
-                // The non-reasoning items, in the order the turn stored them —
-                // which is the order they streamed. Their own indices were not
-                // stored, so the merge places each reasoning item at its
-                // recorded index and lets these fill the gaps in between; a
-                // position beyond the sequence (older rows, a dropped item)
-                // degrades to appending, never to losing anything.
-                let mut others = std::collections::VecDeque::new();
-                if !m.content.is_empty() {
-                    others.push_back(serde_json::json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": m.content}],
-                    }));
-                }
-                if let Some(ref tool_calls) = m.tool_calls {
-                    for tc in tool_calls {
-                        others.push_back(serde_json::json!({
-                            "type": "function_call",
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                            "call_id": tc.id,
-                        }));
-                    }
-                }
-
-                let total = replayed.len() + others.len();
-                let mut reasoning = replayed.into_iter().peekable();
-                for index in 0..total {
-                    let its_turn = reasoning.peek().is_some_and(|(position, _)| *position <= index);
-                    if its_turn || others.is_empty() {
-                        if let Some((_, value)) = reasoning.next() {
-                            input.push(value);
-                        }
-                    } else if let Some(other) = others.pop_front() {
-                        input.push(other);
-                    }
-                }
-            }
+            "assistant" => input.extend(replay_assistant_turn(m, model)),
             "tool" => {
                 if let Some(ref call_id) = m.tool_call_id {
                     input.push(serde_json::json!({
@@ -293,11 +253,83 @@ fn serialize_codex_input(
     Ok((instructions, input))
 }
 
+/// One assistant row as input items, with its reasoning replayed in place.
+///
+/// `pub(super)` because `openai_responses` needs the identical merge under
+/// `CodexShape`, and two copies of it would be two copies of the ordering rule
+/// below — which has already been got wrong once, in exactly the way that does
+/// not fail loudly.
+pub(super) fn replay_assistant_turn(m: &ChatMessage, model: &str) -> Vec<serde_json::Value> {
+    let mut input = Vec::new();
+
+    // The reasoning goes back interleaved where it originally stood, not merely
+    // sorted among itself. `position` is the item's index in the original
+    // output, and the sequence the model emitted was reasoning *adjacent to the
+    // item it produced* — `[reasoning, call, reasoning, call]`, routinely.
+    // Replaying all reasoning first, which this used to do, kept the reasoning
+    // items ordered and moved every one of them away from its call: exactly the
+    // reordering the position field was stored to prevent. Items whose stored
+    // JSON no longer parses are skipped rather than failing the turn: losing the
+    // reasoning costs continuity, sending malformed input costs the whole
+    // request.
+    let mut replayed: Vec<_> = m
+        .provider_state
+        .as_ref()
+        .and_then(|state| state.codex_reasoning_for(model))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            serde_json::from_str::<serde_json::Value>(&item.item_json)
+                .ok()
+                .map(|value| (item.position, value))
+        })
+        .collect();
+    replayed.sort_by_key(|(position, _)| *position);
+
+    // The non-reasoning items, in the order the turn stored them — which is the
+    // order they streamed. Their own indices were not stored, so the merge
+    // places each reasoning item at its recorded index and lets these fill the
+    // gaps in between; a position beyond the sequence (older rows, a dropped
+    // item) degrades to appending, never to losing anything.
+    let mut others = std::collections::VecDeque::new();
+    if !m.content.is_empty() {
+        others.push_back(super::openai_responses::assistant_message_item(
+            &m.content,
+            m.provider_state.as_ref().and_then(|s| s.responses_phase()),
+        ));
+    }
+    if let Some(ref tool_calls) = m.tool_calls {
+        for tc in tool_calls {
+            others.push_back(serde_json::json!({
+                "type": "function_call",
+                "name": tc.name,
+                "arguments": tc.arguments,
+                "call_id": tc.id,
+            }));
+        }
+    }
+
+    let total = replayed.len() + others.len();
+    let mut reasoning = replayed.into_iter().peekable();
+    for index in 0..total {
+        let its_turn = reasoning.peek().is_some_and(|(position, _)| *position <= index);
+        if its_turn || others.is_empty() {
+            if let Some((_, value)) = reasoning.next() {
+                input.push(value);
+            }
+        } else if let Some(other) = others.pop_front() {
+            input.push(other);
+        }
+    }
+
+    input
+}
+
 /// Turn a completed `reasoning` output item into state to be stored.
 ///
 /// Everything else about the event is left to the shared parser; this only
 /// intercepts what that parser has no reason to keep.
-fn reasoning_update(data: &str, model: &str) -> Option<StreamEvent> {
+pub(super) fn reasoning_update(data: &str, model: &str) -> Option<StreamEvent> {
     let value: serde_json::Value = serde_json::from_str(data).ok()?;
     let item = value.get("item")?;
     if item.get("type")?.as_str()? != "reasoning" {
@@ -337,6 +369,11 @@ impl ChatProvider for CodexProvider {
             })
             .await?;
 
+        // `openai-model` off the HTTP headers, which the event parser never
+        // sees — see `openai_responses::http_response_model`. This is the
+        // backend the header was measured on, so it is the likeliest of the
+        // three sources to be the one that answers.
+        let header_model = super::openai_responses::http_response_model(&resp.headers);
         let mut state = StreamState::default();
         let stream = resp
             .bytes
@@ -347,11 +384,19 @@ impl ChatProvider for CodexProvider {
                     Ok(ev) => {
                         let mut out = Vec::new();
                         // Intercept first, then delegate: the shared parser has
-                        // no interest in reasoning items and drops them.
-                        if ev.event == "response.output_item.done"
-                            && let Some(captured) = reasoning_update(&ev.data, &model)
-                        {
-                            out.push(Ok(captured));
+                        // no interest in reasoning items or a message item's
+                        // phase, and drops both.
+                        if ev.event == "response.output_item.done" {
+                            if let Some(captured) = reasoning_update(&ev.data, &model) {
+                                out.push(Ok(captured));
+                            }
+                            if let Some(captured) = super::openai_responses::message_phase_update(
+                                &ev.data,
+                                super::state::CODEX_RESPONSES_PROTOCOL,
+                                &model,
+                            ) {
+                                out.push(Ok(captured));
+                            }
                         }
                         out.extend(parse_responses_event(&ev.event, &ev.data, &mut state));
                         out
@@ -360,6 +405,9 @@ impl ChatProvider for CodexProvider {
                 };
                 futures::stream::iter(events)
             });
+
+        let stream =
+            futures::stream::iter(header_model.map(|model| Ok(StreamEvent::ResponseModel { model }))).chain(stream);
 
         Ok(Box::pin(stream))
     }
@@ -567,22 +615,52 @@ mod tests {
     }
 
     /// The headers the backend requires, and the one that is ours to choose.
+    ///
+    /// **Pinned by spelling.** This assertion said `session_id` for as long as
+    /// the request did, and both were right for the Codex this adapter was
+    /// written against; current Codex sends `session-id` and the underscore
+    /// appears nowhere in its tree. Nothing failed in between, because an
+    /// unknown header is ignored rather than refused — so the test agreeing
+    /// with the code was all the evidence there was, and it was not evidence
+    /// about Codex at all.
     #[test]
     fn the_request_identifies_this_app_and_the_account() {
         let provider = CodexProvider::new("https://example.invalid", test_manager());
+        let params = ChatParams {
+            cache_key: Some("conv-7".into()),
+            ..Default::default()
+        };
         let req = provider
-            .build_request(&test_bearer(false), &[], None, &ChatParams::default(), true)
+            .build_request(&test_bearer(false), &[], None, &params, true)
             .unwrap();
 
         assert_eq!(req.headers["chatgpt-account-id"], "acct-1");
         assert_eq!(req.headers["originator"], ORIGINATOR);
         assert!(req.headers["user-agent"].to_str().unwrap().starts_with(ORIGINATOR));
-        assert!(req.headers.contains_key("session_id"));
+        assert!(req.headers.contains_key("session-id"));
+        assert!(!req.headers.contains_key("session_id"), "the dead spelling is gone");
+        assert_eq!(req.headers["thread-id"], "conv-7");
+        assert_eq!(req.headers["x-client-request-id"], "conv-7");
+        assert_eq!(req.headers[http::header::ACCEPT], "text/event-stream");
         assert!(
             !req.headers.contains_key("x-openai-fedramp"),
             "only sent for a workspace that needs it"
         );
         assert!(req.url.ends_with("/responses"));
+    }
+
+    /// A background pass clears the cache key, and Codex sends no thread
+    /// headers when it has no thread. An empty value would be worse than the
+    /// omission: it names a conversation that does not exist.
+    #[test]
+    fn a_request_with_no_conversation_sends_no_thread_headers() {
+        let provider = CodexProvider::new("https://example.invalid", test_manager());
+        let req = provider
+            .build_request(&test_bearer(false), &[], None, &ChatParams::default(), true)
+            .unwrap();
+        assert!(req.headers.contains_key("session-id"), "the session still has one");
+        assert!(!req.headers.contains_key("thread-id"));
+        assert!(!req.headers.contains_key("x-client-request-id"));
     }
 
     #[test]
@@ -605,7 +683,7 @@ mod tests {
         let second = provider
             .build_request(&test_bearer(false), &[], None, &ChatParams::default(), true)
             .unwrap();
-        assert_eq!(first.headers["session_id"], second.headers["session_id"]);
+        assert_eq!(first.headers["session-id"], second.headers["session-id"]);
     }
 
     /// A completed reasoning item becomes state; anything without replayable

@@ -86,7 +86,8 @@ percent-encoding = "2"
 diesel = { version = "2", features = ["sqlite", "r2d2"] }
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 diesel_migrations = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+os_info = { version = "3", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 strum = { version = "0.27", features = ["derive"] }
 dirs = "6"

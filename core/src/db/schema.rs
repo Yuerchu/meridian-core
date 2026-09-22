@@ -535,6 +535,7 @@ diesel::table! {
         credential_kind -> Text,
         transport_profile -> Text,
         icon -> Nullable<Text>,
+        codex_request_shape -> Integer,
     }
 }
 

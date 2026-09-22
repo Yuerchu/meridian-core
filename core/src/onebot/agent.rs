@@ -295,7 +295,19 @@ pub(super) async fn oneshot_completion(
     // The turn parameters are resolved like any other turn: an extraction
     // request that invents its own temperature is rejected by models the chat
     // path already talks to.
-    let (provider_type, base_url, credential, api_format, transport_profile, turn, provider_id, provider_name, model) = {
+    let (
+        provider_type,
+        base_url,
+        credential,
+        api_format,
+        transport_profile,
+        codex_request_shape,
+        codex_client_version,
+        turn,
+        provider_id,
+        provider_name,
+        model,
+    ) = {
         let pool2 = state.services.db.clone();
         let secrets2 = state.services.secrets.clone();
         let assistant2 = assistant.clone();
@@ -309,6 +321,8 @@ pub(super) async fn oneshot_completion(
                 model,
                 api_format,
                 transport_profile,
+                codex_request_shape,
+                codex_client_version,
             } = resolve_provider_config(&secrets2, &pool2, assistant2.as_ref())?;
             let effective_model = assistant2.as_ref().and_then(|a| a.model_id.clone()).unwrap_or(model);
             let turn = crate::agent::resolve_turn_params(
@@ -320,6 +334,9 @@ pub(super) async fn oneshot_completion(
                     api_format: &api_format,
 
                     transport_profile: &transport_profile,
+                    codex_request_shape,
+                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
+                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
                     model: &effective_model,
                     thinking_level: None,
                     fast: false,
@@ -331,6 +348,8 @@ pub(super) async fn oneshot_completion(
                 credential,
                 api_format,
                 transport_profile,
+                codex_request_shape,
+                codex_client_version,
                 turn,
                 provider_id,
                 provider_name,
@@ -340,8 +359,15 @@ pub(super) async fn oneshot_completion(
         .await
         .map_err(|e| e.to_string())??
     };
-    let provider =
-        provider::registry::create_provider(&provider_type, &base_url, &credential, &api_format, &transport_profile)?;
+    let provider = provider::registry::create_provider(provider::registry::ProviderWire {
+        provider_type: &provider_type,
+        base_url: &base_url,
+        credential: &credential,
+        api_format: &api_format,
+        transport_profile: &transport_profile,
+        codex_request_shape,
+        codex_client_version: codex_client_version.as_deref(),
+    })?;
 
     let messages = vec![
         ChatMessage {
@@ -542,16 +568,7 @@ async fn headless_chat_inner(
     // Resolve provider off the async thread: it takes a pooled connection and
     // reads the OS credential store, either of which can block for as long as
     // the pool's acquire timeout.
-    let crate::agent::ResolvedProvider {
-        provider_type,
-        base_url,
-        credential,
-        model,
-        api_format,
-        transport_profile,
-        provider_id,
-        provider_name,
-    } = {
+    let resolved = {
         let pool2 = pool.clone();
         let secrets2 = secrets.clone();
         let assistant2 = assistant.clone();
@@ -559,8 +576,19 @@ async fn headless_chat_inner(
             .await
             .map_err(|e| e.to_string())??
     };
-    let provider =
-        provider::registry::create_provider(&provider_type, &base_url, &credential, &api_format, &transport_profile)?;
+    let provider = provider::registry::create_provider(resolved.wire())?;
+    let crate::agent::ResolvedProvider {
+        provider_type,
+        base_url: _,
+        credential: _,
+        model,
+        api_format,
+        transport_profile,
+        provider_id,
+        provider_name,
+        codex_request_shape,
+        codex_client_version: _,
+    } = resolved;
 
     // The same resolver the desktop loop uses. Sharing it is what keeps a QQ
     // assistant's tool set honest: this path used to read `enabled_tools` only,
@@ -613,6 +641,7 @@ async fn headless_chat_inner(
         let pt = provider_type.clone();
         let af = api_format.clone();
         let tp = transport_profile.clone();
+        let crs = codex_request_shape;
         let em = effective_model.clone();
         // The provider this turn actually resolved to, not the assistant's
         // stored field. They differ whenever the assistant names none and the
@@ -632,6 +661,9 @@ async fn headless_chat_inner(
                     api_format: &af,
 
                     transport_profile: &tp,
+                    codex_request_shape: crs,
+                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
+                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
                     model: &em,
                     thinking_level: None,
                     fast: false,

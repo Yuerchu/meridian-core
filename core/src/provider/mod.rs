@@ -3,6 +3,8 @@ pub mod balance;
 pub mod capabilities;
 pub mod catalog;
 pub mod codex;
+pub mod codex_identity;
+pub mod codex_metadata;
 pub mod deepseek;
 mod dto;
 pub mod gemma_tool;
@@ -595,6 +597,21 @@ pub struct ChatParams {
     /// Whether this provider+model supports server-side compaction via
     /// `compaction_trigger`. Copied from capabilities by `filter_params`.
     pub supports_remote_compaction: bool,
+    /// What a Codex-shaped request says about the turn it belongs to.
+    ///
+    /// Read by one adapter under one switch (`codex_request_shape`), and `None`
+    /// everywhere else — including on a row with the switch off, so an ordinary
+    /// OpenAI request never grows a header describing this app's sandbox.
+    /// Assembled where the answers live rather than here; see
+    /// [`codex_metadata::CodexTurnMetadata`].
+    pub codex_turn: Option<codex_metadata::CodexTurnMetadata>,
+    /// Whether the model takes Codex's *lite* request shape: tools and base
+    /// instructions inside `input` rather than as top-level fields.
+    ///
+    /// A property of the model, not of the switch — but only the Codex shape
+    /// knows how to send it, so it is read there. Copied from capabilities by
+    /// `filter_params`.
+    pub responses_lite: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -868,6 +885,19 @@ pub struct ProviderCapabilities {
     /// Whether this model supports server-side compaction via `compaction_trigger`.
     /// Only meaningful for the Responses API; chat-completions has no such thing.
     pub supports_remote_compaction: bool,
+    /// Whether this model takes Codex's *lite* request shape.
+    ///
+    /// A fact about the model rather than about the door reached through: Codex
+    /// carries it as `model_info.use_responses_lite` and it changes the body
+    /// substantially — no top-level `tools`, no `instructions`, both moved into
+    /// `input` as developer items, and `parallel_tool_calls` forced off. A
+    /// measured capture showed `x-openai-internal-codex-responses-lite: true`
+    /// for `gpt-6-astra`.
+    ///
+    /// Only the Codex request shape acts on it. An ordinary OpenAI-compatible
+    /// endpoint has never heard of it, and sending a `additional_tools` item
+    /// there would be an input item it refuses.
+    pub responses_lite: bool,
 }
 
 /// Returned by the non-streaming `chat_with_tools` path, which no caller has
@@ -968,7 +998,11 @@ mod capability_contract_tests {
     fn provider_capabilities_are_a_closed_complete_wire_contract() {
         let value = serde_json::to_value(ProviderCapabilities::default()).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 19);
+        // 20 since `responses_lite`. It stays out of the IPC response
+        // (`ProviderCapabilitiesInfoResponse`) on purpose: it decides a request
+        // shape rather than anything a settings page can offer, and a capability
+        // gaining a public field by accident is what this count exists to stop.
+        assert_eq!(object.len(), 20);
         assert_eq!(object.get("thinking_style"), Some(&serde_json::json!("none")));
         assert!(object.get("supported_efforts").is_some());
 

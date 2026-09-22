@@ -11,9 +11,6 @@ pub enum TransportError {
         headers: Option<HeaderMap>,
         body: Option<String>,
     },
-    /// Only `run_with_retry` constructs this; kept with the rest of the ported
-    /// retry surface.
-    #[allow(dead_code)]
     #[error("retry limit reached")]
     RetryLimit,
     #[error("timeout")]
@@ -22,6 +19,29 @@ pub enum TransportError {
     Network(String),
     #[error("request build error: {0}")]
     Build(String),
+}
+
+impl TransportError {
+    /// Which of these it is, as a fixed word. For logs, where the variant's own
+    /// `Display` carries a body or a reqwest chain that must not be written to
+    /// a file the user can export.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Http { .. } => "http",
+            Self::RetryLimit => "retry_limit",
+            Self::Timeout => "timeout",
+            Self::Network(_) => "network",
+            Self::Build(_) => "build",
+        }
+    }
+
+    /// The status, where there was a reply to read one off.
+    pub(crate) fn status(&self) -> Option<u16> {
+        match self {
+            Self::Http { status, .. } => Some(status.as_u16()),
+            _ => None,
+        }
+    }
 }
 
 /// Kept for `client::sse`, the ported SSE half nothing consumes yet —

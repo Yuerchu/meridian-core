@@ -103,7 +103,14 @@ async fn the_backend_accepts_a_request_from_this_app() {
         .header("chatgpt-account-id", &bearer.account_id)
         .header("originator", ORIGINATOR)
         .header("user-agent", format!("{ORIGINATOR}/0.2.0"))
-        .header("session_id", uuid::Uuid::new_v4().to_string())
+        // `session-id`, matching `build_request`. This list is a second copy of
+        // that header set and drifted from it once already: the underscore
+        // spelling it carried was right for an older Codex and is read by
+        // nothing now. A wrong header name is never refused here — it is simply
+        // ignored — so this test cannot catch the next drift either, and what it
+        // proves remains only that the credential and the body are accepted.
+        .header("session-id", uuid::Uuid::new_v4().to_string())
+        .header("accept", "text/event-stream")
         .header("content-type", "application/json")
         .json(&body);
     if bearer.is_fedramp {

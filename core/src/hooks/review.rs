@@ -319,6 +319,9 @@ async fn resolve_params(state: &SharedState, assistant: &AssistantRow) -> Result
                 api_format: &resolved.api_format,
 
                 transport_profile: &resolved.transport_profile,
+                codex_request_shape: resolved.codex_request_shape,
+                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
+                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Hook,
                 model: &resolved.model,
                 thinking_level: None,
                 fast: false,
@@ -772,13 +775,7 @@ async fn build_provider(
     })
     .await
     .map_err(|e| e.to_string())??;
-    let provider = crate::provider::registry::create_provider(
-        &resolved.provider_type,
-        &resolved.base_url,
-        &resolved.credential,
-        &resolved.api_format,
-        &resolved.transport_profile,
-    )?;
+    let provider = crate::provider::registry::create_provider(resolved.wire())?;
     Ok((provider, resolved))
 }
 

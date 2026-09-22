@@ -42,6 +42,15 @@ pub struct ProviderRow {
     /// read by nothing but the renderer. A name the set no longer knows draws
     /// a generic mark; it cannot make a row stop working.
     pub icon: Option<String>,
+    /// Whether requests to this row are shaped exactly the way Codex shapes its
+    /// own — see migration 63.
+    ///
+    /// Separate from `transport_profile` because they answer different
+    /// questions: that one says how we authenticate and where we go, this one
+    /// says what the body and headers look like once we are there. A Codex
+    /// backend behind an ordinary API key is exactly the row where the two come
+    /// apart, and it is the row this exists for.
+    pub codex_request_shape: i32,
 }
 
 #[derive(Debug, Insertable)]
@@ -60,6 +69,7 @@ pub struct ProviderInsert<'a> {
     pub credential_kind: &'a str,
     pub transport_profile: &'a str,
     pub icon: Option<&'a str>,
+    pub codex_request_shape: i32,
 }
 
 /// Pointing a row at a relay does not stop it being the vendor the user picked
@@ -93,4 +103,8 @@ pub struct ProviderChangeset {
     /// choice back to "follow the catalog" is `Some(None)`, and one layer
     /// cannot tell that from "leave it alone".
     pub icon: Option<Option<String>>,
+    /// One layer, unlike the two above: the column is `NOT NULL` and has only
+    /// two values, so "off" is a value the user chose rather than an absence
+    /// that has to be told apart from "not mentioned".
+    pub codex_request_shape: Option<i32>,
 }

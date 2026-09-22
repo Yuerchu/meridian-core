@@ -1053,6 +1053,7 @@ mod tests {
                 credential_kind: "api_key",
                 transport_profile: "standard",
                 icon: None,
+                codex_request_shape: 0,
             })
             .execute(conn)
             .unwrap();
@@ -2057,6 +2058,7 @@ mod tests {
                 credential_kind: "api_key",
                 transport_profile: "standard",
                 icon: None,
+                codex_request_shape: 0,
             })
             .execute(&mut conn)
             .unwrap();
