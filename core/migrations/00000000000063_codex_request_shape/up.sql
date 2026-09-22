@@ -1,0 +1,24 @@
+-- Whether this row's requests are shaped exactly the way Codex shapes its own.
+--
+-- The case it exists for is a Codex backend put behind an ordinary API key.
+-- That row is configured here as `openai` / `responses` / `standard` — because
+-- that is what it looks like from the outside — and so it gets this app's
+-- Responses request rather than Codex's. The two differ in both directions:
+-- we send `temperature`, `top_p` and `max_output_tokens`, which Codex never
+-- does, and we omit `include: ["reasoning.encrypted_content"]` and
+-- `parallel_tool_calls`, which Codex always sends. Neither half is a refusal
+-- — the request succeeds — so the only sign is the answers getting worse.
+--
+-- Deliberately NOT derived from `transport_profile`. That column says how we
+-- authenticate and which endpoint we reach; this one says what the body and
+-- headers look like once we are there. A reverse-proxied Codex is precisely
+-- the row where those two answers come apart, and a flag computed from the
+-- other would be unable to express it.
+--
+-- Read only by the Responses adapter. `chatgpt_codex` rows go to
+-- `CodexProvider`, which is this shape by construction and does not consult
+-- the column; a chat-completions row has no such shape to follow.
+--
+-- 0 is what every existing row gets, which is exactly their current treatment,
+-- so this migration changes nothing about how anything behaves.
+ALTER TABLE providers ADD COLUMN codex_request_shape INTEGER NOT NULL DEFAULT 0;

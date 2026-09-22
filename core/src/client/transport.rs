@@ -1,5 +1,6 @@
 use crate::client::error::TransportError;
 use crate::client::request::{Request, Response};
+use crate::client::retry::run_with_retry;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -145,6 +146,27 @@ impl ReqwestTransport {
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, req: Request) -> Result<Response, TransportError> {
+        match req.retry.clone() {
+            Some(policy) => run_with_retry(policy, || req.clone(), |req, _| self.execute_once(req)).await,
+            None => self.execute_once(req).await,
+        }
+    }
+
+    /// Retried like `execute`, and safe for the same reason `codex::send` gives
+    /// about its own 401 retry: the status is resolved *before* a body is handed
+    /// back, so a retry here cannot follow events that were already delivered
+    /// downstream. A failure mid-stream is a different thing and belongs to the
+    /// turn loop, which can replay the prompt.
+    async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError> {
+        match req.retry.clone() {
+            Some(policy) => run_with_retry(policy, || req.clone(), |req, _| self.stream_once(req)).await,
+            None => self.stream_once(req).await,
+        }
+    }
+}
+
+impl ReqwestTransport {
+    async fn execute_once(&self, req: Request) -> Result<Response, TransportError> {
         let url = req.url.clone();
         let builder = self.build(&req)?;
         let resp = builder.send().await.map_err(Self::map_error)?;
@@ -168,7 +190,7 @@ impl HttpTransport for ReqwestTransport {
         })
     }
 
-    async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError> {
+    async fn stream_once(&self, req: Request) -> Result<StreamResponse, TransportError> {
         let url = req.url.clone();
         let builder = self.build(&req)?;
         let resp = builder.send().await.map_err(Self::map_error)?;

@@ -526,6 +526,7 @@ impl ChatProvider for GemmaToolProvider {
         let req = self.build_request(&messages, tools_opt, &params, true)?;
         let resp = transport.stream(req).await?;
 
+        let mut response_model_emitted = false;
         let raw_stream: ChatStream = Box::pin(
             resp.bytes
                 .map(|r| r.map_err(ProviderError::Transport))
@@ -539,6 +540,13 @@ impl ChatProvider for GemmaToolProvider {
                             match serde_json::from_str::<ChatChunk>(&ev.data) {
                                 Ok(chunk) => {
                                     let (mut stream_events, finish_reason, usage) = parse_openai_sse_events(&chunk);
+                                    // Which model actually answered, for
+                                    // `messages.response_model_id`. Once per
+                                    // stream; every chunk repeats it.
+                                    if !response_model_emitted && let Some(ref model) = chunk.model {
+                                        stream_events.push(StreamEvent::ResponseModel { model: model.clone() });
+                                        response_model_emitted = true;
+                                    }
                                     if let Some(u) = usage {
                                         stream_events.push(StreamEvent::UsageUpdate { usage: u });
                                     }

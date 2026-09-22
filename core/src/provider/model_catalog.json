@@ -245,6 +245,30 @@
 
     {
       "provider": "openai",
+      "prefix": "gpt-6-astra",
+      "_comment": [
+        "Measured, not guessed: a capture of a real Codex client reaching this model through a relay",
+        "carried `x-openai-internal-codex-responses-lite: true`, which is Codex's `use_responses_lite`.",
+        "That flag rewrites the request body -- no top-level `tools`, no `instructions`, both moved",
+        "into `input` as developer items, and `parallel_tool_calls` forced off -- so getting it wrong",
+        "is not a rejected request, it is a worse answer. Only the Codex request shape acts on it.",
+        "The same capture showed `reasoning_effort: high`. Context and output ceilings are the family's",
+        "and are the one part here nothing has measured; a model page can correct them per row."
+      ],
+      "responses_lite": true,
+      "supports_thinking": true,
+      "supports_images": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low"
+    },
+    {
+      "provider": "openai",
       "prefix": "gpt-5.6-sol",
       "supports_thinking": true,
       "supports_images": true,

@@ -1,6 +1,7 @@
 pub mod auto_review;
 mod base_prompt;
 pub mod call_identity;
+pub mod codex_install;
 mod compact;
 mod context;
 pub mod conversation_excerpt;

@@ -258,7 +258,19 @@ pub async fn do_compact(
     // The turn parameters use the same resolution as a normal turn: a
     // summarisation request that invents its own temperature or output ceiling
     // is rejected by models the chat path already knows how to talk to.
-    let (provider_type, base_url, credential, model, api_format, transport_profile, turn, provider_id, provider_name) = {
+    let (
+        provider_type,
+        base_url,
+        credential,
+        model,
+        api_format,
+        transport_profile,
+        codex_request_shape,
+        codex_client_version,
+        turn,
+        provider_id,
+        provider_name,
+    ) = {
         let pool2 = pool.clone();
         let secrets2 = secrets.clone();
         let assistant2 = assistant.cloned();
@@ -270,6 +282,8 @@ pub async fn do_compact(
                 model,
                 api_format,
                 transport_profile,
+                codex_request_shape,
+                codex_client_version,
                 provider_id,
                 provider_name,
             } = resolve_provider_config(&secrets2, &pool2, assistant2.as_ref())?;
@@ -282,6 +296,9 @@ pub async fn do_compact(
                     api_format: &api_format,
 
                     transport_profile: &transport_profile,
+                    codex_request_shape,
+                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Compaction,
+                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
                     model: &model,
                     thinking_level: None,
                     // Summarising is background work; it does not take the priority tier.
@@ -295,6 +312,8 @@ pub async fn do_compact(
                 model,
                 api_format,
                 transport_profile,
+                codex_request_shape,
+                codex_client_version,
                 turn,
                 provider_id,
                 provider_name,
@@ -303,8 +322,15 @@ pub async fn do_compact(
         .await
         .map_err(|e| e.to_string())??
     };
-    let prov =
-        provider::registry::create_provider(&provider_type, &base_url, &credential, &api_format, &transport_profile)?;
+    let prov = provider::registry::create_provider(provider::registry::ProviderWire {
+        provider_type: &provider_type,
+        base_url: &base_url,
+        credential: &credential,
+        api_format: &api_format,
+        transport_profile: &transport_profile,
+        codex_request_shape,
+        codex_client_version: codex_client_version.as_deref(),
+    })?;
     let params = without_thinking(turn.params);
     // The same window and the same tokenizer the turn would use. A summariser
     // sized against a different one is sized against nothing.

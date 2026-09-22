@@ -188,6 +188,9 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
                     // A declarative provider names no logo; the mark
                     // follows whichever vendor the catalog identified.
                     icon: None,
+                    // Nor a request shape: `chat_completions` above has none
+                    // to follow.
+                    codex_request_shape: 0,
                 },
             )
             .map_err(|error| format!("could not create provider `{}`: {error}", provider.id))?;
@@ -514,6 +517,9 @@ mod tests {
                     // A declarative provider names no logo; the mark
                     // follows whichever vendor the catalog identified.
                     icon: None,
+                    // Nor a request shape: `chat_completions` above has none
+                    // to follow.
+                    codex_request_shape: 0,
                 },
             )
             .unwrap();

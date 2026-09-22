@@ -358,6 +358,7 @@ impl Active {
             resolved.api_format.clone(),
             resolved.model.clone(),
             resolved.transport_profile.clone(),
+            resolved.codex_request_shape,
         );
         let params = tokio::task::spawn_blocking(move || {
             crate::agent::resolve_turn_params(
@@ -369,6 +370,9 @@ impl Active {
                     api_format: &r.2,
 
                     transport_profile: &r.4,
+                    codex_request_shape: r.5,
+                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
+                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
                     model: &r.3,
                     thinking_level: None,
                     fast: false,
@@ -384,13 +388,7 @@ impl Active {
         let mut chat_params = crate::agent::without_thinking(params.params.clone());
         chat_params.temperature = Some(0.0);
 
-        let provider = crate::provider::registry::create_provider(
-            &resolved.provider_type,
-            &resolved.base_url,
-            &resolved.credential,
-            &resolved.api_format,
-            &resolved.transport_profile,
-        )?;
+        let provider = crate::provider::registry::create_provider(resolved.wire())?;
 
         let scene = self.scene_text(call, retry_reason).await?;
         let messages = vec![system(&self.system_prompt()), ChatMessage::user(&scene)];

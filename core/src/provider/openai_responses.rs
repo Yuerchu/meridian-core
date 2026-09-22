@@ -16,13 +16,64 @@ use crate::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
 pub struct OpenAIResponsesProvider {
     base_url: String,
     api_key: String,
+    /// Whether to send exactly what Codex sends — see [`CodexShape`].
+    codex_shape: bool,
+    /// The Codex release to claim, when the user has overridden it. Resolved
+    /// from `codex.client_version` where the provider row is read; `None` takes
+    /// [`codex_identity::DEFAULT_CODEX_CLIENT_VERSION`].
+    client_version: Option<String>,
+    /// Stable for the life of this provider, which is one turn. Only ever put
+    /// on the wire under `codex_shape`, where it is one of the four headers
+    /// Codex sends; the backend groups requests by it, so a fresh one per
+    /// request would look like a fresh conversation each time.
+    session_id: String,
+}
+
+/// What `codex_request_shape` turns on, in one place so the two halves cannot
+/// drift apart.
+///
+/// The case is a Codex backend reached through an ordinary API key: a row that
+/// is `openai` / `responses` / `standard` here, because that is what it looks
+/// like from outside, and so gets this app's Responses request instead of
+/// Codex's. The difference runs both ways and neither half is a refusal — the
+/// request succeeds either way, and the only sign is worse answers:
+///
+/// * **Dropped.** `temperature`, `top_p` and `max_output_tokens`. Codex's
+///   request struct has no field for any of them
+///   (`codex-api/src/common.rs::ResponsesApiRequest`), and this app's own
+///   `CodexProvider` already records that the backend rejects
+///   `max_output_tokens` outright.
+/// * **Added.** `include: ["reasoning.encrypted_content"]`, which `store: false`
+///   makes the only way reasoning can survive to the next request, and
+///   `parallel_tool_calls`, which Codex sends unconditionally.
+/// * **Headers.** `originator`, `session_id` and a matching `user-agent`, plus
+///   `Accept: text/event-stream` on the streaming call.
+///
+/// Off by default, and read by this adapter alone. `chatgpt_codex` rows go to
+/// `CodexProvider`, which is this shape by construction; a chat-completions row
+/// has no such shape to follow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexShape {
+    pub enabled: bool,
+    /// The user's `codex.client_version` override, if they set one.
+    pub client_version: Option<String>,
+}
+
+impl CodexShape {
+    /// The ordinary row: no Codex shape at all.
+    pub fn off() -> Self {
+        Self::default()
+    }
 }
 
 impl OpenAIResponsesProvider {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+    pub fn new(base_url: &str, api_key: &str, codex_shape: CodexShape) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
+            codex_shape: codex_shape.enabled,
+            client_version: codex_shape.client_version,
+            session_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -33,30 +84,86 @@ impl OpenAIResponsesProvider {
         params: &ChatParams,
         stream: bool,
     ) -> Result<Request, ProviderError> {
-        let (instructions, input) = serialize_responses_input(messages)?;
+        let (instructions, mut input) = serialize_responses_input(messages, self.reasoning_replay(params))?;
+        // Only the Codex shape knows how to send the lite form, and a plain
+        // OpenAI-compatible endpoint has never heard of an `additional_tools`
+        // item — so the model's own flag is not enough to turn it on.
+        let lite = self.codex_shape && params.responses_lite;
 
         let mut body = serde_json::json!({
             "model": params.model,
-            "input": input,
             "stream": stream,
             "store": false,
         });
-        if let Some(instructions) = instructions {
-            body["instructions"] = serde_json::json!(instructions);
+        match (lite, instructions) {
+            // The lite prefix, in Codex's order: the tools first, then the base
+            // instructions, then the conversation
+            // (`core/src/client.rs`, `use_responses_lite`). Both are `developer`
+            // items and both are spliced at the *front*, which is what keeps
+            // them at the head of the cached prefix.
+            (true, instructions) => {
+                let mut prefix = vec![additional_tools_item(params, tools)?];
+                if let Some(instructions) = instructions.filter(|text| !text.is_empty()) {
+                    prefix.push(base_instructions_item(params, &instructions));
+                }
+                input.splice(0..0, prefix);
+            }
+            (false, Some(instructions)) => {
+                body["instructions"] = serde_json::json!(instructions);
+            }
+            (false, None) => {}
         }
-        if let Some(t) = params.temperature {
-            body["temperature"] = serde_json::json!(t);
+        body["input"] = serde_json::Value::Array(input);
+        if self.codex_shape {
+            // The half of `CodexShape` that adds. `store: false` above is what
+            // makes the first one load-bearing rather than tidy: without it the
+            // reasoning items arrive with nothing replayable inside them, and
+            // the model starts every round having forgotten why it called the
+            // last tool.
+            body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+            // Codex computes this as `prompt.parallel_tool_calls && !use_responses_lite`,
+            // so a lite model is sent `false` however the turn was configured.
+            body["parallel_tool_calls"] = serde_json::json!(!lite);
+        } else {
+            // The half that drops. Codex's request struct has no field for any
+            // of these three, and sending one to a backend that expects Codex's
+            // shape is not refused -- it is answered worse.
+            if let Some(t) = params.temperature {
+                body["temperature"] = serde_json::json!(t);
+            }
+            if let Some(p) = params.top_p {
+                body["top_p"] = serde_json::json!(p);
+            }
+            if let Some(m) = params.max_tokens {
+                body["max_output_tokens"] = serde_json::json!(m);
+            }
         }
-        if let Some(p) = params.top_p {
-            body["top_p"] = serde_json::json!(p);
-        }
-        if let Some(m) = params.max_tokens {
-            body["max_output_tokens"] = serde_json::json!(m);
-        }
-        if let Some(ref effort) = params.thinking_effort {
+        // Built as a map rather than a literal because the lite shape needs a
+        // `reasoning` object even when nothing else would have produced one —
+        // see `context` below, and `Reasoning` in `codex-api/src/common.rs`,
+        // whose three fields are each skipped when absent.
+        let mut reasoning = serde_json::Map::new();
+        if let Some(effort) = params.thinking_effort.as_deref() {
             // Without `summary` the reasoning summary events are never sent,
             // so a reasoning model would think in silence.
-            body["reasoning"] = serde_json::json!({"effort": effort, "summary": "auto"});
+            reasoning.insert("effort".into(), effort.into());
+            reasoning.insert("summary".into(), "auto".into());
+        }
+        if lite {
+            // **Required, and the backend says so in as many words.** Measured:
+            // `unsupported_value` / `X-OpenAI-Internal-Codex-Responses-Lite
+            // requires reasoning.context to be all_turns`. Codex writes exactly
+            // this conditional — `use_responses_lite.then_some(AllTurns)` — and
+            // omits the field otherwise, where the server's own default is
+            // `current_turn`.
+            //
+            // It also pairs with what is already being sent: `all_turns` is the
+            // half of the contract that makes the replayed
+            // `reasoning.encrypted_content` above worth replaying.
+            reasoning.insert("context".into(), "all_turns".into());
+        }
+        if !reasoning.is_empty() {
+            body["reasoning"] = serde_json::Value::Object(reasoning);
         }
         if let Some(ref verbosity) = params.verbosity {
             body["text"] = serde_json::json!({"verbosity": verbosity});
@@ -68,25 +175,23 @@ impl OpenAIResponsesProvider {
         // Server-side tools sit in the same array as our own, and go first: the
         // tool list is the front of what a provider caches, and ours change with
         // the mode while these do not.
-        let mut wire_tools: Vec<serde_json::Value> = params
-            .server_tools
-            .iter()
-            .map(|name| serde_json::json!({ "type": name }))
-            .collect();
-        if let Some(tools) = tools {
-            wire_tools.extend(tools.iter().map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                    "strict": false,
-                })
-            }));
-        }
-        if !wire_tools.is_empty() {
-            body["tools"] = serde_json::Value::Array(wire_tools);
-            body["tool_choice"] = serde_json::json!("auto");
+        //
+        // Skipped entirely under the lite shape, where the whole array has
+        // already gone into `input` as an `additional_tools` item. Sending both
+        // would describe the same tools twice in two grammars.
+        if !lite {
+            let mut wire_tools: Vec<serde_json::Value> = params
+                .server_tools
+                .iter()
+                .map(|name| serde_json::json!({ "type": name }))
+                .collect();
+            if let Some(tools) = tools {
+                wire_tools.extend(tools.iter().map(wire_function));
+            }
+            if !wire_tools.is_empty() {
+                body["tools"] = serde_json::Value::Array(wire_tools);
+                body["tool_choice"] = serde_json::json!("auto");
+            }
         }
         // xAI's spelling of the cache-routing key on this API; the header is the
         // chat-completions form. DeepSeek ignores the field, which its own
@@ -101,9 +206,190 @@ impl OpenAIResponsesProvider {
             http::header::AUTHORIZATION,
             super::auth_header_value(&format!("Bearer {}", self.api_key)),
         );
+        if self.codex_shape {
+            self.insert_codex_headers(&mut req, params, stream);
+        }
         req.body = Some(RequestBody::Json(body));
         Ok(req)
     }
+
+    /// Which model's stored reasoning may be replayed into this request, if any.
+    ///
+    /// Keyed on the model rather than merely on the switch, because a stored
+    /// item is encrypted and bound to the model that produced it: handing
+    /// another one back is a 400, which is why `codex_reasoning_for` takes a
+    /// name at all. `None` is the ordinary case and means the assistant rows go
+    /// in as they always did.
+    fn reasoning_replay<'a>(&self, params: &'a ChatParams) -> Option<&'a str> {
+        self.codex_shape.then_some(params.model.as_str())
+    }
+
+    /// The header half of [`CodexShape`], read off Codex itself rather than off
+    /// this app's own `CodexProvider`.
+    ///
+    /// **That distinction cost three of the five headers below.** `codex.rs` was
+    /// written against an older Codex and sends `session_id` with an underscore;
+    /// current Codex sends `session-id` *and* `thread-id` with hyphens
+    /// (`codex-api/src/requests/headers.rs::build_session_headers`), plus
+    /// `x-client-request-id`. The underscore spelling appears nowhere in the
+    /// Codex tree any more. Copying our own adapter would have reproduced a
+    /// header set no Codex backend has seen in a while — which is the exact
+    /// failure this switch exists to prevent, arrived at from the other side.
+    ///
+    /// What Codex sends on `POST /responses`, and where each comes from here:
+    ///
+    /// | header | Codex | here |
+    /// |---|---|---|
+    /// | `originator` | `codex_cli_rs` | ours — see below |
+    /// | `user-agent` | `{originator}/{v} ({os} {ver}; {arch}) {terminal}` | same shape, our values |
+    /// | `session-id` | the CLI session | this provider's lifetime, one turn |
+    /// | `thread-id` | the thread | the conversation (`cache_key`) |
+    /// | `x-client-request-id` | the thread | the same conversation |
+    /// | `accept` | `text/event-stream` on the stream | same |
+    ///
+    /// **The identity values stay ours, and that is the one place this switch
+    /// stops short of its own name.** Codex classifies the value server-side —
+    /// `login::default_client::is_first_party_originator` matches `codex_cli_rs`,
+    /// `codex-tui`, `codex_vscode` and anything starting `Codex ` — so sending
+    /// `meridian` is visibly not one of them. Claiming otherwise would also mean
+    /// inventing a `codex_cli_rs` version number for a product whose releases we
+    /// do not track, which goes stale silently. `CodexProvider`'s own note
+    /// records that our name was *measured to be accepted*; that is about the
+    /// request not being refused, which is a different question from whether the
+    /// answer is as good, and nothing here settles the second.
+    ///
+    /// Two Codex headers are deliberately absent. `x-openai-subagent` marks a
+    /// review/compaction pass, and this app does not plumb that distinction to
+    /// the adapter — Codex omits it for an ordinary turn, which is the common
+    /// case, and a wrong value is worse than none. `x-openai-internal-codex-residency`
+    /// is set only under a managed policy Codex reads from its own config.
+    fn insert_codex_headers(&self, req: &mut Request, params: &ChatParams, stream: bool) {
+        let mut set = |name: &'static str, value: &str| {
+            if let Ok(value) = http::HeaderValue::from_str(value) {
+                req.headers.insert(http::HeaderName::from_static(name), value);
+            }
+        };
+        set("originator", super::codex_identity::CODEX_ORIGINATOR);
+        set(
+            "user-agent",
+            &super::codex_identity::user_agent(super::codex_identity::client_version(self.client_version.as_deref())),
+        );
+        set("session-id", &self.session_id);
+        // The conversation, which is what `cache_key` holds and what Codex means
+        // by a thread. Absent for the background passes that clear it
+        // (`without_thinking`) — Codex likewise sends neither when it has no
+        // thread, so an empty string here would be worse than the omission.
+        let thread = params.cache_key.as_deref();
+        if let Some(thread) = thread {
+            set("thread-id", thread);
+            set("x-client-request-id", thread);
+            set("x-codex-window-id", &format!("{thread}:0"));
+        }
+        // What this app can honestly say about the turn. Absent rather than
+        // invented where there is no equivalent — see `codex_metadata`.
+        if let Some(metadata) = params.codex_turn.as_ref() {
+            set("x-codex-installation-id", &metadata.installation_id);
+            set(
+                "x-codex-turn-metadata",
+                &metadata.to_json(&self.session_id, thread, params).to_string(),
+            );
+        }
+        // Announced only where it is true of this request: the same flag the
+        // turn loop reads before it sends a `compaction_trigger`.
+        if params.supports_remote_compaction {
+            set("x-codex-beta-features", "remote_compaction_v2");
+        }
+        // The model's own shape, and the one header here that changes how the
+        // body above was built rather than merely describing it.
+        if params.responses_lite {
+            set("x-openai-internal-codex-responses-lite", "true");
+        }
+        if stream {
+            req.headers.insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("text/event-stream"),
+            );
+        }
+    }
+}
+
+/// One of our tools as the Responses API spells a function.
+fn wire_function(tool: &ToolDefinition) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+        "strict": false,
+    })
+}
+
+/// A deterministic id for a prefix item, in Codex's `{prefix}_{uuid}` form.
+///
+/// **Derived rather than random, and that is the point.** These two items are
+/// rebuilt from scratch on every request, so a fresh uuid each time would put a
+/// different id at the head of the prompt on every round — which is a different
+/// prefix, and the prefix is what a provider caches. Codex uses a v5 over the
+/// thread's own namespace for the same reason; here the conversation stands in
+/// for the thread, and a request without one falls back to the model so the id
+/// is at least stable within a session.
+fn prefix_item_id(prefix: &str, params: &ChatParams, payload: &[u8]) -> String {
+    let namespace = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        params.cache_key.as_deref().unwrap_or(params.model.as_str()).as_bytes(),
+    );
+    format!("{prefix}_{}", uuid::Uuid::new_v5(&namespace, payload))
+}
+
+/// The tool array, as the lite shape carries it: one input item rather than a
+/// top-level field.
+///
+/// Codex groups plain functions under a single `functions` namespace
+/// (`tools/src/tool_spec.rs::create_tools_json_for_responses_lite`,
+/// `DEFAULT_FUNCTION_NAMESPACE`) whose description is empty, and leaves
+/// anything that is not a function — the provider-side tools — as its own entry
+/// beside it. The namespace takes the position of the first function, so the
+/// order the turn chose survives.
+fn additional_tools_item(
+    params: &ChatParams,
+    tools: Option<&[ToolDefinition]>,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut entries: Vec<serde_json::Value> = params
+        .server_tools
+        .iter()
+        .map(|name| serde_json::json!({ "type": name }))
+        .collect();
+    let functions: Vec<serde_json::Value> = tools.unwrap_or_default().iter().map(wire_function).collect();
+    if !functions.is_empty() {
+        entries.push(serde_json::json!({
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": functions,
+        }));
+    }
+
+    let payload = serde_json::to_vec(&entries).map_err(|e| ProviderError::Parse(e.to_string()))?;
+    Ok(serde_json::json!({
+        "type": "additional_tools",
+        "id": prefix_item_id("at", params, &payload),
+        "role": "developer",
+        "tools": entries,
+    }))
+}
+
+/// The system prompt, as the lite shape carries it.
+///
+/// `developer`, not `system`: `BaseInstructionsFragment` declares that role and
+/// `requires_separate_message`, so it arrives as its own item rather than being
+/// folded into the first user message.
+fn base_instructions_item(params: &ChatParams, instructions: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "id": prefix_item_id("msg", params, instructions.as_bytes()),
+        "role": "developer",
+        "content": [{ "type": "input_text", "text": instructions }],
+    })
 }
 
 fn responses_user_content(content: &str) -> Result<Vec<serde_json::Value>, ProviderError> {
@@ -134,8 +420,12 @@ fn responses_user_content(content: &str) -> Result<Vec<serde_json::Value>, Provi
         .collect()
 }
 
+/// `reasoning_replay` names the model whose stored reasoning items go back into
+/// the input, or `None` to leave them out — see
+/// [`OpenAIResponsesProvider::reasoning_replay`].
 fn serialize_responses_input(
     messages: &[ChatMessage],
+    reasoning_replay: Option<&str>,
 ) -> Result<(Option<String>, Vec<serde_json::Value>), ProviderError> {
     let mut instructions: Option<String> = None;
     let mut input = Vec::new();
@@ -161,25 +451,30 @@ fn serialize_responses_input(
                     "content": responses_user_content(&rendered.content)?,
                 }));
             }
-            "assistant" => {
-                if !m.content.is_empty() {
-                    input.push(serde_json::json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": m.content}],
-                    }));
-                }
-                if let Some(ref tool_calls) = m.tool_calls {
-                    for tc in tool_calls {
-                        input.push(serde_json::json!({
-                            "type": "function_call",
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                            "call_id": tc.id,
-                        }));
+            "assistant" => match reasoning_replay {
+                // The identical merge `CodexProvider` does, from the one
+                // implementation of it -- the interleaving rule there is subtle
+                // and a second copy would be a second chance to get it wrong.
+                Some(model) => input.extend(super::codex::replay_assistant_turn(m, model)),
+                None => {
+                    if !m.content.is_empty() {
+                        input.push(assistant_message_item(
+                            &m.content,
+                            m.provider_state.as_ref().and_then(|s| s.responses_phase()),
+                        ));
+                    }
+                    if let Some(ref tool_calls) = m.tool_calls {
+                        for tc in tool_calls {
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                                "call_id": tc.id,
+                            }));
+                        }
                     }
                 }
-            }
+            },
             "tool" => {
                 if let Some(ref call_id) = m.tool_call_id {
                     input.push(serde_json::json!({
@@ -233,6 +528,13 @@ pub(super) struct ResponseUsage {
     /// `ServerToolUsage`.
     #[serde(default, rename = "num_server_side_tools_used")]
     _num_server_side_tools_used: IgnoredAny,
+    /// Seen on a Codex backend and **not understood**. It appears nowhere in
+    /// the Codex tree, so there is no reading of it to copy; declared here
+    /// rather than left to `extra` so the unknown-field warning goes back to
+    /// meaning "the wire moved" instead of firing on every reply. If it ever
+    /// turns out to carry something billable, this is the line to change.
+    #[serde(default, rename = "attribution")]
+    _attribution: IgnoredAny,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
 }
@@ -256,6 +558,17 @@ fn read_usage(value: Option<&serde_json::Value>) -> Option<TokenUsage> {
 #[derive(Deserialize)]
 struct ResponseInputTokensDetails {
     cached_tokens: Option<i64>,
+    /// Prompt tokens this request *put into* the cache, as distinct from the
+    /// ones it read out of it.
+    ///
+    /// Measured on a Codex backend, and Codex reads the same field
+    /// (`codex-api/src/sse/responses.rs`, `cache_write_input_tokens`). This
+    /// adapter used to hardcode the figure to `None` under a comment saying the
+    /// Responses API bills no premium for a cache write — which was true of the
+    /// endpoints it had seen and is not a statement this struct should have
+    /// been making at all. The tokens are reported; whether they cost extra is
+    /// what `model_configs.cache_write_price` is for.
+    cache_write_tokens: Option<i64>,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
 }
@@ -322,9 +635,20 @@ pub(super) fn normalise_responses_usage(u: &ResponseUsage) -> TokenUsage {
             .as_ref()
             .and_then(|d| d.cached_tokens)
             .map(|v| v as i32),
-        // The Responses API bills no premium for putting a prefix into cache,
-        // so there is no figure to report — not a zero it never mentioned.
-        cache_write_tokens: None,
+        // Reported where the upstream reports it, and `None` where it says
+        // nothing — not a zero it never mentioned. This was hardcoded to `None`
+        // on the reading that a cache write is never charged a premium here,
+        // which conflated "costs no more" with "did not happen": the tokens
+        // then fell into `uncached_prompt_tokens` and were billed as ordinary
+        // input. The total came out the same, because `cost_of` falls back to
+        // the input price for a blank `cache_write_price` — but the breakdown
+        // was wrong, and the count reached neither the ledger nor the one
+        // person who could decide whether this upstream needs that price set.
+        cache_write_tokens: u
+            .input_tokens_details
+            .as_ref()
+            .and_then(|d| d.cache_write_tokens)
+            .map(|v| v as i32),
     }
 }
 
@@ -333,8 +657,70 @@ pub(super) fn normalise_responses_usage(u: &ResponseUsage) -> TokenUsage {
 struct ResponseError {
     code: Option<String>,
     message: Option<String>,
+    /// The other place a code arrives. OpenAI's own errors carry both — `type`
+    /// is the family (`invalid_request_error`) and `code` the specific reason —
+    /// and a relay routinely sends only one of them. Read as a fallback rather
+    /// than merged, so a row carrying both is classified on the narrower value.
+    #[serde(rename = "type")]
+    error_type: Option<String>,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
+}
+
+impl ResponseError {
+    fn code(&self) -> Option<&str> {
+        self.code.as_deref().or(self.error_type.as_deref())
+    }
+}
+
+/// What a Responses error code means for the retry that follows it.
+///
+/// The taxonomy is Codex's (`codex-api/src/sse/responses.rs`, `response.failed`),
+/// including the part that is easy to read as an oversight and is not: **a code
+/// nobody recognises is retryable**. This adapter had the opposite default —
+/// every `response.failed` became a flat 400 — and 400 is the one status that
+/// says "asking again cannot help", so an upstream reporting `server_is_overloaded`
+/// ended the turn on its first attempt while describing itself as our mistake.
+///
+/// The terminal list is wider than Codex's by five codes. Codex talks to one
+/// backend and can afford to assume a failure it has never seen is transient;
+/// here the other end is any relay, and the cost of guessing wrong is five
+/// identical requests. Every code added is one the OpenAI reference documents
+/// as a client error — a parameter this build sent that the upstream will refuse
+/// every time — rather than one inferred from its wording.
+///
+/// A status rather than an enum of our own because that is the vocabulary the
+/// whole retry path already speaks: `ProviderError::Api`, `TransportError::Http`
+/// and a gateway echoing `status: 503` all end up as one number read by
+/// `agent::stream::is_retryable_stream_error`.
+fn status_for_error_code(code: &str) -> u16 {
+    match code {
+        // Its own path out of the turn loop: `is_context_window_error` matches
+        // on the code as well as on this status, so both spellings agree.
+        "context_length_exceeded" => 413,
+        // Money, in its four spellings. Not 403: the credential is fine and the
+        // account is not, and a retry cannot change either.
+        "insufficient_quota"
+        | "credit_balance_exhausted"
+        | "organization_spend_limit_exceeded"
+        | "project_spend_limit_exceeded"
+        | "usage_not_included" => 402,
+        // A judgement about this content. The same bytes get the same answer.
+        "cyber_policy" | "bio_policy" | "misalignment_policy_violation" => 400,
+        // A request this build composed wrongly. Retrying sends the identical
+        // body, so the only thing five attempts buy is five refusals.
+        "invalid_prompt"
+        | "invalid_request"
+        | "invalid_request_error"
+        | "unsupported_parameter"
+        | "unsupported_value"
+        | "model_not_found"
+        | "unsupported_country_region_territory" => 400,
+        "rate_limit_exceeded" | "slow_down" => 429,
+        "server_is_overloaded" => 503,
+        // Codex's default, and the reason this function exists.
+        _ => 503,
+    }
 }
 
 /// The top-level `error` stream event. Not `ResponseError`: this one carries
@@ -363,13 +749,19 @@ struct StreamErrorEvent {
 struct StreamErrorInner {
     code: Option<String>,
     message: Option<String>,
+    /// As on [`ResponseError`]. Only on the *nested* object: the envelope's own
+    /// `type` is the literal `"error"`, which is the event's name rather than
+    /// anything about what went wrong, and reading it as a code would classify
+    /// every stream error as one unknown kind.
+    #[serde(rename = "type")]
+    error_type: Option<String>,
 }
 
 impl StreamErrorEvent {
     fn code(&self) -> Option<&str> {
         self.error
             .as_ref()
-            .and_then(|e| e.code.as_deref())
+            .and_then(|e| e.code.as_deref().or(e.error_type.as_deref()))
             .or(self.code.as_deref())
     }
 
@@ -386,7 +778,6 @@ impl StreamErrorEvent {
 /// name absent from both this and the `match` is a *new* event — something
 /// worth a warning — instead of one more thing silently dropped.
 const IGNORED_EVENTS: &[&str] = &[
-    "response.created",
     "response.in_progress",
     "response.queued",
     "response.content_part.added",
@@ -596,6 +987,113 @@ fn server_tool_call(item: &serde_json::Value, completed: bool) -> Option<super::
     })
 }
 
+/// One assistant message going back into `input`, carrying the phase the
+/// upstream gave it.
+///
+/// `phase` is written only when there is one to write: the field is `optional`
+/// on the wire, Codex's own copy is `skip_serializing_if = "Option::is_none"`,
+/// and a relay old enough not to know the field is one that never sent a phase
+/// to begin with — so omission is both what the specification asks for and what
+/// keeps this from being a new way to get a 400.
+pub(super) fn assistant_message_item(
+    content: &str,
+    phase: Option<super::state::ResponseMessagePhase>,
+) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": content}],
+    });
+    if let Some(phase) = phase {
+        item["phase"] = serde_json::json!(phase.as_wire());
+    }
+    item
+}
+
+/// Turn a completed `message` output item into the phase it carried.
+///
+/// Its own interception beside [`super::codex::reasoning_update`] and for the
+/// same reason: the shared parser has no use for a message item's metadata and
+/// drops it, while this is the one thing about that item the *next* request
+/// needs.
+pub(super) fn message_phase_update(data: &str, protocol: &str, model: &str) -> Option<StreamEvent> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let item = value.get("item")?;
+    if item.get("type")?.as_str()? != "message" {
+        return None;
+    }
+    let raw = item.get("phase")?.as_str()?;
+    let Some(phase) = super::state::ResponseMessagePhase::from_wire(raw) else {
+        warn_unknown_once("message_phase", raw);
+        return None;
+    };
+    Some(StreamEvent::ProviderStateUpdate {
+        update: super::state::ProviderStateUpdate::ResponsesMessagePhase {
+            protocol: protocol.to_string(),
+            model: model.to_string(),
+            phase,
+        },
+    })
+}
+
+/// The name of the header a Codex backend answers with, in both its spellings.
+///
+/// Case-insensitive, because these arrive as JSON object keys inside an event
+/// rather than as a `HeaderMap` that would fold the case for us.
+pub(super) const OPENAI_MODEL_HEADERS: [&str; 2] = ["openai-model", "x-openai-model"];
+
+/// Read `openai-model` off the real HTTP response headers.
+///
+/// Its own function because a `HeaderMap` already folds the case, so the
+/// JSON-object reader below cannot be reused for it.
+pub(super) fn http_response_model(headers: &http::HeaderMap) -> Option<String> {
+    OPENAI_MODEL_HEADERS
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .and_then(|value| value.to_str().ok())
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+/// Read `openai-model` out of a JSON object of headers.
+fn model_from_header_object(headers: &serde_json::Value) -> Option<&str> {
+    headers.as_object()?.iter().find_map(|(name, value)| {
+        OPENAI_MODEL_HEADERS
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+            .then(|| value.as_str())
+            .flatten()
+    })
+}
+
+/// Which model actually answered, from the places it can be said.
+///
+/// **The header wins over `response.model`, and that ordering is Codex's.** It
+/// has a test named `process_sse_ignores_response_model_field_in_payload`: on
+/// that backend the payload's `model` is the alias that was *asked for* and the
+/// `openai-model` header is what actually served it — so reading the payload is
+/// precisely the way to miss the substitution this column exists to catch
+/// (migration 60).
+///
+/// The payload is kept as a fallback rather than dropped, which is where this
+/// departs from Codex deliberately: Codex talks to one backend, and an ordinary
+/// OpenAI-compatible endpoint sends no such header while `model` on the
+/// response object is part of the documented public shape. Header first,
+/// payload second, silence third.
+///
+/// Empty is treated as absent throughout: a relay that strips the field and one
+/// that blanks it are the same fact, and an empty `response_model_id` would
+/// read as a substitution to something unnamed rather than as silence.
+fn response_model_event(event: &serde_json::Value) -> Option<Result<StreamEvent, ProviderError>> {
+    let model = model_from_header_object(&event["response"]["headers"])
+        .or_else(|| model_from_header_object(&event["headers"]))
+        .or_else(|| event["response"]["model"].as_str())
+        .filter(|model| !model.is_empty())?;
+    Some(Ok(StreamEvent::ResponseModel {
+        model: model.to_string(),
+    }))
+}
+
 pub(super) fn parse_responses_event(
     event_type: &str,
     data: &str,
@@ -754,6 +1252,21 @@ pub(super) fn parse_responses_event(
                 Err(e) => vec![Err(ProviderError::Parse(e.to_string()))],
             }
         }
+        // **Which model actually answered.** `messages.response_model_id`
+        // (migration 60) exists to catch a relay quietly substituting one, and
+        // it was NULL for every row this adapter ever wrote: three adapters
+        // emit `ResponseModel` and this was not one of them, so the whole
+        // Responses API — every OpenAI, xAI, DeepSeek-on-responses and Codex
+        // row — had nothing to compare against the model that was asked for.
+        //
+        // Read here because `response.created` is the first frame of the
+        // stream, so a substitution is known before a single token arrives.
+        // `response.completed` repeats it for a relay that omits the opening
+        // event; the engine keeps whichever came first.
+        "response.created" => match serde_json::from_str::<serde_json::Value>(data) {
+            Ok(v) => response_model_event(&v).into_iter().collect(),
+            Err(e) => vec![Err(ProviderError::Parse(e.to_string()))],
+        },
         "response.completed" => {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(data);
             match parsed {
@@ -761,6 +1274,7 @@ pub(super) fn parse_responses_event(
                     let response = &v["response"];
                     let usage = read_usage(response.get("usage"));
                     let mut events = Vec::new();
+                    events.extend(response_model_event(&v));
                     if let Some(u) = usage {
                         events.push(Ok(StreamEvent::UsageUpdate { usage: u }));
                     }
@@ -784,13 +1298,13 @@ pub(super) fn parse_responses_event(
                     if let Some(error) = error.as_ref() {
                         warn_extra_fields("responses_error", &error.extra);
                     }
-                    let code = error.as_ref().and_then(|e| e.code.as_deref()).unwrap_or("unknown");
+                    let code = error.as_ref().and_then(|e| e.code()).unwrap_or("unknown");
                     let message = error
                         .as_ref()
                         .and_then(|e| e.message.as_deref())
                         .unwrap_or("Unknown error");
                     vec![Err(ProviderError::Api {
-                        status: 400,
+                        status: status_for_error_code(code),
                         body: format!("{}: {}", code, message),
                     })]
                 }
@@ -828,9 +1342,8 @@ pub(super) fn parse_responses_event(
                     warn_extra_fields("responses_stream_error", &error.extra);
                     let code = error.code().unwrap_or("unknown");
                     let message = error.message().unwrap_or("Unknown error");
-                    let status = if code.contains("rate_limit") { 429 } else { 400 };
                     vec![Err(ProviderError::Api {
-                        status,
+                        status: status_for_error_code(code),
                         body: format!("{}: {}", code, message),
                     })]
                 }
@@ -863,7 +1376,30 @@ impl ChatProvider for OpenAIResponsesProvider {
         let req = self.build_request(&messages, tools_opt, &params, true)?;
         let resp = transport.stream(req).await?;
 
+        // **The third place the model can be said, and the first to arrive.**
+        // Codex reads `openai-model` off the HTTP response headers before a
+        // single frame is parsed (`codex-api/src/sse/responses.rs`), which the
+        // event parser cannot do because it never sees them. Emitted ahead of
+        // the stream so it wins the engine's first-one-kept rule over anything
+        // the payload later claims.
+        let header_model = http_response_model(&resp.headers);
+
         let mut state = StreamState::default();
+        // Only under `CodexShape`: asking for `include` is what makes these
+        // items replayable, so capturing them without it would store reasoning
+        // with nothing inside it and then send it back as input the upstream
+        // refuses.
+        let capture_reasoning = self.reasoning_replay(&params).map(str::to_string);
+        // The phase, unlike the reasoning, is captured whichever shape this is:
+        // it needs nothing asked for in the request, and the upstream only ever
+        // sends one if it has one. Which protocol it is stored under decides
+        // whether it can share a payload with the reasoning above.
+        let phase_protocol = if self.codex_shape {
+            super::state::CODEX_RESPONSES_PROTOCOL
+        } else {
+            super::state::RESPONSES_PROTOCOL
+        };
+        let phase_model = params.model.clone();
 
         let stream = resp
             .bytes
@@ -871,11 +1407,31 @@ impl ChatProvider for OpenAIResponsesProvider {
             .eventsource()
             .flat_map(move |event| {
                 let events: Vec<Result<StreamEvent, ProviderError>> = match event {
-                    Ok(ev) => parse_responses_event(&ev.event, &ev.data, &mut state),
+                    Ok(ev) => {
+                        let mut out = Vec::new();
+                        // Intercept first, then delegate: the shared parser has
+                        // no interest in reasoning items or a message item's
+                        // phase, and drops both.
+                        if ev.event == "response.output_item.done" {
+                            if let Some(model) = capture_reasoning.as_deref()
+                                && let Some(captured) = super::codex::reasoning_update(&ev.data, model)
+                            {
+                                out.push(Ok(captured));
+                            }
+                            if let Some(captured) = message_phase_update(&ev.data, phase_protocol, &phase_model) {
+                                out.push(Ok(captured));
+                            }
+                        }
+                        out.extend(parse_responses_event(&ev.event, &ev.data, &mut state));
+                        out
+                    }
                     Err(e) => vec![Err(ProviderError::Parse(e.to_string()))],
                 };
                 futures::stream::iter(events)
             });
+
+        let stream =
+            futures::stream::iter(header_model.map(|model| Ok(StreamEvent::ResponseModel { model }))).chain(stream);
 
         Ok(Box::pin(stream))
     }
@@ -989,7 +1545,7 @@ impl ChatProvider for OpenAIResponsesProvider {
         messages: &[ChatMessage],
         params: &ChatParams,
     ) -> Result<super::RemoteCompactResult, ProviderError> {
-        let (instructions, mut input) = serialize_responses_input(messages)?;
+        let (instructions, mut input) = serialize_responses_input(messages, self.reasoning_replay(params))?;
         input.push(serde_json::json!({ "type": "compaction_trigger" }));
 
         let mut body = serde_json::json!({
@@ -1004,12 +1560,22 @@ impl ChatProvider for OpenAIResponsesProvider {
         if let Some(key) = params.cache_key.as_deref() {
             body["prompt_cache_key"] = serde_json::json!(key);
         }
+        if self.codex_shape {
+            // The history being compacted is the same history a turn sends, so
+            // the request carrying it has to be the same shape -- a compaction
+            // that replayed reasoning items without asking for `include` would
+            // send input the upstream refuses.
+            body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+        }
 
         let mut req = Request::new(http::Method::POST, format!("{}/responses", self.base_url));
         req.headers.insert(
             http::header::AUTHORIZATION,
             super::auth_header_value(&format!("Bearer {}", self.api_key)),
         );
+        if self.codex_shape {
+            self.insert_codex_headers(&mut req, params, true);
+        }
         req.body = Some(RequestBody::Json(body));
 
         let transport = ReqwestTransport::shared();
@@ -1065,7 +1631,7 @@ mod tests {
         };
         mutate(&mut params);
         crate::provider::capabilities::filter_params(&mut params, &caps).unwrap();
-        let provider = OpenAIResponsesProvider::new("https://example.test", "k");
+        let provider = OpenAIResponsesProvider::new("https://example.test", "k", CodexShape::off());
         let req = provider
             .build_request(&[ChatMessage::user("hi")], None, &params, false)
             .unwrap();
@@ -1090,7 +1656,7 @@ mod tests {
             },
         );
 
-        let (_, input) = serialize_responses_input(&[message]).expect("serialize multimodal user input");
+        let (_, input) = serialize_responses_input(&[message], None).expect("serialize multimodal user input");
         let content = input[0]["content"].as_array().expect("message content array");
         assert_eq!(content.len(), 3);
         assert_eq!(content[0]["type"], "input_text");
@@ -1124,7 +1690,7 @@ mod tests {
         ])
         .to_string();
 
-        let (_, input) = serialize_responses_input(&[ChatMessage::user(&body)]).expect("serialize file input");
+        let (_, input) = serialize_responses_input(&[ChatMessage::user(&body)], None).expect("serialize file input");
         assert_eq!(
             input[0]["content"][0],
             serde_json::json!({
@@ -1137,7 +1703,7 @@ mod tests {
 
     #[test]
     fn ordinary_user_text_keeps_the_existing_responses_shape() {
-        let (_, input) = serialize_responses_input(&[ChatMessage::user("hello")]).expect("serialize text input");
+        let (_, input) = serialize_responses_input(&[ChatMessage::user("hello")], None).expect("serialize text input");
         assert_eq!(
             input[0]["content"],
             serde_json::json!([{ "type": "input_text", "text": "hello" }])
@@ -1175,7 +1741,7 @@ mod tests {
     /// the mode.
     #[test]
     fn server_tools_lead_the_tool_array() {
-        let provider = OpenAIResponsesProvider::new("https://api.x.ai/v1", "k");
+        let provider = OpenAIResponsesProvider::new("https://api.x.ai/v1", "k", CodexShape::off());
         let params = ChatParams {
             model: "grok-4.6".into(),
             server_tools: vec![ServerToolKind::WebSearch, ServerToolKind::XSearch],
@@ -1208,7 +1774,7 @@ mod tests {
     /// otherwise switching the local tools off switches the provider's off too.
     #[test]
     fn server_tools_alone_still_produce_a_tool_array() {
-        let provider = OpenAIResponsesProvider::new("https://api.x.ai/v1", "k");
+        let provider = OpenAIResponsesProvider::new("https://api.x.ai/v1", "k", CodexShape::off());
         let params = ChatParams {
             model: "grok-4.6".into(),
             server_tools: vec![ServerToolKind::WebSearch],
@@ -1349,6 +1915,583 @@ mod tests {
         );
     }
 
+    fn codex_shaped_body(mutate: impl FnOnce(&mut ChatParams)) -> (serde_json::Value, http::HeaderMap) {
+        let provider = OpenAIResponsesProvider::new(
+            "https://relay.invalid/v1",
+            "k",
+            CodexShape {
+                enabled: true,
+                client_version: None,
+            },
+        );
+        let mut params = ChatParams {
+            model: "gpt-5.6-sol".into(),
+            cache_key: Some("conv-9".into()),
+            ..Default::default()
+        };
+        mutate(&mut params);
+        let defs = [ToolDefinition {
+            name: "read_file".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let req = provider
+            .build_request(&[ChatMessage::user("hi")], Some(&defs), &params, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        (body, req.headers)
+    }
+
+    /// **The switch runs both ways, and the dropped half is the easy one to
+    /// forget.** A Codex backend reached through an API key answers a request
+    /// carrying `temperature` — it does not refuse it — so the only evidence of
+    /// getting this wrong is worse replies.
+    #[test]
+    fn the_codex_shape_drops_what_codex_never_sends() {
+        let (body, _) = codex_shaped_body(|p| {
+            p.temperature = Some(0.7);
+            p.top_p = Some(0.9);
+            p.max_tokens = Some(4096);
+        });
+        for absent in ["temperature", "top_p", "max_output_tokens"] {
+            assert!(body.get(absent).is_none(), "{absent} is still on the wire: {body}");
+        }
+
+        // And with the switch off they are exactly where they were.
+        let body = body_for("gpt-5.6-sol", |p| {
+            p.temperature = Some(0.7);
+            p.top_p = Some(0.9);
+            p.max_tokens = Some(4096);
+        });
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["top_p"], 0.9);
+        assert_eq!(body["max_output_tokens"], 4096);
+    }
+
+    /// The added half. `include` is the one that is load-bearing rather than
+    /// cosmetic: with `store: false` and no `include`, the reasoning items come
+    /// back with nothing replayable inside them.
+    #[test]
+    fn the_codex_shape_adds_what_codex_always_sends() {
+        // The headers are their own test below; this one is about the body.
+        let (body, _) = codex_shaped_body(|_| {});
+        assert_eq!(body["include"], serde_json::json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["store"], false);
+
+        let body = body_for("gpt-5.6-sol", |_| {});
+        assert!(body.get("include").is_none(), "off by default");
+        assert!(body.get("parallel_tool_calls").is_none(), "off by default");
+    }
+
+    /// **The lite shape moves the tools and the system prompt into `input`.**
+    /// Measured: a capture of a real Codex client on `gpt-6-astra` carried
+    /// `x-openai-internal-codex-responses-lite: true`, which is Codex's
+    /// `model_info.use_responses_lite`. Getting it wrong is not a refused
+    /// request — the endpoint answers either way — so the only sign is that the
+    /// tools and the prompt are not where the model was tuned to find them,
+    /// at the very front of the cached prefix.
+    #[test]
+    fn a_lite_model_carries_its_tools_and_prompt_inside_the_input() {
+        let provider = OpenAIResponsesProvider::new(
+            "https://relay.invalid/v1",
+            "k",
+            CodexShape {
+                enabled: true,
+                client_version: None,
+            },
+        );
+        let params = ChatParams {
+            model: "gpt-6-astra".into(),
+            cache_key: Some("conv-9".into()),
+            responses_lite: true,
+            server_tools: vec![ServerToolKind::WebSearch],
+            ..Default::default()
+        };
+        let defs = [ToolDefinition {
+            name: "read_file".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let messages = [
+            ChatMessage {
+                role: "system".into(),
+                ..ChatMessage::user("you are a helpful assistant")
+            },
+            ChatMessage::user("hi"),
+        ];
+        let req = provider.build_request(&messages, Some(&defs), &params, true).unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+
+        assert!(body.get("tools").is_none(), "no top-level tools under lite: {body}");
+        assert!(body.get("instructions").is_none(), "no top-level instructions");
+        assert_eq!(body["parallel_tool_calls"], false, "Codex forces this off under lite");
+
+        let input = body["input"].as_array().expect("an input array");
+        assert_eq!(input[0]["type"], "additional_tools");
+        assert_eq!(input[0]["role"], "developer");
+        assert!(
+            input[0]["id"].as_str().unwrap().starts_with("at_"),
+            "{}",
+            input[0]["id"]
+        );
+        // The provider-side tool stays its own entry; ours are grouped under
+        // the `functions` namespace, which is what Codex's lite builder does.
+        assert_eq!(input[0]["tools"][0], serde_json::json!({"type": "web_search"}));
+        assert_eq!(input[0]["tools"][1]["type"], "namespace");
+        assert_eq!(input[0]["tools"][1]["name"], "functions");
+        assert_eq!(input[0]["tools"][1]["tools"][0]["name"], "read_file");
+
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "developer", "not `system`");
+        assert_eq!(input[1]["content"][0]["text"], "you are a helpful assistant");
+        assert!(input[1]["id"].as_str().unwrap().starts_with("msg_"));
+
+        assert_eq!(input[2]["role"], "user", "the conversation follows the prefix");
+        assert_eq!(
+            req.headers.get("x-openai-internal-codex-responses-lite").unwrap(),
+            "true"
+        );
+    }
+
+    /// **`messages.response_model_id` was NULL for every row this adapter ever
+    /// wrote.** The column exists (migration 60) to catch a relay quietly
+    /// answering with a different model than the one asked for, and three
+    /// adapters emit `ResponseModel` — this was not one of them, so the whole
+    /// Responses API had nothing to compare the request against. Nothing
+    /// failed; the column was simply always empty, which reads exactly like
+    /// "no substitution ever happened".
+    #[test]
+    fn the_model_that_answered_is_reported_from_both_ends_of_the_stream() {
+        let mut state = StreamState::default();
+        // The opening frame, so a substitution is known before a token lands.
+        let out = parse_responses_event(
+            "response.created",
+            r#"{"response":{"id":"resp_1","model":"gpt-6-astra-2026-09-01"}}"#,
+            &mut state,
+        );
+        assert!(
+            matches!(out.first(), Some(Ok(StreamEvent::ResponseModel { model })) if model == "gpt-6-astra-2026-09-01"),
+            "{out:?}"
+        );
+
+        // **The header outranks the payload, which is the whole point.** Codex
+        // has a test called `process_sse_ignores_response_model_field_in_payload`:
+        // on that backend `response.model` is the alias that was asked for and
+        // the header is what served it, so reading the payload is exactly how
+        // the substitution gets missed. Both spellings, either nesting, any
+        // case — these are JSON keys, not a `HeaderMap` that folds it for us.
+        for event in [
+            r#"{"response":{"model":"asked-for","headers":{"OpenAI-Model":"actually-served"}}}"#,
+            r#"{"response":{"model":"asked-for"},"headers":{"x-openai-model":"actually-served"}}"#,
+        ] {
+            let out = parse_responses_event("response.created", event, &mut state);
+            assert!(
+                matches!(out.first(), Some(Ok(StreamEvent::ResponseModel { model })) if model == "actually-served"),
+                "{event} produced {out:?}"
+            );
+        }
+
+        // And off the real response headers, which the parser never sees — the
+        // earliest of the three, so it wins the engine's first-one-kept rule.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("openai-model", http::HeaderValue::from_static("actually-served"));
+        assert_eq!(http_response_model(&headers).as_deref(), Some("actually-served"));
+        assert_eq!(http_response_model(&http::HeaderMap::new()), None);
+
+        // And again on completion, for a relay that omits the opening event.
+        // The engine keeps whichever arrived first, so repeating is free.
+        let out = parse_responses_event(
+            "response.completed",
+            r#"{"response":{"model":"gpt-6-astra-2026-09-01","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            &mut state,
+        );
+        assert!(
+            out.iter().any(
+                |event| matches!(event, Ok(StreamEvent::ResponseModel { model }) if model == "gpt-6-astra-2026-09-01")
+            ),
+            "{out:?}"
+        );
+
+        // A relay that strips the field and one that blanks it say the same
+        // thing, and neither may become an empty `response_model_id` — that
+        // would read as a substitution to something unnamed.
+        for silent in [r#"{"response":{"id":"resp_1"}}"#, r#"{"response":{"model":""}}"#] {
+            assert!(
+                parse_responses_event("response.created", silent, &mut state).is_empty(),
+                "{silent}"
+            );
+        }
+    }
+
+    /// **Measured on a Codex backend**, which reports cache writes separately
+    /// from cache reads. This adapter dropped them: the field was hardcoded to
+    /// `None` under a comment saying the Responses API charges no premium for a
+    /// cache write, which conflated "costs no more" with "did not happen".
+    ///
+    /// The cost of getting it wrong was not the total — `cost_of` bills a
+    /// blank `cache_write_price` at the input rate, so the number came out the
+    /// same — but the breakdown put those tokens under `input` instead of
+    /// `cache`, and the count reached no ledger at all.
+    #[test]
+    fn a_cache_write_is_reported_where_the_upstream_reports_one() {
+        let usage = read_usage(Some(&serde_json::json!({
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "total_tokens": 1050,
+            "input_tokens_details": { "cached_tokens": 800, "cache_write_tokens": 150 },
+        })))
+        .expect("usage");
+        assert_eq!(usage.cache_read_tokens, Some(800));
+        assert_eq!(usage.cache_write_tokens, Some(150));
+        // The three parts of the prompt, each billed once: 1000 - 800 - 150.
+        assert_eq!(usage.uncached_prompt_tokens(), 50);
+
+        // And an upstream that says nothing still reports nothing: `None` is
+        // "not mentioned", which is not the same claim as zero.
+        let usage = read_usage(Some(&serde_json::json!({
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "input_tokens_details": { "cached_tokens": 800 },
+        })))
+        .expect("usage");
+        assert_eq!(usage.cache_write_tokens, None);
+        assert_eq!(usage.uncached_prompt_tokens(), 200);
+    }
+
+    /// **Measured against the real backend**, which refused the first attempt
+    /// with `unsupported_value` / `X-OpenAI-Internal-Codex-Responses-Lite
+    /// requires reasoning.context to be all_turns`.
+    ///
+    /// The trap is that it is required even on a request that would otherwise
+    /// carry no `reasoning` at all: this adapter only emitted the object when
+    /// an effort was set, so a lite model with thinking off had nowhere to put
+    /// `context`. Codex builds `Reasoning` unconditionally and lets its three
+    /// fields skip themselves, which is why the bug does not exist there.
+    #[test]
+    fn a_lite_request_always_says_reasoning_covers_every_turn() {
+        let provider = OpenAIResponsesProvider::new(
+            "https://relay.invalid/v1",
+            "k",
+            CodexShape {
+                enabled: true,
+                client_version: None,
+            },
+        );
+        let lite = |effort: Option<&str>| {
+            let params = ChatParams {
+                model: "gpt-6-astra".into(),
+                responses_lite: true,
+                thinking_effort: effort.map(str::to_string),
+                ..Default::default()
+            };
+            let req = provider
+                .build_request(&[ChatMessage::user("hi")], None, &params, true)
+                .unwrap();
+            match req.body {
+                Some(RequestBody::Json(body)) => body,
+                _ => panic!("JSON body"),
+            }
+        };
+
+        // With an effort, beside it.
+        let body = lite(Some("high"));
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+
+        // And with none, which is the case that was refused: the object has to
+        // exist for `context` to be in it.
+        let body = lite(None);
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert!(body["reasoning"].get("effort").is_none(), "nothing invented beside it");
+        assert!(body["reasoning"].get("summary").is_none());
+
+        // Not on an ordinary row: the server's own default is `current_turn`,
+        // and Codex omits the field rather than restating it.
+        let plain = OpenAIResponsesProvider::new("https://api.openai.com/v1", "k", CodexShape::off());
+        let req = plain
+            .build_request(
+                &[ChatMessage::user("hi")],
+                None,
+                &ChatParams {
+                    model: "gpt-5.6-sol".into(),
+                    thinking_effort: Some("high".into()),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        assert!(body["reasoning"].get("context").is_none());
+        assert_eq!(body["reasoning"]["effort"], "high", "the old shape is untouched");
+    }
+
+    /// **The prefix ids are derived, not random.** They are rebuilt on every
+    /// request, so a fresh uuid each time would put a different id at the head
+    /// of the prompt every round — and the head of the prompt is what a
+    /// provider caches.
+    #[test]
+    fn the_lite_prefix_keeps_the_same_ids_across_requests() {
+        let params = ChatParams {
+            model: "gpt-6-astra".into(),
+            cache_key: Some("conv-9".into()),
+            responses_lite: true,
+            ..Default::default()
+        };
+        let defs = [ToolDefinition {
+            name: "read_file".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let first = additional_tools_item(&params, Some(&defs)).unwrap();
+        let second = additional_tools_item(&params, Some(&defs)).unwrap();
+        assert_eq!(first["id"], second["id"], "same tools, same id");
+
+        let other = ChatParams {
+            cache_key: Some("conv-10".into()),
+            ..params.clone()
+        };
+        assert_ne!(
+            first["id"],
+            additional_tools_item(&other, Some(&defs)).unwrap()["id"],
+            "a different conversation is a different prefix"
+        );
+    }
+
+    /// The flag is the model's, but only the Codex shape can send it: an
+    /// ordinary endpoint has never heard of an `additional_tools` item.
+    #[test]
+    fn a_lite_model_on_a_plain_row_keeps_the_ordinary_shape() {
+        let provider = OpenAIResponsesProvider::new("https://api.openai.com/v1", "k", CodexShape::off());
+        let params = ChatParams {
+            model: "gpt-6-astra".into(),
+            responses_lite: true,
+            ..Default::default()
+        };
+        let defs = [ToolDefinition {
+            name: "read_file".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let req = provider
+            .build_request(&[ChatMessage::user("hi")], Some(&defs), &params, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        assert_eq!(body["tools"][0]["name"], "read_file", "still a top-level array");
+        assert!(body["input"].as_array().unwrap()[0]["type"] != "additional_tools");
+        assert!(req.headers.get("x-openai-internal-codex-responses-lite").is_none());
+    }
+
+    /// **The header names are pinned by spelling, because the wrong one is
+    /// never refused.** An unknown header is ignored, so a request carrying
+    /// `session_id` instead of `session-id` succeeds and simply stops being
+    /// read — which is how this app's own `CodexProvider` went on sending a
+    /// name that exists nowhere in Codex any more. Nothing but an assertion
+    /// like this one can catch it.
+    ///
+    /// Read off Codex, not off `codex.rs`:
+    /// `codex-api/src/requests/headers.rs::build_session_headers` and
+    /// `codex-api/src/endpoint/responses.rs::stream_request`.
+    #[test]
+    fn the_codex_shape_sends_codex_own_header_names() {
+        let (_, headers) = codex_shaped_body(|_| {});
+        assert_eq!(
+            headers.get("originator").unwrap(),
+            crate::provider::codex_identity::CODEX_ORIGINATOR
+        );
+        assert_eq!(headers.get(http::header::ACCEPT).unwrap(), "text/event-stream");
+        // Hyphens. The underscore spelling is the defect this pins.
+        assert!(headers.get("session-id").is_some(), "session-id");
+        assert!(
+            headers.get("session_id").is_none(),
+            "the dead spelling must not come back"
+        );
+        // The conversation, under both names Codex gives it.
+        assert_eq!(headers.get("thread-id").unwrap(), "conv-9");
+        assert_eq!(headers.get("x-client-request-id").unwrap(), "conv-9");
+        // Codex's user-agent shape, down to the trailing terminal token.
+        let ua = headers.get("user-agent").unwrap().to_str().unwrap();
+        assert!(
+            ua.starts_with(&format!(
+                "{}/{}",
+                crate::provider::codex_identity::CODEX_ORIGINATOR,
+                crate::provider::codex_identity::DEFAULT_CODEX_CLIENT_VERSION
+            )) && ua.ends_with(") unknown"),
+            "{ua}"
+        );
+        // The window id Codex derives from the thread, and the beta feature it
+        // announces only where remote compaction is really on.
+        assert_eq!(headers.get("x-codex-window-id").unwrap(), "conv-9:0");
+        assert!(headers.get("x-codex-beta-features").is_none(), "not on this model");
+
+        // A background pass clears the cache key, and Codex sends no thread
+        // headers when it has no thread -- an empty value would be worse.
+        let provider = OpenAIResponsesProvider::new(
+            "https://relay.invalid/v1",
+            "k",
+            CodexShape {
+                enabled: true,
+                client_version: None,
+            },
+        );
+        let req = provider
+            .build_request(
+                &[ChatMessage::user("hi")],
+                None,
+                &ChatParams {
+                    model: "gpt-5.6-sol".into(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert!(req.headers.get("thread-id").is_none());
+        assert!(req.headers.get("x-client-request-id").is_none());
+
+        // And none of it on an ordinary OpenAI-compatible row.
+        let plain = OpenAIResponsesProvider::new("https://api.openai.com/v1", "k", CodexShape::off());
+        let req = plain
+            .build_request(
+                &[ChatMessage::user("hi")],
+                None,
+                &ChatParams {
+                    model: "gpt-5.6-sol".into(),
+                    cache_key: Some("conv-9".into()),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        for absent in ["originator", "session-id", "thread-id", "x-client-request-id"] {
+            assert!(req.headers.get(absent).is_none(), "{absent} leaked onto a plain row");
+        }
+    }
+
+    /// Reasoning goes back only under the switch, and only for the model that
+    /// produced it. Stored items are encrypted and model-bound; replaying one
+    /// against another model is a 400.
+    #[test]
+    fn reasoning_is_replayed_only_under_the_codex_shape() {
+        let mut assistant = ChatMessage::assistant("thinking done");
+        use crate::provider::state;
+        assistant.provider_state = Some(state::ProviderState {
+            version: 1,
+            producer: state::ProviderStateProducer {
+                vendor: "openai".into(),
+                protocol: state::CODEX_RESPONSES_PROTOCOL.into(),
+                model: "gpt-5.6-sol".into(),
+            },
+            payload: state::ProviderStatePayload::CodexReasoning {
+                items: vec![state::CodexReasoningItem {
+                    position: 0,
+                    item_json: r#"{"type":"reasoning","id":"rs_1","encrypted_content":"gAAAA"}"#.into(),
+                }],
+            },
+        });
+
+        let (_, replayed) = serialize_responses_input(&[assistant.clone()], Some("gpt-5.6-sol")).unwrap();
+        assert_eq!(replayed[0]["type"], "reasoning", "it goes back ahead of the prose");
+        assert_eq!(replayed[0]["encrypted_content"], "gAAAA");
+
+        let (_, plain) = serialize_responses_input(&[assistant], None).unwrap();
+        assert!(
+            plain.iter().all(|item| item["type"] != "reasoning"),
+            "nothing is replayed with the switch off: {plain:?}"
+        );
+    }
+
+    fn done_event(item: serde_json::Value) -> String {
+        serde_json::json!({ "output_index": 0, "item": item }).to_string()
+    }
+
+    /// The phase is a fact the upstream states and this app hands back.
+    /// OpenAI's own documentation asks for it: dropping it on a follow-up
+    /// "can degrade performance" for `gpt-5.3-codex` and beyond, which is a
+    /// failure with no error attached to it — the request succeeds and the
+    /// answers get worse.
+    #[test]
+    fn a_message_items_phase_is_captured_and_sent_back() {
+        use crate::provider::state;
+
+        let captured = message_phase_update(
+            &done_event(serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "done"}],
+            })),
+            state::RESPONSES_PROTOCOL,
+            "gpt-6-astra",
+        );
+        let Some(StreamEvent::ProviderStateUpdate {
+            update: state::ProviderStateUpdate::ResponsesMessagePhase { phase, protocol, model },
+        }) = captured
+        else {
+            panic!("expected a phase update")
+        };
+        assert_eq!(phase, state::ResponseMessagePhase::FinalAnswer);
+        assert_eq!(protocol, state::RESPONSES_PROTOCOL);
+        assert_eq!(model, "gpt-6-astra");
+
+        let mut assistant = ChatMessage::assistant("done");
+        let mut acc = state::ProviderStateAccumulator::default();
+        acc.apply(state::ProviderStateUpdate::ResponsesMessagePhase {
+            protocol: state::RESPONSES_PROTOCOL.into(),
+            model: "gpt-6-astra".into(),
+            phase: state::ResponseMessagePhase::FinalAnswer,
+        })
+        .unwrap();
+        assistant.provider_state = acc.finish();
+
+        let (_, input) = serialize_responses_input(&[assistant], None).unwrap();
+        assert_eq!(input[0]["phase"], "final_answer");
+    }
+
+    /// Absent is the common answer and its own one: a model that never sent a
+    /// phase must not be handed one this app made up.
+    #[test]
+    fn an_unstated_phase_is_left_off_the_wire() {
+        assert!(
+            message_phase_update(
+                &done_event(serde_json::json!({ "type": "message", "role": "assistant" })),
+                crate::provider::state::RESPONSES_PROTOCOL,
+                "gpt-6-astra",
+            )
+            .is_none()
+        );
+        // A label this app has not heard of is not stored either — sending it
+        // back would be handing the upstream a string we cannot vouch for.
+        assert!(
+            message_phase_update(
+                &done_event(serde_json::json!({ "type": "message", "phase": "rumination" })),
+                crate::provider::state::RESPONSES_PROTOCOL,
+                "gpt-6-astra",
+            )
+            .is_none()
+        );
+        // And a reasoning item is somebody else's business.
+        assert!(
+            message_phase_update(
+                &done_event(serde_json::json!({ "type": "reasoning", "phase": "commentary" })),
+                crate::provider::state::RESPONSES_PROTOCOL,
+                "gpt-6-astra",
+            )
+            .is_none()
+        );
+
+        let (_, input) = serialize_responses_input(&[ChatMessage::assistant("plain")], None).unwrap();
+        assert!(input[0].get("phase").is_none(), "{:?}", input[0]);
+    }
+
     #[test]
     fn a_stream_error_event_ends_the_stream_as_an_api_error() {
         let mut state = StreamState::default();
@@ -1366,12 +2509,80 @@ mod tests {
             other => panic!("expected an API error, got {other:?}"),
         }
 
+        // Unrecognised, and therefore retryable -- Codex's default, and the
+        // opposite of the flat 400 this branch used to produce.
         let out = parse_responses_event(
             "error",
             r#"{"type":"error","code":"server_error","message":"x"}"#,
             &mut state,
         );
-        assert!(matches!(out.first(), Some(Err(ProviderError::Api { status: 400, .. }))));
+        assert!(matches!(out.first(), Some(Err(ProviderError::Api { status: 503, .. }))));
+    }
+
+    /// The failure that prompted this table. An upstream reporting itself
+    /// overloaded arrived as a flat 400, which the turn loop reads as "asking
+    /// again cannot help" -- so a transient outage ended the turn on its first
+    /// attempt, described as a fault in our own request.
+    #[test]
+    fn a_failed_response_is_classified_by_its_code_rather_than_flattened() {
+        let mut state = StreamState::default();
+        let out = parse_responses_event(
+            "response.failed",
+            r#"{"response":{"error":{"code":"server_is_overloaded",
+                "message":"Our servers are currently overloaded. Please try again later."}}}"#,
+            &mut state,
+        );
+        match out.first() {
+            Some(Err(ProviderError::Api { status, body })) => {
+                assert_eq!(*status, 503, "an overloaded server is asked again, not blamed");
+                assert!(body.starts_with("server_is_overloaded: "), "{body}");
+            }
+            other => panic!("expected an API error, got {other:?}"),
+        }
+    }
+
+    /// Each arm of the table, and the two defaults that bracket it: a code we
+    /// know to be permanent stops the turn, and one we have never seen is
+    /// treated as transient.
+    #[test]
+    fn the_error_code_table_separates_permanent_from_transient() {
+        for (code, expected) in [
+            ("context_length_exceeded", 413),
+            ("insufficient_quota", 402),
+            ("project_spend_limit_exceeded", 402),
+            ("usage_not_included", 402),
+            ("cyber_policy", 400),
+            ("misalignment_policy_violation", 400),
+            ("invalid_prompt", 400),
+            ("unsupported_parameter", 400),
+            ("model_not_found", 400),
+            ("rate_limit_exceeded", 429),
+            ("slow_down", 429),
+            ("server_is_overloaded", 503),
+            ("something_nobody_here_has_seen", 503),
+        ] {
+            assert_eq!(status_for_error_code(code), expected, "{code}");
+        }
+    }
+
+    /// OpenAI's own errors carry the family in `type` and the reason in `code`,
+    /// and a relay routinely sends only one. Read from `code` where both are
+    /// present, since that is the narrower answer.
+    #[test]
+    fn an_error_type_stands_in_for_a_missing_code() {
+        let mut state = StreamState::default();
+        let out = parse_responses_event(
+            "response.failed",
+            r#"{"response":{"error":{"type":"invalid_request_error","message":"bad"}}}"#,
+            &mut state,
+        );
+        match out.first() {
+            Some(Err(ProviderError::Api { status, body })) => {
+                assert_eq!(*status, 400);
+                assert!(body.starts_with("invalid_request_error: "), "{body}");
+            }
+            other => panic!("expected an API error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1438,7 +2649,7 @@ mod tests {
     #[test]
     fn compaction_message_serializes_as_compaction_input_item() {
         let msgs = [ChatMessage::compaction("gAAAAB_encrypted".into())];
-        let (instructions, input) = serialize_responses_input(&msgs).unwrap();
+        let (instructions, input) = serialize_responses_input(&msgs, None).unwrap();
         assert!(instructions.is_none());
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "compaction");

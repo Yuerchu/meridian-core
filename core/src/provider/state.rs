@@ -10,6 +10,13 @@ pub const GOOGLE_GENERATE_CONTENT_PROTOCOL: &str = "google_generate_content";
 /// has to travel with the next request. A provider that stores its own responses
 /// produces none of this.
 pub const CODEX_RESPONSES_PROTOCOL: &str = "codex_responses";
+/// The Responses API reached as an ordinary API, where the upstream stores the
+/// response itself.
+///
+/// Nothing replayable comes back from it — that is what
+/// [`CODEX_RESPONSES_PROTOCOL`] is for — but an assistant message still carries
+/// a phase, and that has to travel with the row.
+pub const RESPONSES_PROTOCOL: &str = "responses";
 
 /// Provider-owned continuation state attached to one assistant message.
 ///
@@ -50,14 +57,69 @@ pub enum ProviderStatePayload {
     AnthropicContentBlocks {
         blocks: Vec<AnthropicContentBlock>,
     },
-    /// Reasoning items from a `store: false` Responses turn, kept to be sent
-    /// back on the next request of the same turn.
-    ///
-    /// Not a signature like the two above: this is the whole item, opaque and
-    /// encrypted. See [`CodexReasoningItem`].
+    /// Reasoning items alone, from before an assistant message's phase had
+    /// anywhere to live. Still read for rows written then; nothing writes it
+    /// any more — see [`ProviderStatePayload::ResponsesTurn`].
     CodexReasoning {
         items: Vec<CodexReasoningItem>,
     },
+    /// What one Responses-API assistant turn has to hand back on the next
+    /// request: the reasoning items a `store: false` turn produced, and the
+    /// phase its message carried.
+    ///
+    /// The two live in one payload because a single turn produces both and
+    /// [`ProviderStateAccumulator`] holds exactly one — two payload kinds in
+    /// one response is the "mixed incompatible" error, which is right for two
+    /// *vendors* and wrong for two facts about the same reply.
+    ResponsesTurn {
+        /// Whole items, opaque and encrypted. See [`CodexReasoningItem`].
+        /// Empty on the ordinary Responses API, which stores its own.
+        reasoning: Vec<CodexReasoningItem>,
+        /// `None` means the upstream did not say, which is not the same as
+        /// either label — see [`ResponseMessagePhase`].
+        phase: Option<ResponseMessagePhase>,
+    },
+}
+
+/// Whether an assistant message was interim narration or the answer itself.
+///
+/// OpenAI documents this on both the input and the output shape, and asks for
+/// it *back*: "for models like `gpt-5.3-codex` and beyond, when sending
+/// follow-up requests, preserve and resend phase on all assistant messages —
+/// dropping it can degrade performance". So it is a fact the upstream states
+/// and we return, never one derived here: a row could be labelled from whether
+/// it ended in a tool call and would be wrong exactly where the model cared.
+///
+/// Absent is its own answer and the common one. Codex says the same thing about
+/// its own copy — "providers do not emit this consistently, so callers must
+/// treat `None` as phase unknown" — and omitting the field is what a model that
+/// has never heard of it expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMessagePhase {
+    /// Mid-turn text: more tool calls or more output may follow.
+    Commentary,
+    /// The turn's terminal answer.
+    FinalAnswer,
+}
+
+impl ResponseMessagePhase {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Commentary => "commentary",
+            Self::FinalAnswer => "final_answer",
+        }
+    }
+
+    /// `None` for a label this app has not heard of. Storing it unread and
+    /// sending it back would be handing the upstream a string we cannot say is
+    /// still one of its own.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "commentary" => Some(Self::Commentary),
+            "final_answer" => Some(Self::FinalAnswer),
+            _ => None,
+        }
+    }
 }
 
 /// One reasoning item, exactly as the upstream sent it.
@@ -128,6 +190,28 @@ enum StoredProviderStateV1 {
         producer: StoredProviderStateProducer,
         payload: StoredCodexReasoningPayload,
     },
+    ResponsesTurn {
+        version: u32,
+        producer: StoredProviderStateProducer,
+        payload: StoredResponsesTurnPayload,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredResponsesTurnPayload {
+    reasoning: Vec<StoredCodexReasoningItem>,
+    /// Omitted rather than written as null, so a row whose upstream said
+    /// nothing is the same shape as a row from before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase: Option<StoredResponseMessagePhase>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum StoredResponseMessagePhase {
+    Commentary,
+    FinalAnswer,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -252,6 +336,15 @@ pub enum ProviderStateUpdate {
         position: usize,
         item_json: String,
     },
+    /// The phase off a completed `message` output item.
+    ///
+    /// Carries its protocol because the same adapter speaks both: the Codex
+    /// shape stores reasoning beside this, the ordinary API stores only this.
+    ResponsesMessagePhase {
+        protocol: String,
+        model: String,
+        phase: ResponseMessagePhase,
+    },
     GoogleThoughtSignatureDelta {
         protocol: String,
         model: String,
@@ -323,6 +416,32 @@ impl ProviderState {
         }
         match &self.payload {
             ProviderStatePayload::CodexReasoning { items } => Some(items),
+            ProviderStatePayload::ResponsesTurn { reasoning, .. } => Some(reasoning),
+            _ => None,
+        }
+    }
+
+    /// The phase to send back with this turn's assistant message.
+    ///
+    /// **Not model-matched, which is the one place this parts company with the
+    /// reasoning above.** That is an encrypted blob bound to the model that
+    /// produced it, and handing another one back is a 400. A phase is a plain
+    /// label about what an assistant message *was* — the next model is being
+    /// shown that message either way, and withholding the label from it is
+    /// precisely the degradation the field exists to prevent. The vendor and
+    /// protocol checks are what keep it off a reply that came from somewhere
+    /// else entirely.
+    pub fn responses_phase(&self) -> Option<ResponseMessagePhase> {
+        if self.producer.vendor != "openai"
+            || !matches!(
+                self.producer.protocol.as_str(),
+                RESPONSES_PROTOCOL | CODEX_RESPONSES_PROTOCOL
+            )
+        {
+            return None;
+        }
+        match &self.payload {
+            ProviderStatePayload::ResponsesTurn { phase, .. } => *phase,
             _ => None,
         }
     }
@@ -370,6 +489,28 @@ impl ProviderState {
                 }
                 if items.is_empty() || items.iter().any(|item| item.item_json.is_empty()) {
                     return Err("Codex reasoning is empty".into());
+                }
+            }
+            ProviderStatePayload::ResponsesTurn { reasoning, phase } => {
+                if self.producer.vendor != "openai"
+                    || !matches!(
+                        self.producer.protocol.as_str(),
+                        RESPONSES_PROTOCOL | CODEX_RESPONSES_PROTOCOL
+                    )
+                {
+                    return Err("a Responses turn has the wrong producer".into());
+                }
+                if reasoning.iter().any(|item| item.item_json.is_empty()) {
+                    return Err("Codex reasoning is empty".into());
+                }
+                // Reasoning only survives `store: false`, which is the Codex
+                // shape; under the ordinary API the upstream keeps its own and
+                // an item here would be one nobody could have produced.
+                if !reasoning.is_empty() && self.producer.protocol != CODEX_RESPONSES_PROTOCOL {
+                    return Err("Responses reasoning has the wrong protocol".into());
+                }
+                if reasoning.is_empty() && phase.is_none() {
+                    return Err("a Responses turn carries nothing".into());
                 }
             }
         }
@@ -435,6 +576,38 @@ impl From<&ProviderState> for StoredProviderStateV1 {
                         .collect(),
                 },
             },
+            ProviderStatePayload::ResponsesTurn { reasoning, phase } => StoredProviderStateV1::ResponsesTurn {
+                version: state.version,
+                producer: producer(),
+                payload: StoredResponsesTurnPayload {
+                    reasoning: reasoning
+                        .iter()
+                        .map(|item| StoredCodexReasoningItem {
+                            position: item.position,
+                            item_json: item.item_json.clone(),
+                        })
+                        .collect(),
+                    phase: phase.map(StoredResponseMessagePhase::from),
+                },
+            },
+        }
+    }
+}
+
+impl From<ResponseMessagePhase> for StoredResponseMessagePhase {
+    fn from(phase: ResponseMessagePhase) -> Self {
+        match phase {
+            ResponseMessagePhase::Commentary => Self::Commentary,
+            ResponseMessagePhase::FinalAnswer => Self::FinalAnswer,
+        }
+    }
+}
+
+impl From<StoredResponseMessagePhase> for ResponseMessagePhase {
+    fn from(phase: StoredResponseMessagePhase) -> Self {
+        match phase {
+            StoredResponseMessagePhase::Commentary => Self::Commentary,
+            StoredResponseMessagePhase::FinalAnswer => Self::FinalAnswer,
         }
     }
 }
@@ -505,6 +678,25 @@ impl From<StoredProviderStateV1> for ProviderState {
                             item_json: item.item_json,
                         })
                         .collect(),
+                },
+            ),
+            StoredProviderStateV1::ResponsesTurn {
+                version,
+                producer,
+                payload,
+            } => (
+                version,
+                producer,
+                ProviderStatePayload::ResponsesTurn {
+                    reasoning: payload
+                        .reasoning
+                        .into_iter()
+                        .map(|item| CodexReasoningItem {
+                            position: item.position,
+                            item_json: item.item_json,
+                        })
+                        .collect(),
+                    phase: payload.phase.map(ResponseMessagePhase::from),
                 },
             ),
         };
@@ -615,20 +807,58 @@ impl ProviderStateAccumulator {
                                 protocol: CODEX_RESPONSES_PROTOCOL.into(),
                                 model,
                             },
-                            payload: ProviderStatePayload::CodexReasoning { items: vec![arriving] },
+                            payload: ProviderStatePayload::ResponsesTurn {
+                                reasoning: vec![arriving],
+                                phase: None,
+                            },
                         });
                     }
                     Some(ProviderState {
                         producer,
-                        payload: ProviderStatePayload::CodexReasoning { items },
+                        payload: ProviderStatePayload::ResponsesTurn { reasoning, .. },
                         ..
-                    }) if producer.model == model => {
+                    }) if producer.model == model && producer.protocol == CODEX_RESPONSES_PROTOCOL => {
                         // The upstream announces an item once, but a repeat
                         // would otherwise be replayed twice at the same index.
-                        match items.iter_mut().find(|item| item.position == arriving.position) {
+                        match reasoning.iter_mut().find(|item| item.position == arriving.position) {
                             Some(existing) => *existing = arriving,
-                            None => items.push(arriving),
+                            None => reasoning.push(arriving),
                         }
+                    }
+                    Some(_) => return Err("a response mixed incompatible provider state".into()),
+                }
+            }
+            ProviderStateUpdate::ResponsesMessagePhase { protocol, model, phase } => {
+                match self.state.as_mut() {
+                    None => {
+                        self.state = Some(ProviderState {
+                            version: STORAGE_VERSION,
+                            producer: ProviderStateProducer {
+                                vendor: "openai".into(),
+                                protocol,
+                                model,
+                            },
+                            payload: ProviderStatePayload::ResponsesTurn {
+                                reasoning: Vec::new(),
+                                phase: Some(phase),
+                            },
+                        });
+                    }
+                    Some(ProviderState {
+                        producer,
+                        payload: ProviderStatePayload::ResponsesTurn { phase: existing, .. },
+                        ..
+                    }) if producer.model == model && producer.protocol == protocol => {
+                        // **The last message item's phase wins, and that is a
+                        // limitation rather than a choice.** One round is one
+                        // response and one row, whose `content` is every
+                        // message item of that response joined — so only one
+                        // label can travel with it. A response that narrates
+                        // and then answers gets `final_answer`, which is what
+                        // the merged text ends as; the narration inside it is
+                        // labelled with the answer's phase and nothing here can
+                        // say otherwise without splitting the row.
+                        *existing = Some(phase);
                     }
                     Some(_) => return Err("a response mixed incompatible provider state".into()),
                 }
@@ -812,8 +1042,153 @@ mod tests {
         acc.apply(codex_item(0, "rs_strict")).unwrap();
         let mut value: serde_json::Value =
             serde_json::from_str(&acc.finish().unwrap().to_storage_json().unwrap()).unwrap();
-        value["payload"]["items"][0]["future"] = serde_json::json!(true);
+        value["payload"]["reasoning"][0]["future"] = serde_json::json!(true);
         rejects_stored_value(value);
+    }
+
+    fn phase_update(protocol: &str, phase: ResponseMessagePhase) -> ProviderStateUpdate {
+        ProviderStateUpdate::ResponsesMessagePhase {
+            protocol: protocol.into(),
+            model: "gpt-5.6".into(),
+            phase,
+        }
+    }
+
+    /// The reasoning and the phase are two facts about one reply, so they share
+    /// a payload — holding them as two would be the "mixed incompatible" error,
+    /// which is meant for two vendors.
+    #[test]
+    fn a_turns_reasoning_and_phase_live_in_one_payload() {
+        let mut acc = ProviderStateAccumulator::default();
+        acc.apply(codex_item(0, "rs_1")).unwrap();
+        acc.apply(phase_update(
+            CODEX_RESPONSES_PROTOCOL,
+            ResponseMessagePhase::FinalAnswer,
+        ))
+        .unwrap();
+        let state = acc.finish().unwrap();
+
+        assert_eq!(state.codex_reasoning_for("gpt-5.6").unwrap().len(), 1);
+        assert_eq!(state.responses_phase(), Some(ResponseMessagePhase::FinalAnswer));
+
+        let raw = state.to_storage_json().unwrap();
+        assert!(raw.contains("responses_turn"));
+        assert!(raw.contains("final_answer"));
+        assert_eq!(ProviderState::from_storage_json(&raw).unwrap(), state);
+    }
+
+    /// The ordinary Responses API stores its own reasoning, so a phase is all
+    /// there is to keep — and it is kept under its own protocol.
+    #[test]
+    fn a_phase_alone_is_state_worth_storing() {
+        let mut acc = ProviderStateAccumulator::default();
+        acc.apply(phase_update(RESPONSES_PROTOCOL, ResponseMessagePhase::Commentary))
+            .unwrap();
+        let state = acc.finish().unwrap();
+
+        assert_eq!(state.responses_phase(), Some(ResponseMessagePhase::Commentary));
+        // Not the Codex shape, so nothing replayable came back with it.
+        assert!(state.codex_reasoning_for("gpt-5.6").is_none());
+        assert_eq!(
+            ProviderState::from_storage_json(&state.to_storage_json().unwrap()).unwrap(),
+            state
+        );
+    }
+
+    /// One round is one row whose content is every message item joined, so only
+    /// one label can travel with it; the one the response ended on is the one
+    /// the merged text ends as.
+    #[test]
+    fn the_last_message_items_phase_is_the_one_kept() {
+        let mut acc = ProviderStateAccumulator::default();
+        acc.apply(phase_update(RESPONSES_PROTOCOL, ResponseMessagePhase::Commentary))
+            .unwrap();
+        acc.apply(phase_update(RESPONSES_PROTOCOL, ResponseMessagePhase::FinalAnswer))
+            .unwrap();
+        assert_eq!(
+            acc.finish().unwrap().responses_phase(),
+            Some(ResponseMessagePhase::FinalAnswer)
+        );
+    }
+
+    /// Unlike the reasoning beside it, the phase is a plain label rather than a
+    /// blob bound to the model that made it: the next model is shown that
+    /// message either way, and withholding the label is the degradation the
+    /// field exists to prevent.
+    #[test]
+    fn a_phase_survives_a_model_switch_while_the_reasoning_does_not() {
+        let mut acc = ProviderStateAccumulator::default();
+        acc.apply(codex_item(0, "rs_1")).unwrap();
+        acc.apply(phase_update(
+            CODEX_RESPONSES_PROTOCOL,
+            ResponseMessagePhase::FinalAnswer,
+        ))
+        .unwrap();
+        let state = acc.finish().unwrap();
+
+        assert!(state.codex_reasoning_for("gpt-5.4").is_none());
+        assert_eq!(state.responses_phase(), Some(ResponseMessagePhase::FinalAnswer));
+    }
+
+    /// Another vendor's reply has no phase to give, whatever it stored.
+    #[test]
+    fn another_vendors_state_offers_no_phase() {
+        let mut acc = ProviderStateAccumulator::default();
+        acc.apply(anthropic_block(
+            0,
+            r#"{"type":"thinking","thinking":"hm","signature":"sig"}"#,
+        ))
+        .unwrap();
+        assert!(acc.finish().unwrap().responses_phase().is_none());
+    }
+
+    /// Rows written before the phase had anywhere to live still read.
+    #[test]
+    fn legacy_codex_reasoning_rows_still_read() {
+        let raw = r#"{"version":1,"producer":{"vendor":"openai","protocol":"codex_responses","model":"gpt-5.6"},"kind":"codex_reasoning","payload":{"items":[{"position":0,"item_json":"{\"type\":\"reasoning\"}"}]}}"#;
+        let state = ProviderState::from_storage_json(raw).unwrap();
+        assert_eq!(state.codex_reasoning_for("gpt-5.6").unwrap().len(), 1);
+        assert!(state.responses_phase().is_none());
+    }
+
+    /// Reasoning only survives `store: false`, so an item stored under the
+    /// ordinary API is one nobody could have produced.
+    #[test]
+    fn reasoning_under_the_plain_protocol_is_refused() {
+        let state = ProviderState {
+            version: STORAGE_VERSION,
+            producer: ProviderStateProducer {
+                vendor: "openai".into(),
+                protocol: RESPONSES_PROTOCOL.into(),
+                model: "gpt-5.6".into(),
+            },
+            payload: ProviderStatePayload::ResponsesTurn {
+                reasoning: vec![CodexReasoningItem {
+                    position: 0,
+                    item_json: "{}".into(),
+                }],
+                phase: None,
+            },
+        };
+        assert!(state.to_storage_json().is_err());
+    }
+
+    /// A turn that captured neither is not a row.
+    #[test]
+    fn an_empty_responses_turn_is_refused() {
+        let state = ProviderState {
+            version: STORAGE_VERSION,
+            producer: ProviderStateProducer {
+                vendor: "openai".into(),
+                protocol: RESPONSES_PROTOCOL.into(),
+                model: "gpt-5.6".into(),
+            },
+            payload: ProviderStatePayload::ResponsesTurn {
+                reasoning: Vec::new(),
+                phase: None,
+            },
+        };
+        assert!(state.to_storage_json().is_err());
     }
 
     #[test]

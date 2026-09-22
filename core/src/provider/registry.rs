@@ -198,6 +198,31 @@ fn validate_runtime_credential(transport_profile: &str, credential: &super::Cred
     }
 }
 
+/// Everything about a provider row that decides what goes on the wire.
+///
+/// A struct rather than five positional arguments plus a bare `bool`, and the
+/// bool is the reason. `codex_request_shape` is off for almost every row, so a
+/// caller that forgot to pass it would be indistinguishable from one that meant
+/// `false` — and the sites that build a provider are scattered across the
+/// summariser, the reviewer, OneBot, the sub-agent runner and three commands.
+/// Named fields make the omission a compile error instead.
+pub struct ProviderWire<'a> {
+    pub provider_type: &'a str,
+    pub base_url: &'a str,
+    pub credential: &'a super::Credential,
+    pub api_format: &'a str,
+    pub transport_profile: &'a str,
+    /// Whether to send exactly what Codex sends. See
+    /// [`super::openai_responses::CodexShape`] and migration 63.
+    pub codex_request_shape: bool,
+    /// The user's `codex.client_version` override, read beside the row.
+    ///
+    /// Global rather than per-row: it answers "which Codex release does this
+    /// app claim to be", and a second answer per provider would be two
+    /// identities for one install. Meaningless unless the shape is on.
+    pub codex_client_version: Option<&'a str>,
+}
+
 /// Pick the adapter for a provider row.
 ///
 /// Keyed on `provider_type`, `api_format` and `transport_profile`. Deliberately
@@ -205,13 +230,24 @@ fn validate_runtime_credential(transport_profile: &str, credential: &super::Cred
 /// request is shaped, and two ChatGPT logins reaching one endpoint must not
 /// produce two adapters. The credential arrives as a value that already knows
 /// which of those it is.
-pub fn create_provider(
-    provider_type: &str,
-    base_url: &str,
-    credential: &super::Credential,
-    api_format: &str,
-    transport_profile: &str,
-) -> Result<Box<dyn ChatProvider>, String> {
+///
+/// `codex_request_shape` is not a selector either — it never changes *which*
+/// adapter is built, only what the Responses one puts on the wire. A row that
+/// is not `responses` carries it harmlessly and nothing reads it.
+pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, String> {
+    let ProviderWire {
+        provider_type,
+        base_url,
+        credential,
+        api_format,
+        transport_profile,
+        codex_request_shape,
+        codex_client_version,
+    } = wire;
+    let codex_shape = super::openai_responses::CodexShape {
+        enabled: codex_request_shape,
+        client_version: codex_client_version.map(str::to_string),
+    };
     let provider_type = ProviderType::parse(provider_type)?;
     let api_format = ApiFormat::parse(api_format)?;
     validate_transport_profile(transport_profile)?;
@@ -250,7 +286,7 @@ pub fn create_provider(
         // `{"type":"web_search"}` outright — measured, it answers 422 with
         // "expected `function` or `live_search`".
         ProviderType::Deepseek => match api_format {
-            ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key)),
+            ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key, codex_shape.clone())),
             ApiFormat::ChatCompletions => Box::new(DeepSeekProvider::new(base_url, api_key)),
             other => {
                 return Err(format!(
@@ -262,7 +298,7 @@ pub fn create_provider(
         // see `OpenAICompatFlavor` for why that is a flavor rather than an
         // adapter of its own.
         ProviderType::Xai => match api_format {
-            ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key)),
+            ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key, codex_shape.clone())),
             ApiFormat::ChatCompletions => Box::new(OpenAICompatProvider::new_xai(base_url, api_key)),
             other => {
                 return Err(format!(
@@ -281,7 +317,7 @@ pub fn create_provider(
         },
         ProviderType::Openai => match api_format {
             ApiFormat::ChatCompletions => Box::new(OpenAICompatProvider::new(base_url, api_key)),
-            ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key)),
+            ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key, codex_shape.clone())),
             ApiFormat::GemmaTool => Box::new(GemmaToolProvider::new(base_url, api_key)),
             ApiFormat::GeminiGenerateContent => {
                 return Err(format!(
@@ -327,27 +363,47 @@ mod tests {
         }))
     }
 
+    /// A row as it comes out of the database for every test but the one below:
+    /// the Codex shape off, which is what every existing row holds.
+    fn wire<'a>(
+        provider_type: &'a str,
+        base_url: &'a str,
+        credential: &'a Credential,
+        api_format: &'a str,
+        transport_profile: &'a str,
+    ) -> ProviderWire<'a> {
+        ProviderWire {
+            provider_type,
+            base_url,
+            credential,
+            api_format,
+            transport_profile,
+            codex_request_shape: false,
+            codex_client_version: None,
+        }
+    }
+
     /// The Codex transport is an OpenAI contract, not a generic escape hatch
     /// for provider types this build does not know.
     #[test]
     fn the_transport_profile_selects_the_codex_adapter() {
-        let provider = create_provider(
+        let provider = create_provider(wire(
             "openai",
             "https://example.invalid",
             &chatgpt_credential(),
             "responses",
             "chatgpt_codex",
-        )
+        ))
         .unwrap();
         assert_eq!(provider.adapter_name(), "CodexProvider");
         assert!(
-            create_provider(
+            create_provider(wire(
                 "anything-else",
                 "https://example.invalid",
                 &chatgpt_credential(),
                 "responses",
                 "chatgpt_codex",
-            )
+            ))
             .is_err()
         );
     }
@@ -368,13 +424,13 @@ mod tests {
         assert!(!Arc::ptr_eq(&from_cli, &app_owned), "two distinct stores");
 
         for manager in [from_cli, app_owned] {
-            let provider = create_provider(
+            let provider = create_provider(wire(
                 "openai",
                 "https://example.invalid",
                 &Credential::ChatGpt(manager),
                 "responses",
                 "chatgpt_codex",
-            )
+            ))
             .unwrap();
             assert_eq!(provider.adapter_name(), "CodexProvider");
         }
@@ -384,13 +440,13 @@ mod tests {
     /// broken first-party contract before an adapter is constructed.
     #[test]
     fn an_api_key_against_the_codex_transport_is_rejected() {
-        let error = create_provider(
+        let error = create_provider(wire(
             "openai",
             "https://example.invalid",
             &Credential::ApiKey("sk-test".into()),
             "responses",
             "chatgpt_codex",
-        )
+        ))
         .err()
         .expect("an API key cannot authenticate the ChatGPT Codex transport");
         assert!(error.contains("ChatGPT login"), "{error}");
@@ -398,13 +454,13 @@ mod tests {
 
     #[test]
     fn a_chatgpt_login_against_the_standard_transport_is_rejected() {
-        let error = create_provider(
+        let error = create_provider(wire(
             "openai",
             "https://example.invalid",
             &chatgpt_credential(),
             "responses",
             "standard",
-        )
+        ))
         .err()
         .expect("a ChatGPT session cannot authenticate a standard API endpoint");
         assert!(error.contains("API-key"), "{error}");
@@ -427,7 +483,30 @@ mod tests {
             ("openai", "gemma_tool", "GemmaToolProvider"),
         ];
         for (provider_type, api_format, expected) in cases {
-            let provider = create_provider(provider_type, "https://e.invalid", &key, api_format, "standard").unwrap();
+            let provider =
+                create_provider(wire(provider_type, "https://e.invalid", &key, api_format, "standard")).unwrap();
+            assert_eq!(provider.adapter_name(), expected, "{provider_type}/{api_format}");
+        }
+    }
+
+    /// **The Codex shape picks no adapter.** It changes what the Responses one
+    /// puts on the wire and nothing else — so turning it on must not quietly
+    /// route a row somewhere new, and a row that is not `responses` has to
+    /// carry it harmlessly rather than being refused.
+    #[test]
+    fn the_codex_request_shape_changes_the_wire_and_not_the_adapter() {
+        let key = Credential::ApiKey("k".into());
+        for (provider_type, api_format, expected) in [
+            ("openai", "responses", "OpenAIResponsesProvider"),
+            ("xai", "responses", "OpenAIResponsesProvider"),
+            ("openai", "chat_completions", "OpenAICompatProvider"),
+            ("anthropic", "chat_completions", "AnthropicProvider"),
+        ] {
+            let provider = create_provider(ProviderWire {
+                codex_request_shape: true,
+                ..wire(provider_type, "https://e.invalid", &key, api_format, "standard")
+            })
+            .unwrap();
             assert_eq!(provider.adapter_name(), expected, "{provider_type}/{api_format}");
         }
     }
@@ -435,15 +514,15 @@ mod tests {
     #[test]
     fn unknown_wire_selectors_are_rejected_instead_of_using_openai_compat() {
         let key = Credential::ApiKey("k".into());
-        assert!(create_provider("custom", "https://e.invalid", &key, "future_api", "standard").is_err());
+        assert!(create_provider(wire("custom", "https://e.invalid", &key, "future_api", "standard")).is_err());
         assert!(
-            create_provider(
+            create_provider(wire(
                 "custom",
                 "https://e.invalid",
                 &key,
                 "chat_completions",
                 "future_transport"
-            )
+            ))
             .is_err()
         );
     }

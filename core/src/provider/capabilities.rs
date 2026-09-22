@@ -97,6 +97,7 @@ struct CatalogEntry {
     default_verbosity: Option<CapabilityVerbosity>,
     server_tools: Option<Vec<ServerToolKind>>,
     supports_remote_compaction: Option<bool>,
+    responses_lite: Option<bool>,
 }
 
 static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
@@ -165,6 +166,9 @@ fn apply(base: &mut ProviderCapabilities, entry: &CatalogEntry) {
     }
     if let Some(v) = entry.supports_remote_compaction {
         base.supports_remote_compaction = v;
+    }
+    if let Some(v) = entry.responses_lite {
+        base.responses_lite = v;
     }
 }
 
@@ -354,6 +358,25 @@ pub fn resolve_on(
         caps.supports_fast = false;
     }
     caps
+}
+
+/// The same narrowing, for a row that reaches a Codex backend through an
+/// ordinary API key rather than through the `chatgpt_codex` transport.
+///
+/// Its own function because the two arrive at different times: the transport is
+/// part of the wire contract every capability caller already passes, while
+/// `codex_request_shape` is a per-row setting that only the paths holding a
+/// provider row can answer. Folding it into `resolve_on` would put a sixth
+/// argument on every call site, most of which have no row to read it from.
+///
+/// It says less than the transport arm does, and the difference is deliberate:
+/// `supports_fast` stays, because `service_tier` is the one field Codex itself
+/// sends (`model_info.service_tier_for_request`) and an API-key account is
+/// exactly the kind that can buy the priority tier. What goes is only what
+/// [`super::openai_responses::CodexShape`] actually stops sending.
+pub fn narrow_to_codex_shape(caps: &mut ProviderCapabilities) {
+    caps.supports_temperature = false;
+    caps.supports_top_p = false;
 }
 
 fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> ProviderCapabilities {
@@ -705,6 +728,7 @@ pub fn filter_params(params: &mut ChatParams, caps: &ProviderCapabilities) -> Re
         params.temperature = Some(max_temp as f64);
     }
     params.supports_remote_compaction = caps.supports_remote_compaction;
+    params.responses_lite = caps.responses_lite;
     Ok(())
 }
 

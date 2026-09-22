@@ -334,6 +334,12 @@ pub async fn deliver(endpoint: &NotificationWebhookRow, secret: Option<&str>, al
         attempts += 1;
         let mut request = Request::new(http::Method::POST, prepared.url.clone());
         request.timeout = Some(TIMEOUT);
+        // This loop is the retry. The transport's own would sit underneath it
+        // with a different budget, no 429 arm, and no way to be counted — so a
+        // 503 it absorbed would leave `attempts` reporting one delivery where
+        // the endpoint saw three, in a report the user reads to decide whether
+        // their webhook is healthy.
+        request.retry = None;
         request.body = Some(RequestBody::Raw(prepared.body.clone().into()));
         for (name, value) in &prepared.headers {
             match (
