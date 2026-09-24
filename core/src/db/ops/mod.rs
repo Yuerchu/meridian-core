@@ -4,6 +4,7 @@ pub mod acp_session_notice;
 pub mod assistant;
 pub mod audit;
 pub mod cached_model;
+pub mod composer_draft;
 pub mod conversation;
 pub mod custom_tool;
 pub mod emoji;

@@ -80,6 +80,20 @@ diesel::table! {
 }
 
 diesel::table! {
+    composer_drafts (slot) {
+        slot -> Text,
+        conversation_id -> Nullable<Text>,
+        body -> Text,
+        attachments -> Text,
+        conversation_refs -> Text,
+        sticker_id -> Nullable<Text>,
+        revision -> BigInt,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
     conversations (id) {
         id -> Text,
         title -> Nullable<Text>,
@@ -844,6 +858,8 @@ diesel::joinable!(todo_items -> todo_lists (list_id));
 diesel::joinable!(turns -> conversations (conversation_id));
 diesel::joinable!(acp_sessions -> conversations (conversation_id));
 diesel::joinable!(acp_session_notices -> conversations (conversation_id));
+diesel::joinable!(composer_drafts -> conversations (conversation_id));
+diesel::joinable!(composer_drafts -> emojis (sticker_id));
 diesel::joinable!(voice_clips -> voice_blobs (blob_id));
 diesel::joinable!(journal_versions -> journal_files (file_id));
 
@@ -854,6 +870,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     assistant_emoji_packs,
     assistants,
     cached_models,
+    composer_drafts,
     conversations,
     custom_tools,
     emoji_packs,
