@@ -1,0 +1,9 @@
+# One compiler for every machine and every CI job. Floating `stable` let a new
+# release's clippy turn CI red on code nobody had touched, while a local run on
+# an older stable passed. Upgrading is a change of its own: bump this, fix what
+# the new clippy reports, in one commit. The Meridian shell pins the same
+# version in its own rust-toolchain.toml; keep the two in step.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
