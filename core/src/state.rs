@@ -29,11 +29,6 @@ pub struct PendingApproval {
     /// What the model called it, and what the tool result must be sent back
     /// under. Never used to look an approval up.
     pub provider_call_id: String,
-    /// The call this one is a second attempt at. Set only for sandbox
-    /// escalations. It currently equals `provider_call_id` — the retry reuses
-    /// the id — but the two mean different things, and recording it keeps the
-    /// front end from having to know that they coincide.
-    pub origin_call_id: Option<String>,
     pub tool_name: String,
     /// What the tool was called with.
     ///
@@ -45,9 +40,19 @@ pub struct PendingApproval {
     /// Kept for both kinds so that redrawing a card does not depend on which it
     /// is.
     pub arguments: String,
-    /// Why a sandbox-blocked command is asking to run again without the
-    /// sandbox. Present exactly when this approval is such a retry.
-    pub retry_reason: Option<String>,
+    /// Present exactly when this approval asks to run an already-asked call
+    /// outside the sandbox: which kind of escalation, why, and the call it is a
+    /// second attempt at. `origin_call_id` currently equals `provider_call_id`
+    /// — the retry reuses the id — but the two mean different things, and
+    /// recording it keeps the front end from having to know that they coincide.
+    /// The same value the announcing event carries, so a card rebuilt from the
+    /// register says what the original said.
+    pub retry: Option<crate::events::ApprovalRetry>,
+    /// When the question was registered, in Unix milliseconds. Stamped once,
+    /// by the asker, and sent on both the announcing event and every listing —
+    /// so a question rebuilt after a reload or a remote connect keeps its time
+    /// instead of having none.
+    pub asked_at: i64,
     /// Set when this call belongs to a delegated run.
     pub bubble: Option<Bubble>,
     /// When this stops standing, if it ever does.
@@ -275,10 +280,10 @@ mod tests {
             turn_id: "turn-1".into(),
             assistant_message_id: "msg-1".into(),
             provider_call_id: call_id.into(),
-            origin_call_id: None,
             tool_name: "read_file".into(),
             arguments: "{}".into(),
-            retry_reason: None,
+            retry: None,
+            asked_at: 0,
             bubble: None,
             expires_at: None,
             sender: tx,

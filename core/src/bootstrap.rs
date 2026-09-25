@@ -113,7 +113,10 @@ pub fn bootstrap_with_secrets(
                     sort_order: 0,
                     created_at: now,
                     updated_at: now,
-                    context_limit: 128000,
+                    // No override: 0 is "the model's own window". 128000 here
+                    // outranked the window of every model the default
+                    // assistant was pointed at, and nobody chose it.
+                    context_limit: 0,
                     compact_keep_recent: 10,
                     enabled_tools: None,
                     thinking_enabled: 0,

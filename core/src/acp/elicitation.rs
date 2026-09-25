@@ -597,6 +597,10 @@ pub async fn ask(
     // `acp::approvals::ask`.
     let ttl = crate::approval::ttl(services)?;
 
+    // Stamped once and sent both ways: on the event, and in the register every
+    // listing reads, so a card rebuilt after a reload keeps its time.
+    let asked_at = crate::util::now_ms();
+
     // Registered before the event goes out, so an answer cannot arrive before
     // there is somewhere to put it.
     services.approvals.lock().insert(
@@ -606,10 +610,10 @@ pub async fn ask(
             turn_id: turn.turn_id.clone(),
             assistant_message_id: turn.assistant_message_id.clone(),
             provider_call_id: call_id.clone(),
-            origin_call_id: None,
             tool_name: ASK_TOOL.to_string(),
             arguments: arguments.clone(),
-            retry_reason: None,
+            retry: None,
+            asked_at,
             bubble: None,
             expires_at: ttl.map(|ttl| std::time::Instant::now() + ttl),
             sender: tx,
@@ -625,6 +629,7 @@ pub async fn ask(
         conversation_id: conversation_id.to_string(),
         delegation: None,
         retry: None,
+        asked_at,
     };
     if let Err(e) = services.events.emit_chat(event) {
         services.approvals.claim(&approval_id);

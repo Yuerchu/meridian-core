@@ -78,7 +78,8 @@ pub(crate) fn truncate_middle_with_token_budget(s: &str, max_tokens: usize) -> (
     }
 
     let truncated = truncate_with_byte_estimate(s, approx_bytes_for_tokens(max_tokens), /*use_tokens*/ true);
-    let total_tokens = u64::try_from(approx_token_count(s)).unwrap_or(u64::MAX);
+    // `usize` fits in `u64` on every target this builds for.
+    let total_tokens = approx_token_count(s) as u64;
 
     if truncated == s {
         (truncated, None)

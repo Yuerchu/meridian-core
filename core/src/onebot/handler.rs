@@ -2023,7 +2023,13 @@ async fn dispatch_status(
             .as_ref()
             .and_then(|a| a.model_id.clone())
             .unwrap_or_else(|| "未配置".into());
-        let context_limit = assistant.as_ref().map(|a| a.context_limit).unwrap_or(128000);
+        // 0 is "the model's own window", not a window of zero; an absent
+        // assistant has no override at all. Neither is a number to print.
+        let context_limit = match assistant.as_ref().map(|a| a.context_limit) {
+            Some(limit) if limit > 0 => limit.to_string(),
+            Some(_) => "跟随模型".to_string(),
+            None => "未配置".to_string(),
+        };
         // The active path, not every row: counting branches the user has
         // switched away from would not describe the conversation /status is
         // reporting on.
@@ -2036,7 +2042,9 @@ async fn dispatch_status(
                     .filter(|m| m.role != "context")
                     .count() as i64
             })
-            .unwrap_or(0);
+            // A failed read is reported as a failure, not as an empty
+            // conversation.
+            .map_err(|e| e.to_string())?;
         Ok::<_, String>((assistant_name, model, context_limit, msg_count))
     })
     .await;

@@ -34,6 +34,7 @@ impl CustomToolExecutor {
             command: tool.command.clone(),
             args_template: tool.args_template.clone(),
             tool_working_directory: tool.working_directory.clone(),
+            // domain-default: a user's custom tool with no timeout configured gets this app's own thirty-second ceiling
             timeout: Duration::from_millis(tool.timeout_ms.unwrap_or(30000) as u64),
             perm,
         })
@@ -104,10 +105,14 @@ impl Tool for CustomToolExecutor {
 
         // A containered command resolves its argv inside the container, where
         // the host's Git Bash path means nothing — same rule as `run_command`.
-        let containered = context
-            .sandbox_policy
-            .as_ref()
-            .is_some_and(|p| p.backend == crate::sandbox::SandboxBackend::Container);
+        // The same refusal `run_command` gives, and the same way past it: with
+        // the settings unread there is no answer to where this should run, so
+        // the turn asks the user whether it may run outside the sandbox.
+        let policy = match context.sandbox_policy.policy() {
+            Ok(policy) => policy,
+            Err(error) => return Err(super::encode_settings_unreadable(error)),
+        };
+        let containered = context.sandbox_policy.is_container();
         let argv: Vec<String> = if !containered && cfg!(target_os = "windows") {
             // Reuse run_command's Git Bash discovery instead of a bare "bash"
             // that depends on PATH.
@@ -136,15 +141,9 @@ impl Tool for CustomToolExecutor {
             Some(j) => j.command_bracket().await,
             None => None,
         };
-        let res = crate::sandbox::execute(
-            &argv,
-            &wd,
-            context.sandbox_policy.as_ref(),
-            self.timeout,
-            &context.cancel,
-        )
-        .await
-        .map_err(|e| e.to_string());
+        let res = crate::sandbox::execute(&argv, &wd, policy, self.timeout, &context.cancel)
+            .await
+            .map_err(|e| e.to_string());
         if let (Some(j), Some(b)) = (&context.journal, bracket) {
             j.settle_command_bracket(b, &self.tool_name).await;
         }
@@ -220,5 +219,40 @@ mod tests {
             panic!("unknown permission must fail");
         };
         assert!(error.contains("unknown tool permission"), "{error}");
+    }
+
+    /// A user's own command tool is a command like any other: with the
+    /// settings unread it runs nowhere and asks, through the same escalation
+    /// `run_command` uses. Otherwise it is the documented way round the rule.
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn unreadable_settings_run_no_custom_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let mut stored = row(r#"{"type":"object"}"#);
+        stored.command = format!("echo ran > \"{}\"", marker.display().to_string().replace('\\', "/"));
+        let tool = CustomToolExecutor::from_db(&stored).unwrap();
+        let context = ToolContext {
+            working_directory: Some(dir.path().display().to_string()),
+            shell: crate::tools::ShellType::default_for_platform(),
+            file_access: crate::tools::FileAccess::Unrestricted,
+            project_id: None,
+            conversation_id: Some("c-1".into()),
+            turn_id: None,
+            assistant_id: None,
+            db_pool: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::Unreadable("database is locked".into()),
+            tool_secrets: Default::default(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            journal: None,
+        };
+
+        let err = tool.execute(serde_json::json!({}), &context).await.unwrap_err();
+        let escalation = crate::tools::decode_escalation(&err).expect("an escalation, not a plain error");
+        assert_eq!(escalation.kind, crate::events::ApprovalRetryKind::SettingsUnreadable);
+        assert!(
+            !marker.exists(),
+            "the custom command ran with nothing known about where it should"
+        );
     }
 }

@@ -113,16 +113,16 @@ impl Approvals for DeniedMemory<'_> {
         &self,
         assistant_message_id: &str,
         call: &ToolCall,
-        retry_reason: Option<&str>,
+        retry: Option<crate::agent::engine::Escalation<'_>>,
     ) -> Result<Option<ApprovalDecision>, String> {
         if Self::passthrough(&call.name) {
-            return self.inner.ask(assistant_message_id, call, retry_reason).await;
+            return self.inner.ask(assistant_message_id, call, retry).await;
         }
 
         // An escalation is its own aspect: refusing to run something with the
         // sandbox removed is not refusing to run it at all, and the ordinary
         // attempt afterwards is the safer of the two.
-        let aspect = if retry_reason.is_some() {
+        let aspect = if retry.is_some() {
             Aspect::Escalation
         } else {
             Aspect::Ordinary
@@ -144,7 +144,7 @@ impl Approvals for DeniedMemory<'_> {
             )))));
         }
 
-        let decision = self.inner.ask(assistant_message_id, call, retry_reason).await?;
+        let decision = self.inner.ask(assistant_message_id, call, retry).await?;
 
         // Only a refusal is remembered. `None` is nobody answering, which is
         // not a decision about the action; `Approved` and `Response` are not
@@ -182,7 +182,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Approvals for Counting {
-        async fn ask(&self, _: &str, _: &ToolCall, _: Option<&str>) -> Result<Option<ApprovalDecision>, String> {
+        async fn ask(
+            &self,
+            _: &str,
+            _: &ToolCall,
+            _: Option<crate::agent::engine::Escalation<'_>>,
+        ) -> Result<Option<ApprovalDecision>, String> {
             self.asked.fetch_add(1, Ordering::Relaxed);
             let mut answers = self.answer.lock().unwrap();
             if answers.len() > 1 {
@@ -294,6 +299,11 @@ mod tests {
         assert_eq!(inner.asked(), 2);
     }
 
+    const DENIAL: crate::agent::engine::Escalation<'static> = crate::agent::engine::Escalation {
+        kind: crate::events::ApprovalRetryKind::SandboxDenied,
+        reason: "sandbox denied",
+    };
+
     /// Refusing to run something outside the sandbox is not refusing to run it
     /// at all — and the ordinary attempt is the safer of the two, so turning it
     /// down unasked is a refusal the user never gave.
@@ -303,14 +313,14 @@ mod tests {
         let memory = DeniedMemory::wrap(&inner);
         let escalation = call("run_command", r#"{"command":"cargo test"}"#);
 
-        let _ = memory.ask("m-1", &escalation, Some("sandbox denied")).await;
+        let _ = memory.ask("m-1", &escalation, Some(DENIAL)).await;
         assert_eq!(inner.asked(), 1);
 
         let _ = memory.ask("m-1", &escalation, None).await;
         assert_eq!(inner.asked(), 2, "the ordinary call was refused on the user's behalf");
 
         // And the escalation itself is still remembered.
-        let _ = memory.ask("m-1", &escalation, Some("sandbox denied")).await;
+        let _ = memory.ask("m-1", &escalation, Some(DENIAL)).await;
         assert_eq!(inner.asked(), 2);
     }
 
@@ -350,7 +360,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Approvals for AnswersItself<'_> {
-        async fn ask(&self, _: &str, _: &ToolCall, _: Option<&str>) -> Result<Option<ApprovalDecision>, String> {
+        async fn ask(
+            &self,
+            _: &str,
+            _: &ToolCall,
+            _: Option<crate::agent::engine::Escalation<'_>>,
+        ) -> Result<Option<ApprovalDecision>, String> {
             self.reached.fetch_add(1, Ordering::Relaxed);
             let _ = &self.inner;
             Ok(Some(ApprovalDecision::Denied(Some("the reviewer said no".into()))))

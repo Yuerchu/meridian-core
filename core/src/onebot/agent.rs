@@ -111,16 +111,16 @@ pub fn turn_stop_event(
     turn_id: &str,
     message_id: Option<&str>,
     reason: crate::events::ChatStopReason,
-    input_tokens: i32,
-    output_tokens: i32,
+    input_tokens: Option<i32>,
+    output_tokens: Option<i32>,
 ) -> crate::events::ChatStreamEvent {
     crate::events::ChatStreamEvent::Stop {
         reason,
         message_id: message_id.map(str::to_string),
         turn_id: turn_id.to_string(),
         conversation_id: conversation_id.to_string(),
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(output_tokens),
+        input_tokens,
+        output_tokens,
     }
 }
 
@@ -156,8 +156,18 @@ impl crate::agent::engine::Approvals for ChatApprovals<'_> {
         &self,
         _assistant_message_id: &str,
         call: &ToolCall,
-        retry_reason: Option<&str>,
+        retry: Option<crate::agent::engine::Escalation<'_>>,
     ) -> Result<Option<crate::agent::engine::ApprovalDecision>, String> {
+        // A QQ chat is never where "may this run with nothing known about
+        // where it should run" gets answered: the answer is typed text in a
+        // group, possibly by somebody other than the owner, and a yes there
+        // runs a command on the owner's machine. Refused without asking.
+        if let Some(escalation) = retry.filter(|r| r.kind == crate::events::ApprovalRetryKind::SettingsUnreadable) {
+            return Ok(Some(crate::agent::engine::ApprovalDecision::Denied(Some(format!(
+                "the shell and sandbox settings could not be read ({}); running a command outside the sandbox \n                 needs the owner's confirmation on the desktop, which QQ cannot give",
+                escalation.reason
+            )))));
+        }
         // A QQ approval is a message in a chat and can sit there for the full
         // minute, so this is a window the process can easily be killed in — and
         // dying here means nothing ran, which is worth being able to say.
@@ -166,7 +176,7 @@ impl crate::agent::engine::Approvals for ChatApprovals<'_> {
             &self.turn_id,
             TurnPhase::AwaitingApproval,
             Some(&call.name),
-            (self.approval_fn)(call.clone(), retry_reason.map(str::to_string)),
+            (self.approval_fn)(call.clone(), retry.map(|r| r.reason.to_string())),
         )
         .await?;
         //
@@ -959,43 +969,30 @@ async fn headless_chat_inner(
     }
 
     // Build tool context
-    let (shell_type, sandbox_pref) = {
+    // A read that fails is its own answer, never "unset": unset is `auto`, and
+    // guessing `auto` for somebody who chose a container runs their commands on
+    // the host. See `CommandSettings`; the escalation it leads to is refused in
+    // QQ by `ChatApprovals`, because nobody there may answer it.
+    let command_settings = {
         let pool2 = pool.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool2.get().ok()?;
-            let shell = crate::db::ops::preference::get_preference(&mut conn, "shell")
-                .ok()
-                .flatten();
-            let sandbox = crate::db::ops::preference::get_preference(&mut conn, "sandbox.enabled")
-                .ok()
-                .flatten();
-            Some((shell, sandbox))
-        })
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or((None, None))
+        tokio::task::spawn_blocking(move || crate::sandbox::CommandSettings::read(&pool2))
+            .await
+            .map_err(|e| e.to_string())??
     };
-    let execution_mode = crate::sandbox::ExecutionMode::parse(sandbox_pref.as_deref())?;
     // Headless sessions have no project directory. A requested container is
     // therefore refused explicitly instead of being downgraded to the platform
     // default; there is no honest answer to what the container should mount.
     #[cfg(not(target_os = "android"))]
-    let sandbox_policy = crate::sandbox::resolve_sandbox_policy(
-        execution_mode,
+    let sandbox_policy = crate::sandbox::resolve_command_sandbox(
+        &command_settings,
         None,
         conversation_id,
         services.map(|services| services.containers.clone() as std::sync::Arc<dyn crate::container::CommandConnector>),
     )
     .map_err(|error| error.to_string())?;
-    #[cfg(target_os = "android")]
-    let _ = execution_mode;
     let tool_context = tools::ToolContext {
         working_directory: None,
-        shell: shell_type
-            .map(|value| tools::ShellType::parse(&value))
-            .transpose()?
-            .unwrap_or_else(tools::ShellType::default_for_platform),
+        shell: command_settings.shell(),
         // Headless (QQ) sessions have no project dir, and Unrestricted access
         // with no directory to be restricted to is the whole host filesystem.
         // An empty root set denies every path at the validation layer instead.
@@ -1199,8 +1196,8 @@ mod tests {
             "turn-1",
             failed.progress.message_id.as_deref(),
             failed.chat_stop_reason(),
-            0,
-            0,
+            Some(0),
+            Some(0),
         );
         let payload = serde_json::to_value(event).unwrap();
 
@@ -1220,8 +1217,8 @@ mod tests {
             "turn-1",
             Some("msg-9"),
             crate::events::ChatStopReason::EndTurn,
-            12,
-            34,
+            Some(12),
+            Some(34),
         ))
         .unwrap();
         assert_eq!(payload["message_id"], "msg-9");
@@ -1268,6 +1265,50 @@ mod tests {
                 .unwrap()
                 .block_on(adapter.ask("m1", &call, None))
                 .unwrap()
+        }
+
+        /// **A QQ chat never answers "run it with nothing known about where".**
+        /// Even an admin typing yes would authorise a command on the owner's
+        /// machine from a group chat; the escalation is refused before the chat
+        /// is asked anything. A sandbox *denial* is still put to the admin, as
+        /// it always was.
+        #[test]
+        fn unreadable_settings_are_refused_without_asking_the_chat() {
+            let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let pool = test_db();
+            let counter = asked.clone();
+            let approval_fn: ApprovalFn = Box::new(move |_, _| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move { Ok(Some("y".to_string())) })
+            });
+            let adapter = ChatApprovals {
+                approval_fn: &approval_fn,
+                pool,
+                turn_id: "t1".into(),
+            };
+            let call = ToolCall {
+                id: "call-1".into(),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+            };
+            let escalation = crate::agent::engine::Escalation {
+                kind: crate::events::ApprovalRetryKind::SettingsUnreadable,
+                reason: "database is locked",
+            };
+            let decision = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(adapter.ask("m1", &call, Some(escalation)))
+                .unwrap();
+
+            match decision {
+                Some(ApprovalDecision::Denied(Some(reason))) => {
+                    assert!(reason.contains("database is locked"), "{reason}")
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0, "the chat was asked");
         }
 
         /// The distinction the whole mapping exists for. `ask_user` asked a

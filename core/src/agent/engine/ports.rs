@@ -50,12 +50,31 @@ pub trait Approvals: Send + Sync {
     /// turn has — a person can leave a card on screen for an hour — and what the
     /// record says during it is the difference between "stopped waiting for you"
     /// and "may have already run".
+    ///
+    /// `retry` is set when the call has already been put to whoever decides and
+    /// is now asking to run outside the sandbox — see [`Escalation`].
     async fn ask(
         &self,
         assistant_message_id: &str,
         call: &ToolCall,
-        retry_reason: Option<&str>,
+        retry: Option<Escalation<'_>>,
     ) -> Result<Option<ApprovalDecision>, String>;
+}
+
+/// A request to run a call outside the sandbox, and why.
+///
+/// **Typed rather than a bare reason string**, because the two kinds are put to
+/// a person in different words and are not equally answerable everywhere. A
+/// denial is the sandbox doing its job; an unreadable setting means nothing is
+/// known about where the command should run, so it may only be answered by a
+/// person looking at a card — an asker with nobody behind it (QQ, the automatic
+/// reviewer when unattended) refuses it rather than deciding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Escalation<'a> {
+    pub kind: crate::events::ApprovalRetryKind,
+    /// The sandbox's output for a denial; the read error for unreadable
+    /// settings.
+    pub reason: &'a str,
 }
 
 /// Where the model's text goes when it is not the last thing it says.

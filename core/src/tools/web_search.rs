@@ -95,6 +95,7 @@ impl Tool for WebSearchTool {
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String> {
         let query = args["query"].as_str().ok_or("missing 'query' argument")?.to_string();
+        // domain-default: how many results a search returns unless the model asks is this app's own page size, not a fact about the provider
         let max_results = args["max_results"].as_u64().unwrap_or(5).min(20) as usize;
         let time_range = args["time_range"].as_str().map(|s| s.to_string());
 

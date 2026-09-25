@@ -480,8 +480,8 @@ pub struct RunningTurn {
     /// writing one leaves the previous round's, which is closer to the truth
     /// than nothing.
     message_id: Option<String>,
-    input_tokens: i32,
-    output_tokens: i32,
+    input_tokens: crate::provider::TokenTally,
+    output_tokens: crate::provider::TokenTally,
 }
 
 impl RunningTurn {
@@ -503,8 +503,8 @@ impl RunningTurn {
             conversation_id,
             turn_id,
             message_id: None,
-            input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Default::default(),
+            output_tokens: Default::default(),
         }
     }
 
@@ -535,8 +535,8 @@ impl RunningTurn {
     /// Fold a finished round's numbers in. Follow-up rounds are the same turn,
     /// so they add up rather than each reporting their own.
     pub fn record(&mut self, progress: agent::TurnProgress) {
-        self.input_tokens += progress.input_tokens;
-        self.output_tokens += progress.output_tokens;
+        self.input_tokens.merge(progress.input_tokens);
+        self.output_tokens.merge(progress.output_tokens);
         if progress.message_id.is_some() {
             self.message_id = progress.message_id;
         }
@@ -549,8 +549,8 @@ impl RunningTurn {
             &self.turn_id,
             self.message_id.as_deref(),
             reason,
-            self.input_tokens,
-            self.output_tokens,
+            self.input_tokens.value(),
+            self.output_tokens.value(),
         ));
     }
 
@@ -2360,8 +2360,8 @@ mod tests {
 
         running.record(agent::TurnProgress {
             message_id: Some("msg-1".into()),
-            input_tokens: 10,
-            output_tokens: 1,
+            input_tokens: crate::provider::TokenTally::reported(10),
+            output_tokens: crate::provider::TokenTally::reported(1),
             aborted: false,
             steps: 1,
             ..Default::default()
@@ -2369,8 +2369,8 @@ mod tests {
         assert!(running.end_round(crate::events::ChatStopReason::EndTurn).is_some());
         // The follow-up round never wrote a row, so the first round's stands.
         running.record(agent::TurnProgress {
-            input_tokens: 5,
-            output_tokens: 2,
+            input_tokens: crate::provider::TokenTally::reported(5),
+            output_tokens: crate::provider::TokenTally::reported(2),
             ..Default::default()
         });
         assert!(running.end_round(crate::events::ChatStopReason::EndTurn).is_none());

@@ -706,6 +706,7 @@ fn resolve(group: &GroupRow, current: &HashMap<(String, String), Prices>) -> Que
         && current_prices
             .as_ref()
             .is_some_and(|prices| prices.server_tool_price.is_some());
+    // domain-default: `Prices::default()` is every rate `None` — unknown, not zero — so a row with no rate anywhere stays unpriced
     let mut prices = snapshot.or_else(|| current_prices.clone()).unwrap_or_default();
 
     // A tool rate is independent of the token rates. Preserve an explicit

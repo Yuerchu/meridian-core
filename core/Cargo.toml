@@ -93,11 +93,10 @@ strum = { version = "0.27", features = ["derive"] }
 dirs = "6"
 tiktoken = "3.5"
 
-# Offline voice input. On Android the prebuilt libraries have to be fetched
-# separately and pointed at with SHERPA_ONNX_LIB_DIR — sherpa-onnx-sys has no
-# android entry in its download table and panics without it. See
-# scripts/fetch-sherpa-android.sh.
-sherpa-onnx = { version = "1.13.4", default-features = false, features = ["shared"] }
+# Offline voice input. From 1.13.8 sherpa-onnx-sys downloads the prebuilt
+# libraries for every target itself, Android included, and copies the Android
+# ones into the Tauri project's jniLibs; nothing has to fetch them beforehand.
+sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
 tar = "0.4"
 bzip2 = "0.4"
 

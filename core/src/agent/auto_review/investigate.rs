@@ -139,7 +139,7 @@ fn build_context(
         assistant_id: None,
         db_pool: Some(db_pool),
         #[cfg(not(target_os = "android"))]
-        sandbox_policy: None,
+        sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
         // None of the four read a credential. An empty map is the honest
         // description of that rather than an oversight.
         tool_secrets: HashMap::new(),

@@ -145,6 +145,10 @@ pub async fn ask(
     // stop standing" — and the listing paths read the stored one.
     let ttl = crate::approval::ttl(services)?;
 
+    // Stamped once and sent both ways: on the event, and in the register every
+    // listing reads, so a card rebuilt after a reload keeps its time.
+    let asked_at = crate::util::now_ms();
+
     // Registered before the event goes out, so an answer cannot arrive before
     // there is somewhere to put it.
     services.approvals.lock().insert(
@@ -154,10 +158,10 @@ pub async fn ask(
             turn_id: turn.turn_id.clone(),
             assistant_message_id: turn.assistant_message_id.clone(),
             provider_call_id: call_id.clone(),
-            origin_call_id: None,
             tool_name: tool_name.clone(),
             arguments: arguments.clone(),
-            retry_reason: None,
+            retry: None,
+            asked_at,
             // Nothing delegated here: an ACP session is watched in its own
             // conversation, so the question is asked where it happens.
             bubble: None,
@@ -175,6 +179,7 @@ pub async fn ask(
         conversation_id: conversation_id.to_string(),
         delegation: None,
         retry: None,
+        asked_at,
     };
     if let Err(e) = services.events.emit_chat(event) {
         // Nobody can answer a card that was never drawn.
@@ -261,5 +266,74 @@ mod tests {
         assert!(Choices::pick(&[option("yes", "allow_once")]).is_none());
         assert!(Choices::pick(&[option("no", "reject_once")]).is_none());
         assert!(Choices::pick(&[]).is_none());
+    }
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<serde_json::Value>>);
+
+    impl crate::events::EventSink for Recorder {
+        fn emit(&self, _channel: &str, payload: &serde_json::Value) -> Result<(), String> {
+            self.0.lock().unwrap().push(payload.clone());
+            Ok(())
+        }
+    }
+
+    /// **When a question was asked is stamped once, by the asker.** The event
+    /// and the register carry the same value, so a window that reloads and
+    /// rebuilds its queue from `all_pending_approvals` shows the time the
+    /// event showed rather than none.
+    #[tokio::test]
+    async fn the_event_and_the_register_agree_on_when_it_was_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::services::bare_services(dir.path());
+        let recorder = Arc::new(Recorder::default());
+        services.events.register(recorder.clone(), false);
+        let turn = TurnContext {
+            turn_id: "t-1".into(),
+            assistant_message_id: "m-1".into(),
+            cancel: CancellationToken::new(),
+            plan_reviews: Arc::new(plan_review::ReviewControl::default()),
+        };
+        let params: RequestPermissionParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "s-1",
+            "toolCall": { "toolCallId": "call-1", "title": "Read" },
+            "options": [
+                { "optionId": "yes", "name": "Yes", "kind": "allow_once" },
+                { "optionId": "no", "name": "No", "kind": "reject_once" },
+            ],
+        }))
+        .unwrap();
+        let before = crate::util::now_ms();
+
+        let answering = async {
+            let event = loop {
+                let found = recorder
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|p| p["type"] == "tool_approval_req")
+                    .cloned();
+                if let Some(event) = found {
+                    break event;
+                }
+                tokio::task::yield_now().await;
+            };
+            let approval_id = event["approval_id"].as_str().unwrap().to_string();
+            let registered = services.approvals.lock()[&approval_id].asked_at;
+            services
+                .approvals
+                .claim(&approval_id)
+                .unwrap()
+                .sender
+                .send(ApprovalDecision::Approved)
+                .unwrap();
+            (event, registered)
+        };
+        let (answered, (event, registered)) = tokio::join!(ask(&services, "c-1", &turn, params), answering);
+
+        answered.unwrap();
+        assert!(registered >= before, "stamped when it was asked, not left at zero");
+        assert_eq!(event["asked_at"], serde_json::json!(registered));
     }
 }

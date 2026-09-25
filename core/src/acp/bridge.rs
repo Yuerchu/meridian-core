@@ -251,6 +251,7 @@ impl Tool for ConversationScopedLogs {
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
+            // domain-default: how many log lines the bridge hands a hosted agent is this app's own page size
             .unwrap_or(BRIDGE_LOG_LIMIT)
             .clamp(1, BRIDGE_LOG_LIMIT);
         args.insert("limit".into(), json!(limit));
@@ -556,7 +557,7 @@ impl Bridge {
             assistant_id: turn.assistant_id.clone(),
             db_pool: Some(self.services.db.clone()),
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets,
             cancel: turn.cancel.clone(),
             journal: None,
@@ -933,7 +934,7 @@ mod tests {
             assistant_id: None,
             db_pool: None,
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: Default::default(),
             cancel: CancellationToken::new(),
             journal: None,

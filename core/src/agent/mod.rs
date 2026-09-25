@@ -63,7 +63,7 @@ pub use project_instructions::{instruction_budget, load_project_instructions};
 pub(crate) use provider_config::without_thinking;
 pub use provider_config::{
     ResolvedProvider, TurnParams, TurnParamsResolveRequest, build_tool_secrets, get_provider_api_key,
-    provider_secret_name, resolve_provider_config, resolve_turn_params, resolve_with_overrides,
+    provider_secret_name, resolve_max_tokens, resolve_provider_config, resolve_turn_params, resolve_with_overrides,
 };
 pub(crate) use stream::{
     MAX_STREAM_RETRIES, STREAM_RETRY_BASE, StreamResult, is_context_window_error, is_retryable_stream_error,

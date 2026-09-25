@@ -101,9 +101,14 @@ pub const BILLED_ROLES: &[&str] = &[
 /// price change mid-month, and that is a thing it already handles.
 ///
 /// `prompt_tokens` is the whole prompt, cached part included, because that is
-/// what the upstreams measure against. A row with no token count falls to the
-/// base rates: an unknown prompt size cannot be argued into a tier, and the base
-/// rate is the one that cannot overcharge.
+/// what the upstreams measure against. A row with no prompt size on a model
+/// that prices by size snapshots **no** token rate: an unknown size cannot be
+/// argued into a tier, and the base rate is no safe stand-in — for a long prompt
+/// it is the cheap one. The row then counts as unpriced for its tokens (see
+/// `pricing::rates_for`), which the report's legacy fallback may estimate from
+/// today's base rate and flags as an estimate; its tool rate, which no tier
+/// changes, is kept. A model without tiers has one rate at every size and is
+/// snapshotted as usual.
 fn prices_for(
     conn: &mut SqliteConnection,
     provider_id: Option<&str>,
@@ -116,7 +121,7 @@ fn prices_for(
     let Some(config) = crate::agent::model_config::load(conn, provider, model)? else {
         return Ok(Prices::default());
     };
-    let effective = crate::agent::pricing::Prices::for_prompt(&config, prompt_tokens.unwrap_or(0) as i64)
+    let effective = crate::agent::pricing::Prices::for_prompt(&config, prompt_tokens.map(i64::from))
         .map_err(|error| diesel::result::Error::DeserializationError(Box::new(error)))?;
     // A partial base rate is still unknown; an explicit Decimal zero is a
     // complete, free rate and is snapshotted like any other known price.
@@ -869,6 +874,18 @@ mod tests {
         let long = append_message(&mut conn, &long, None).unwrap();
         record(&mut conn, &long).unwrap();
 
+        // No prompt size at all: which tier it was in is not known, so no token
+        // rate is snapshotted rather than the base one guessed.
+        let mut no_size = user_row("m3", "c1");
+        no_size.role = "assistant";
+        no_size.provider_id = Some("p1");
+        no_size.model_id = Some("grok-4.6");
+        no_size.input_tokens = None;
+        no_size.output_tokens = Some(10);
+        no_size.created_at = 3_000;
+        let no_size = append_message(&mut conn, &no_size, None).unwrap();
+        record(&mut conn, &no_size).unwrap();
+
         let logged = list_recent(&mut conn, 10).unwrap();
         let of = |id: &str| {
             logged
@@ -885,6 +902,9 @@ mod tests {
         );
         assert_eq!(of("m2").output_price, Some(decimal("12")));
         assert_eq!(of("m2").cache_read_price, Some(decimal("1")));
+        assert_eq!(of("m3").input_price, None, "an unknown size is not the base tier");
+        assert_eq!(of("m3").output_price, None);
+        assert_eq!(of("m3").cache_read_price, None);
     }
 
     /// A question has no model and so no price. Storing a zero would make it

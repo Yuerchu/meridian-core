@@ -169,7 +169,7 @@ mod tests {
             assistant_id: None,
             db_pool: None,
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: Default::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,

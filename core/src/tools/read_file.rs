@@ -53,14 +53,14 @@ impl Tool for ReadFileTool {
         let capped = super::backend::read_capped_opened(target, MAX_OUTPUT_BYTES).await?;
 
         if capped.truncated {
-            let size_info = capped
-                .total_size
-                .map(|s| format!(", total {} bytes", s))
-                .unwrap_or_default();
-            return Ok(format!(
-                "{}...\n\n(file truncated at 256KB{})",
-                capped.content, size_info
-            ));
+            // The size is said only when the backend knows it (SAF may not).
+            return Ok(match capped.total_size {
+                Some(size) => format!(
+                    "{}...\n\n(file truncated at 256KB, total {} bytes)",
+                    capped.content, size
+                ),
+                None => format!("{}...\n\n(file truncated at 256KB)", capped.content),
+            });
         }
 
         Ok(capped.content)
@@ -83,7 +83,7 @@ mod tests {
             assistant_id: None,
             db_pool: None,
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: std::collections::HashMap::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,

@@ -81,6 +81,27 @@ use super::{
 /// Why no request was made. Counts only -- this reaches a window, and the
 /// numbers are the whole diagnosis: what the conversation costs against what it
 /// is allowed to.
+/// What the model is told when a request to run a call outside the sandbox was
+/// refused, went unanswered, or could not be put to anybody.
+///
+/// The two kinds say different things because different things happened: a
+/// denial ran the command once, inside the sandbox, and its output is real; an
+/// unreadable setting stopped the command before it ran anywhere, and the model
+/// must not read that as the command having failed.
+fn escalation_not_approved(escalation: super::Escalation<'_>) -> String {
+    match escalation.kind {
+        crate::events::ApprovalRetryKind::SandboxDenied => format!(
+            "{}\n[blocked by sandbox; user declined to retry without sandbox]",
+            escalation.reason
+        ),
+        crate::events::ApprovalRetryKind::SettingsUnreadable => format!(
+            "[not run: the shell and sandbox settings could not be read ({}), so where this command should run is \
+             unknown. Running it outside the sandbox needs the user's explicit confirmation, which was not given.]",
+            escalation.reason
+        ),
+    }
+}
+
 fn no_room(budget: &TokenBudget) -> String {
     format!(
         "the conversation fills the context window ({used} of {limit} tokens) and compacting it \
@@ -334,18 +355,20 @@ pub struct TurnProgress {
     /// failed before creating one — the stop still has to go out, it just has no
     /// message to hang off.
     pub message_id: Option<String>,
-    pub input_tokens: i32,
-    pub output_tokens: i32,
+    /// Summed over rounds, and unknown — `value()` is `None` — as soon as one
+    /// round did not report it. A round that reported no usage at all makes
+    /// every one of these unknown: it was a request, and whatever it used is
+    /// part of the turn.
+    pub input_tokens: crate::provider::TokenTally,
+    pub output_tokens: crate::provider::TokenTally,
     /// Prompt tokens this turn's rounds got out of the upstream's cache, and
     /// wrote into it, summed the same way as the two above.
     ///
-    /// Plain `i32` rather than `Option<i32>`, unlike the row columns. A turn
-    /// total has nowhere to put "nobody said": it is a sum over rounds that may
-    /// disagree about whether they reported at all, and `Some(0) + None` has no
-    /// honest answer. That distinction is kept per row, where each number has
-    /// exactly one reporter.
-    pub cache_read_tokens: i32,
-    pub cache_write_tokens: i32,
+    /// A `TokenTally` for the same reason: `Some(0) + None` has no honest
+    /// answer, so a round that said nothing about caching makes the turn's
+    /// figure unknown rather than a partial sum that reads as the whole.
+    pub cache_read_tokens: crate::provider::TokenTally,
+    pub cache_write_tokens: crate::provider::TokenTally,
     /// What this turn cost, summed per round rather than derived from the totals
     /// above.
     ///
@@ -356,9 +379,11 @@ pub struct TurnProgress {
     /// the fact from `input_tokens` would put the first turn in the second one's
     /// bracket.
     ///
-    /// `None` means no cost could be worked out — either nobody priced this
-    /// model, or no round reported any usage to price. Both are distinct from
-    /// zero, which would be a claim that the turn was free.
+    /// `None` means nobody priced this model at all. A round that reported no
+    /// usage, a count a round left out, or a prompt size a tiered model needed
+    /// and did not get, all leave a gap in it (`RequestCost::gaps`) rather than
+    /// a zero: the known part is kept as a lower bound, and `total()` refuses
+    /// to call it the whole.
     pub cost: Option<crate::agent::pricing::RequestCost>,
     /// The loop guard cut it short.
     pub aborted: bool,
@@ -726,25 +751,40 @@ async fn run(
             }
         };
 
-        if let Some(ref u) = result.usage {
-            progress.input_tokens += u.prompt_tokens.unwrap_or(0);
-            progress.output_tokens += u.completion_tokens.unwrap_or(0);
-            // Added, not replaced, for the same reason as the two above: a turn
-            // is however many requests it took, and the round that reused a
-            // cached prefix and the round that had to rebuild it are both part
-            // of what it cost. Subsets of `input_tokens`, so a caller wanting
-            // "tokens paid for at full price" subtracts them rather than adds.
-            progress.cache_read_tokens += u.cache_read_tokens.unwrap_or(0);
-            progress.cache_write_tokens += u.cache_write_tokens.unwrap_or(0);
-            // Priced here, per round, because this is the last place the size of
-            // *this* request is known. Everything downstream has only the sums,
-            // and on a model with tiered rates the sum sits in a bracket no
-            // single request necessarily reached.
-            if let Some(ref pricing) = pricing {
-                let prices = pricing.for_prompt(u.prompt_tokens.unwrap_or(0) as i64);
-                *progress.cost.get_or_insert_default() += crate::agent::pricing::compute_cost(u, &prices);
+        match result.usage {
+            Some(ref u) => {
+                progress.input_tokens.add(u.prompt_tokens);
+                progress.output_tokens.add(u.completion_tokens);
+                // Added, not replaced, for the same reason as the two above: a turn
+                // is however many requests it took, and the round that reused a
+                // cached prefix and the round that had to rebuild it are both part
+                // of what it cost. Subsets of `input_tokens`, so a caller wanting
+                // "tokens paid for at full price" subtracts them rather than adds.
+                progress.cache_read_tokens.add(u.cache_read_tokens);
+                progress.cache_write_tokens.add(u.cache_write_tokens);
+                // Priced here, per round, because this is the last place the size of
+                // *this* request is known. Everything downstream has only the sums,
+                // and on a model with tiered rates the sum sits in a bracket no
+                // single request necessarily reached.
+                // A tiered model with no reported prompt size gets no token rates
+                // (see `pricing::rates_for`), so those parts become gaps here.
+                if let Some(ref pricing) = pricing {
+                    let prices = pricing.for_prompt(u.prompt_tokens.map(i64::from));
+                    *progress.cost.get_or_insert_default() += crate::agent::pricing::compute_cost(u, &prices);
+                }
+                budget.calibrate_from_usage(u);
             }
-            budget.calibrate_from_usage(u);
+            // A request that reported nothing still happened. Its tokens and its
+            // cost are unknown, which makes the turn's unknown too.
+            None => {
+                progress.input_tokens.add(None);
+                progress.output_tokens.add(None);
+                progress.cache_read_tokens.add(None);
+                progress.cache_write_tokens.add(None);
+                if pricing.is_some() {
+                    *progress.cost.get_or_insert_default() += crate::agent::pricing::RequestCost::unreported();
+                }
+            }
         }
 
         // A reply cut off at the length limit may hold half a call. Treating it
@@ -1425,14 +1465,14 @@ async fn run(
                                 .await;
                                 match executed {
                                     Ok(o) => (o, "success"),
-                                    Err(e) => match tools::decode_sandbox_denied(&e) {
+                                    Err(e) => match tools::decode_escalation(&e) {
                                         None => (format!("Error: {e}"), "error"),
-                                        Some(blocked) => {
+                                        Some(escalation) => {
                                             // The same call under the same id: it is the
                                             // approval that is new, and that has an
                                             // identity of its own.
                                             let retry =
-                                                ports.approvals.ask(&assistant_msg_id, tc, Some(blocked)).await?;
+                                                ports.approvals.ask(&assistant_msg_id, tc, Some(escalation)).await?;
                                             if matches!(retry, Some(ApprovalDecision::Approved)) {
                                                 let escalated = tool_context.without_sandbox();
                                                 let retried = in_phase(
@@ -1448,12 +1488,7 @@ async fn run(
                                                     Err(e2) => (format!("Error: {e2}"), "error"),
                                                 }
                                             } else {
-                                                (
-                                                    format!(
-                                                        "{blocked}\n[blocked by sandbox; user declined to retry without sandbox]"
-                                                    ),
-                                                    "denied",
-                                                )
+                                                (escalation_not_approved(escalation), "denied")
                                             }
                                         }
                                     },
@@ -1945,12 +1980,12 @@ mod tests {
             &self,
             _assistant_message_id: &str,
             call: &ToolCall,
-            retry_reason: Option<&str>,
+            retry: Option<crate::agent::engine::Escalation<'_>>,
         ) -> Result<Option<ApprovalDecision>, String> {
             self.asked
                 .lock()
                 .unwrap()
-                .push((call.name.clone(), retry_reason.map(str::to_string)));
+                .push((call.name.clone(), retry.map(|r| r.reason.to_string())));
             Ok(self.answer.clone())
         }
     }
@@ -2108,7 +2143,7 @@ mod tests {
             assistant_id: None,
             db_pool: Some(pool.clone()),
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: Default::default(),
             cancel: cancel.clone(),
             journal: None,
@@ -3601,8 +3636,87 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.progress.input_tokens, 300);
-        assert_eq!(outcome.progress.output_tokens, 30);
+        assert_eq!(outcome.progress.input_tokens.value(), Some(300));
+        assert_eq!(outcome.progress.output_tokens.value(), Some(30));
+    }
+
+    /// **A round that did not report is not a round that used nothing.** The
+    /// first round reports its output and not its prompt, the second reports
+    /// nothing at all: the turn's prompt and output counts are unknown — the
+    /// known part survives as a lower bound, never as the total — and on a
+    /// priced model the cost carries gaps where the zeros used to be.
+    #[tokio::test]
+    async fn an_unreported_count_leaves_the_turn_total_unknown_not_short() {
+        let pool = test_db();
+        conversation(&pool);
+        let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
+        let provider = Scripted::of(vec![
+            vec![
+                StreamEvent::ToolCallStart {
+                    index: 0,
+                    id: "c".into(),
+                    name: "fixture".into(),
+                },
+                StreamEvent::ToolCallDone {
+                    index: 0,
+                    arguments: "{}".into(),
+                },
+                StreamEvent::Stop {
+                    reason: "tool_calls".into(),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: None,
+                        completion_tokens: Some(10),
+                        ..Default::default()
+                    }),
+                },
+            ],
+            vec![
+                StreamEvent::Text { content: "done".into() },
+                StreamEvent::Stop {
+                    reason: "stop".into(),
+                    usage: None,
+                },
+            ],
+        ]);
+        let approvals = Answers::nobody();
+        let fixture = Fixture::returning("ok");
+        let mut turn = setup(&provider, &pool, &cancel, &["fixture"]);
+        turn.pricing = Some(crate::agent::pricing::TurnPricing::with_base_rates("2", "8"));
+
+        let outcome = run_turn(
+            &services(&pool, &tools, &mcp),
+            turn,
+            TurnPorts {
+                surface_tools: Some(&fixture),
+                ..ports(&approvals, None)
+            },
+        )
+        .await;
+
+        assert!(outcome.reply.is_ok());
+        assert_eq!(
+            outcome.progress.input_tokens.value(),
+            None,
+            "no round said how big its prompt was"
+        );
+        assert_eq!(
+            outcome.progress.output_tokens.value(),
+            None,
+            "the second round said nothing"
+        );
+        assert_eq!(
+            outcome.progress.output_tokens.known(),
+            10,
+            "and the part that was said is kept"
+        );
+        let cost = outcome.progress.cost.expect("the model is priced");
+        assert!(cost.gaps.input && cost.gaps.output, "{:?}", cost.gaps);
+        assert_eq!(cost.total(), None, "a partial bill is not the bill");
+        assert_eq!(
+            cost.output_cost,
+            "0.00008".parse::<crate::decimal::Decimal>().unwrap(),
+            "the reported output is still priced: 10 at 8/M"
+        );
     }
 
     /// The whole chain in one test: a provider reports a cache hit, the loop
@@ -3667,8 +3781,13 @@ mod tests {
             Some(200),
             "the read is a subset of the prompt, not an addition to it",
         );
-        assert_eq!(outcome.progress.cache_read_tokens, 180, "summed across rounds");
-        assert_eq!(outcome.progress.cache_write_tokens, 0);
+        assert_eq!(
+            outcome.progress.cache_read_tokens.value(),
+            Some(180),
+            "summed across rounds"
+        );
+        // Neither round said anything about cache writes, and that is not zero.
+        assert_eq!(outcome.progress.cache_write_tokens.value(), None);
     }
 
     /// An upstream that says nothing about caching leaves the columns empty
@@ -3854,5 +3973,131 @@ mod tests {
         );
         let told = provider.requests()[1].0.last().unwrap().content.clone();
         assert_eq!(told, UNANSWERED_APPROVAL);
+    }
+
+    /// One question as `Sequence` saw it: the tool, and the escalation if any.
+    type Asked = (String, Option<(crate::events::ApprovalRetryKind, String)>);
+
+    /// Answers from a script, one per question, and keeps what each question
+    /// was: the tool, and the escalation it carried if any.
+    struct Sequence {
+        answers: Mutex<Vec<Option<ApprovalDecision>>>,
+        asked: Mutex<Vec<Asked>>,
+    }
+
+    impl Sequence {
+        fn of(answers: Vec<Option<ApprovalDecision>>) -> Self {
+            Self {
+                answers: Mutex::new(answers),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Approvals for Sequence {
+        async fn ask(
+            &self,
+            _assistant_message_id: &str,
+            call: &ToolCall,
+            retry: Option<crate::agent::engine::Escalation<'_>>,
+        ) -> Result<Option<ApprovalDecision>, String> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((call.name.clone(), retry.map(|r| (r.kind, r.reason.to_string()))));
+            Ok(self.answers.lock().unwrap().remove(0))
+        }
+    }
+
+    /// A turn whose shell/sandbox settings could not be read, calling
+    /// `run_command` for a command that leaves a file behind if it runs. What
+    /// the model was told comes back with the file's path.
+    #[cfg(not(target_os = "android"))]
+    async fn run_with_unreadable_settings(approvals: &Sequence) -> (String, std::path::PathBuf, tempfile::TempDir) {
+        let pool = test_db();
+        conversation(&pool);
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let command = format!("echo ran > \"{}\"", marker.display().to_string().replace('\\', "/"));
+        let arguments = serde_json::json!({ "command": command }).to_string();
+        let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
+        let provider = Scripted::of(vec![calls("call-1", "run_command", &arguments), says("fine")]);
+        let mut turn = setup(&provider, &pool, &cancel, &["run_command"]);
+        turn.tool_context.sandbox_policy = crate::sandbox::CommandSandbox::Unreadable("database is locked".into());
+
+        run_turn(&services(&pool, &tools, &mcp), turn, ports_with(approvals)).await;
+
+        let told = provider.requests()[1].0.last().unwrap().content.clone();
+        (told, marker, dir)
+    }
+
+    fn ports_with(approvals: &Sequence) -> TurnPorts<'_> {
+        TurnPorts {
+            emit: None,
+            approvals,
+            interim: None,
+            surface_tools: None,
+            steering: None,
+            transitions: None,
+            sub_agents: None,
+        }
+    }
+
+    /// **The card is offered, and a refusal runs nothing.** The command is
+    /// approved as usual; the unread settings then put a second question —
+    /// carrying the read error — and the user saying no leaves it unrun.
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn unreadable_settings_ask_before_running_and_a_refusal_runs_nothing() {
+        let approvals = Sequence::of(vec![
+            Some(ApprovalDecision::Approved),
+            Some(ApprovalDecision::Denied(None)),
+        ]);
+        let (told, marker, _dir) = run_with_unreadable_settings(&approvals).await;
+
+        assert_eq!(
+            *approvals.asked.lock().unwrap(),
+            [
+                ("run_command".to_string(), None),
+                (
+                    "run_command".to_string(),
+                    Some((
+                        crate::events::ApprovalRetryKind::SettingsUnreadable,
+                        "database is locked".to_string()
+                    ))
+                ),
+            ]
+        );
+        assert!(!marker.exists(), "refused, and it ran anyway");
+        assert!(
+            told.starts_with("[not run: the shell and sandbox settings could not be read (database is locked)"),
+            "{told}"
+        );
+    }
+
+    /// Nobody answering — a card that expired, a turn swept away — is not a
+    /// yes either.
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn unreadable_settings_with_nobody_answering_run_nothing() {
+        let approvals = Sequence::of(vec![Some(ApprovalDecision::Approved), None]);
+        let (told, marker, _dir) = run_with_unreadable_settings(&approvals).await;
+
+        assert_eq!(approvals.asked.lock().unwrap().len(), 2);
+        assert!(!marker.exists(), "unanswered, and it ran anyway");
+        assert!(told.contains("which was not given"), "{told}");
+    }
+
+    /// The explicit yes is the only way through, and it does go through: on
+    /// the host, outside any sandbox — which is what the card says.
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn unreadable_settings_run_on_the_host_only_once_confirmed() {
+        let approvals = Sequence::of(vec![Some(ApprovalDecision::Approved), Some(ApprovalDecision::Approved)]);
+        let (_told, marker, _dir) = run_with_unreadable_settings(&approvals).await;
+
+        assert_eq!(approvals.asked.lock().unwrap().len(), 2);
+        assert!(marker.exists(), "confirmed, and it did not run");
     }
 }

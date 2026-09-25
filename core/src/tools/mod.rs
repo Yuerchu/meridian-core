@@ -89,8 +89,11 @@ pub struct ToolContext {
     /// are anchored on the assistant as well as the project.
     pub assistant_id: Option<String>,
     pub db_pool: Option<crate::db::DbPool>,
+    /// What confines commands this turn — or that the setting could not be
+    /// read, in which case no command runs without the user. See
+    /// [`crate::sandbox::CommandSandbox`].
     #[cfg(not(target_os = "android"))]
-    pub sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
+    pub sandbox_policy: crate::sandbox::CommandSandbox,
     pub tool_secrets: HashMap<String, String>,
     /// Cancelled when the owning chat turn is stopped; long-running tools must
     /// observe it and terminate their work.
@@ -105,13 +108,14 @@ pub struct ToolContext {
 
 impl ToolContext {
     /// Clone of this context with the sandbox disabled — used for the
-    /// user-approved "retry without sandbox" escalation path.
+    /// user-approved "retry without sandbox" escalation path, and for the
+    /// user-approved "run it anyway" answer to settings that could not be read.
     pub fn without_sandbox(&self) -> Self {
         #[allow(unused_mut)]
         let mut ctx = self.clone();
         #[cfg(not(target_os = "android"))]
         {
-            ctx.sandbox_policy = None;
+            ctx.sandbox_policy = crate::sandbox::CommandSandbox::UNCONFINED;
         }
         ctx
     }
@@ -446,6 +450,37 @@ pub fn decode_sandbox_denied(err: &str) -> Option<&str> {
     err.strip_prefix(SANDBOX_DENIED_MARKER)
 }
 
+/// Sentinel marking a tool error as "not run, because the shell/sandbox
+/// preferences could not be read". The command never started; the text after
+/// the marker is the read error.
+pub const SETTINGS_UNREADABLE_MARKER: &str = "\u{1}SANDBOX_SETTINGS_UNREADABLE\u{1}";
+
+pub fn encode_settings_unreadable(error: &str) -> String {
+    format!("{SETTINGS_UNREADABLE_MARKER}{error}")
+}
+
+/// Which escalation a tool error asks for, if any.
+///
+/// Both lead to the same question — may this call run outside the sandbox —
+/// and to the same answer when it is yes (`ToolContext::without_sandbox`). They
+/// differ in what the user is told and in whether the command already ran once:
+/// a denial happened inside the sandbox, an unreadable setting stopped the
+/// command before it started anywhere.
+pub fn decode_escalation(err: &str) -> Option<crate::agent::engine::Escalation<'_>> {
+    use crate::events::ApprovalRetryKind;
+    if let Some(output) = decode_sandbox_denied(err) {
+        return Some(crate::agent::engine::Escalation {
+            kind: ApprovalRetryKind::SandboxDenied,
+            reason: output,
+        });
+    }
+    err.strip_prefix(SETTINGS_UNREADABLE_MARKER)
+        .map(|error| crate::agent::engine::Escalation {
+            kind: ApprovalRetryKind::SettingsUnreadable,
+            reason: error,
+        })
+}
+
 /// The `description` property, for the tools that change something.
 ///
 /// A tool card shows one line beside the name, and for a read that line is the
@@ -623,7 +658,7 @@ mod tests {
             assistant_id: None,
             db_pool: None,
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: HashMap::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,
@@ -659,7 +694,7 @@ mod tests {
             assistant_id: None,
             db_pool: None,
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: HashMap::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,
