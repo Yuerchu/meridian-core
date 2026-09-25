@@ -7,3 +7,12 @@ resolver = "3"
 # `exclude`s this directory, and cargo resolves `key.workspace = true` against
 # the workspace *doing the build* — so an inherited field would fail there with
 # "workspace.package.<key> was not defined". Every crate states its own fields.
+
+# Dependencies are built without debug info in the dev profile. They are most of
+# what `cargo test` / `tauri dev` write to target/debug, which had grown to
+# ~100 GB on a machine short of disk; a backtrace through a dependency loses its
+# line numbers, ours keep theirs. The shell and core share one target directory
+# (`--target-dir ../target`), so both workspaces must say the same thing or every
+# dependency is built and stored twice.
+[profile.dev.package."*"]
+debug = false
