@@ -67,6 +67,7 @@ impl Tool for SearchFilesTool {
                     .to_string());
             }
         };
+        // domain-default: the result page size is this app's own policy for keeping a search from flooding the context, not a fact about anything searched
         let max_results = args["max_results"].as_u64().unwrap_or(50) as usize;
 
         tokio::task::spawn_blocking(move || search(&path_buf, &pattern, max_results))

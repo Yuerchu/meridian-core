@@ -2166,7 +2166,7 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, Some(800));
         assert_eq!(usage.cache_write_tokens, Some(150));
         // The three parts of the prompt, each billed once: 1000 - 800 - 150.
-        assert_eq!(usage.uncached_prompt_tokens(), 50);
+        assert_eq!(usage.uncached_prompt_tokens(), Some(50));
 
         // And an upstream that says nothing still reports nothing: `None` is
         // "not mentioned", which is not the same claim as zero.
@@ -2177,7 +2177,7 @@ mod tests {
         })))
         .expect("usage");
         assert_eq!(usage.cache_write_tokens, None);
-        assert_eq!(usage.uncached_prompt_tokens(), 200);
+        assert_eq!(usage.uncached_prompt_tokens(), Some(200));
     }
 
     /// **Measured against the real backend**, which refused the first attempt

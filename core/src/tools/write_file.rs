@@ -71,7 +71,7 @@ mod tests {
             assistant_id: None,
             db_pool: None,
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: std::collections::HashMap::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,

@@ -47,8 +47,8 @@ pub use assessment::{Assessment, AuthLevel, Outcome, Read, RiskLevel};
 use crate::agent::engine::{ApprovalDecision, Approvals};
 use crate::db::models::message::MessageUsage;
 use crate::events::{
-    AutoReviewAuthorization, AutoReviewEvidence, AutoReviewOutcome as EventOutcome, AutoReviewRisk, AutoReviewStage,
-    AutoReviewVerdict, ChatStreamEvent,
+    ApprovalRetryKind, AutoReviewAuthorization, AutoReviewEvidence, AutoReviewOutcome as EventOutcome, AutoReviewRisk,
+    AutoReviewStage, AutoReviewVerdict, ChatStreamEvent,
 };
 use crate::provider::{ChatMessage, TokenUsage, ToolCall};
 use crate::services::Services;
@@ -622,11 +622,21 @@ impl Approvals for AutoReviewed<'_> {
         &self,
         assistant_message_id: &str,
         call: &ToolCall,
-        retry_reason: Option<&str>,
+        retry: Option<crate::agent::engine::Escalation<'_>>,
     ) -> Result<Option<ApprovalDecision>, String> {
         let Some(active) = self.active.as_ref().filter(|_| !Self::passthrough(&call.name)) else {
-            return self.inner.ask(assistant_message_id, call, retry_reason).await;
+            return self.inner.ask(assistant_message_id, call, retry).await;
         };
+
+        // Never reviewed. Whether a command may run with nothing known about
+        // where it should is not a judgement about the command, and a second
+        // model saying yes would be the same guess the unread setting forbids.
+        if let Some(escalation) = retry.filter(|r| r.kind == ApprovalRetryKind::SettingsUnreadable) {
+            return self
+                .unreadable_settings(active.context.unattended, assistant_message_id, call, escalation)
+                .await;
+        }
+        let retry_reason = retry.map(|r| r.reason);
 
         // Already given up on this turn. Refusing without asking is the point:
         // the alternative is paying for a review of every further attempt to
@@ -661,7 +671,7 @@ impl Approvals for AutoReviewed<'_> {
                     },
                 );
                 return self
-                    .unresolved(active.context.unattended, assistant_message_id, call, retry_reason, &e)
+                    .unresolved(active.context.unattended, assistant_message_id, call, retry, &e)
                     .await;
             }
         };
@@ -706,7 +716,7 @@ impl Approvals for AutoReviewed<'_> {
                 // for it — including what the escalating pass looked at before
                 // giving up.
                 active.announce(assistant_message_id, call, &event_verdict);
-                self.unresolved(active.context.unattended, assistant_message_id, call, retry_reason, why)
+                self.unresolved(active.context.unattended, assistant_message_id, call, retry, why)
                     .await
             }
         }
@@ -724,7 +734,7 @@ impl AutoReviewed<'_> {
         unattended: bool,
         assistant_message_id: &str,
         call: &ToolCall,
-        retry_reason: Option<&str>,
+        retry: Option<crate::agent::engine::Escalation<'_>>,
         why: &str,
     ) -> Result<Option<ApprovalDecision>, String> {
         if unattended {
@@ -732,7 +742,26 @@ impl AutoReviewed<'_> {
                 "自动审查没有给出结论（{why}），且当前没有人可以确认，因此拒绝。"
             )))));
         }
-        self.inner.ask(assistant_message_id, call, retry_reason).await
+        self.inner.ask(assistant_message_id, call, retry).await
+    }
+
+    /// A request to run outside the sandbox because the settings could not be
+    /// read. Only a person may answer it: handed to the asker underneath when
+    /// there is one to draw a card, refused when there is not.
+    async fn unreadable_settings(
+        &self,
+        unattended: bool,
+        assistant_message_id: &str,
+        call: &ToolCall,
+        escalation: crate::agent::engine::Escalation<'_>,
+    ) -> Result<Option<ApprovalDecision>, String> {
+        if unattended {
+            return Ok(Some(ApprovalDecision::Denied(Some(format!(
+                "无法读取 shell 与沙箱设置（{}），且当前没有人可以确认是否在沙箱外运行，因此拒绝。",
+                escalation.reason
+            )))));
+        }
+        self.inner.ask(assistant_message_id, call, Some(escalation)).await
     }
 }
 
@@ -808,7 +837,7 @@ mod tests {
             &self,
             _assistant_message_id: &str,
             _call: &ToolCall,
-            _retry_reason: Option<&str>,
+            _retry: Option<crate::agent::engine::Escalation<'_>>,
         ) -> Result<Option<ApprovalDecision>, String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(Some(ApprovalDecision::Approved))
@@ -864,6 +893,46 @@ mod tests {
 
         let decision = wrapped
             .unresolved(false, "m1", &call("run_command"), None, "审查超时")
+            .await
+            .unwrap();
+        assert!(matches!(decision, Some(ApprovalDecision::Approved)));
+        assert_eq!(asker.0.load(Ordering::SeqCst), 1);
+    }
+
+    const UNREADABLE: crate::agent::engine::Escalation<'static> = crate::agent::engine::Escalation {
+        kind: ApprovalRetryKind::SettingsUnreadable,
+        reason: "database is locked",
+    };
+
+    /// Running a command with nothing known about where it should run is not
+    /// a judgement about the command, so the reviewer never makes it — and
+    /// with nobody watching, nobody else can either.
+    #[tokio::test]
+    async fn unreadable_settings_with_nobody_watching_are_refused() {
+        let asker = Asker::default();
+        let wrapped = AutoReviewed::inert(&asker);
+
+        let decision = wrapped
+            .unreadable_settings(true, "m1", &call("run_command"), UNREADABLE)
+            .await
+            .unwrap();
+        match decision {
+            Some(ApprovalDecision::Denied(Some(reason))) => {
+                assert!(reason.contains("database is locked"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(asker.0.load(Ordering::SeqCst), 0, "nobody was asked");
+    }
+
+    /// With a window open it is the person's card, not the reviewer's verdict.
+    #[tokio::test]
+    async fn unreadable_settings_with_a_window_open_go_to_the_person() {
+        let asker = Asker::default();
+        let wrapped = AutoReviewed::inert(&asker);
+
+        let decision = wrapped
+            .unreadable_settings(false, "m1", &call("run_command"), UNREADABLE)
             .await
             .unwrap();
         assert!(matches!(decision, Some(ApprovalDecision::Approved)));

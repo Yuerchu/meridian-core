@@ -1099,15 +1099,23 @@ async fn resolve_one(
 /// The per-turn token ceiling every frozen context item is accounted against.
 /// Exposed so the conversation-reference freeze can spend what the workspace
 /// references left over, instead of each kind assuming it is alone.
-pub fn turn_context_token_limit(context_limit: usize) -> usize {
-    MAX_CONTEXT_TOKENS.min(context_limit / 4)
+///
+/// `None` is a window nobody knows here — a hosted agent's, or a queued
+/// turn's before it runs — and is bounded by `MAX_CONTEXT_TOKENS` alone. It
+/// used to be spelled as an invented window (`128_000`, `100_000`), which
+/// read as a statement about some model and was never one.
+pub fn turn_context_token_limit(context_limit: Option<usize>) -> usize {
+    match context_limit {
+        Some(window) => MAX_CONTEXT_TOKENS.min(window / 4),
+        None => MAX_CONTEXT_TOKENS,
+    }
 }
 
 pub async fn prepare_references(
     context: &ToolContext,
     inputs: &[WorkspaceReferenceRequest],
     counter: &TokenCounter,
-    context_limit: usize,
+    context_limit: Option<usize>,
 ) -> Result<Vec<PreparedContextItem>, String> {
     if inputs.len() > MAX_REFERENCES {
         return Err(format!(
@@ -1193,6 +1201,15 @@ pub fn render_context_item(
 mod tests {
     use super::*;
 
+    /// A window nobody knows is bounded by the ceiling alone, not by a number
+    /// standing in for some model's window; a known one still narrows it.
+    #[test]
+    fn an_unknown_window_is_bounded_by_the_ceiling_alone() {
+        assert_eq!(turn_context_token_limit(None), MAX_CONTEXT_TOKENS);
+        assert_eq!(turn_context_token_limit(Some(8_000)), 2_000);
+        assert_eq!(turn_context_token_limit(Some(1_000_000)), MAX_CONTEXT_TOKENS);
+    }
+
     fn context(working_directory: &std::path::Path) -> ToolContext {
         ToolContext {
             working_directory: Some(working_directory.to_string_lossy().into_owned()),
@@ -1204,7 +1221,7 @@ mod tests {
             assistant_id: None,
             db_pool: None,
             #[cfg(not(target_os = "android"))]
-            sandbox_policy: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: std::collections::HashMap::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,
@@ -1596,7 +1613,7 @@ mod tests {
         });
         let counter = TokenCounter::new(crate::agent::tokenizer::TokenizerKind::Cl100kBase);
 
-        let error = prepare_references(&context(dir.path()), &refs, &counter, 100_000)
+        let error = prepare_references(&context(dir.path()), &refs, &counter, None)
             .await
             .unwrap_err();
 
@@ -1619,7 +1636,7 @@ mod tests {
         };
         let counter = TokenCounter::new(crate::agent::tokenizer::TokenizerKind::Cl100kBase);
 
-        let got = prepare_references(&context(dir.path()), &[reference], &counter, 100_000)
+        let got = prepare_references(&context(dir.path()), &[reference], &counter, None)
             .await
             .unwrap();
 

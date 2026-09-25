@@ -239,9 +239,23 @@ pub struct ApprovalDelegation {
     pub sub_conversation_id: String,
 }
 
+/// Why a call that was already put to the user is being put to them again, as a
+/// request to run it outside the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRetryKind {
+    /// The command ran inside the sandbox and was refused by it. `reason` is
+    /// its output.
+    SandboxDenied,
+    /// The command never ran: the shell and sandbox settings could not be read,
+    /// so there is no answer to where it should. `reason` is the read error.
+    SettingsUnreadable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRetry {
+    pub kind: ApprovalRetryKind,
     pub reason: String,
     pub origin_call_id: String,
 }
@@ -611,6 +625,10 @@ pub enum ChatStreamEvent {
         delegation: Option<ApprovalDelegation>,
         #[serde(deserialize_with = "deserialize_required_nullable")]
         retry: Option<ApprovalRetry>,
+        /// When the question was registered, in Unix milliseconds. The same value
+        /// `all_pending_approvals` reports, so a card rebuilt after a reload
+        /// keeps the time it was asked rather than losing it.
+        asked_at: i64,
     },
     ToolApprovalExpired {
         approval_id: String,
@@ -1282,10 +1300,12 @@ mod tests {
             conversation_id: "conversation-1".into(),
             delegation: None,
             retry: None,
+            asked_at: 1_700_000_000_000,
         })
         .unwrap();
         assert_eq!(approval["delegation"], serde_json::Value::Null);
         assert_eq!(approval["retry"], serde_json::Value::Null);
+        assert_eq!(approval["asked_at"], serde_json::json!(1_700_000_000_000_i64));
 
         let stop = serde_json::to_value(ChatStreamEvent::Stop {
             reason: ChatStopReason::Error,

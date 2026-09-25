@@ -234,6 +234,145 @@ pub fn resolve_sandbox_policy(
     }
 }
 
+/// The two preferences that decide where and how a command runs, as read from
+/// the database — or the fact that they could not be.
+///
+/// **`Unreadable` is its own answer, not an absent preference.** Both were
+/// once folded into `None` with `.ok().flatten()`, and an absent
+/// `sandbox.enabled` is `ExecutionMode::Auto` — so a database that failed to
+/// answer turned a conversation configured for a container into one running
+/// commands on the host, with a log line as the only witness. Nothing about a
+/// failed read says what the user chose; the only honest thing to do with it is
+/// to ask them.
+///
+/// Read together because they fail together: the realistic causes are a pool
+/// with no connection to give and a database that will not answer, and either
+/// takes both keys with it. One of the two having been read tells nobody what
+/// the other says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandSettings {
+    Read {
+        shell: crate::tools::ShellType,
+        mode: ExecutionMode,
+    },
+    /// The read itself failed. Carries the error, which is what the card shows.
+    Unreadable(String),
+}
+
+impl CommandSettings {
+    /// Reads both preferences on an open connection.
+    ///
+    /// `Err` is a value that *was* read and is not one of ours — an unknown
+    /// shell or execution mode. That is a contract violation and fails like
+    /// one, rather than becoming a question for the user: they did choose
+    /// something, and it is the stored data that is wrong.
+    pub fn read_on(conn: &mut diesel::sqlite::SqliteConnection) -> Result<Self, String> {
+        let read = |conn: &mut diesel::sqlite::SqliteConnection, key: &str| {
+            crate::db::ops::preference::get_preference(conn, key)
+                .map_err(|error| format!("could not read the `{key}` preference: {error}"))
+        };
+        let shell = match read(conn, "shell") {
+            Ok(value) => value,
+            Err(error) => return Ok(Self::Unreadable(error)),
+        };
+        let mode = match read(conn, "sandbox.enabled") {
+            Ok(value) => value,
+            Err(error) => return Ok(Self::Unreadable(error)),
+        };
+        Ok(Self::Read {
+            shell: shell
+                .map(|value| crate::tools::ShellType::parse(&value))
+                .transpose()?
+                .unwrap_or_else(crate::tools::ShellType::default_for_platform),
+            mode: ExecutionMode::parse(mode.as_deref())?,
+        })
+    }
+
+    /// Reads both preferences, counting a pool that cannot hand out a
+    /// connection as a failed read. Blocking.
+    pub fn read(pool: &crate::db::DbPool) -> Result<Self, String> {
+        match pool.get() {
+            Ok(mut conn) => Self::read_on(&mut conn),
+            Err(error) => Ok(Self::Unreadable(format!(
+                "could not open the database to read the shell and sandbox preferences: {error}"
+            ))),
+        }
+    }
+
+    /// The shell a command will be run with. For `Unreadable` that is the
+    /// platform default — which is only ever used after the user has
+    /// confirmed, on a card that says so, that the command may run outside the
+    /// sandbox.
+    pub fn shell(&self) -> crate::tools::ShellType {
+        match self {
+            Self::Read { shell, .. } => *shell,
+            Self::Unreadable(_) => crate::tools::ShellType::default_for_platform(),
+        }
+    }
+}
+
+/// What confines a turn's commands, including "nobody could find out".
+///
+/// `Resolved(None)` is what `Option<SandboxPolicy>` used to say with `None`:
+/// nothing confines commands, and that is what was asked for. `Unreadable` is
+/// the case `None` could not express, and it is not a weaker form of either —
+/// no command runs under it. `run_command` and custom tools refuse with an
+/// escalation that asks the user whether to run the command outside the
+/// sandbox (see `tools::encode_settings_unreadable`), and the only way past it
+/// is that user's explicit yes, after which the call runs under
+/// `ToolContext::without_sandbox`.
+#[derive(Debug, Clone)]
+pub enum CommandSandbox {
+    Resolved(Option<SandboxPolicy>),
+    Unreadable(String),
+}
+
+impl CommandSandbox {
+    /// Nothing confines commands, deliberately. What every context that runs
+    /// no commands at all carries.
+    pub const UNCONFINED: Self = Self::Resolved(None);
+
+    /// The policy to run under, or the read error that means nothing may run.
+    pub fn policy(&self) -> Result<Option<&SandboxPolicy>, &str> {
+        match self {
+            Self::Resolved(policy) => Ok(policy.as_ref()),
+            Self::Unreadable(error) => Err(error),
+        }
+    }
+
+    /// Whether commands are placed in a container. `false` for `Unreadable`,
+    /// which places them nowhere until somebody says where.
+    pub fn is_container(&self) -> bool {
+        matches!(self, Self::Resolved(Some(policy)) if policy.backend == SandboxBackend::Container)
+    }
+}
+
+/// Turns what was read into what a turn's commands run under.
+///
+/// `Unreadable` goes straight through without consulting the connector or the
+/// project: there is no mode to resolve, and picking one is the defect this
+/// type exists to prevent.
+#[cfg(not(target_os = "android"))]
+pub fn resolve_command_sandbox(
+    settings: &CommandSettings,
+    project_dir: Option<&str>,
+    conversation_id: &str,
+    connector: Option<std::sync::Arc<dyn crate::container::CommandConnector>>,
+) -> Result<CommandSandbox, SandboxConfigError> {
+    match settings {
+        CommandSettings::Read { mode, .. } => {
+            resolve_sandbox_policy(*mode, project_dir, conversation_id, connector).map(CommandSandbox::Resolved)
+        }
+        CommandSettings::Unreadable(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not read the shell/sandbox preferences; commands in this turn will ask before running anywhere"
+            );
+            Ok(CommandSandbox::Unreadable(error.clone()))
+        }
+    }
+}
+
 /// Largest amount of stdout/stderr retained per stream. Reads continue to EOF
 /// past this cap (dropping data) so the child never blocks on a full pipe.
 pub const MAX_CAPTURE_BYTES: usize = 256 * 1024;
@@ -1270,5 +1409,126 @@ mod tests {
         assert_eq!(buf.len(), 150);
         assert!(append_capped(&mut buf, &[3u8; 1], 150));
         assert_eq!(buf.len(), 150);
+    }
+
+    /// The shell and sandbox preferences, read as one answer. What these pin
+    /// is the difference between "could not be read" and "unset": the second
+    /// is `auto`, and reading the first as the second ran a container user's
+    /// commands on the host.
+    mod command_settings {
+        use super::super::*;
+        use diesel::RunQueryDsl;
+
+        fn set(pool: &crate::db::DbPool, key: &str, value: &str) {
+            let mut conn = pool.get().unwrap();
+            crate::db::ops::preference::set_preference(&mut conn, key, value, 1).unwrap();
+        }
+
+        #[test]
+        fn absent_preferences_are_the_documented_defaults() {
+            let pool = crate::db::test_db();
+            assert_eq!(
+                CommandSettings::read(&pool),
+                Ok(CommandSettings::Read {
+                    shell: crate::tools::ShellType::default_for_platform(),
+                    mode: ExecutionMode::Auto,
+                })
+            );
+        }
+
+        #[test]
+        fn stored_preferences_are_read_as_stored() {
+            let pool = crate::db::test_db();
+            set(&pool, "shell", "powershell");
+            set(&pool, "sandbox.enabled", "container");
+            assert_eq!(
+                CommandSettings::read(&pool),
+                Ok(CommandSettings::Read {
+                    shell: crate::tools::ShellType::PowerShell,
+                    mode: ExecutionMode::Container,
+                })
+            );
+        }
+
+        /// **The defect.** A database that fails to answer is not a user who
+        /// chose nothing; it becomes `Unreadable` carrying the error, never
+        /// `Read { mode: Auto }`.
+        #[test]
+        fn a_failed_read_is_unreadable_and_never_the_default() {
+            let pool = crate::db::test_db();
+            set(&pool, "sandbox.enabled", "container");
+            diesel::sql_query("DROP TABLE preferences")
+                .execute(&mut pool.get().unwrap())
+                .unwrap();
+
+            match CommandSettings::read(&pool) {
+                Ok(CommandSettings::Unreadable(error)) => {
+                    assert!(error.contains("preference"), "{error}");
+                }
+                other => panic!("a failed read must be Unreadable, got {other:?}"),
+            }
+        }
+
+        /// A pool with no connection to give is the other realistic cause,
+        /// and gets the same answer.
+        #[test]
+        fn a_pool_that_cannot_hand_out_a_connection_is_unreadable() {
+            let manager = diesel::r2d2::ConnectionManager::<diesel::sqlite::SqliteConnection>::new(":memory:");
+            let pool = diesel::r2d2::Pool::builder()
+                .max_size(1)
+                .connection_timeout(Duration::from_millis(50))
+                .build(manager)
+                .unwrap();
+            let _held = pool.get().unwrap();
+
+            assert!(
+                matches!(CommandSettings::read(&pool), Ok(CommandSettings::Unreadable(_))),
+                "an exhausted pool must not read as unset"
+            );
+        }
+
+        /// A value that *was* read and is not ours is a broken contract, not a
+        /// question for the user: they chose something, and the data is wrong.
+        #[test]
+        fn a_stored_value_that_is_not_ours_fails_loudly() {
+            let pool = crate::db::test_db();
+            set(&pool, "sandbox.enabled", "docker");
+            assert!(CommandSettings::read(&pool).is_err());
+        }
+
+        /// Unreadable goes through resolution untouched: no mode is picked,
+        /// even with a connector and a project that would satisfy any of them.
+        #[cfg(not(target_os = "android"))]
+        #[test]
+        fn resolving_unreadable_settings_picks_no_mode() {
+            #[derive(Debug)]
+            struct Nowhere;
+            #[async_trait::async_trait]
+            impl crate::container::CommandConnector for Nowhere {
+                fn backend(&self) -> SandboxBackend {
+                    SandboxBackend::Container
+                }
+                async fn execute(
+                    &self,
+                    _: &[String],
+                    _: &Path,
+                    _: &Path,
+                    _: &str,
+                    _: Duration,
+                    _: &CancellationToken,
+                ) -> Result<ExecResult, ExecError> {
+                    unreachable!("nothing may run")
+                }
+            }
+            let settings = CommandSettings::Unreadable("database is locked".into());
+            let got =
+                resolve_command_sandbox(&settings, Some("/p"), "c-1", Some(std::sync::Arc::new(Nowhere))).unwrap();
+            match got {
+                CommandSandbox::Unreadable(error) => assert_eq!(error, "database is locked"),
+                other => panic!("expected Unreadable, got {other:?}"),
+            }
+            // And the platform default shell is what a confirmed host run uses.
+            assert_eq!(settings.shell(), crate::tools::ShellType::default_for_platform());
+        }
     }
 }

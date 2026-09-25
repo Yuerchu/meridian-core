@@ -107,6 +107,7 @@ impl Tool for ReadAppLogsTool {
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
         let level = crate::logging::validate_level(args.get("level").and_then(Value::as_str).unwrap_or("warn"))?;
+        // domain-default: how many log lines a read returns unless the model asks is this app's own page size
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)

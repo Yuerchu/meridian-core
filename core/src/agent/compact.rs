@@ -462,6 +462,7 @@ async fn compact_with_retry(
     // bounded artefact. Providers count the prompt and `max_tokens` against one
     // window, so carrying that ceiling over refuses the summariser in exactly
     // the situation that called for it.
+    // domain-default: a summary's output budget, when the caller names none, is this app's own policy for how long a summary may be
     let configured = params
         .max_tokens
         .filter(|m| *m > 0)

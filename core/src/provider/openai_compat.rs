@@ -829,14 +829,16 @@ pub fn normalise_openai_usage(u: &ChunkUsage) -> TokenUsage {
 /// inflated by us.
 fn billable_completion_tokens(u: &ChunkUsage) -> Option<i32> {
     let completion = u.completion_tokens?;
-    let reasoning = u
+    // No reasoning figure, or none worth adding, is no evidence either way:
+    // the count stands as reported.
+    let Some(reasoning) = u
         .completion_tokens_details
         .as_ref()
         .and_then(|d| d.reasoning_tokens)
-        .unwrap_or(0);
-    if reasoning <= 0 {
+        .filter(|reasoning| *reasoning > 0)
+    else {
         return Some(completion);
-    }
+    };
     let unaccounted = match (u.total_tokens, u.prompt_tokens) {
         (Some(total), Some(prompt)) => total.saturating_sub(prompt).saturating_sub(completion),
         _ => return Some(completion),
@@ -1211,7 +1213,7 @@ mod xai_tests {
         assert_eq!(u.completion_tokens, Some(60));
         assert_eq!(u.prompt_tokens, Some(214), "the prompt is untouched");
         assert_eq!(u.cache_read_tokens, Some(128));
-        assert_eq!(u.uncached_prompt_tokens(), 86);
+        assert_eq!(u.uncached_prompt_tokens(), Some(86));
     }
 
     /// OpenAI counts reasoning *inside* `completion_tokens`, and its own total

@@ -72,8 +72,8 @@ fn stopped(state: &SharedState, conversation_id: &str, turn_id: &str, outcome: &
         message_id: outcome.progress.message_id.clone(),
         turn_id: turn_id.to_string(),
         conversation_id: conversation_id.to_string(),
-        input_tokens: Some(outcome.progress.input_tokens),
-        output_tokens: Some(outcome.progress.output_tokens),
+        input_tokens: outcome.progress.input_tokens.value(),
+        output_tokens: outcome.progress.output_tokens.value(),
     });
 }
 
@@ -118,7 +118,7 @@ impl Approvals for NoApprovals {
         &self,
         _assistant_message_id: &str,
         call: &ToolCall,
-        _retry_reason: Option<&str>,
+        _retry: Option<crate::agent::engine::Escalation<'_>>,
     ) -> Result<Option<ApprovalDecision>, String> {
         tracing::warn!(tool = %call.name, "plan review asked for approval; nobody can answer");
         Ok(None)
@@ -332,11 +332,12 @@ async fn resolve_params(state: &SharedState, assistant: &AssistantRow) -> Result
     .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
 
-    // Left absent rather than clamped to the baseline assistant's ceiling. That
-    // number was chosen for whatever that assistant answers, and a review is a
-    // short verdict after a lot of reading — letting the provider fit the reply
-    // to the room it has is closer to right than any number carried over here.
-    params.params.max_tokens = None;
+    // `max_tokens` here is the model's own maximum, not the baseline assistant's
+    // ceiling: `effective_assistant` cleared that override, so resolution fell to
+    // the model (`agent::resolve_max_tokens`). A review is a short verdict after
+    // a lot of reading and must not be clamped to some assistant's small limit —
+    // nor left absent, which Anthropic refuses.
+    //
     // The reviewer's four read-only tools are the whole of what it may do, and
     // `turn_config` is only half of enforcing that: the tools the *provider*
     // runs never pass through a tool set at all, they ride on the request
@@ -636,7 +637,7 @@ async fn run_turn(
         assistant_id: Some(assistant.id.clone()),
         db_pool: Some(state.services.db.clone()),
         #[cfg(not(target_os = "android"))]
-        sandbox_policy: None,
+        sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
         tool_secrets,
         cancel: cancel.clone(),
         journal: None,

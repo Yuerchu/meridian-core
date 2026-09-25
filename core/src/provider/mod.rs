@@ -812,21 +812,96 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// The cache figures as billed.
+    ///
+    /// Each itemises a part of `prompt_tokens`; an absent one itemised nothing.
+    /// That is the usage contract rather than a guess — a report is incomplete
+    /// when its input or output count is missing, not when it says nothing
+    /// about caching, because most upstreams never do — and it can only
+    /// over-report: tokens nobody itemised as cached are billed whole, at the
+    /// input rate, as part of the prompt they belong to.
+    pub fn billed_cache_tokens(&self) -> (i32, i32) {
+        // domain-default: an absent cache figure itemises none of the prompt; the uncached rest is billed whole (usage contract)
+        let read = self.cache_read_tokens.unwrap_or(0);
+        // domain-default: an absent cache figure itemises none of the prompt; the uncached rest is billed whole (usage contract)
+        let write = self.cache_write_tokens.unwrap_or(0);
+        (read, write)
+    }
+
     /// The part of the prompt billed at the plain input rate: neither read from
     /// cache nor written to it. This replaces the old `cache_miss_tokens` field
     /// — a miss is derivable, so storing it only invited the two numbers to
     /// disagree.
     ///
+    /// `None` when the provider did not report the prompt: an unknown prompt
+    /// has an unknown uncached part, and zero would price it as free.
+    ///
     /// Saturating rather than signed: a provider reporting a cached count larger
     /// than the prompt it belongs to is contradicting itself, and the right
     /// answer to that is to bill nothing rather than hand a negative token count
     /// to the cost formula and print a negative price.
-    pub fn uncached_prompt_tokens(&self) -> i32 {
+    pub fn uncached_prompt_tokens(&self) -> Option<i32> {
+        let (read, write) = self.billed_cache_tokens();
         self.prompt_tokens
-            .unwrap_or(0)
-            .saturating_sub(self.cache_read_tokens.unwrap_or(0))
-            .saturating_sub(self.cache_write_tokens.unwrap_or(0))
-            .max(0)
+            .map(|prompt| prompt.saturating_sub(read).saturating_sub(write).max(0))
+    }
+}
+
+/// A token count summed over the requests of one turn, which knows whether
+/// every request reported it.
+///
+/// **A partial sum is not the total.** One round that reported no output count
+/// leaves the turn's output count unknown; adding zero for it would present the
+/// other rounds' sum as the whole. `known` is kept anyway — it is a true lower
+/// bound — and `value()` is the only way to read it as the total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenTally {
+    known: i32,
+    complete: bool,
+}
+
+impl Default for TokenTally {
+    /// No request yet: nothing has been counted and nothing is missing.
+    fn default() -> Self {
+        Self {
+            known: 0,
+            complete: true,
+        }
+    }
+}
+
+impl TokenTally {
+    /// A tally of one request that reported `count`.
+    pub fn reported(count: i32) -> Self {
+        Self {
+            known: count,
+            complete: true,
+        }
+    }
+
+    /// Adds one request's count, or records that it had none.
+    pub fn add(&mut self, reported: Option<i32>) {
+        match reported {
+            Some(count) => self.known = self.known.saturating_add(count),
+            None => self.complete = false,
+        }
+    }
+
+    /// Folds another tally in, as a later round of the same turn.
+    pub fn merge(&mut self, other: TokenTally) {
+        self.known = self.known.saturating_add(other.known);
+        self.complete &= other.complete;
+    }
+
+    /// The total, or `None` when some request did not report it.
+    pub fn value(&self) -> Option<i32> {
+        self.complete.then_some(self.known)
+    }
+
+    /// What the requests that did report add up to — a lower bound when
+    /// `value()` is `None`.
+    pub fn known(&self) -> i32 {
+        self.known
     }
 }
 
@@ -921,6 +996,11 @@ pub enum ProviderError {
     Parse(String),
     #[error("upstream API error: {0}")]
     Upstream(String),
+    /// The request cannot be built from what the caller supplied — a field the
+    /// wire requires and nothing resolved. Never retried: sending it again
+    /// fails the same way.
+    #[error("{0}")]
+    InvalidRequest(String),
     /// For providers that decline a capability; none do yet.
     #[allow(dead_code)]
     #[error("not implemented: {0}")]
@@ -1043,7 +1123,7 @@ mod usage_tests {
             cache_write_tokens: Some(100),
             ..Default::default()
         };
-        assert_eq!(u.uncached_prompt_tokens(), 200);
+        assert_eq!(u.uncached_prompt_tokens(), Some(200));
     }
 
     /// A provider reporting more cached tokens than the prompt they belong to is
@@ -1056,7 +1136,7 @@ mod usage_tests {
             cache_read_tokens: Some(9_999),
             ..Default::default()
         };
-        assert_eq!(u.uncached_prompt_tokens(), 0);
+        assert_eq!(u.uncached_prompt_tokens(), Some(0));
     }
 
     /// DeepSeek's own invariant, asserted rather than assumed: its miss count is
@@ -1070,7 +1150,7 @@ mod usage_tests {
         assert_eq!(u.prompt_tokens, Some(1000));
         assert_eq!(u.cache_read_tokens, Some(896));
         assert_eq!(u.cache_write_tokens, None, "the dialect has no write concept");
-        assert_eq!(u.uncached_prompt_tokens(), 104, "equals prompt_cache_miss_tokens");
+        assert_eq!(u.uncached_prompt_tokens(), Some(104), "equals prompt_cache_miss_tokens");
     }
 
     /// OpenAI nests the same information one object deeper. The fixture keeps
@@ -1083,7 +1163,7 @@ mod usage_tests {
                 "prompt_tokens_details":{"cached_tokens":1792,"audio_tokens":0}}"#,
         );
         assert_eq!(u.cache_read_tokens, Some(1792));
-        assert_eq!(u.uncached_prompt_tokens(), 208);
+        assert_eq!(u.uncached_prompt_tokens(), Some(208));
     }
 
     /// `None` and `Some(0)` are different answers. A hit rate that reads the
@@ -1094,7 +1174,7 @@ mod usage_tests {
         let u = openai_style(r#"{"prompt_tokens":300,"completion_tokens":40,"total_tokens":340}"#);
         assert_eq!(u.cache_read_tokens, None);
         assert_eq!(u.cache_write_tokens, None);
-        assert_eq!(u.uncached_prompt_tokens(), 300);
+        assert_eq!(u.uncached_prompt_tokens(), Some(300));
     }
 
     /// A gateway emitting both shapes is a DeepSeek proxy padding itself into
@@ -1172,8 +1252,8 @@ mod usage_tests {
             let write = u.cache_write_tokens.unwrap_or(0);
             assert!(read + write <= expected_prompt, "{name}: cache legs exceed the prompt");
             assert_eq!(
-                u.uncached_prompt_tokens() + read + write,
-                expected_prompt,
+                u.uncached_prompt_tokens().map(|uncached| uncached + read + write),
+                Some(expected_prompt),
                 "{name}: the three parts must partition the prompt",
             );
         }

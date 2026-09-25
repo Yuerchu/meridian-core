@@ -833,12 +833,12 @@ impl QqToolExecutor {
         let name = data.get("group_name").and_then(|v| v.as_str()).unwrap_or("?");
         let mut out = format!("群名: {name}\n群号: {}", self.session.id);
         if let Some(n) = data.get("member_count").and_then(|v| v.as_i64()) {
-            let max = data
-                .get("max_member_count")
-                .and_then(|v| v.as_i64())
-                .map(|m| format!("/{m}"))
-                .unwrap_or_default();
-            out.push_str(&format!("\n成员数: {n}{max}"));
+            out.push_str(&format!("\n成员数: {n}"));
+            // The capacity is shown only when the group states it; otherwise the
+            // line ends at the count rather than inventing one.
+            if let Some(max) = data.get("max_member_count").and_then(|v| v.as_i64()) {
+                out.push_str(&format!("/{max}"));
+            }
         }
         Ok(out)
     }

@@ -248,9 +248,18 @@ impl AnthropicProvider {
             "stream": stream,
         });
 
-        // Anthropic requires max_tokens. Callers normally backfill it from the
-        // resolved per-model output budget; fall back to a safe floor otherwise.
-        body["max_tokens"] = serde_json::json!(params.max_tokens.unwrap_or(4096));
+        // Anthropic requires max_tokens, and every caller resolves it through
+        // `agent::resolve_max_tokens`: the assistant's override, or the model's
+        // configured maximum output. Arriving without one is a caller that skipped
+        // that, and a guessed ceiling here would silently cut answers short (it
+        // used to be 4096) — so it is refused instead.
+        let max_tokens = params.max_tokens.filter(|m| *m > 0).ok_or_else(|| {
+            ProviderError::InvalidRequest(format!(
+                "No output limit was resolved for '{}'. Set the model's max output tokens in Settings → Provider → Model.",
+                params.model
+            ))
+        })?;
+        body["max_tokens"] = serde_json::json!(max_tokens);
 
         // The `thinking` shape is model-generation-specific and getting it wrong
         // is a 400, not a silently ignored field:
@@ -641,10 +650,8 @@ fn note_refusal(details: Option<&AnthropicStopDetails>) {
 /// prompt we never learned would produce a confident number for a request whose
 /// size the provider declined to state.
 pub(super) fn normalise_anthropic_usage(u: &AnthropicUsage) -> TokenUsage {
-    let read = u.cache_read_input_tokens.unwrap_or(0);
-    let write = u.cache_creation_input_tokens.unwrap_or(0);
-    TokenUsage {
-        prompt_tokens: u.input_tokens.map(|uncached| uncached + read + write),
+    let mut usage = TokenUsage {
+        prompt_tokens: None,
         completion_tokens: u.output_tokens,
         // Anthropic states no total. Deriving one would invent a field the wire
         // did not carry — see the note on `TokenUsage::total_tokens`.
@@ -658,7 +665,12 @@ pub(super) fn normalise_anthropic_usage(u: &AnthropicUsage) -> TokenUsage {
             .server_tool_use
             .as_ref()
             .map(|s| s.web_search_requests.unwrap_or(0) + s.web_fetch_requests.unwrap_or(0)),
-    }
+    };
+    // The cache figures read the way every other adapter's do: an absent one
+    // itemised none of the prompt (`TokenUsage::billed_cache_tokens`).
+    let (read, write) = usage.billed_cache_tokens();
+    usage.prompt_tokens = u.input_tokens.map(|uncached| uncached + read + write);
+    usage
 }
 
 /// Combine the halves of one streamed usage record.
@@ -1112,7 +1124,7 @@ mod tests {
         assert_eq!(u.completion_tokens, Some(300));
         assert_eq!(u.cache_read_tokens, Some(40_000));
         assert_eq!(u.cache_write_tokens, Some(800));
-        assert_eq!(u.uncached_prompt_tokens(), 1_200, "back to what the wire said");
+        assert_eq!(u.uncached_prompt_tokens(), Some(1_200), "back to what the wire said");
     }
 
     /// A write is not a miss. Anthropic charges a premium for one and nothing
@@ -1202,7 +1214,7 @@ mod tests {
         assert_eq!(merged.prompt_tokens, Some(100));
         assert_eq!(merged.cache_read_tokens, Some(10));
         assert_eq!(merged.cache_write_tokens, Some(40));
-        assert_eq!(merged.uncached_prompt_tokens(), 50);
+        assert_eq!(merged.uncached_prompt_tokens(), Some(50));
     }
 
     fn legacy_signature_state(model: &str, signature: &str) -> ProviderState {
@@ -1417,12 +1429,34 @@ mod tests {
         assert_eq!(blocks[1]["content"], "boom");
     }
 
+    /// **No guessed output ceiling.** Anthropic requires `max_tokens`; a request
+    /// that arrives without one is a caller that skipped `resolve_max_tokens`,
+    /// and it is refused with the setting to fill rather than sent with 4096.
+    #[test]
+    fn a_request_without_an_output_limit_is_refused_not_guessed() {
+        let provider = AnthropicProvider::new("https://example.test", "k");
+        let params = ChatParams {
+            model: "claude-sonnet-5".into(),
+            ..Default::default()
+        };
+        let Err(error) = provider.build_request(&[ChatMessage::user("hi")], None, &params, false) else {
+            panic!("a request without max_tokens must not be sent");
+        };
+        assert!(matches!(error, ProviderError::InvalidRequest(_)), "{error}");
+        assert!(error.to_string().contains("max output tokens"), "{error}");
+
+        let body = body_for("claude-sonnet-5", |p| p.max_tokens = Some(64_000));
+        assert_eq!(body["max_tokens"], 64_000, "what was resolved is what is sent");
+    }
+
     /// Build a request the way the chat command does: resolve the model's
     /// capabilities, run filter_params, then serialize.
     fn body_for(model: &str, mutate: impl FnOnce(&mut ChatParams)) -> serde_json::Value {
         let caps = crate::provider::capabilities::resolve("anthropic", None, model);
         let mut params = ChatParams {
             model: model.into(),
+            // Resolved by every real caller; see `agent::resolve_max_tokens`.
+            max_tokens: Some(8_192),
             ..Default::default()
         };
         mutate(&mut params);
@@ -1569,6 +1603,7 @@ mod tests {
         let mut params = ChatParams {
             model: "claude-opus-4-8".into(),
             fast: true,
+            max_tokens: Some(8_192),
             ..Default::default()
         };
         crate::provider::capabilities::filter_params(&mut params, &caps).unwrap();
@@ -1589,6 +1624,7 @@ mod tests {
         let mut params = ChatParams {
             model: "claude-sonnet-4-6".into(),
             fast: true,
+            max_tokens: Some(8_192),
             ..Default::default()
         };
         crate::provider::capabilities::filter_params(&mut params, &caps).unwrap();

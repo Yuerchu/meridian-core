@@ -409,6 +409,21 @@ fn enabled_server_tools(
     Ok(requested)
 }
 
+/// The output ceiling a request asks for, decided in one place for every caller.
+///
+/// The assistant's own `max_tokens` when it set one; otherwise the model's
+/// maximum output — `max_output_tokens` on the model page, or the catalog's
+/// figure for that model, which `resolve_turn_params` has already refused to
+/// go without. There is no third answer: an adapter that needs the field
+/// (Anthropic) refuses a request that arrives without it rather than guessing
+/// one, because a guessed ceiling cuts answers short without saying so.
+pub fn resolve_max_tokens(assistant_override: Option<i32>, model_max_output: usize) -> i32 {
+    match assistant_override.filter(|m| *m > 0) {
+        Some(configured) => configured,
+        None => model_max_output.min(i32::MAX as usize) as i32,
+    }
+}
+
 pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -> Result<TurnParams, String> {
     let TurnParamsResolveRequest {
         assistant,
@@ -477,7 +492,7 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
         model: model.to_string(),
         temperature: assistant.and_then(|a| a.temperature.map(|t| t as f64)),
         top_p: assistant.and_then(|a| a.top_p.map(|t| t as f64)),
-        max_tokens: assistant.and_then(|a| a.max_tokens).or(Some(max_output as i32)),
+        max_tokens: Some(resolve_max_tokens(assistant.and_then(|a| a.max_tokens), max_output)),
         thinking_enabled,
         thinking_budget,
         thinking_effort,
@@ -521,6 +536,19 @@ mod tests {
 
     fn decimal(raw: &str) -> crate::decimal::Decimal {
         raw.parse().unwrap()
+    }
+
+    /// One rule for the output ceiling: the assistant's override when it set
+    /// one, otherwise the model's maximum — never a number from nowhere.
+    #[test]
+    fn the_output_ceiling_is_the_override_or_the_model_maximum() {
+        assert_eq!(resolve_max_tokens(Some(2_000), 64_000), 2_000);
+        assert_eq!(resolve_max_tokens(None, 64_000), 64_000);
+        assert_eq!(
+            resolve_max_tokens(Some(0), 64_000),
+            64_000,
+            "a zero override is no override"
+        );
     }
 
     #[test]

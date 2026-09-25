@@ -66,6 +66,11 @@ impl CommandExecution {
 #[derive(Debug)]
 pub enum CommandExecutionError {
     SandboxDenied(CommandExecution),
+    /// Nothing ran: the shell/sandbox preferences could not be read, so there
+    /// is no answer to where the command should run. Carries the read error.
+    /// Like `SandboxDenied`, the one state a caller may answer with an explicit,
+    /// user-confirmed run outside the sandbox.
+    SettingsUnreadable(String),
     Cancelled,
     Execution(String),
 }
@@ -74,6 +79,12 @@ impl std::fmt::Display for CommandExecutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SandboxDenied(_) => write!(f, "command blocked by the sandbox"),
+            Self::SettingsUnreadable(error) => {
+                write!(
+                    f,
+                    "command not run: the shell and sandbox settings could not be read ({error})"
+                )
+            }
             Self::Cancelled => write!(f, "command cancelled"),
             Self::Execution(message) => write!(f, "{message}"),
         }
@@ -114,6 +125,7 @@ impl Tool for RunCommandTool {
         match execute_command(command, context).await {
             Ok(result) => Ok(result.formatted()),
             Err(CommandExecutionError::SandboxDenied(result)) => Err(super::encode_sandbox_denied(&result.formatted())),
+            Err(CommandExecutionError::SettingsUnreadable(error)) => Err(super::encode_settings_unreadable(&error)),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -161,10 +173,7 @@ async fn execute_command_inner(
     // default image is Alpine, which ships `sh` alone. So a containered
     // command gets the one shell the POSIX image contract promises, and the
     // host shell selection applies only where the command actually runs.
-    let containered = context
-        .sandbox_policy
-        .as_ref()
-        .is_some_and(|p| p.backend == SandboxBackend::Container);
+    let containered = context.sandbox_policy.is_container();
     let shell_argv: Vec<String> = if containered {
         vec!["sh".into(), "-c".into(), command.into()]
     } else {
@@ -184,37 +193,35 @@ async fn execute_command_inner(
         }
     };
 
-    let timeout = context
+    // With the settings unread there is no answer to where this command should
+    // run, and the only one allowed to give it is the user — see
+    // `CommandSandbox`. Before anything is spawned, on any backend.
+    let policy = context
         .sandbox_policy
-        .as_ref()
-        .map(|p| p.timeout)
-        .unwrap_or(COMMAND_TIMEOUT);
+        .policy()
+        .map_err(|error| CommandExecutionError::SettingsUnreadable(error.to_string()))?;
+    // domain-default: a command with no sandbox policy gets this app's own two-minute ceiling; nothing about the command says how long it should take
+    let timeout = policy.map(|p| p.timeout).unwrap_or(COMMAND_TIMEOUT);
 
-    let sandboxed = context.sandbox_policy.is_some();
+    let sandboxed = policy.is_some();
     let started = std::time::Instant::now();
-    let res = crate::sandbox::execute(
-        &shell_argv,
-        &cwd,
-        context.sandbox_policy.as_ref(),
-        timeout,
-        &context.cancel,
-    )
-    .await
-    .map_err(|e| {
-        if matches!(e, ExecError::Cancelled) {
-            return CommandExecutionError::Cancelled;
-        }
-        // The command string is never logged: it is model-generated and
-        // routinely contains exported tokens and passwords.
-        tracing::warn!(
-            tool = "run_command",
-            sandboxed,
-            timeout_secs = timeout.as_secs(),
-            error = %e,
-            "run_command could not be executed"
-        );
-        CommandExecutionError::Execution(e.to_string())
-    })?;
+    let res = crate::sandbox::execute(&shell_argv, &cwd, policy, timeout, &context.cancel)
+        .await
+        .map_err(|e| {
+            if matches!(e, ExecError::Cancelled) {
+                return CommandExecutionError::Cancelled;
+            }
+            // The command string is never logged: it is model-generated and
+            // routinely contains exported tokens and passwords.
+            tracing::warn!(
+                tool = "run_command",
+                sandboxed,
+                timeout_secs = timeout.as_secs(),
+                error = %e,
+                "run_command could not be executed"
+            );
+            CommandExecutionError::Execution(e.to_string())
+        })?;
 
     let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let result = structured_output(&res, duration_ms);
@@ -341,6 +348,62 @@ pub(crate) fn find_bash() -> &'static str {
 mod tests {
     use super::*;
 
+    fn unreadable_context(dir: &std::path::Path) -> ToolContext {
+        ToolContext {
+            working_directory: Some(dir.display().to_string()),
+            shell: ShellType::default_for_platform(),
+            file_access: crate::tools::FileAccess::Unrestricted,
+            project_id: None,
+            conversation_id: Some("c-1".into()),
+            turn_id: None,
+            assistant_id: None,
+            db_pool: None,
+            sandbox_policy: crate::sandbox::CommandSandbox::Unreadable("database is locked".into()),
+            tool_secrets: Default::default(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            journal: None,
+        }
+    }
+
+    /// **Settings that could not be read run nothing, anywhere.** The command
+    /// would leave a file behind if it ran; it must not, and the error has to
+    /// be the escalation the turn loop turns into a card — carrying the read
+    /// error, so the card can say what went wrong.
+    #[tokio::test]
+    async fn unreadable_settings_run_nothing_and_ask_to_escalate() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let command = format!("echo ran > \"{}\"", marker.display().to_string().replace('\\', "/"));
+        let context = unreadable_context(dir.path());
+
+        let err = RunCommandTool
+            .execute(serde_json::json!({ "command": command }), &context)
+            .await
+            .unwrap_err();
+
+        let escalation = crate::tools::decode_escalation(&err).expect("an escalation, not a plain error");
+        assert_eq!(escalation.kind, crate::events::ApprovalRetryKind::SettingsUnreadable);
+        assert_eq!(escalation.reason, "database is locked");
+        assert!(
+            !marker.exists(),
+            "the command ran with nothing known about where it should"
+        );
+        assert!(matches!(
+            execute_command(&command, &context).await,
+            Err(CommandExecutionError::SettingsUnreadable(ref e)) if e == "database is locked"
+        ));
+        assert!(!marker.exists());
+
+        // The user's explicit yes is `without_sandbox`, and that one does run —
+        // which is what shows the refusal above was about the settings and not
+        // about a command that could not have run anyway.
+        RunCommandTool
+            .execute(serde_json::json!({ "command": command }), &context.without_sandbox())
+            .await
+            .unwrap();
+        assert!(marker.exists(), "the confirmed host run must actually run");
+    }
+
     /// A connector that records the argv it was handed and answers success.
     #[derive(Debug, Default)]
     struct ArgvRecorder {
@@ -391,13 +454,13 @@ mod tests {
             turn_id: None,
             assistant_id: None,
             db_pool: None,
-            sandbox_policy: Some(crate::sandbox::SandboxPolicy {
+            sandbox_policy: crate::sandbox::CommandSandbox::Resolved(Some(crate::sandbox::SandboxPolicy {
                 project_dir: Some(std::path::PathBuf::from("/the/project")),
                 backend: SandboxBackend::Container,
                 connector: Some(recorder.clone()),
                 conversation_id: Some("c-1".into()),
                 ..Default::default()
-            }),
+            })),
             tool_secrets: Default::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,
