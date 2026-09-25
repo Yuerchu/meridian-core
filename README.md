@@ -29,10 +29,9 @@ Requirements:
 
 - A stable Rust toolchain (edition 2024).
 - On Linux, `libasound2-dev` for microphone capture (`cpal`).
-- `sherpa-onnx-sys` downloads a prebuilt library archive for the host platform
-  on first build. On Android it cannot, and `SHERPA_ONNX_LIB_DIR` has to point
-  at prebuilt libraries fetched separately; keep that variable scoped to the
-  build that needs it, since it is honoured for every target.
+- `sherpa-onnx-sys` downloads a prebuilt library archive for the target on
+  first build, Android included (from 1.13.8). `SHERPA_ONNX_LIB_DIR` still
+  overrides that for every target, so leave it unset unless you mean it.
 
 Style gates are `cargo fmt --all --check` and
 `cargo clippy --workspace --all-targets -- -D warnings`. A pre-commit hook that
