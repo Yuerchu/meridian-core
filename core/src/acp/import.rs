@@ -658,6 +658,10 @@ pub(super) fn plan(recital: Vec<Recital>) -> Imported {
                 // row keeps a `tool_calls` entry with nothing answering it, and
                 // the card sits unfinished for the life of the conversation.
                 match call_row(&mut turn, &mut out.turns, &call_id) {
+                    // Once. A call announced already finished and then
+                    // reported finished again would otherwise write two tool
+                    // rows answering one call.
+                    Some(row) if row.results.iter().any(|(id, ..)| *id == call_id) => {}
                     Some(row) => row.results.push((call_id, result, outcome)),
                     // A result whose call really was never recited. Written out
                     // it would be a tool row answering nothing, which is exactly

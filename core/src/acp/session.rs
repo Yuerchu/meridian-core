@@ -204,8 +204,8 @@ struct Shared {
     /// Held whole rather than as the one value this app reads, because the
     /// composer offers them: what a `select` may be set to is the agent's to
     /// decide and changes under us — picking a model re-derives which modes
-    /// exist. See [`Shared::merge_config`] for why this is merged rather than
-    /// replaced.
+    /// exist. See [`Shared::adopt_config`] for why this is replaced rather than
+    /// merged.
     config: Mutex<Vec<protocol::SessionConfigOption>>,
     /// Whether a `session/load` is in progress, and what to do with what it
     /// recites. See [`Replay`].
@@ -319,11 +319,15 @@ impl Shared {
 
     /// Take in a set of options the agent just described.
     ///
-    /// **Merged, never replaced.** A `config_option_update` is allowed to carry
-    /// only what changed, and an option in one is allowed to omit its `options`
-    /// list — it is reporting a new `currentValue`, not redefining the knob. A
-    /// wholesale replace would empty the picker the moment the user used it,
-    /// which is the one moment they are looking at it.
+    /// **Replaced, never merged.** Every source of this set — `session/new`,
+    /// `session/load`, `config_option_update` and the reply to
+    /// `session/set_config_option` — is defined by the schema as "the full set
+    /// of configuration options", and a `select` must carry its `options`. This
+    /// used to merge on the reading that an update could carry only what
+    /// changed, which the schema does not allow; what the merge actually did was
+    /// keep knobs the agent had withdrawn. `effort` exists only for a model that
+    /// supports it, so after switching to one that does not, the composer kept
+    /// offering an effort the adapter answered with "Unknown config option".
     ///
     /// Also keeps the model in step: it is one of these options, and reading it
     /// from anywhere else would be a second source that could disagree.
@@ -341,12 +345,12 @@ impl Shared {
     /// transaction as the transcript, once the recital is complete. The model
     /// is still merged, because that is how the imported rows learn which model
     /// answered; only the announcement is held back.
-    fn merge_config(&self, incoming: Vec<protocol::SessionConfigOption>) {
+    fn adopt_config(&self, incoming: Vec<protocol::SessionConfigOption>) {
         if let Some(model) = incoming.iter().find_map(|o| o.as_model()) {
             self.set_model(model.to_string());
         }
         if let Ok(mut held) = self.config.lock() {
-            merge_options(&mut held, incoming);
+            *held = incoming;
         }
         if !self.importing() {
             self.emit(ChatStreamEvent::AcpConfig {
@@ -361,7 +365,7 @@ impl Shared {
     /// Takes the `replay` lock, which is not reentrant: no caller may already
     /// hold it. Today none does — `absorb`'s gate is a `let` chain whose guard
     /// is dropped at the end of its `if`, and the `match` after it is a
-    /// separate statement — but a `merge_config` moved *into* that gate block
+    /// separate statement — but a `adopt_config` moved *into* that gate block
     /// would deadlock rather than fail to compile.
     fn importing(&self) -> bool {
         self.replay.lock().is_ok_and(|r| matches!(*r, Replay::Collect(_)))
@@ -378,8 +382,12 @@ impl Shared {
     }
 
     async fn absorb(&self, notification: SessionNotification) {
-        let effect = mapping::effect_of(notification.update);
+        for effect in mapping::effects_of(notification.update) {
+            self.absorb_effect(effect).await;
+        }
+    }
 
+    async fn absorb_effect(&self, effect: Effect) {
         // The agent reciting rather than answering. Which of the two things
         // that means is [`Replay`]'s to say; this is the one place either is
         // acted on, and both of them end the update's journey here.
@@ -525,16 +533,45 @@ impl Shared {
                 result,
                 outcome,
             } => {
-                let Some((message_id, quiet)) = self.with_turn(|t| {
+                let Some(landed) = self.with_turn(|t| {
+                    // **Matched by id, never counted.** A result belongs to the
+                    // open row only if that row made the call and has not heard
+                    // back from it yet. Counting results against calls let a
+                    // result that belonged to nothing here — a repeat
+                    // `completed`, a call announced between turns and dropped —
+                    // stand in for a sibling still running, closing the round
+                    // under it; the sibling's real result then landed on the
+                    // next row, answering a call that row never made.
+                    //
+                    // A result for a call on an earlier row is always a repeat:
+                    // a row is written out only once every call on it has
+                    // answered.
+                    let made_here = t.row.tool_calls.iter().any(|c| c.id == call_id);
+                    let answered = t.row.results.iter().any(|(id, ..)| *id == call_id);
+                    if !made_here || answered {
+                        return None;
+                    }
                     t.row.results.push((call_id.clone(), result.clone(), outcome));
                     // Round is over only when every call on it has a result.
                     // Settling on the first one closed the row under a parallel
                     // sibling still outstanding, so a thought between A and B
                     // parked B's result on a new round that never asked for it.
-                    let quiet = t.row.results.len() >= t.row.tool_calls.len();
+                    let quiet = t
+                        .row
+                        .tool_calls
+                        .iter()
+                        .all(|c| t.row.results.iter().any(|(id, ..)| *id == c.id));
                     t.row.settled = quiet;
-                    (t.row.message_id.clone(), quiet)
+                    Some((t.row.message_id.clone(), quiet))
                 }) else {
+                    return;
+                };
+                let Some((message_id, quiet)) = landed else {
+                    tracing::debug!(
+                        call_id = %call_id,
+                        conversation_id = %self.conversation_id,
+                        "an ACP tool result matched no outstanding call on the open round"
+                    );
                     return;
                 };
                 if quiet {
@@ -567,8 +604,8 @@ impl Shared {
                     size,
                 });
             }
-            // Nothing to do beyond merging: `merge_config` announces.
-            Effect::ConfigOptions(options) => self.merge_config(options),
+            // Nothing to do beyond merging: `adopt_config` announces.
+            Effect::ConfigOptions(options) => self.adopt_config(options),
             // Not gated on a running turn: an incident noticed between turns
             // (a login that expired, a worker that died) is still one to keep,
             // filed against no turn.
@@ -1955,7 +1992,7 @@ impl AcpSession {
         // first turn records the real model rather than the placeholder, and
         // the composer has something to offer before anyone has typed. Re-sent
         // on every change after this, as a `config_option_update`.
-        shared.merge_config(session.config_options);
+        shared.adopt_config(session.config_options);
         Ok(Handshook {
             acp_session_id: session.session_id,
             steering,
@@ -2039,7 +2076,7 @@ impl AcpSession {
                 return Err(e);
             }
         };
-        shared.merge_config(session.config_options);
+        shared.adopt_config(session.config_options);
         // A collection stays up until the caller takes it with `take_recital`,
         // which is also what puts the session back to live.
         if !keep {
@@ -2183,7 +2220,18 @@ impl AcpSession {
             if !needs_prompt {
                 return Outcome::Acknowledged;
             }
-            return match self.prompt_with(services, &prompt, None, None, Vec::new(), true).await {
+            return match self
+                .prompt_with(
+                    services,
+                    &prompt,
+                    None,
+                    None,
+                    Vec::new(),
+                    true,
+                    CancellationToken::new(),
+                )
+                .await
+            {
                 Ok(()) => Outcome::Acknowledged,
                 Err(error) if !self.is_alive() => Outcome::InDoubt(error),
                 Err(error) => Outcome::Held(error),
@@ -2197,7 +2245,18 @@ impl AcpSession {
         if self.shared.turn.lock().is_ok_and(|turn| turn.is_some()) {
             return Outcome::Held("the ACP session is busy with another turn".into());
         }
-        let outcome = match self.prompt_with(services, &prompt, None, None, Vec::new(), true).await {
+        let outcome = match self
+            .prompt_with(
+                services,
+                &prompt,
+                None,
+                None,
+                Vec::new(),
+                true,
+                CancellationToken::new(),
+            )
+            .await
+        {
             Ok(()) => Outcome::Acknowledged,
             Err(error) if !self.is_alive() => Outcome::InDoubt(error),
             Err(error) => Outcome::Held(error),
@@ -2326,7 +2385,7 @@ impl AcpSession {
         // option list catches up either way.
         match serde_json::from_value::<protocol::SetConfigOptionResult>(answered) {
             Ok(result) if !result.config_options.is_empty() => {
-                self.shared.merge_config(result.config_options);
+                self.shared.adopt_config(result.config_options);
             }
             Ok(_) => {}
             Err(e) => tracing::debug!(error = %e, "could not read the reply to session/set_config_option"),
@@ -2346,20 +2405,36 @@ impl AcpSession {
     /// would not exist until the adapter had been reached, and everything
     /// arriving in the gap would be measured against nothing.
     pub async fn prompt(&self, services: &Services, text: &str, turn_id: Option<String>) -> Result<(), String> {
-        self.prompt_with(services, text, turn_id, None, Vec::new(), false).await
+        self.prompt_with(
+            services,
+            text,
+            turn_id,
+            None,
+            Vec::new(),
+            false,
+            CancellationToken::new(),
+        )
+        .await
     }
 
     /// The same turn with user-selected workspace snapshots. `text` remains
     /// the clean transcript body; `context` is committed beside its row and is
     /// appended only to the ACP payload.
+    ///
+    /// `stop` is the turn's cancellation, handed in because the send it
+    /// belongs to began before this session was even reopened — see
+    /// [`super::PendingSend`]. Already cancelled, the turn is written up as
+    /// stopped and its prompt never goes out.
     pub async fn prompt_with_context(
         &self,
         services: &Services,
         text: &str,
         turn_id: Option<String>,
         context: Vec<crate::workspace::reference::PreparedContextItem>,
+        stop: CancellationToken,
     ) -> Result<(), String> {
-        self.prompt_with(services, text, turn_id, None, context, false).await
+        self.prompt_with(services, text, turn_id, None, context, false, stop)
+            .await
     }
 
     /// Deliver a queued item as a turn of its own.
@@ -2379,8 +2454,16 @@ impl AcpSession {
         })
         .await
         .map_err(|e| e.to_string())??;
-        self.prompt_with(services, &item.content, None, Some(&item.id), context, false)
-            .await
+        self.prompt_with(
+            services,
+            &item.content,
+            None,
+            Some(&item.id),
+            context,
+            false,
+            CancellationToken::new(),
+        )
+        .await
     }
 
     async fn prompt_with(
@@ -2391,6 +2474,7 @@ impl AcpSession {
         queued: Option<&str>,
         context: Vec<crate::workspace::reference::PreparedContextItem>,
         bypass_plan_review_barrier: bool,
+        cancel: CancellationToken,
     ) -> Result<(), String> {
         // Usually the coordinator lease is the whole concurrency guard. A
         // waiting_review turn has intentionally released that lease while its
@@ -2409,7 +2493,6 @@ impl AcpSession {
         // The peer's drop counter never resets, so what this turn lost is the
         // difference across it rather than the total.
         let dropped_before = self.peer.dropped_notifications();
-        let cancel = CancellationToken::new();
         let mut lease = Some(
             Arc::clone(&services.turns)
                 .try_acquire_turn_with(
@@ -2474,13 +2557,45 @@ impl AcpSession {
         // Read after the turn record exists, so `asking` can exclude it, and
         // sent in front of the message rather than stored: this is background
         // the agent needs for *this* answer, not something anybody said.
-        let owed = self.owed_explanations(services, &turn_id).await?;
-        let payload_text = prompt_with_workspace_context(text, &context);
-        let params = serde_json::to_value(protocol::PromptParams {
-            session_id: self.acp_session_id.clone(),
-            prompt: vec![protocol::ContentBlock::text(owed.in_front_of(&payload_text))],
-        })
-        .map_err(|e| e.to_string())?;
+        //
+        // **Neither of these may `?` out.** The turn state, the bridge window,
+        // the turn record and the `MessageStart` above all exist by now, and
+        // only `finish` takes them down. Returning past it left `turn` set for
+        // good — every later send refused as "still finishing the previous
+        // plan review decision" until the adapter was closed — with the bridge
+        // window open, the turn row at `running` and a spinner nothing would
+        // stop. A failure here is a turn that ended before its prompt went out.
+        let assembled = match self.owed_explanations(services, &turn_id).await {
+            Ok(owed) => {
+                let payload_text = prompt_with_workspace_context(text, &context);
+                serde_json::to_value(protocol::PromptParams {
+                    session_id: self.acp_session_id.clone(),
+                    prompt: vec![protocol::ContentBlock::text(owed.in_front_of(&payload_text))],
+                })
+                .map(|params| (owed, params))
+                .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e),
+        };
+        let (owed, params) = match assembled {
+            Ok(assembled) => assembled,
+            Err(e) => {
+                tracing::error!(error = %e, conversation_id = %self.conversation_id, "could not assemble an ACP prompt");
+                // Nothing to settle: no prompt carried anything, which is what
+                // `NeverSent` with an empty ledger says.
+                return self
+                    .finish(
+                        services,
+                        &turn_id,
+                        Err(PeerError::Rpc(format!("could not assemble the prompt: {e}"))),
+                        lease,
+                        dropped_before,
+                        Owed::default(),
+                        PromptDelivery::NeverSent,
+                    )
+                    .await;
+            }
+        };
 
         // No timeout: a turn legitimately runs for as long as the work takes,
         // and the stop button is the bound.
@@ -3137,32 +3252,6 @@ fn describe(peer: &Peer, error: PeerError) -> String {
     }
 }
 
-/// Fold a freshly described set of config options into the one being held.
-///
-/// Free of the session so the rule can be stated on its own, because it is not
-/// the obvious one: an option in an update may carry only a new `currentValue`
-/// and omit the values it accepts. It is reporting a change, not redefining the
-/// knob. Replacing wholesale — or even replacing one option wholesale — empties
-/// the picker at the exact moment somebody is using it.
-fn merge_options(held: &mut Vec<protocol::SessionConfigOption>, incoming: Vec<protocol::SessionConfigOption>) {
-    for option in incoming {
-        match held.iter_mut().find(|o| o.id == option.id) {
-            Some(existing) => {
-                // Keep what the update did not restate.
-                let previous = std::mem::take(&mut existing.options);
-                let keep_previous = option.options.is_empty();
-                *existing = option;
-                if keep_previous {
-                    existing.options = previous;
-                }
-            }
-            // A knob that did not exist a moment ago. Agents add them when a
-            // model changes, so this is ordinary rather than exceptional.
-            None => held.push(option),
-        }
-    }
-}
-
 /// How a turn ended, from the reply to `session/prompt` and from what the
 /// adapter said about the turn while it ran.
 ///
@@ -3303,30 +3392,6 @@ mod tests {
         }
     }
 
-    /// The whole reason this is a merge.
-    ///
-    /// An update that reports a new `currentValue` need not restate what the
-    /// knob accepts. Taking it at face value would leave the picker with one
-    /// entry and no way back — and it would happen on the very update that
-    /// follows the user changing the model.
-    #[test]
-    fn an_update_that_omits_its_values_keeps_the_ones_already_known() {
-        let mut held = vec![select("model", "sonnet", &["sonnet", "opus"])];
-
-        let mut narrowed = select("model", "opus", &[]);
-        narrowed.options.clear();
-        merge_options(&mut held, vec![narrowed]);
-
-        assert_eq!(held.len(), 1);
-        assert_eq!(held[0].current_str(), Some("opus"), "the change is taken");
-        assert_eq!(
-            held[0].options.len(),
-            2,
-            "and what it may be set to survives: {:?}",
-            held[0].options
-        );
-    }
-
     /// **An agent that cannot take the options still gets a session.**
     ///
     /// The ask reaches the user's own `claude` as a command-line flag and this
@@ -3388,18 +3453,6 @@ mod tests {
             "the real reason survives, rather than being masked by the options"
         );
         assert_eq!(&*asked.lock().unwrap(), &[true, false], "and it stops at two");
-    }
-
-    /// When an update *does* restate them, it wins — an agent that re-derives
-    /// which modes exist for a newly chosen model is telling us the old list is
-    /// wrong, and keeping it would offer a mode that no longer applies.
-    #[test]
-    fn an_update_that_restates_its_values_replaces_them() {
-        let mut held = vec![select("mode", "code", &["code", "plan", "bypass"])];
-        merge_options(&mut held, vec![select("mode", "code", &["code"])]);
-
-        assert_eq!(held[0].options.len(), 1);
-        assert_eq!(held[0].options[0].value, "code");
     }
 
     /// A hosted prompt is one lump of text, so anything that has to be
@@ -3641,22 +3694,6 @@ mod tests {
         let encoded =
             serde_json::to_value(new_session_params("/repo", None, None, &mounts::MountMap::default())).unwrap();
         assert_eq!(encoded["mcpServers"], serde_json::json!([]), "{encoded}");
-    }
-
-    /// Only what the update mentions is touched, and a knob it has never
-    /// mentioned before is added rather than ignored.
-    #[test]
-    fn options_the_update_does_not_mention_are_left_alone() {
-        let mut held = vec![
-            select("model", "sonnet", &["sonnet"]),
-            select("mode", "code", &["code"]),
-        ];
-        merge_options(&mut held, vec![select("effort", "high", &["low", "high"])]);
-
-        assert_eq!(held.len(), 3);
-        assert_eq!(held[0].current_str(), Some("sonnet"));
-        assert_eq!(held[1].current_str(), Some("code"));
-        assert_eq!(held[2].id, "effort");
     }
 
     /// What an ended turn proves about the explanations it carried.
@@ -4006,5 +4043,145 @@ mod tests {
         assert!(settled);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A conversation `c1` with turn `t1` running and its first assistant row
+    /// open — the state `prompt_with` leaves a session in once the prompt is
+    /// out.
+    async fn live_turn(dir: &std::path::Path) -> Shared {
+        let services = bare_services(dir);
+        {
+            let mut conn = services.db.get().unwrap();
+            crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();
+            crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).unwrap();
+        }
+        let first = begin_assistant(
+            &services.db,
+            "c1",
+            "t1",
+            (None, Some(PROVIDER_LABEL)),
+            "claude-code",
+            None,
+        )
+        .await
+        .unwrap();
+        Shared {
+            services,
+            conversation_id: "c1".into(),
+            turn: Mutex::new(Some(TurnState {
+                turn_id: "t1".into(),
+                cancel: CancellationToken::new(),
+                row: OpenRow::new(first.clone()),
+                parent: first,
+                interjected: Vec::new(),
+                error_notice: None,
+            })),
+            model: Mutex::new(None),
+            config: Mutex::new(Vec::new()),
+            replay: Mutex::new(Replay::No),
+            announced: Mutex::new(HashSet::new()),
+            unwritten_rows: std::sync::atomic::AtomicUsize::new(0),
+            memory_lost: Mutex::new(false),
+            tools_lost: Mutex::new(false),
+            plan_reviews: Arc::new(crate::acp::plan_review::ReviewControl::default()),
+            agent_title: Mutex::new(None),
+            placeholder_title: String::new(),
+        }
+    }
+
+    fn finished(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            "status": "completed",
+            "content": [{ "type": "content", "content": { "type": "text", "text": text } }],
+        })
+    }
+
+    /// The adapter's `memory_recall`: one `tool_call`, already `completed`,
+    /// never updated. Read as a bare call it was a round that could not settle,
+    /// so the prose after it — the whole rest of the turn — joined the row that
+    /// recalled the memory, and the turn reloaded as `interrupted`.
+    #[tokio::test]
+    async fn a_call_announced_finished_closes_its_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = live_turn(dir.path()).await;
+
+        let mut recalled = call("M", "memory_recall", serde_json::json!({}));
+        recalled["status"] = "completed".into();
+        recalled["content"] = serde_json::json!([{ "type": "content", "content": { "type": "text", "text": "m" } }]);
+        shared.absorb(update(recalled)).await;
+        shared
+            .absorb(update(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "done" },
+            })))
+            .await;
+
+        let (calls, text) = shared
+            .with_turn(|t| (t.row.tool_calls.len(), t.row.text.clone()))
+            .unwrap();
+        assert_eq!(
+            (calls, text.as_str()),
+            (0, "done"),
+            "the prose opened a round of its own"
+        );
+        let answered = {
+            let mut conn = shared.services.db.get().unwrap();
+            crate::db::ops::message::list_messages(&mut conn, "c1")
+                .unwrap()
+                .into_iter()
+                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("M"))
+        };
+        assert!(answered, "the recalled memory has its result row");
+    }
+
+    /// A result that answers nothing outstanding on the open round — a repeat
+    /// `completed`, or a call this turn never saw — does not stand in for a
+    /// sibling that is still running. Counted, it closed the round under `B`,
+    /// and `B`'s real result then landed on a row that never made the call.
+    #[tokio::test]
+    async fn only_a_result_for_an_outstanding_call_counts_towards_the_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = live_turn(dir.path()).await;
+
+        shared.absorb(update(call("A", "Bash", serde_json::json!({})))).await;
+        shared.absorb(update(call("B", "Read", serde_json::json!({})))).await;
+        shared.absorb(update(finished("A", "a"))).await;
+        shared.absorb(update(finished("A", "a again"))).await;
+        shared.absorb(update(finished("Z", "from nowhere"))).await;
+
+        let (results, settled) = shared
+            .with_turn(|t| {
+                (
+                    t.row.results.iter().map(|(id, ..)| id.clone()).collect::<Vec<_>>(),
+                    t.row.settled,
+                )
+            })
+            .unwrap();
+        assert_eq!(results, vec!["A".to_string()]);
+        assert!(!settled, "B is still running");
+
+        shared.absorb(update(finished("B", "b"))).await;
+        assert!(shared.with_turn(|t| t.row.settled).unwrap());
+    }
+
+    /// Every source of the option set is the whole set, so a knob the agent
+    /// stops offering disappears. Merged, `effort` outlived the switch to a
+    /// model without it and the adapter refused every attempt to set it.
+    #[tokio::test]
+    async fn an_option_the_agent_withdraws_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = live_turn(dir.path()).await;
+
+        shared.adopt_config(vec![
+            select("model", "opus", &["opus", "haiku"]),
+            select("effort", "high", &["low", "high"]),
+        ]);
+        shared.adopt_config(vec![select("model", "haiku", &["opus", "haiku"])]);
+
+        let held = shared.config_options();
+        assert_eq!(held.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), vec!["model"]);
+        assert_eq!(held[0].current_str(), Some("haiku"));
     }
 }

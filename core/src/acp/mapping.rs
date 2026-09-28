@@ -15,7 +15,8 @@ use crate::events::{AcpNoticeAction, AcpNoticeCategory, AcpNoticeSeverity, ToolC
 
 /// What one `session/update` means here.
 ///
-/// One update maps to at most one effect; the variants this step does not draw
+/// One update maps to at most one effect through [`effect_of`], with the one
+/// exception [`effects_of`] exists for; the variants this step does not draw
 /// collapse to [`Effect::Ignored`] rather than being an error, for the same
 /// reason the parse is lax.
 #[derive(Debug, PartialEq)]
@@ -59,7 +60,7 @@ pub enum Effect {
     },
     /// The agent's own todo list.
     Plan(Vec<PlanItem>),
-    /// Context usage. Reported, never priced — see [`Usage::cost`].
+    /// Context usage. Reported, never priced — see `Usage`'s `cost`.
     Usage { used: u64, size: u64 },
     /// The agent has described its configuration knobs.
     ///
@@ -171,6 +172,42 @@ pub fn notice_of(record: &SessionFailureRecord) -> Option<SessionNoticeRecord> {
     })
 }
 
+/// Everything one update means, in the order it has to be applied.
+///
+/// One effect, except for a `tool_call` that arrives already finished. ACP
+/// lets a call's first announcement carry a terminal `status`, and the adapter
+/// uses it: `memory_recall` is announced once, `completed`, and never updated;
+/// a compaction whose start was missed is announced at its end. Read as a bare
+/// call, that is a card no result will ever close and a round with more calls
+/// than results — which never settles, so every later round of the turn lands
+/// on the same row and the transcript reader draws the finished turn as
+/// `interrupted`. So the call and its result are both said here, call first.
+pub fn effects_of(update: SessionUpdate) -> Vec<Effect> {
+    let finished = match &update {
+        SessionUpdate::ToolCall(call) => result_of(call),
+        _ => None,
+    };
+    let mut effects = vec![effect_of(update)];
+    effects.extend(finished);
+    effects
+}
+
+/// The result a call's status reports, if it reports one.
+fn result_of(call: &ToolCall) -> Option<Effect> {
+    let outcome = match call.status.as_deref() {
+        Some("completed") => ToolOutcome::Success,
+        Some("failed") => ToolOutcome::Error,
+        _ => return None,
+    };
+    Some(Effect::ToolResult {
+        call_id: call.tool_call_id.clone(),
+        result: output_of(call),
+        outcome,
+    })
+}
+
+/// The first thing an update means. See [`effects_of`] for the one update that
+/// means two things, and use that on every path that applies effects.
 pub fn effect_of(update: SessionUpdate) -> Effect {
     match update {
         SessionUpdate::AgentMessageChunk { content, message_id } => match content.as_text() {
@@ -199,17 +236,8 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
             tool_name: tool_name_of(&call),
             arguments: arguments_of(&call),
         },
-        SessionUpdate::ToolCallUpdate(call) => match call.status.as_deref() {
-            Some("completed") => Effect::ToolResult {
-                call_id: call.tool_call_id.clone(),
-                result: output_of(&call),
-                outcome: ToolOutcome::Success,
-            },
-            Some("failed") => Effect::ToolResult {
-                call_id: call.tool_call_id.clone(),
-                result: output_of(&call),
-                outcome: ToolOutcome::Error,
-            },
+        SessionUpdate::ToolCallUpdate(call) => match result_of(&call) {
+            Some(result) => result,
             // What an Edit or Write actually changed, once it has run: no
             // status, `content` replaced by one diff block per hunk. Asked
             // before the revision arm below, because this frame carries
@@ -232,13 +260,10 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
         },
         SessionUpdate::Plan { entries } => Effect::Plan(entries.iter().map(plan_item).collect()),
         SessionUpdate::UsageUpdate(Usage { used, size, .. }) => Effect::Usage { used, size },
-        // Passed through whole, including an update that changes nothing this
-        // app reads: the set is merged rather than replaced, so an option
-        // carrying only a new `currentValue` still has to reach the merge.
-        SessionUpdate::ConfigOptionUpdate { config_options } if !config_options.is_empty() => {
-            Effect::ConfigOptions(config_options)
-        }
-        SessionUpdate::ConfigOptionUpdate { .. } => Effect::Ignored,
+        // Passed through whole, empty included: the schema defines this as "the
+        // full set of configuration options", so an empty one says the agent
+        // now offers none, and the session replaces what it held.
+        SessionUpdate::ConfigOptionUpdate { config_options } => Effect::ConfigOptions(config_options),
         // An incident outranks a title. The adapter sends them in separate
         // updates, so this is only a rule about which to keep if that changes;
         // a title arriving beside a failure record is logged and waits for
@@ -699,6 +724,23 @@ mod tests {
         );
     }
 
+    /// The adapter sends `total_cost_usd`, a sum of doubles, and JavaScript
+    /// prints a double in its shortest round-tripping form — which for an
+    /// ordinary small bill has nineteen decimal places or an exponent. The
+    /// usage beside it must survive whatever spelling the cost arrives in.
+    #[test]
+    fn usage_survives_a_cost_spelled_the_way_a_double_prints() {
+        for amount in ["0.0031200000000000004", "1.2e-7", "2.1e-05"] {
+            let frame = format!(
+                r#"{{"sessionUpdate":"usage_update","used":1200,"size":200000,
+                    "cost":{{"amount":{amount},"currency":"USD"}}}}"#
+            );
+            let parsed: Result<SessionNotification, _> =
+                serde_json::from_str(&format!(r#"{{"sessionId":"s","update":{frame}}}"#));
+            assert!(parsed.is_ok(), "{amount}: {:?}", parsed.err());
+        }
+    }
+
     /// ACP has no model field. It reports the model as one of the session's
     /// configuration options — and the whole set travels, because the composer
     /// offers the others.
@@ -768,13 +810,41 @@ mod tests {
         assert!(!options[0].is_select());
     }
 
-    /// An update with nothing in it is not a change to merge.
+    /// The update is the full set, so an empty one says there are no options
+    /// now — it has to reach the session, which replaces what it held.
     #[test]
-    fn an_empty_option_set_is_ignored() {
+    fn an_empty_option_set_is_still_the_whole_set() {
         assert_eq!(
             effect_of(update(r#"{"sessionUpdate":"config_option_update","configOptions":[]}"#)),
-            Effect::Ignored
+            Effect::ConfigOptions(Vec::new())
         );
+    }
+
+    /// A call announced already finished is the call *and* its result. The
+    /// adapter's `memory_recall` frame, as it sends it: one `tool_call`,
+    /// `completed`, never updated.
+    #[test]
+    fn a_call_announced_finished_carries_its_result() {
+        let effects = effects_of(update(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"mem-1","title":"Recalled memory","kind":"read",
+                "status":"completed","content":[{"type":"content","content":{"type":"text","text":"remembered"}}],
+                "_meta":{"claudeCode":{"toolName":"memory_recall"}}}"#,
+        ));
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        assert!(matches!(&effects[0], Effect::ToolCall { call_id, .. } if call_id == "mem-1"));
+        assert_eq!(
+            effects[1],
+            Effect::ToolResult {
+                call_id: "mem-1".into(),
+                result: "remembered".into(),
+                outcome: ToolOutcome::Success,
+            }
+        );
+
+        let pending = effects_of(update(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"b-1","title":"Terminal","status":"pending"}"#,
+        ));
+        assert_eq!(pending.len(), 1, "a call still running is only a call: {pending:?}");
     }
 
     /// The adapter's own frame for a warning on the way to a failure (an

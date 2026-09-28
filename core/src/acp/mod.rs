@@ -46,6 +46,49 @@ pub struct AcpRegistry {
     /// Keyed by conversation, which is what every caller has: the id in the
     /// sidebar, in the approval card, in the IPC command.
     sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
+    /// Sends that have been asked for and have no turn yet, by conversation.
+    ///
+    /// A send spends a while before there is any turn a stop could reach:
+    /// preparing `@` references, and — after a restart — reopening the
+    /// session, which recites the whole history and was measured at ~37 s on a
+    /// large one. A stop pressed in that window found no session, or one with
+    /// no turn, and answered success; the prompt then went out anyway and ran
+    /// to the end. This is what a stop can reach instead: the token becomes
+    /// the turn's own, and a turn whose token is already cancelled is written
+    /// up as stopped without its prompt ever being sent.
+    starting: Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
+    next_start: std::sync::atomic::AtomicU64,
+}
+
+/// A send in progress, from the moment it was asked for. Dropping it is what
+/// says the send has ended one way or the other.
+pub struct PendingSend {
+    registry: Arc<AcpRegistry>,
+    conversation_id: String,
+    generation: u64,
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl PendingSend {
+    /// What the turn is to be cancelled through. Already cancelled if a stop
+    /// arrived before the turn existed.
+    pub fn token(&self) -> tokio_util::sync::CancellationToken {
+        self.token.clone()
+    }
+}
+
+impl Drop for PendingSend {
+    fn drop(&mut self) {
+        let mut starting = self.registry.starting.lock().unwrap_or_else(|e| e.into_inner());
+        // Only its own entry: a later send on the same conversation may have
+        // replaced it, and that one is still waiting.
+        if starting
+            .get(&self.conversation_id)
+            .is_some_and(|(generation, _)| *generation == self.generation)
+        {
+            starting.remove(&self.conversation_id);
+        }
+    }
 }
 
 impl AcpRegistry {
@@ -152,6 +195,40 @@ impl AcpRegistry {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AcpSession>>> {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register a send before anything slow happens, so a stop can reach it.
+    /// See [`AcpRegistry::starting`].
+    pub fn begin_send(self: &Arc<Self>, conversation_id: &str) -> PendingSend {
+        let generation = self.next_start.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let token = tokio_util::sync::CancellationToken::new();
+        self.starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conversation_id.to_string(), (generation, token.clone()));
+        PendingSend {
+            registry: Arc::clone(self),
+            conversation_id: conversation_id.to_string(),
+            generation,
+            token,
+        }
+    }
+
+    /// Stop whatever is running in a conversation: a send still on its way to
+    /// becoming a turn, and the turn itself. Either may be absent, and both
+    /// being absent is success — the turn this was meant to stop has ended.
+    pub async fn stop(&self, conversation_id: &str) {
+        if let Some((_, token)) = self
+            .starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(conversation_id)
+        {
+            token.cancel();
+        }
+        if let Some(session) = self.get(conversation_id) {
+            session.cancel().await;
+        }
     }
 }
 
@@ -517,6 +594,34 @@ fn title_for(cwd: &str) -> String {
 mod tests {
     use super::*;
     use crate::db::test_db;
+
+    /// A stop pressed while a send is still reopening its session reaches the
+    /// send, with no session in the registry at all — the case that used to
+    /// answer success and let the prompt go out anyway.
+    #[tokio::test]
+    async fn a_stop_reaches_a_send_that_has_no_turn_yet() {
+        let registry = AcpRegistry::new();
+        let pending = registry.begin_send("c1");
+        registry.stop("c1").await;
+        assert!(pending.token().is_cancelled());
+
+        // And a later send starts clean once the first has ended.
+        drop(pending);
+        let next = registry.begin_send("c1");
+        assert!(!next.token().is_cancelled());
+    }
+
+    /// An earlier send ending must not unregister a later one still waiting —
+    /// that would leave the later one unreachable by stop again.
+    #[tokio::test]
+    async fn an_earlier_send_ending_leaves_the_later_one_reachable() {
+        let registry = AcpRegistry::new();
+        let first = registry.begin_send("c1");
+        let second = registry.begin_send("c1");
+        drop(first);
+        registry.stop("c1").await;
+        assert!(second.token().is_cancelled());
+    }
 
     /// The directory a session is about is the useful half of its name, and it
     /// has to survive both separators — a Windows path reaches this with
