@@ -1559,6 +1559,8 @@ struct Opening<'a> {
     /// "the adapter cannot load sessions" want three different responses and
     /// the fallback turns all three into the same one.
     fall_back_to_new: bool,
+    /// Which project the bridge scopes its memory tools to. See [`ProjectOf`].
+    project: ProjectOf<'a>,
     /// Whether this session should be lent Meridian's own tools.
     ///
     /// False for an import, which opens a session only to read its recital: no
@@ -1567,6 +1569,24 @@ struct Opening<'a> {
     /// yet. A port bound for the length of a recital is a port bound for
     /// nothing.
     wants_tools: bool,
+}
+
+/// Where the bridge learns which project a conversation belongs to.
+///
+/// **A new conversation has no row to read it from yet.** `open_session` starts
+/// the adapter before it writes the conversation — so that an adapter that
+/// never comes up leaves no dead row in the sidebar — and the bridge has to be
+/// in the very first thing said to the adapter. Reading the row there failed
+/// with "Record not found" on every new hosted conversation, which then ran
+/// without Meridian's tools until the app was restarted and it was reopened.
+/// So the caller that is about to write the row hands over the value it will
+/// write, and both come from the one lookup.
+#[derive(Clone, Copy)]
+enum ProjectOf<'a> {
+    /// The conversation exists; its row says.
+    Stored,
+    /// The conversation is being created with this project.
+    Known(Option<&'a str>),
 }
 
 impl AcpSession {
@@ -1598,7 +1618,7 @@ impl AcpSession {
         // already says: the tools are missing, and the agent is told so.
         let containerised = super::process::launches_in_container(&config.command, &config.args);
         let bridge = if opening.wants_tools && !containerised {
-            match Self::start_bridge(&services, &conversation_id).await {
+            match Self::start_bridge(&services, &conversation_id, opening.project).await {
                 Ok(bridge) => Some(bridge),
                 Err(e) => {
                     tracing::error!(
@@ -1713,17 +1733,26 @@ impl AcpSession {
     /// memory tools are offered at all and it cannot change under a session.
     /// A conversation that has none is not an error — it gets the two tools
     /// that need no project.
-    async fn start_bridge(services: &Services, conversation_id: &str) -> Result<Arc<bridge::Bridge>, String> {
-        let pool = services.db.clone();
-        let id = conversation_id.to_string();
-        let project_id = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::conversation::get_conversation(&mut conn, &id)
-                .map(|c| c.project_id)
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+    async fn start_bridge(
+        services: &Services,
+        conversation_id: &str,
+        project: ProjectOf<'_>,
+    ) -> Result<Arc<bridge::Bridge>, String> {
+        let project_id = match project {
+            ProjectOf::Known(project_id) => project_id.map(str::to_string),
+            ProjectOf::Stored => {
+                let pool = services.db.clone();
+                let id = conversation_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let mut conn = get_conn(&pool)?;
+                    crate::db::ops::conversation::get_conversation(&mut conn, &id)
+                        .map(|c| c.project_id)
+                        .map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())??
+            }
+        };
 
         bridge::Bridge::start(
             services.clone(),
@@ -1735,12 +1764,14 @@ impl AcpSession {
     }
 
     /// A session for a conversation being created. Nothing to resume, and
-    /// nothing above for the agent to be blind to.
+    /// nothing above for the agent to be blind to. `project_id` is the project
+    /// the caller is about to file the conversation under — see [`ProjectOf`].
     pub async fn open(
         services: Services,
         config: &AcpConfig,
         conversation_id: String,
         cwd: String,
+        project_id: Option<&str>,
     ) -> Result<Arc<Self>, String> {
         Self::open_with(
             services,
@@ -1752,6 +1783,7 @@ impl AcpSession {
                 transcript_above: false,
                 keep_recital: false,
                 fall_back_to_new: true,
+                project: ProjectOf::Known(project_id),
                 wants_tools: true,
             },
         )
@@ -1778,6 +1810,7 @@ impl AcpSession {
                 transcript_above,
                 keep_recital: false,
                 fall_back_to_new: true,
+                project: ProjectOf::Stored,
                 wants_tools: true,
             },
         )
@@ -1815,6 +1848,8 @@ impl AcpSession {
                 transcript_above: false,
                 keep_recital: true,
                 fall_back_to_new: false,
+                // Unread: an import is lent no tools.
+                project: ProjectOf::Stored,
                 wants_tools: false,
             },
         )
@@ -3615,6 +3650,27 @@ mod tests {
         bridge.stop();
     }
 
+    /// A new conversation's bridge starts before the conversation row exists.
+    /// Reading the row there was "Record not found" on every new hosted
+    /// conversation, which then had no Meridian tools until it was reopened.
+    #[tokio::test]
+    async fn a_new_conversations_bridge_does_not_need_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = bare_services(dir.path());
+
+        let bridge = AcpSession::start_bridge(&services, "not-written-yet", ProjectOf::Known(None))
+            .await
+            .expect("the project is handed over, not read back");
+        bridge.stop();
+
+        assert!(
+            AcpSession::start_bridge(&services, "not-written-yet", ProjectOf::Stored)
+                .await
+                .is_err(),
+            "the premise: there is no row to read"
+        );
+    }
+
     /// And a session opened without one advertises nothing rather than a
     /// half-filled descriptor. The field is mandatory even when empty.
     /// **What a containerised adapter is told the directory is.**
@@ -4164,6 +4220,38 @@ mod tests {
 
         shared.absorb(update(finished("B", "b"))).await;
         assert!(shared.with_turn(|t| t.row.settled).unwrap());
+    }
+
+    /// **The gate for "a card on the wrong row".** A permission request is
+    /// drawn on the row `turn_context` names, and the front end looks for the
+    /// call's card on that row only. So whatever arrives while a call waits —
+    /// a stray `completed` for some other call, prose, a thought — must leave
+    /// the call on the row the question will name. Rotated away, the question
+    /// lands on a row with no card for it and the real card keeps a button
+    /// that answers nothing: a card that "flashes and does nothing" when
+    /// pressed, with the agent waiting until the turn is stopped.
+    #[tokio::test]
+    async fn a_call_waiting_for_permission_is_on_the_row_the_question_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = live_turn(dir.path()).await;
+
+        shared.absorb(update(call("A", "Bash", serde_json::json!({})))).await;
+        // Everything the adapter may send while A is still waiting on a person.
+        shared
+            .absorb(update(finished("Z", "a result for a call this turn never saw")))
+            .await;
+        shared
+            .absorb(update(serde_json::json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": "waiting" },
+            })))
+            .await;
+
+        let asked_on = shared.turn_context().expect("a turn").assistant_message_id;
+        let holds_a = shared
+            .with_turn(|t| t.row.message_id == asked_on && t.row.tool_calls.iter().any(|c| c.id == "A"))
+            .unwrap();
+        assert!(holds_a, "the question for A would name a row A is not on");
     }
 
     /// Every source of the option set is the whole set, so a knob the agent

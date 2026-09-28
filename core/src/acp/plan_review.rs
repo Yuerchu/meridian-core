@@ -501,6 +501,7 @@ mod tests {
                 raw_input: Some(raw_input),
                 content: Vec::new(),
                 locations: Vec::new(),
+                name: None,
                 meta: Some(ToolCallMeta {
                     claude_code: Some(ClaudeCodeMeta {
                         tool_name: Some(tool_name.into()),
@@ -509,6 +510,30 @@ mod tests {
             },
             options: Vec::new(),
         }
+    }
+
+    /// The shape the adapter actually sends for a top-level `ExitPlanMode`:
+    /// no `_meta` (that is only for sub-agent and MCP calls), the name in
+    /// `name`, and a title written for a person. The fixture above puts the
+    /// name in `_meta`, which is why this path passed its tests while every
+    /// real plan went to the ordinary two-button card.
+    #[test]
+    fn exit_plan_is_detected_as_the_adapter_actually_sends_it() {
+        let params: RequestPermissionParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "toolCall": {
+                "toolCallId": "call-1",
+                "name": "ExitPlanMode",
+                "status": "pending",
+                "title": "Ready to code?",
+                "kind": "switch_mode",
+                "rawInput": { "plan": "# Plan\nA" },
+            },
+            "options": [],
+        }))
+        .unwrap();
+        let parsed = exit_plan_submission(&params).unwrap().expect("recognised as a plan");
+        assert_eq!(parsed.markdown, "# Plan\nA");
     }
 
     #[test]

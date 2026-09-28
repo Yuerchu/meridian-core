@@ -353,13 +353,38 @@ pub async fn open_session(services: &crate::services::Services, cwd: &str) -> Re
     let config = AcpConfig::load(&services.db)?;
     let conversation_id = uuid::Uuid::new_v4().to_string();
 
-    let session = AcpSession::open(services.clone(), &config, conversation_id.clone(), cwd.to_string()).await?;
+    // Decided once, before the adapter: the bridge needs it in the first thing
+    // said to the adapter, and the row written afterwards must file the
+    // conversation under the same project the bridge was scoped to.
+    //
+    // Same reasoning as a review conversation: file it under the project that
+    // owns this directory when there is one, and leave it ungrouped rather than
+    // inventing a project the user did not ask for.
+    let pool = services.db.clone();
+    let path = cwd.to_string();
+    let project_id = tokio::task::spawn_blocking(move || {
+        let mut conn = crate::util::get_conn(&pool)?;
+        crate::db::ops::project::find_project_by_path(&mut conn, &path)
+            .map(|p| p.map(|p| p.id))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let session = AcpSession::open(
+        services.clone(),
+        &config,
+        conversation_id.clone(),
+        cwd.to_string(),
+        project_id.as_deref(),
+    )
+    .await?;
 
     // The session is running but not yet in the registry, so a `?` here would
     // strand it: nothing holds a handle, nothing can close it, and the adapter
     // outlives the app's interest in it. Close it by hand — this is the one
     // window where the registry cannot do it for us.
-    if let Err(e) = write_conversation_row(services, &conversation_id, cwd).await {
+    if let Err(e) = write_conversation_row(services, &conversation_id, cwd, project_id.as_deref()).await {
         session.close().await;
         return Err(e);
     }
@@ -447,6 +472,7 @@ async fn write_conversation_row(
     services: &crate::services::Services,
     conversation_id: &str,
     cwd: &str,
+    project_id: Option<&str>,
 ) -> Result<(), String> {
     use crate::db::models::conversation::ConversationInsert;
     use diesel::Connection;
@@ -455,15 +481,12 @@ async fn write_conversation_row(
     let conversation_id = conversation_id.to_string();
     let cwd = cwd.to_string();
     let title = title_for(&cwd);
+    let project_id = project_id.map(str::to_string);
 
     tokio::task::spawn_blocking(move || {
         let mut conn = crate::util::get_conn(&pool)?;
         let now = crate::util::now_ms();
         conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            // Same reasoning as a review conversation: file it under the project
-            // that owns this directory when there is one, and leave it ungrouped
-            // rather than inventing a project the user did not ask for.
-            let project_id = crate::db::ops::project::find_project_by_path(conn, &cwd)?.map(|p| p.id);
             let assistant_id = crate::db::ops::assistant::get_default_assistant(conn)
                 .ok()
                 .flatten()

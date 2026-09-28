@@ -1103,6 +1103,14 @@ pub struct ToolCall {
     pub content: Vec<ToolCallContent>,
     #[serde(default)]
     pub locations: Vec<ToolCallLocation>,
+    /// The tool's real name, as `claude-agent-acp` sends it beside the ACP
+    /// fields on every `tool_call` and on the `toolCall` of a permission
+    /// request. Not in the ACP schema, which is why `_meta` below was read
+    /// first — but on a permission request the adapter fills `_meta` only for
+    /// a sub-agent's or an MCP server's call, so for an ordinary one this is the
+    /// only place the name is.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Vendor extensions. `claude-code-acp` puts the *real* tool name here —
     /// `title` is display prose and `kind` is one of five categories, so this is
     /// the only field that says "Bash".

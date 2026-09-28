@@ -302,14 +302,25 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
 /// Public because an approval card labels the same call, and the two must not
 /// disagree — a question naming the tool differently from the block it belongs
 /// to reads as being about something else.
+///
+/// **`name` is the second place to look, and for a permission request usually
+/// the only one.** The adapter puts `_meta.claudeCode.toolName` on a permission
+/// request's call only for a sub-agent or an MCP server; an ordinary `Bash`
+/// arrives with its name in `name` and its command as `title`. Falling
+/// through to `title` there labelled the approval with the command line, so a
+/// top-level `ExitPlanMode` — titled "Ready to code?" — never reached the plan
+/// review, and the notification stack could not recognise a `Read` as a read.
 pub fn tool_name_of(call: &ToolCall) -> String {
     let from_meta = call
         .meta
         .as_ref()
         .and_then(|m| m.claude_code.as_ref())
-        .and_then(|c| c.tool_name.as_deref());
+        .and_then(|c| c.tool_name.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
 
     from_meta
+        .or(call.name.as_deref().map(str::trim).filter(|t| !t.is_empty()))
         .or(call.title.as_deref())
         .map(str::trim)
         .filter(|t| !t.is_empty())
