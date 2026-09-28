@@ -108,6 +108,87 @@ pub struct Incoming {
     pub error: Option<RpcError>,
 }
 
+impl Incoming {
+    /// Read one line off the agent's stdout.
+    ///
+    /// **A string cut through a surrogate pair is repaired, not refused.**
+    /// JavaScript strings are UTF-16, and one truncated between the halves of
+    /// an astral character — the CLI shortening a tool's output that ends in an
+    /// emoji — is serialised by `JSON.stringify` as a lone `\ud83d`. serde_json
+    /// rejects that escape, and a rejected line used to be dropped as if the
+    /// adapter had printed something by accident: a lost `completed` left a
+    /// card running for ever, a lost reply left its caller waiting for ever.
+    /// The half character becomes U+FFFD, which is what a lossy UTF-16 decode
+    /// would have made of it anyway.
+    pub fn parse(line: &str) -> Result<Self, serde_json::Error> {
+        match serde_json::from_str(line) {
+            Ok(frame) => Ok(frame),
+            Err(error) => match repair_lone_surrogates(line) {
+                Some(repaired) => serde_json::from_str(&repaired),
+                None => Err(error),
+            },
+        }
+    }
+}
+
+/// Replace every `\uXXXX` escape naming half a surrogate pair with the escape
+/// for U+FFFD. `None` when there was nothing to replace.
+///
+/// Walks escapes rather than searching for them, so the `\u` in an escaped
+/// backslash followed by `u` (`\\ud83d`, which is text) is left alone.
+fn repair_lone_surrogates(line: &str) -> Option<String> {
+    const REPLACEMENT: &[u8] = br"\uFFFD";
+
+    fn escape_at(bytes: &[u8], at: usize) -> Option<u16> {
+        let hex = bytes.get(at..at + 6)?;
+        if hex[0] != b'\\' || hex[1] != b'u' {
+            return None;
+        }
+        u16::from_str_radix(std::str::from_utf8(&hex[2..]).ok()?, 16).ok()
+    }
+
+    let bytes = line.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match escape_at(bytes, i) {
+            Some(0xD800..=0xDBFF) => {
+                if let Some(0xDC00..=0xDFFF) = escape_at(bytes, i + 6) {
+                    out.extend_from_slice(&bytes[i..i + 12]);
+                    i += 12;
+                } else {
+                    out.extend_from_slice(REPLACEMENT);
+                    changed = true;
+                    i += 6;
+                }
+            }
+            Some(0xDC00..=0xDFFF) => {
+                out.extend_from_slice(REPLACEMENT);
+                changed = true;
+                i += 6;
+            }
+            Some(_) => {
+                out.extend_from_slice(&bytes[i..i + 6]);
+                i += 6;
+            }
+            // Any other escape is two characters; taking both is what keeps
+            // `\\` from being read as the start of the next one.
+            None => {
+                out.extend_from_slice(&bytes[i..(i + 2).min(bytes.len())]);
+                i += 2;
+            }
+        }
+    }
+    // Only ASCII was replaced, so what was UTF-8 still is.
+    changed.then(|| String::from_utf8(out).expect("only ASCII escapes were rewritten"))
+}
+
 /// Records that a member was *there*, whatever it said.
 ///
 /// serde only calls a field's `deserialize_with` when the member is present, so
@@ -1022,6 +1103,14 @@ pub struct ToolCall {
     pub content: Vec<ToolCallContent>,
     #[serde(default)]
     pub locations: Vec<ToolCallLocation>,
+    /// The tool's real name, as `claude-agent-acp` sends it beside the ACP
+    /// fields on every `tool_call` and on the `toolCall` of a permission
+    /// request. Not in the ACP schema, which is why `_meta` below was read
+    /// first — but on a permission request the adapter fills `_meta` only for
+    /// a sub-agent's or an MCP server's call, so for an ordinary one this is the
+    /// only place the name is.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Vendor extensions. `claude-code-acp` puts the *real* tool name here —
     /// `title` is display prose and `kind` is one of five categories, so this is
     /// the only field that says "Bash".
@@ -1086,33 +1175,19 @@ pub struct Usage {
     pub used: u64,
     #[serde(default)]
     pub size: u64,
-    /// The agent's own figure. Deliberately not run through `agent::pricing`:
+    /// The agent's own figure, declared and not read. Nothing here uses it:
     /// these tokens are billed by whatever the adapter is logged in as, and
-    /// this app has no rate for them. A number computed from a rate we invented
-    /// would look authoritative and be wrong.
-    #[serde(default)]
-    pub cost: Option<Cost>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Cost {
-    /// ACP is an external protocol and specifies this field as a JSON number.
-    /// Convert its lexical decimal spelling immediately; Meridian's own JSON
-    /// contracts continue to accept monetary values only as strings.
-    #[serde(deserialize_with = "deserialize_acp_decimal")]
-    pub amount: crate::decimal::Decimal,
-    #[serde(default)]
-    pub currency: Option<String>,
-}
-
-fn deserialize_acp_decimal<'de, D>(deserializer: D) -> Result<crate::decimal::Decimal, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error as _;
-
-    let number = serde_json::Number::deserialize(deserializer)?;
-    number.to_string().parse().map_err(D::Error::custom)
+    /// this app has no rate for them.
+    ///
+    /// **Not parsed either**, because parsing it cost the usage beside it. The
+    /// adapter sends `total_cost_usd`, a sum of doubles printed in shortest
+    /// form, so an ordinary bill arrives as `0.0031200000000000004` or `1.2e-7`
+    /// — past `NUMERIC(38,18)` or not a fixed-point spelling at all — and the
+    /// whole `session/update` failed to decode and was dropped. Reading it
+    /// honestly means deciding what a double's rounding error is worth, which
+    /// is a decision for whoever first displays it.
+    #[serde(default, rename = "cost")]
+    _cost: serde::de::IgnoredAny,
 }
 
 // -------------------------------------------------------------- permission
@@ -1328,6 +1403,48 @@ pub fn elicitation_cancelled() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JSON `\u` escape, built at run time so no editor or tool on the way
+    /// can turn it into the character it names.
+    fn esc(hex: &str) -> String {
+        format!("{}u{hex}", char::from(92))
+    }
+
+    /// A string JavaScript cut between the halves of an emoji. serde_json
+    /// refuses the line outright; read through `parse` it is the update it was,
+    /// with the half character replaced.
+    #[test]
+    fn a_line_with_half_a_surrogate_pair_is_still_read() {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"text":"cut{}"}}}}"#,
+            esc("d83d")
+        );
+        assert!(serde_json::from_str::<Incoming>(&line).is_err(), "the premise");
+
+        let frame = Incoming::parse(&line).expect("repaired");
+        assert_eq!(frame.params.unwrap()["text"], "cut\u{FFFD}");
+    }
+
+    /// A whole pair is a character, and an escaped backslash before a `u` is
+    /// text — neither is touched.
+    #[test]
+    fn only_a_lone_half_is_rewritten() {
+        let whole = format!(r#"{{"text":"{}{}"}}"#, esc("d83d"), esc("de00"));
+        assert_eq!(repair_lone_surrogates(&whole), None);
+        let text = format!(r#"{{"text":"{}{}"}}"#, char::from(92), esc("d83d"));
+        assert_eq!(
+            repair_lone_surrogates(&text),
+            None,
+            "an escaped backslash, then the letters ud83d"
+        );
+
+        let trailing_low = format!(r#"{{"text":"a{}"}}"#, esc("dc00"));
+        let repaired = repair_lone_surrogates(&trailing_low).expect("a lone low half");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&repaired).unwrap()["text"],
+            "a\u{FFFD}"
+        );
+    }
 
     #[test]
     fn a_response_a_request_and_a_notification_are_told_apart() {

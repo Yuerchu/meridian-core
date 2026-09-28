@@ -188,6 +188,21 @@ pub async fn ask(
         return Ok(protocol::permission_cancelled());
     }
 
+    // At info, so it reaches the file. A card that cannot be answered is
+    // otherwise a fault with no trace at all: which id was asked, which call
+    // and row it was drawn for, and — below — how it ended are the three facts
+    // that tell a card holding a stale id from an answer that never went back.
+    // Ids only; the arguments can be a whole command line.
+    tracing::info!(
+        approval_id = %approval_id,
+        call_id = %call_id,
+        message_id = %turn.assistant_message_id,
+        turn_id = %turn.turn_id,
+        conversation_id,
+        tool = %tool_name,
+        "ACP permission asked"
+    );
+
     let pool = services.db.clone();
     let decision = engine::in_phase(
         &pool,
@@ -198,6 +213,17 @@ pub async fn ask(
     )
     .await;
 
+    tracing::info!(
+        approval_id = %approval_id,
+        call_id = %call_id,
+        outcome = match &decision {
+            Some(ApprovalDecision::Approved) => "approved",
+            Some(ApprovalDecision::Denied(_)) => "denied",
+            Some(ApprovalDecision::Response(_)) => "response",
+            None => "unanswered",
+        },
+        "ACP permission settled"
+    );
     Ok(match decision {
         Some(ApprovalDecision::Approved) => protocol::permission_selected(&choices.allow),
         Some(ApprovalDecision::Denied(_)) => protocol::permission_selected(&choices.reject),

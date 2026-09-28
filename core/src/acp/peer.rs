@@ -322,10 +322,25 @@ impl Peer {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let Ok(incoming) = serde_json::from_str::<Incoming>(trimmed) else {
+                    let Ok(incoming) = Incoming::parse(trimmed) else {
                         // Adapters print to stdout by accident; a line we
                         // cannot parse is not a reason to end a session.
-                        tracing::debug!(chars = trimmed.chars().count(), "unparseable line from the ACP adapter");
+                        //
+                        // **But one shaped like a frame is counted as lost.**
+                        // Stray output is prose; a line opening a JSON-RPC
+                        // object is a piece of this answer that was never
+                        // read, and a turn missing one may not report `Done` —
+                        // the same rule a full queue follows below.
+                        if trimmed.starts_with('{') && trimmed.contains("\"jsonrpc\"") {
+                            let lost = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                            tracing::warn!(
+                                lost,
+                                chars = trimmed.chars().count(),
+                                "an ACP frame could not be parsed and was dropped"
+                            );
+                        } else {
+                            tracing::debug!(chars = trimmed.chars().count(), "unparseable line from the ACP adapter");
+                        }
                         continue;
                     };
 
