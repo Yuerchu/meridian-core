@@ -74,8 +74,8 @@ const MAX_PAUSE_CONTINUATIONS: usize = 8;
 const UNANSWERED_APPROVAL: &str = "No one answered the approval request before it expired. The tool was not run — this was not \
      a refusal, so you may ask again later or continue without it.";
 use super::{
-    ApprovalDecision, append_steering, append_tool_result, begin_assistant, complete_assistant, consume_stream,
-    in_phase, transitions,
+    ApprovalDecision, SteeringRole, append_steering, append_tool_result, begin_assistant, complete_assistant,
+    consume_stream, in_phase, transitions,
 };
 
 /// Why no request was made. Counts only -- this reaches a window, and the
@@ -323,6 +323,9 @@ pub struct TurnSetup<'a> {
     /// size. `None` leaves `progress.cost` unset — for a model nobody has
     /// priced, and for the runners that report tokens rather than money.
     pub pricing: Option<crate::agent::pricing::TurnPricing>,
+    /// What set this turn going, announced with every round it opens so the
+    /// transcript can tell a turn nobody asked for from the one before it.
+    pub trigger: crate::turn::TurnTrigger,
 }
 
 /// What one reply reported, in the shape a row stores.
@@ -491,6 +494,7 @@ async fn run(
         mut interrupted,
         compaction,
         pricing,
+        trigger,
     } = setup;
     let pool = services.pool;
     let emit = ports.emit;
@@ -610,6 +614,7 @@ async fn run(
             message_id: assistant_msg_id.clone(),
             turn_id: turn_id.clone(),
             conversation_id: conversation_id.clone(),
+            trigger,
         })?;
 
         let result = {
@@ -1669,6 +1674,10 @@ async fn inject_steering(
                     &item.text,
                     sender,
                     parent_cursor.as_deref(),
+                    match item.origin {
+                        SteeredOrigin::System => SteeringRole::Context,
+                        SteeredOrigin::User(_) => SteeringRole::User,
+                    },
                 )
                 .await
             }
@@ -2152,6 +2161,7 @@ mod tests {
 
     fn setup<'a>(provider: &'a Scripted, pool: &DbPool, cancel: &CancellationToken, offered: &[&str]) -> TurnSetup<'a> {
         TurnSetup {
+            trigger: crate::turn::TurnTrigger::User,
             provider,
             params: ChatParams {
                 model: "m".into(),
@@ -2900,6 +2910,20 @@ mod tests {
             crate::provider::MessageOrigin::User(_)
         ));
         assert_eq!(rows(&pool).iter().filter(|r| r.sender_id == Some(7)).count(), 1);
+
+        // And each is stored as what it was sent as. The next turn is built
+        // from these rows, so a notice stored as `user` is a notice that
+        // becomes somebody talking one request later.
+        let stored = rows(&pool);
+        let role_of = |text: &str| {
+            stored
+                .iter()
+                .find(|r| r.content == text)
+                .map(|r| r.role.clone())
+                .unwrap_or_else(|| panic!("no row for {text:?}"))
+        };
+        assert_eq!(role_of("one more thing"), "user");
+        assert_eq!(role_of("they left the group"), "context");
     }
 
     /// Who opened a turn is not who gets to finish it.

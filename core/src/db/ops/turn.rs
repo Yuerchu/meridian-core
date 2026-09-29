@@ -16,7 +16,7 @@ use diesel::sqlite::SqliteConnection;
 
 use crate::db::models::turn::{TurnInsert, TurnPhase, TurnRow, TurnStatus};
 use crate::db::schema::turns;
-use crate::turn::TurnOrigin;
+use crate::turn::{TurnOrigin, TurnTrigger};
 
 /// Record a turn that is starting. Called once the conversation has actually
 /// been taken, so a refused turn leaves nothing behind.
@@ -33,6 +33,28 @@ pub fn begin(
     self_id: Option<i64>,
     now: i64,
 ) -> QueryResult<usize> {
+    begin_triggered(
+        conn,
+        id,
+        conversation_id,
+        origin,
+        self_id,
+        (TurnTrigger::User, None),
+        now,
+    )
+}
+
+/// [`begin`], for a turn that says what set it going. Everything a person
+/// started goes through `begin`, which is this with `TurnTrigger::User`.
+pub fn begin_triggered(
+    conn: &mut SqliteConnection,
+    id: &str,
+    conversation_id: &str,
+    origin: TurnOrigin,
+    self_id: Option<i64>,
+    (trigger, trigger_ref): (TurnTrigger, Option<&str>),
+    now: i64,
+) -> QueryResult<usize> {
     diesel::insert_into(turns::table)
         .values(&TurnInsert {
             id,
@@ -43,6 +65,8 @@ pub fn begin(
             started_at: now,
             updated_at: now,
             self_id,
+            trigger: trigger.as_str(),
+            trigger_ref,
         })
         .execute(conn)
 }
@@ -385,6 +409,48 @@ mod tests {
 
     fn get(conn: &mut SqliteConnection, id: &str) -> TurnRow {
         turns::table.find(id).first::<TurnRow>(conn).unwrap()
+    }
+
+    /// A turn says what set it going, and a person's turn says so without
+    /// being asked: every caller of `begin` is one.
+    #[test]
+    fn a_turn_records_what_set_it_going() {
+        let pool = test_db();
+        let mut conn = pool.get().unwrap();
+        conv(&mut conn, "c1");
+
+        begin(&mut conn, "asked", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
+        begin_triggered(
+            &mut conn,
+            "woken",
+            "c1",
+            TurnOrigin::Desktop,
+            None,
+            (TurnTrigger::TaskCompletion, Some("task-1")),
+            1001,
+        )
+        .unwrap();
+
+        assert_eq!(get(&mut conn, "asked").trigger().unwrap(), TurnTrigger::User);
+        let woken = get(&mut conn, "woken");
+        assert_eq!(woken.trigger().unwrap(), TurnTrigger::TaskCompletion);
+        assert_eq!(woken.trigger_ref.as_deref(), Some("task-1"));
+    }
+
+    /// The column takes only the four words the enum has; anything else is a
+    /// broken row, refused where it is written rather than discovered where it
+    /// is read.
+    #[test]
+    fn an_unknown_trigger_is_refused_by_the_table() {
+        let pool = test_db();
+        let mut conn = pool.get().unwrap();
+        conv(&mut conn, "c1");
+        let refused = diesel::sql_query(
+            "INSERT INTO turns (id, conversation_id, origin, status, started_at, updated_at, trigger) \
+             VALUES ('t', 'c1', 'desktop', 'running', 1, 1, 'whenever')",
+        )
+        .execute(&mut conn);
+        assert!(refused.is_err());
     }
 
     #[test]

@@ -29,12 +29,44 @@ pub async fn begin(
     origin: TurnOrigin,
     self_id: Option<i64>,
 ) -> Result<(), String> {
+    begin_triggered(
+        pool,
+        turn_id,
+        conversation_id,
+        origin,
+        self_id,
+        crate::turn::TurnTrigger::User,
+        None,
+    )
+    .await
+}
+
+/// [`begin`], for a turn that says what set it going.
+pub async fn begin_triggered(
+    pool: &DbPool,
+    turn_id: &str,
+    conversation_id: &str,
+    origin: TurnOrigin,
+    self_id: Option<i64>,
+    trigger: crate::turn::TurnTrigger,
+    trigger_ref: Option<&str>,
+) -> Result<(), String> {
     let pool = pool.clone();
     let id = turn_id.to_string();
     let conv = conversation_id.to_string();
+    let trigger_ref = trigger_ref.map(str::to_string);
     let written = tokio::task::spawn_blocking(move || {
         let mut conn = pool.get().map_err(|e| Failure::Unrecorded(e.to_string()))?;
-        crate::db::ops::turn::begin(&mut conn, &id, &conv, origin, self_id, now_ms()).map_err(|e| match e {
+        crate::db::ops::turn::begin_triggered(
+            &mut conn,
+            &id,
+            &conv,
+            origin,
+            self_id,
+            (trigger, trigger_ref.as_deref()),
+            now_ms(),
+        )
+        .map_err(|e| match e {
             diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::UniqueViolation, _) => {
                 Failure::Duplicate
             }

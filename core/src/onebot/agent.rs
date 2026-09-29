@@ -1084,6 +1084,7 @@ async fn headless_chat_inner(
             redaction_mappings: services.map(|s| &s.redaction_mappings).unwrap_or(&DISABLED_MAPPINGS),
         },
         engine::TurnSetup {
+            trigger: crate::turn::TurnTrigger::User,
             provider: &*provider,
             params,
             chat_messages,

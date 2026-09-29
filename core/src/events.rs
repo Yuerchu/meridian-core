@@ -571,6 +571,10 @@ pub enum ChatStreamEvent {
         message_id: String,
         turn_id: String,
         conversation_id: String,
+        /// What set the turn going. Every round of a turn repeats it, so a
+        /// window that joins half way still learns whether there is a question
+        /// above this turn or not.
+        trigger: crate::turn::TurnTrigger,
     },
     UserMessage {
         content: String,

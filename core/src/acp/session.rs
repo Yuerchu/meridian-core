@@ -1021,6 +1021,7 @@ impl Shared {
                     message_id: id,
                     turn_id: turn_id.clone(),
                     conversation_id: self.conversation_id.clone(),
+                    trigger: crate::turn::TurnTrigger::User,
                 });
             }
             // The database is not answering, which the rest of this turn is
@@ -2624,6 +2625,7 @@ impl AcpSession {
             message_id: assistant_message_id,
             turn_id: turn_id.clone(),
             conversation_id: self.conversation_id.clone(),
+            trigger: crate::turn::TurnTrigger::User,
         });
 
         // Read after the turn record exists, so `asking` can exclude it, and
