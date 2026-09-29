@@ -250,19 +250,24 @@ pub struct AcpConfig {
 /// and stopped at 0.16.2 — a version that announces a tool call twice from its
 /// two sources instead of revising the first. The successor deduplicates
 /// (`emittedToolCalls`), and is where updates now go.
-const ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
+const ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.84.0";
 
-/// **Deliberately unpinned, and that is a standing hazard rather than an
-/// oversight.** The package is a fast-moving `0.x` (64 releases by 0.70) that
-/// wraps a `claude` updating on its own schedule, so pinning trades one kind of
-/// drift for another: a pinned adapter falls behind the CLI it is a shim for.
+/// **Pinned, and upgrading is a change to this repository.** This used to be
+/// unpinned, on the reasoning that a pinned adapter falls behind the `claude`
+/// it wraps. What that cost arrived on 2026-09-29: npx picked up 0.82, whose AIR
+/// tool-call contract stopped repeating unchanged fields and `_meta` keys to a
+/// client that declares `_meta.jetbrains.air` — which this one does — and
+/// every tool card in every hosted conversation was renamed "tool" overnight,
+/// with no commit here to point at. Everything this client knows about the
+/// adapter's behaviour — replay shapes, `messageId` stamping, what
+/// `session/list` returns, which fields an update leaves out — was measured
+/// against one build.
 ///
-/// What it costs is that everything this client knows about the adapter's
-/// behaviour — that message chunks carry `messageId`, what `session/list`
-/// returns, that a load recites the history at all — was measured against one
-/// build and can change with no commit here. Two mitigations, both cheap:
-/// `handshake` logs the version that answered, and anyone who wants a pin puts
-/// one in `acp.args`, which is a user setting.
+/// So the default names the build that was measured, and an upgrade reads the
+/// adapter's CHANGELOG and `docs/air-extensions.md`, runs the `#[ignore]`d
+/// probes (`tests/mcp_bridge_probe.rs`) and moves this constant together
+/// with whatever the new version needs. `acp.args` still overrides it: the
+/// user may point at any adapter, and `handshake` logs which one answered.
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {

@@ -19,7 +19,7 @@
 //! `interrupted`, with the whole answer folded away as process. Every finished
 //! hosted turn that called a tool was reported as stopped.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -227,7 +227,16 @@ struct Shared {
     /// Only ever grows, and only during a live turn: the [`Replay`] gate at the
     /// top of `absorb` returns before this is reached, so a recital cannot fill
     /// it with ids belonging to rows this app already has.
-    announced: Mutex<HashSet<String>>,
+    ///
+    /// **And what each one is called.** From 0.82 the adapter treats this app
+    /// as an AIR client (it declares `_meta.jetbrains.air`), and an AIR client
+    /// is sent a call's name once: the first report carries
+    /// `_meta.claudeCode.toolName`, later updates leave out every key that has
+    /// not changed, and a permission request's call carries only its id, title
+    /// and input — "the client already has the rest of the tool call". So the
+    /// name is kept here, from the announcement, for the two places that need
+    /// it later.
+    announced: Mutex<HashMap<String, String>>,
     /// Assistant rows this turn produced and could not store.
     ///
     /// A refused write leaves the answer on screen and absent from the
@@ -294,9 +303,32 @@ impl Shared {
     /// treats one: the update is dropped rather than guessed at.
     ///
     /// See [`Shared::announced`] for why the session is the right scope.
-    fn announce(&self, call_id: &str) -> Option<bool> {
+    fn announce(&self, call_id: &str, tool_name: &str) -> Option<bool> {
         let mut seen = self.announced.lock().ok()?;
-        Some(seen.insert(call_id.to_string()))
+        if seen.contains_key(call_id) {
+            return Some(false);
+        }
+        seen.insert(call_id.to_string(), tool_name.to_string());
+        Some(true)
+    }
+
+    /// The name a call was announced under, for a message about it that does
+    /// not say. See [`Shared::announced`].
+    fn announced_name(&self, call_id: &str) -> Option<String> {
+        self.announced
+            .lock()
+            .ok()?
+            .get(call_id)
+            .filter(|name| !name.is_empty())
+            .cloned()
+    }
+
+    /// Give a call that does not say what it is the name it was announced
+    /// under. See [`Shared::announced`].
+    fn name_from_announcement(&self, call: &mut protocol::ToolCall) {
+        if mapping::explicit_tool_name(call).is_none() {
+            call.name = self.announced_name(&call.tool_call_id);
+        }
     }
 
     /// What to record as the model on a row written now.
@@ -487,7 +519,7 @@ impl Shared {
                 if self.with_turn(|_| ()).is_none() {
                     return;
                 }
-                match self.announce(&call_id) {
+                match self.announce(&call_id, &tool_name) {
                     // Where it still stands, this fills it in; where the round
                     // holding it has already been written out, `revise` reaches
                     // the stored row instead. That second case is the common
@@ -1206,7 +1238,13 @@ impl Handler for Shared {
     async fn request(&self, method: String, params: serde_json::Value) -> Result<serde_json::Value, String> {
         match method.as_str() {
             "session/request_permission" => {
-                let params = serde_json::from_value(params).map_err(|e| e.to_string())?;
+                let mut params: protocol::RequestPermissionParams =
+                    serde_json::from_value(params).map_err(|e| e.to_string())?;
+                // The call's name, when the request does not carry one — which
+                // for an AIR client it never does. Without it the approval is
+                // labelled with the command line, a top-level ExitPlanMode
+                // misses the plan review, and a Read is not recognised as a read.
+                self.name_from_announcement(&mut params.tool_call);
                 match self.turn_context() {
                     Some(context) => approvals::ask(&self.services, &self.conversation_id, &context, params).await,
                     // A question with no turn behind it has nowhere to draw a
@@ -1670,7 +1708,7 @@ impl AcpSession {
             model: Mutex::new(None),
             config: Mutex::new(Vec::new()),
             replay: Mutex::new(Replay::No),
-            announced: Mutex::new(HashSet::new()),
+            announced: Mutex::new(HashMap::new()),
             unwritten_rows: std::sync::atomic::AtomicUsize::new(0),
             memory_lost: Mutex::new(false),
             tools_lost: Mutex::new(tools_lost),
@@ -1927,9 +1965,8 @@ impl AcpSession {
         let steering = init.steering_supported();
         tracing::info!(
             protocol_version = init.protocol_version,
-            // The default command is an unpinned `npx -y`, so which adapter
-            // answered is a fact about *today* and nothing in this repository
-            // records it. Everything this client knows about replay shapes,
+            // The default command pins a version, but `acp.args` can name any
+            // adapter, so which one answered is still worth a line. Everything this client knows about replay shapes,
             // `messageId` stamping and what `session/list` returns was measured
             // against one version; when that stops being true the symptom will
             // be a transcript that is subtly wrong, and this line is the only
@@ -3937,7 +3974,7 @@ mod tests {
             model: Mutex::new(None),
             config: Mutex::new(Vec::new()),
             replay: Mutex::new(Replay::No),
-            announced: Mutex::new(HashSet::new()),
+            announced: Mutex::new(HashMap::new()),
             unwritten_rows: std::sync::atomic::AtomicUsize::new(0),
             memory_lost: Mutex::new(false),
             tools_lost: Mutex::new(false),
@@ -4049,7 +4086,7 @@ mod tests {
             model: Mutex::new(None),
             config: Mutex::new(Vec::new()),
             replay: Mutex::new(Replay::No),
-            announced: Mutex::new(HashSet::new()),
+            announced: Mutex::new(HashMap::new()),
             unwritten_rows: std::sync::atomic::AtomicUsize::new(0),
             memory_lost: Mutex::new(false),
             tools_lost: Mutex::new(false),
@@ -4135,7 +4172,7 @@ mod tests {
             model: Mutex::new(None),
             config: Mutex::new(Vec::new()),
             replay: Mutex::new(Replay::No),
-            announced: Mutex::new(HashSet::new()),
+            announced: Mutex::new(HashMap::new()),
             unwritten_rows: std::sync::atomic::AtomicUsize::new(0),
             memory_lost: Mutex::new(false),
             tools_lost: Mutex::new(false),
@@ -4220,6 +4257,64 @@ mod tests {
 
         shared.absorb(update(finished("B", "b"))).await;
         assert!(shared.with_turn(|t| t.row.settled).unwrap());
+    }
+
+    /// What adapter 0.84 sends an AIR client: the name once, on the
+    /// announcement, and updates that leave out whatever did not change —
+    /// `_meta.claudeCode.toolName`, `title` and `kind` included. Each such
+    /// update used to rename the card "tool".
+    #[tokio::test]
+    async fn an_update_that_leaves_out_the_name_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = live_turn(dir.path()).await;
+
+        shared.absorb(update(call("A", "Bash", serde_json::json!({})))).await;
+        shared
+            .absorb(update(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "A",
+                "rawInput": { "command": "ls" },
+            })))
+            .await;
+
+        let named = shared.with_turn(|t| t.row.tool_calls[0].clone()).unwrap();
+        assert_eq!(named.name, "Bash");
+        assert_eq!(named.arguments, r#"{"command":"ls"}"#);
+    }
+
+    /// A permission request's call, as an AIR client is sent it: id, title and
+    /// input, no name. It is named from the announcement — otherwise the
+    /// approval is labelled with the command line and a top-level ExitPlanMode
+    /// is not recognised as a plan.
+    #[tokio::test]
+    async fn a_permission_request_is_named_from_the_announcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = live_turn(dir.path()).await;
+        shared
+            .absorb(update(call(
+                "P",
+                "ExitPlanMode",
+                serde_json::json!({ "plan": "# Plan" }),
+            )))
+            .await;
+
+        let mut asked: protocol::ToolCall = serde_json::from_value(serde_json::json!({
+            "toolCallId": "P",
+            "title": "Ready to code?",
+            "rawInput": { "plan": "# Plan" },
+        }))
+        .unwrap();
+        shared.name_from_announcement(&mut asked);
+        assert_eq!(mapping::tool_name_of(&asked), "ExitPlanMode");
+
+        // A request that does say is believed over the announcement.
+        let mut said: protocol::ToolCall = serde_json::from_value(serde_json::json!({
+            "toolCallId": "P",
+            "name": "Bash",
+        }))
+        .unwrap();
+        shared.name_from_announcement(&mut said);
+        assert_eq!(mapping::tool_name_of(&said), "Bash");
     }
 
     /// **The gate for "a card on the wrong row".** A permission request is
