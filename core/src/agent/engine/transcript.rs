@@ -269,6 +269,14 @@ pub(crate) async fn append_tool_result(
 /// Fails the same way a tool result does, and for a weaker version of the same
 /// reason: the message has already been said, and refusing to carry on would
 /// throw away the turn it was said to.
+///
+/// `role` is what the message *is*: `user` for somebody talking, `context`
+/// for a notice this app generated. The two reach the model differently — a
+/// notice as `system_context` — and the row has to say the same, because the
+/// next turn is built from the rows. Stored as `user` (which this used to do
+/// for both), a notice sent as context became a user message on the very next
+/// request: the cached prefix broke at that row, and the reviewer read
+/// "they left the group" as something a person asked for.
 pub(crate) async fn append_steering(
     pool: &DbPool,
     conversation_id: &str,
@@ -276,8 +284,9 @@ pub(crate) async fn append_steering(
     content: &str,
     sender_id: Option<i64>,
     parent: Option<&str>,
+    role: SteeringRole,
 ) -> Option<String> {
-    match write_steering(pool, conversation_id, turn_id, content, sender_id, parent).await {
+    match write_steering_as(pool, conversation_id, turn_id, content, sender_id, parent, role).await {
         Ok(id) => Some(id),
         Err(e) => {
             tracing::error!("failed to persist steered message: {e}");
@@ -300,6 +309,46 @@ pub async fn write_steering(
     sender_id: Option<i64>,
     parent: Option<&str>,
 ) -> Result<String, String> {
+    write_steering_as(
+        pool,
+        conversation_id,
+        turn_id,
+        content,
+        sender_id,
+        parent,
+        SteeringRole::User,
+    )
+    .await
+}
+
+/// Who a steered message is from, as far as its row is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringRole {
+    /// Somebody talking. Stored as `role = 'user'`.
+    User,
+    /// A notice this app generated. Stored as `role = 'context'`, which is
+    /// read back as `system_context` — what it was sent as.
+    Context,
+}
+
+impl SteeringRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            SteeringRole::User => "user",
+            SteeringRole::Context => "context",
+        }
+    }
+}
+
+async fn write_steering_as(
+    pool: &DbPool,
+    conversation_id: &str,
+    turn_id: &str,
+    content: &str,
+    sender_id: Option<i64>,
+    parent: Option<&str>,
+    role: SteeringRole,
+) -> Result<String, String> {
     let pool = pool.clone();
     let conv_id = conversation_id.to_string();
     let message_id = uuid::Uuid::new_v4().to_string();
@@ -314,7 +363,7 @@ pub async fn write_steering(
             &MessageInsert {
                 id: &msg_id,
                 conversation_id: &conv_id,
-                role: "user",
+                role: role.as_str(),
                 content: &content,
                 provider_id: None,
                 model_id: None,

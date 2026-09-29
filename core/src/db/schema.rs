@@ -690,6 +690,8 @@ diesel::table! {
         reported_at -> Nullable<BigInt>,
         parent_reported_at -> Nullable<BigInt>,
         self_id -> Nullable<BigInt>,
+        trigger -> Text,
+        trigger_ref -> Nullable<Text>,
     }
 }
 

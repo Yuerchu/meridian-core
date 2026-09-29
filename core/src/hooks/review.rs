@@ -645,6 +645,7 @@ async fn run_turn(
 
     let approvals = NoApprovals;
     let setup = engine::TurnSetup {
+        trigger: crate::turn::TurnTrigger::User,
         provider: &*provider.0,
         params: params.params.clone(),
         chat_messages,

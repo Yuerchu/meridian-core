@@ -79,6 +79,53 @@ impl TurnOrigin {
     }
 }
 
+/// What set a turn going — a second fact beside [`TurnOrigin`], and not a
+/// variant of it.
+///
+/// `TurnOrigin` says which runner is writing, and several things branch on that
+/// alone: the audit ledger calls a hosted reply `external` by it, an
+/// interruption report picks its subject by it, the journal attributes a
+/// change by it. A turn Claude Code starts on its own after a background task
+/// is still a `ClaudeCode` turn for every one of those, and a native one woken
+/// the same way is still `Desktop`. What differs is only whether somebody asked
+/// — which is what the transcript needs to know, because a turn nobody asked
+/// for has no question above it and must not be folded into the one before.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, strum::IntoStaticStr, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum TurnTrigger {
+    /// Somebody sent something: the composer, an edit or regeneration, a
+    /// queued follow-up.
+    User,
+    /// An approved plan carrying on where its review left off. No row of its
+    /// own, but the question it answers is the one above it, so the
+    /// transcript keeps it in that turn.
+    PlanContinuation,
+    /// A background task finished, and the model was woken to act on it.
+    TaskCompletion,
+    /// A hosted agent went round again on its own — a peer or coordinator
+    /// message, or a cycle whose cause it did not say.
+    AgentAutonomous,
+}
+
+impl TurnTrigger {
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        value.parse().map_err(|_| format!("unknown turn trigger '{value}'"))
+    }
+
+    /// Whether the turn has a question of its own above it. A turn without one
+    /// begins a group of its own in the transcript.
+    pub fn is_unprompted(&self) -> bool {
+        matches!(self, TurnTrigger::TaskCompletion | TurnTrigger::AgentAutonomous)
+    }
+}
+
 struct ActiveTurn {
     turn_id: String,
     cancel: CancellationToken,

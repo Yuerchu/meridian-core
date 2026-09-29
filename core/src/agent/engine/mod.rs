@@ -36,8 +36,8 @@ pub use ports::{
     SubAgents, SurfaceTools, TurnPorts,
 };
 pub(crate) use stream::consume_stream;
+pub use transcript::{SteeringRole, in_phase, write_steering};
 pub(crate) use transcript::{append_steering, append_tool_result, begin_assistant, complete_assistant};
-pub use transcript::{in_phase, write_steering};
 pub use transitions::{PlanReadResult, PlanUpdateResult, SubmitPlanRequest, Transitions, UpdatePlanRequest};
 pub use turn::{ApprovalRule, TurnOutcome, TurnProgress, TurnServices, TurnSetup, WithheldWording, run_turn};
 

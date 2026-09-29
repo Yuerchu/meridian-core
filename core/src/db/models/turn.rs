@@ -120,9 +120,17 @@ pub struct TurnRow {
     /// knowable nowhere else, and a second account connecting to the same port
     /// would otherwise split no history at all.
     pub self_id: Option<i64>,
+    /// What set the turn going. See [`crate::turn::TurnTrigger`].
+    pub trigger: String,
+    /// What did the waking, for a turn nobody asked for.
+    pub trigger_ref: Option<String>,
 }
 
 impl TurnRow {
+    pub fn trigger(&self) -> Result<crate::turn::TurnTrigger, String> {
+        crate::turn::TurnTrigger::parse(&self.trigger)
+    }
+
     pub fn status(&self) -> Result<TurnStatus, String> {
         TurnStatus::parse(&self.status)
     }
@@ -143,4 +151,6 @@ pub struct TurnInsert<'a> {
     pub started_at: i64,
     pub updated_at: i64,
     pub self_id: Option<i64>,
+    pub trigger: &'a str,
+    pub trigger_ref: Option<&'a str>,
 }
