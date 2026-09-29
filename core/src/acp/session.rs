@@ -20,7 +20,8 @@
 //! hosted turn that called a tool was reported as stopped.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -35,7 +36,7 @@ use crate::events::{
 };
 use crate::provider;
 use crate::services::Services;
-use crate::turn::TurnOrigin;
+use crate::turn::{TurnOrigin, TurnTrigger};
 use crate::util::{get_conn, now_ms};
 
 use super::mapping::{self, Effect};
@@ -183,7 +184,65 @@ struct TurnState {
     /// with a plain `end_turn` once `sessionFailure` is declared, and this is
     /// what says the turn nevertheless failed.
     error_notice: Option<String>,
+    /// What set this turn going. Sent with every round's `MessageStart`, not
+    /// only the first: the front end files the trigger per turn, and a later
+    /// round claiming `User` would re-file a turn nobody asked for as one
+    /// somebody did.
+    trigger: TurnTrigger,
+    /// Present when nobody's `session/prompt` is behind this turn — see
+    /// [`Unprompted`].
+    unprompted: Option<Unprompted>,
 }
+
+/// A turn the agent started by itself, and what closing it needs.
+///
+/// **A background command finishing is the common case.** Claude Code runs it
+/// with `run_in_background`, the prompt that started it is answered, and when
+/// it finishes the CLI feeds the completion back to the model, which answers
+/// it — a whole cycle of text, tool calls and permission requests with no
+/// `session/prompt` open. Before this existed every one of those updates was
+/// dropped (no turn to land on), and worse, its permission requests were
+/// answered `cancelled`, which the adapter documents as *aborting* the tool
+/// rather than as a refusal: the follow-up work was cut off unseen.
+///
+/// What a prompted turn gets from `prompt_with` — the lease, the record, the
+/// `finish` — an unprompted one gets from [`Shared::open_unprompted`] and
+/// [`Shared::close_unprompted`], because there is no request to hang them on.
+struct Unprompted {
+    /// Held for the turn's length, so a prompt sent meanwhile is told the
+    /// conversation is busy and queued rather than started beside it.
+    lease: crate::turn::TurnLease,
+    /// The peer's drop counter when the turn opened; see `finish`.
+    dropped_before: u64,
+    /// When the adapter last said anything this turn heard. Read by the
+    /// watchdog, which is the only thing that can end a turn whose `idle` never
+    /// comes.
+    last_heard: Instant,
+}
+
+/// How an unprompted turn ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// The agent said it was done: `session_state_changed: idle`.
+    Idle,
+    /// Nothing heard for [`QUIET_FOR`] with nothing outstanding.
+    Quiet,
+    /// Somebody pressed stop.
+    Stopped,
+    /// The adapter went away under it.
+    AdapterGone,
+}
+
+/// How often an unprompted turn is checked on.
+const WATCH_EVERY: Duration = Duration::from_secs(15);
+/// How long an unprompted turn may go quiet, with no call outstanding and no
+/// question on screen, before it is taken to be over without its `idle`.
+///
+/// The `idle` is what normally ends it; this is only for when it never comes.
+/// It is long because being wrong in that direction costs little — the next
+/// update opens another turn — while an open turn holds the conversation's
+/// lease, and every message typed meanwhile is queued behind it.
+const QUIET_FOR: Duration = Duration::from_secs(600);
 
 /// The half of a session the protocol handler needs.
 ///
@@ -278,6 +337,25 @@ struct Shared {
     /// [`super::title_for`]. Held here so `absorb` can tell a placeholder
     /// from a choice without a second lookup.
     placeholder_title: String,
+    /// This value, for the watchdog an unprompted turn spawns. Weak because the
+    /// peer's handler already holds it strongly, and empty in tests that build
+    /// a `Shared` by hand — which then simply get no watchdog.
+    me: Weak<Shared>,
+    /// The session's tool bridge, whose window an unprompted turn opens and
+    /// shuts itself. The same one [`AcpSession::bridge`] holds.
+    bridge: Option<Arc<bridge::Bridge>>,
+    /// The peer this is the handler of. Set once, right after the peer starts —
+    /// the handler has to exist first — and weak, since the peer holds this.
+    peer: OnceLock<Weak<Peer>>,
+    /// The background task whose completion the agent was last told about,
+    /// while no turn was running to be told with it. Taken by the next
+    /// unprompted turn to open, which is the one answering it; cleared by the
+    /// `idle` that ends a cycle nobody saw, so it cannot mislabel a later one.
+    woken_by: Mutex<Option<String>>,
+    /// Held while an unprompted turn is being opened. A permission request is
+    /// handled on a task of its own while updates are handled in order, so the
+    /// two can both find no turn and both try to open one.
+    opening: tokio::sync::Mutex<()>,
 }
 
 impl Shared {
@@ -414,6 +492,7 @@ impl Shared {
     }
 
     async fn absorb(&self, notification: SessionNotification) {
+        self.heard();
         for effect in mapping::effects_of(notification.update) {
             self.absorb_effect(effect).await;
         }
@@ -432,6 +511,20 @@ impl Shared {
                 recital.push(effect);
             }
             return;
+        }
+
+        // Output with no turn to land on is the agent carrying on by itself —
+        // see [`Unprompted`]. These three and nothing else: a usage figure, a
+        // title or a config change arrives between turns as a matter of course
+        // and is not the agent doing anything. A tool *result* with no turn is
+        // an answer to a call nothing here recorded, which no turn opened now
+        // could place.
+        if matches!(
+            effect,
+            Effect::Text { .. } | Effect::Reasoning { .. } | Effect::ToolCall { .. }
+        ) && self.with_turn(|_| ()).is_none()
+        {
+            self.open_unprompted().await;
         }
 
         // Every branch below takes the lock, drops it, and only then emits.
@@ -988,10 +1081,11 @@ impl Shared {
                     t.parent.clone(),
                     std::mem::replace(&mut t.row, carried),
                     std::mem::take(&mut t.interjected),
+                    t.trigger,
                 ))
             })
             .flatten();
-        let Some((turn_id, parent, finished, interjected)) = taken else {
+        let Some((turn_id, parent, finished, interjected, trigger)) = taken else {
             return;
         };
 
@@ -1022,7 +1116,7 @@ impl Shared {
                     message_id: id,
                     turn_id: turn_id.clone(),
                     conversation_id: self.conversation_id.clone(),
-                    trigger: crate::turn::TurnTrigger::User,
+                    trigger,
                 });
             }
             // The database is not answering, which the rest of this turn is
@@ -1209,6 +1303,342 @@ impl Shared {
 
     /// Where an inbound question can draw its card, if a turn is running.
     ///
+    /// The peer this handler belongs to, while it is still there.
+    fn peer(&self) -> Option<Arc<Peer>> {
+        self.peer.get().and_then(Weak::upgrade)
+    }
+
+    /// Note that the adapter said something, for an unprompted turn's
+    /// watchdog.
+    fn heard(&self) {
+        self.with_turn(|t| {
+            if let Some(unprompted) = &mut t.unprompted {
+                unprompted.last_heard = Instant::now();
+            }
+        });
+    }
+
+    /// One of the SDK messages [`protocol::SessionMeta`] subscribes to.
+    async fn on_sdk_message(&self, message: protocol::SdkMessage) {
+        // A recital is history, and none of this is about history. The load
+        // does not replay these today; the gate is so that it cannot matter.
+        if !self.replay.lock().is_ok_and(|r| r.is_live()) {
+            return;
+        }
+        self.heard();
+        match message {
+            // Inside a turn the completion is part of that turn — the adapter
+            // holds a prompt open for background agents it spawned, and the
+            // answer to their completion is that prompt's own. Outside one, it
+            // is what the next unprompted turn is answering.
+            protocol::SdkMessage::TaskNotification { task_id, status } => {
+                tracing::info!(
+                    conversation_id = %self.conversation_id,
+                    task_id = %task_id,
+                    status = %status,
+                    "Claude Code reported a background task finished"
+                );
+                if self.with_turn(|_| ()).is_none()
+                    && let Ok(mut slot) = self.woken_by.lock()
+                {
+                    *slot = Some(task_id);
+                }
+            }
+            protocol::SdkMessage::SessionStateChanged {
+                state: protocol::SdkSessionState::Idle,
+            } => {
+                // Only an unprompted turn is ended here. A prompted one ends
+                // when its `session/prompt` is answered — and measured, its own
+                // `idle` arrives *after* that answer, by which time `finish` has
+                // taken it or is about to. Ending it here as well would race
+                // `finish` for the same state.
+                self.close_unprompted(Ending::Idle, None).await;
+                // A completion whose cycle said nothing opened no turn, and
+                // must not name a later one.
+                if let Ok(mut slot) = self.woken_by.lock() {
+                    *slot = None;
+                }
+            }
+            // `running` does not open a turn, and that is deliberate: a turn
+            // opens on the first thing worth drawing. After a stop the adapter
+            // swallows a cycle's output until the next prompt while still
+            // reporting its states, so opening here would leave an empty
+            // bubble for every background task that finishes in that window.
+            protocol::SdkMessage::SessionStateChanged { .. } => {}
+        }
+    }
+
+    /// Open a turn for output nobody prompted, if one can be.
+    ///
+    /// Returns whether a turn is running afterwards — this one, or one that
+    /// got there first. `false` leaves the output with nowhere to go, which is
+    /// what happens when something else holds the conversation: a `!` command,
+    /// or a prompt this app is in the middle of sending.
+    async fn open_unprompted(&self) -> bool {
+        let _opening = self.opening.lock().await;
+        if self.with_turn(|_| ()).is_some() {
+            return true;
+        }
+        if !self.replay.lock().is_ok_and(|r| r.is_live()) {
+            return false;
+        }
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+        let lease = match Arc::clone(&self.services.turns).try_acquire_turn_with(
+            &self.conversation_id,
+            TurnOrigin::ClaudeCode,
+            turn_id.clone(),
+            cancel.clone(),
+        ) {
+            Ok(lease) => lease,
+            Err(busy) => {
+                tracing::warn!(
+                    %busy,
+                    conversation_id = %self.conversation_id,
+                    "Claude Code carried on by itself while the conversation was busy; that output is not shown"
+                );
+                return false;
+            }
+        };
+
+        // Hung off the head, as a prompt's row would be. A conversation with no
+        // head has had no prompt, so there is nothing for the agent to be
+        // carrying on from — and nothing sensible to hang a row off.
+        let head = crate::db::sea::ops::conversation::get_conversation(&self.services.sea, &self.conversation_id)
+            .await
+            .map(|conversation| conversation.and_then(|c| c.head_message_id))
+            .map_err(|e| e.to_string());
+        let head = match head {
+            Ok(Some(head)) => head,
+            Ok(None) => {
+                tracing::warn!(conversation_id = %self.conversation_id, "unprompted output in a conversation with no messages");
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not read where to put unprompted output");
+                return false;
+            }
+        };
+
+        let woken_by = self.woken_by.lock().ok().and_then(|mut slot| slot.take());
+        let trigger = if woken_by.is_some() {
+            TurnTrigger::TaskCompletion
+        } else {
+            TurnTrigger::AgentAutonomous
+        };
+        if let Err(error) = crate::agent::turn_record::begin_triggered(
+            &self.services.db,
+            &turn_id,
+            &self.conversation_id,
+            TurnOrigin::ClaudeCode,
+            None,
+            trigger,
+            woken_by.as_deref(),
+        )
+        .await
+        {
+            tracing::warn!(%error, conversation_id = %self.conversation_id, "could not record an unprompted turn");
+            return false;
+        }
+        let message_id = match begin_assistant(
+            &self.services.db,
+            &self.conversation_id,
+            &turn_id,
+            (None, Some(PROVIDER_LABEL)),
+            &self.model(),
+            Some(&head),
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(%error, conversation_id = %self.conversation_id, "could not open an unprompted turn's row");
+                crate::agent::turn_record::finish(&self.services.db, &turn_id, TurnStatus::Failed, Some(&error)).await;
+                return false;
+            }
+        };
+
+        if let Some(bridge) = &self.bridge {
+            bridge.begin_turn(&turn_id, Some(&message_id), cancel.clone());
+        }
+        let dropped_before = self.peer().map(|p| p.dropped_notifications()).unwrap_or(0);
+        if let Ok(mut slot) = self.turn.lock() {
+            *slot = Some(TurnState {
+                turn_id: turn_id.clone(),
+                cancel,
+                row: OpenRow::new(message_id.clone()),
+                parent: head,
+                interjected: Vec::new(),
+                error_notice: None,
+                trigger,
+                unprompted: Some(Unprompted {
+                    lease,
+                    dropped_before,
+                    last_heard: Instant::now(),
+                }),
+            });
+        }
+        tracing::info!(
+            conversation_id = %self.conversation_id,
+            turn_id = %turn_id,
+            trigger = trigger.as_str(),
+            task_id = woken_by.as_deref().unwrap_or(""),
+            "Claude Code started a turn by itself"
+        );
+        self.emit(ChatStreamEvent::MessageStart {
+            message_id,
+            turn_id: turn_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            trigger,
+        });
+        self.watch(turn_id);
+        true
+    }
+
+    /// End the unprompted turn, if that is what is running.
+    ///
+    /// `only` names the turn the caller means, for the watchdog, which must
+    /// not end a turn that opened after the one it was watching. A prompted
+    /// turn is never touched: `finish` owns it.
+    ///
+    /// The tail of `finish`, minus everything a reply would have said.
+    async fn close_unprompted(&self, ending: Ending, only: Option<&str>) {
+        let state = self.turn.lock().ok().and_then(|mut slot| {
+            let ours = slot
+                .as_ref()
+                .is_some_and(|t| t.unprompted.is_some() && only.is_none_or(|id| id == t.turn_id));
+            if ours { slot.take() } else { None }
+        });
+        let Some(mut state) = state else {
+            return;
+        };
+        let Some(unprompted) = state.unprompted.take() else {
+            return;
+        };
+        let turn_id = state.turn_id.clone();
+
+        if let Some(bridge) = &self.bridge {
+            bridge.end_turn(&turn_id);
+        }
+        // Releases anything still waiting on a person, as `finish` does.
+        state.cancel.cancel();
+        let retired = crate::approval::retire_turn(&self.services, &turn_id, crate::approval::RetireCause::TurnGone);
+        if retired > 0 {
+            tracing::debug!(retired, turn_id, "dropped approvals nobody was left to answer");
+        }
+
+        let last = if state.row.written {
+            state.parent.clone()
+        } else {
+            self.write_row(&turn_id, &state.parent, &state.row).await
+        };
+        self.write_interjections(&turn_id, &last, &state.interjected).await;
+
+        let (status, reason, error) = match ending {
+            Ending::Idle | Ending::Quiet => (TurnStatus::Done, ChatStopReason::EndTurn, None),
+            Ending::Stopped => (TurnStatus::Cancelled, ChatStopReason::Cancelled, None),
+            Ending::AdapterGone => (
+                TurnStatus::Failed,
+                ChatStopReason::Error,
+                Some("Claude Code stopped while it was working on its own.".to_string()),
+            ),
+        };
+        let lost = self
+            .peer()
+            .map(|p| p.dropped_notifications())
+            .unwrap_or(unprompted.dropped_before)
+            .saturating_sub(unprompted.dropped_before);
+        let unwritten = self.unwritten_rows.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let (status, reason, error) = incomplete_unless_whole(status, reason, error, lost, unwritten);
+        if ending == Ending::Quiet {
+            tracing::warn!(
+                conversation_id = %self.conversation_id,
+                turn_id,
+                "an unprompted turn went quiet without Claude Code saying it was done; ended it"
+            );
+        }
+        tracing::info!(
+            conversation_id = %self.conversation_id,
+            turn_id,
+            status = status.as_str(),
+            "an unprompted turn ended"
+        );
+
+        crate::agent::turn_record::finish(&self.services.db, &turn_id, status, error.as_deref()).await;
+        self.emit(ChatStreamEvent::Stop {
+            reason,
+            message_id: Some(state.row.message_id),
+            turn_id: turn_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+        });
+        let _ = self.services.events.emit_conversation_updated(&self.conversation_id);
+        drop(unprompted.lease);
+
+        // What was typed while the agent worked waits for exactly this, as it
+        // would behind a prompted turn — and for the same reason, a turn that
+        // did not reach an ending holds it instead.
+        match status {
+            TurnStatus::Done => crate::agent::queue::pump_later(&self.services, &self.conversation_id),
+            _ => crate::agent::queue::hold(&self.services, &self.conversation_id).await,
+        }
+    }
+
+    /// Keep an eye on an unprompted turn, for the endings nothing announces.
+    ///
+    /// A prompted turn is ended by its reply, and a reply always comes — the
+    /// peer fails every pending request when the adapter dies. An unprompted
+    /// one has only `idle`, which a dead adapter never sends and a CLI that
+    /// changes its cadence might not. Left open, it would hold the lease and
+    /// queue every message typed after it for ever.
+    fn watch(&self, turn_id: String) {
+        let Some(me) = self.me.upgrade() else {
+            return;
+        };
+        let me = Arc::downgrade(&me);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(WATCH_EVERY).await;
+                let Some(shared) = me.upgrade() else {
+                    return;
+                };
+                let adapter_alive = shared.peer().is_some_and(|p| p.is_alive());
+                let asking = shared
+                    .services
+                    .approvals
+                    .lock()
+                    .values()
+                    .any(|pending| pending.turn_id == turn_id);
+                let verdict = shared
+                    .with_turn(|t| {
+                        let unprompted = t.unprompted.as_ref().filter(|_| t.turn_id == turn_id)?;
+                        if !adapter_alive {
+                            return Some(Some(Ending::AdapterGone));
+                        }
+                        let outstanding = t
+                            .row
+                            .tool_calls
+                            .iter()
+                            .any(|c| !t.row.results.iter().any(|(id, ..)| *id == c.id));
+                        let quiet = unprompted.last_heard.elapsed() >= QUIET_FOR && !outstanding && !asking;
+                        Some(quiet.then_some(Ending::Quiet))
+                    })
+                    .flatten();
+                match verdict {
+                    // Gone, or replaced by another turn.
+                    None => return,
+                    Some(None) => {}
+                    Some(Some(ending)) => {
+                        shared.close_unprompted(ending, Some(&turn_id)).await;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     /// Both things the agent can stop to ask about — a permission and an
     /// elicitation — need the same three facts and neither may hold the lock
     /// across the wait that follows, which is minutes long.
@@ -1227,13 +1657,19 @@ impl Shared {
 #[async_trait::async_trait]
 impl Handler for Shared {
     async fn notification(&self, method: String, params: serde_json::Value) {
-        if method != "session/update" {
-            tracing::debug!(method, "an ACP notification this client does not handle");
-            return;
-        }
-        match serde_json::from_value::<SessionNotification>(params) {
-            Ok(notification) => self.absorb(notification).await,
-            Err(e) => tracing::debug!(error = %e, "could not read a session/update"),
+        match method.as_str() {
+            "session/update" => match serde_json::from_value::<SessionNotification>(params) {
+                Ok(notification) => self.absorb(notification).await,
+                Err(e) => tracing::debug!(error = %e, "could not read a session/update"),
+            },
+            // Only ever the two messages `SessionMeta` asked for. Unreadable is
+            // loud rather than quiet: it is what ends an unprompted turn, and a
+            // shape that moved would leave every one of them to the watchdog.
+            "_claude/sdkMessage" => match serde_json::from_value::<protocol::SdkMessageParams>(params) {
+                Ok(forwarded) => self.on_sdk_message(forwarded.message).await,
+                Err(e) => tracing::warn!(error = %e, "could not read a forwarded SDK message"),
+            },
+            _ => tracing::debug!(method, "an ACP notification this client does not handle"),
         }
     }
 
@@ -1247,11 +1683,19 @@ impl Handler for Shared {
                 // labelled with the command line, a top-level ExitPlanMode
                 // misses the plan review, and a Read is not recognised as a read.
                 self.name_from_announcement(&mut params.tool_call);
+                // The agent asking while nothing is running is the agent
+                // working by itself — see [`Unprompted`]. It is asked like any
+                // other question, on a turn of its own. This used to refuse,
+                // and a refusal here is `cancelled`, which aborts the call.
+                self.heard();
+                if self.turn_context().is_none() {
+                    self.open_unprompted().await;
+                }
                 match self.turn_context() {
                     Some(context) => approvals::ask(&self.services, &self.conversation_id, &context, params).await,
-                    // A question with no turn behind it has nowhere to draw a
-                    // card and nobody to answer it. Refusing beats hanging the
-                    // adapter on a prompt that will never appear.
+                    // No turn could be opened for it — something else holds the
+                    // conversation. Refusing beats hanging the adapter on a
+                    // card that will never appear.
                     None => {
                         tracing::warn!("an ACP permission request arrived with no turn running");
                         Ok(protocol::permission_cancelled())
@@ -1264,6 +1708,10 @@ impl Handler for Shared {
             // `AskUserQuestion` exist at all.
             "elicitation/create" => {
                 let params = serde_json::from_value(params).map_err(|e| e.to_string())?;
+                self.heard();
+                if self.turn_context().is_none() {
+                    self.open_unprompted().await;
+                }
                 match self.turn_context() {
                     Some(context) => elicitation::ask(&self.services, &self.conversation_id, &context, params).await,
                     // A question nobody can be shown is one the agent should
@@ -1740,7 +2188,12 @@ impl AcpSession {
             }
         };
 
-        let shared = Arc::new(Shared {
+        let shared = Arc::new_cyclic(|me| Shared {
+            me: me.clone(),
+            bridge: bridge.clone(),
+            peer: OnceLock::new(),
+            woken_by: Mutex::new(None),
+            opening: tokio::sync::Mutex::new(()),
             services,
             conversation_id: conversation_id.clone(),
             turn: Mutex::new(None),
@@ -1756,6 +2209,7 @@ impl AcpSession {
             placeholder_title: super::title_for(opening.cwd),
         });
         let peer = Peer::start(process, shared.clone() as Arc<dyn Handler>);
+        let _ = shared.peer.set(Arc::downgrade(&peer));
 
         // From here on the adapter is running, so every failure has to take it
         // down again. `?` alone would return leaving the peer's tasks holding a
@@ -2082,7 +2536,7 @@ impl AcpSession {
         let session = match peer
             .request(
                 "session/new",
-                serde_json::to_value(new(Some(protocol::SessionMeta::default()))).map_err(|e| e.to_string())?,
+                serde_json::to_value(new(protocol::SessionMeta::with_thinking())).map_err(|e| e.to_string())?,
             )
             .await
             .map_err(|e| describe(peer, e))
@@ -2092,7 +2546,7 @@ impl AcpSession {
                 let plain = peer
                     .request(
                         "session/new",
-                        serde_json::to_value(new(None)).map_err(|e| e.to_string())?,
+                        serde_json::to_value(new(protocol::SessionMeta::default())).map_err(|e| e.to_string())?,
                     )
                     .await
                     .map_err(|e| describe(peer, e));
@@ -2170,10 +2624,10 @@ impl AcpSession {
                 .map_err(|e| describe(peer, e))
                 .and_then(protocol::LoadSessionResult::read)
         };
-        let loaded = match load_once(Some(protocol::SessionMeta::default())).await {
+        let loaded = match load_once(protocol::SessionMeta::with_thinking()).await {
             Ok(session) => Ok(session),
             Err(refused) => {
-                let plain = load_once(None).await;
+                let plain = load_once(protocol::SessionMeta::default()).await;
                 if plain.is_ok() {
                     tracing::warn!(
                         error = %refused,
@@ -2230,6 +2684,13 @@ impl AcpSession {
     pub fn current_turn_id(&self) -> Option<String> {
         let guard = self.shared.turn.lock().ok()?;
         let turn = guard.as_ref()?;
+        // Nothing was prompted, so there is nothing to steer: what the agent
+        // is doing is answering a background task, and a message steered into
+        // that would be read as part of the answer to it. Queued instead, it
+        // goes as a prompt of its own once the agent is done.
+        if turn.unprompted.is_some() {
+            return None;
+        }
         // A durable review deliberately releases the ordinary runner lease.
         // Reporting it as steerable would let the queue inject a prompt into
         // an adapter parked inside ExitPlanMode, bypassing the review barrier.
@@ -2655,8 +3116,14 @@ impl AcpSession {
         // ACP request is still alive, so the session-local state is the second
         // half: no new prompt may overwrite the parked turn before its durable
         // decision has crossed the adapter boundary.
-        if self.shared.turn.lock().is_ok_and(|turn| turn.is_some()) {
-            return Err("Claude Code is still finishing the previous plan review decision.".into());
+        if let Ok(turn) = self.shared.turn.lock()
+            && let Some(turn) = turn.as_ref()
+        {
+            return Err(if turn.unprompted.is_some() {
+                "Claude Code is still working on its own. Wait for it to finish, or stop it first.".into()
+            } else {
+                "Claude Code is still finishing the previous plan review decision.".into()
+            });
         }
         let turn_id = match turn_id {
             Some(raw) => uuid::Uuid::parse_str(&raw)
@@ -2725,6 +3192,8 @@ impl AcpSession {
                 parent: user_message_id.clone(),
                 interjected: Vec::new(),
                 error_notice: None,
+                trigger: TurnTrigger::User,
+                unprompted: None,
             });
         }
 
@@ -3194,22 +3663,7 @@ impl AcpSession {
         // are counted together rather than given separate rules.
         let lost = self.peer.dropped_notifications().saturating_sub(dropped_before);
         let unwritten = self.shared.unwritten_rows.swap(0, std::sync::atomic::Ordering::Relaxed);
-        let (status, reason, error) = if (lost > 0 || unwritten > 0) && status == TurnStatus::Done {
-            tracing::error!(
-                lost,
-                unwritten,
-                conversation_id = %self.conversation_id,
-                "an ACP turn's transcript is incomplete"
-            );
-            let why = if unwritten > 0 {
-                format!("{unwritten} part(s) of this answer could not be saved, so it is incomplete.")
-            } else {
-                format!("{lost} update(s) from Claude Code were dropped, so this answer is incomplete.")
-            };
-            (TurnStatus::Failed, ChatStopReason::Error, Some(why))
-        } else {
-            (status, reason, error)
-        };
+        let (status, reason, error) = incomplete_unless_whole(status, reason, error, lost, unwritten);
 
         if review_boundary.is_some() {
             let pool = services.db.clone();
@@ -3306,10 +3760,12 @@ impl AcpSession {
 
     /// Stop whatever this session is doing, without closing it.
     pub async fn cancel(&self) {
+        let mut unprompted = false;
         if let Ok(slot) = self.shared.turn.lock()
             && let Some(state) = slot.as_ref()
         {
             state.cancel.cancel();
+            unprompted = state.unprompted.is_some();
         }
         let _ = self
             .peer
@@ -3318,6 +3774,21 @@ impl AcpSession {
                 serde_json::json!({ "sessionId": self.acp_session_id }),
             )
             .await;
+        // A prompted turn ends when the adapter answers its prompt, which the
+        // cancel makes it do. An unprompted one has no prompt to answer, so it
+        // is ended here rather than left for an `idle` a stopped cycle may not
+        // send.
+        if unprompted {
+            self.shared.close_unprompted(Ending::Stopped, None).await;
+        }
+    }
+
+    /// Whether the agent is in the middle of a turn nobody prompted.
+    pub fn working_unprompted(&self) -> bool {
+        self.shared
+            .turn
+            .lock()
+            .is_ok_and(|t| t.as_ref().is_some_and(|t| t.unprompted.is_some()))
     }
 
     /// End the session and the process behind it.
@@ -3332,6 +3803,29 @@ impl AcpSession {
             bridge.stop();
         }
     }
+}
+
+/// Demote a turn that would report `Done` while missing part of its answer.
+///
+/// Shared by the two ways a turn ends — `finish` and an unprompted turn's
+/// close — because the rule is about the transcript, not about who asked.
+fn incomplete_unless_whole(
+    status: TurnStatus,
+    reason: ChatStopReason,
+    error: Option<String>,
+    lost: u64,
+    unwritten: usize,
+) -> (TurnStatus, ChatStopReason, Option<String>) {
+    if (lost == 0 && unwritten == 0) || status != TurnStatus::Done {
+        return (status, reason, error);
+    }
+    tracing::error!(lost, unwritten, "an ACP turn's transcript is incomplete");
+    let why = if unwritten > 0 {
+        format!("{unwritten} part(s) of this answer could not be saved, so it is incomplete.")
+    } else {
+        format!("{lost} update(s) from Claude Code were dropped, so this answer is incomplete.")
+    };
+    (TurnStatus::Failed, ChatStopReason::Error, Some(why))
 }
 
 /// What goes in `mcpServers`, for whichever way a session is being opened.
@@ -3395,7 +3889,7 @@ fn cwd_for_agent(cwd: &str, mounts: &super::mounts::MountMap) -> String {
 fn new_session_params(
     cwd: &str,
     bridge: Option<&Arc<bridge::Bridge>>,
-    meta: Option<protocol::SessionMeta>,
+    meta: protocol::SessionMeta,
     mounts: &super::mounts::MountMap,
 ) -> protocol::NewSessionParams {
     protocol::NewSessionParams {
@@ -3409,7 +3903,7 @@ fn load_session_params(
     resume: &str,
     cwd: &str,
     bridge: Option<&Arc<bridge::Bridge>>,
-    meta: Option<protocol::SessionMeta>,
+    meta: protocol::SessionMeta,
     mounts: &super::mounts::MountMap,
 ) -> protocol::LoadSessionParams {
     protocol::LoadSessionParams {
@@ -3536,12 +4030,12 @@ mod tests {
     async fn ask_for_the_thinking<T>(
         conversation_id: &str,
         what_happened: &str,
-        open: impl AsyncFn(Option<protocol::SessionMeta>) -> Result<T, String>,
+        open: impl AsyncFn(protocol::SessionMeta) -> Result<T, String>,
     ) -> Result<T, String> {
-        match open(Some(protocol::SessionMeta::default())).await {
+        match open(protocol::SessionMeta::with_thinking()).await {
             Ok(session) => Ok(session),
             Err(refused) => {
-                let plain = open(None).await;
+                let plain = open(protocol::SessionMeta::default()).await;
                 if plain.is_ok() {
                     tracing::warn!(
                         error = %refused,
@@ -3583,14 +4077,15 @@ mod tests {
     #[tokio::test]
     async fn a_session_that_cannot_take_the_options_is_opened_without_them() {
         let asked = std::sync::Mutex::new(Vec::new());
-        let record = |meta: &Option<protocol::SessionMeta>| asked.lock().unwrap().push(meta.is_some());
+        let record = |meta: &protocol::SessionMeta| asked.lock().unwrap().push(meta.thinking);
 
         // The old binary: everything is fine except the flag.
         let opened = ask_for_the_thinking("c1", "opened", async |meta| {
             record(&meta);
-            match meta {
-                Some(_) => Err("unknown option '--thinking-display'".to_string()),
-                None => Ok("sess-1"),
+            if meta.thinking {
+                Err("unknown option '--thinking-display'".to_string())
+            } else {
+                Ok("sess-1")
             }
         })
         .await;
@@ -3622,9 +4117,10 @@ mod tests {
         asked.lock().unwrap().clear();
         let refused = ask_for_the_thinking("c1", "opened", async |meta| {
             record(&meta);
-            Err::<&str, _>(match meta {
-                Some(_) => "unknown option '--thinking-display'".to_string(),
-                None => "not authenticated".to_string(),
+            Err::<&str, _>(if meta.thinking {
+                "unknown option '--thinking-display'".to_string()
+            } else {
+                "not authenticated".to_string()
             })
         })
         .await;
@@ -3783,8 +4279,19 @@ mod tests {
         // Through the constructors the openers actually use. Asserting on
         // `advertised` instead left this green while `session/load` was mutated
         // back to `Vec::new()` — the assertion was beside the defect.
-        let opened = new_session_params("/repo", Some(&bridge), None, &mounts::MountMap::default());
-        let resumed = load_session_params("s-1", "/repo", Some(&bridge), None, &mounts::MountMap::default());
+        let opened = new_session_params(
+            "/repo",
+            Some(&bridge),
+            protocol::SessionMeta::default(),
+            &mounts::MountMap::default(),
+        );
+        let resumed = load_session_params(
+            "s-1",
+            "/repo",
+            Some(&bridge),
+            protocol::SessionMeta::default(),
+            &mounts::MountMap::default(),
+        );
 
         assert_eq!(opened.mcp_servers.len(), 1, "a new session was given no tools");
         assert_eq!(
@@ -3839,9 +4346,9 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let opened = new_session_params("C:\\work\\repo", None, None, &mounts);
+        let opened = new_session_params("C:\\work\\repo", None, protocol::SessionMeta::default(), &mounts);
         assert_eq!(opened.cwd, "/repo");
-        let resumed = load_session_params("s-1", "C:\\work\\repo", None, None, &mounts);
+        let resumed = load_session_params("s-1", "C:\\work\\repo", None, protocol::SessionMeta::default(), &mounts);
         assert_eq!(
             resumed.cwd, "/repo",
             "a resumed session was sent a path the container cannot reach"
@@ -3854,11 +4361,11 @@ mod tests {
     fn an_ordinary_adapter_is_told_the_host_path() {
         let none = mounts::MountMap::default();
         assert_eq!(
-            new_session_params("C:\\work\\repo", None, None, &none).cwd,
+            new_session_params("C:\\work\\repo", None, protocol::SessionMeta::default(), &none).cwd,
             "C:\\work\\repo"
         );
         assert_eq!(
-            load_session_params("s-1", "/home/me/repo", None, None, &none).cwd,
+            load_session_params("s-1", "/home/me/repo", None, protocol::SessionMeta::default(), &none).cwd,
             "/home/me/repo"
         );
     }
@@ -3876,7 +4383,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(
-            new_session_params("/somewhere/else", None, None, &mounts).cwd,
+            new_session_params("/somewhere/else", None, protocol::SessionMeta::default(), &mounts).cwd,
             "/somewhere/else"
         );
     }
@@ -3884,17 +4391,33 @@ mod tests {
     #[test]
     fn a_session_with_no_bridge_advertises_an_empty_list() {
         assert!(
-            new_session_params("/repo", None, None, &mounts::MountMap::default())
-                .mcp_servers
-                .is_empty()
+            new_session_params(
+                "/repo",
+                None,
+                protocol::SessionMeta::default(),
+                &mounts::MountMap::default()
+            )
+            .mcp_servers
+            .is_empty()
         );
         assert!(
-            load_session_params("s-1", "/repo", None, None, &mounts::MountMap::default())
-                .mcp_servers
-                .is_empty()
+            load_session_params(
+                "s-1",
+                "/repo",
+                None,
+                protocol::SessionMeta::default(),
+                &mounts::MountMap::default()
+            )
+            .mcp_servers
+            .is_empty()
         );
-        let encoded =
-            serde_json::to_value(new_session_params("/repo", None, None, &mounts::MountMap::default())).unwrap();
+        let encoded = serde_json::to_value(new_session_params(
+            "/repo",
+            None,
+            protocol::SessionMeta::default(),
+            &mounts::MountMap::default(),
+        ))
+        .unwrap();
         assert_eq!(encoded["mcpServers"], serde_json::json!([]), "{encoded}");
     }
 
@@ -4106,46 +4629,8 @@ mod tests {
     async fn a_repeated_tool_call_is_not_a_second_card_once_its_round_has_closed() {
         let dir = std::env::temp_dir().join(format!("meridian-acp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let services = bare_services(&dir).await;
-
-        {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();
-            crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).unwrap();
-        }
-        let first = begin_assistant(
-            &services.db,
-            "c1",
-            "t1",
-            (None, Some(PROVIDER_LABEL)),
-            "claude-code",
-            None,
-        )
-        .await
-        .unwrap();
-
-        let shared = Shared {
-            services: services.clone(),
-            conversation_id: "c1".into(),
-            turn: Mutex::new(Some(TurnState {
-                turn_id: "t1".into(),
-                cancel: CancellationToken::new(),
-                row: OpenRow::new(first.clone()),
-                parent: first.clone(),
-                interjected: Vec::new(),
-                error_notice: None,
-            })),
-            model: Mutex::new(None),
-            config: Mutex::new(Vec::new()),
-            replay: Mutex::new(Replay::No),
-            announced: Mutex::new(HashMap::new()),
-            unwritten_rows: std::sync::atomic::AtomicUsize::new(0),
-            memory_lost: Mutex::new(false),
-            tools_lost: Mutex::new(false),
-            plan_reviews: Arc::new(crate::acp::plan_review::ReviewControl::default()),
-            agent_title: Mutex::new(None),
-            placeholder_title: String::new(),
-        };
+        let shared = live_turn(&dir).await;
+        let services = shared.services.clone();
 
         // The first announcement is the placeholder one: the adapter knows a
         // call is coming and not yet what it is.
@@ -4218,46 +4703,7 @@ mod tests {
     async fn a_thought_between_parallel_results_stays_on_the_same_round() {
         let dir = std::env::temp_dir().join(format!("meridian-acp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let services = bare_services(&dir).await;
-
-        {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();
-            crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).unwrap();
-        }
-        let first = begin_assistant(
-            &services.db,
-            "c1",
-            "t1",
-            (None, Some(PROVIDER_LABEL)),
-            "claude-code",
-            None,
-        )
-        .await
-        .unwrap();
-
-        let shared = Shared {
-            services: services.clone(),
-            conversation_id: "c1".into(),
-            turn: Mutex::new(Some(TurnState {
-                turn_id: "t1".into(),
-                cancel: CancellationToken::new(),
-                row: OpenRow::new(first.clone()),
-                parent: first.clone(),
-                interjected: Vec::new(),
-                error_notice: None,
-            })),
-            model: Mutex::new(None),
-            config: Mutex::new(Vec::new()),
-            replay: Mutex::new(Replay::No),
-            announced: Mutex::new(HashMap::new()),
-            unwritten_rows: std::sync::atomic::AtomicUsize::new(0),
-            memory_lost: Mutex::new(false),
-            tools_lost: Mutex::new(false),
-            plan_reviews: Arc::new(crate::acp::plan_review::ReviewControl::default()),
-            agent_title: Mutex::new(None),
-            placeholder_title: String::new(),
-        };
+        let shared = live_turn(&dir).await;
 
         shared.absorb(update(call("A", "Bash", serde_json::json!({})))).await;
         shared.absorb(update(call("B", "Read", serde_json::json!({})))).await;
@@ -4305,7 +4751,7 @@ mod tests {
     /// A conversation `c1` with turn `t1` running and its first assistant row
     /// open — the state `prompt_with` leaves a session in once the prompt is
     /// out.
-    async fn live_turn(dir: &std::path::Path) -> Shared {
+    pub(super) async fn live_turn(dir: &std::path::Path) -> Shared {
         let services = bare_services(dir).await;
         {
             let mut conn = services.db.get().unwrap();
@@ -4332,6 +4778,8 @@ mod tests {
                 parent: first,
                 interjected: Vec::new(),
                 error_notice: None,
+                trigger: TurnTrigger::User,
+                unprompted: None,
             })),
             model: Mutex::new(None),
             config: Mutex::new(Vec::new()),
@@ -4343,6 +4791,11 @@ mod tests {
             plan_reviews: Arc::new(crate::acp::plan_review::ReviewControl::default()),
             agent_title: Mutex::new(None),
             placeholder_title: String::new(),
+            me: Weak::new(),
+            bridge: None,
+            peer: OnceLock::new(),
+            woken_by: Mutex::new(None),
+            opening: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -4530,5 +4983,328 @@ mod tests {
         let held = shared.config_options();
         assert_eq!(held.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), vec!["model"]);
         assert_eq!(held[0].current_str(), Some("haiku"));
+    }
+}
+
+/// Turns the agent starts by itself. The frames are the ones
+/// `tests/acp_autonomous_probe.rs` recorded from adapter 0.84.0, trimmed to
+/// what each case is about.
+#[cfg(test)]
+mod unprompted {
+    use super::*;
+    use serde_json::json;
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<serde_json::Value>>);
+
+    impl crate::events::EventSink for Recorder {
+        fn emit(&self, _channel: &str, payload: &serde_json::Value) -> Result<(), String> {
+            self.0.lock().unwrap().push(payload.clone());
+            Ok(())
+        }
+    }
+
+    /// A hosted conversation between turns: one finished turn on record, its
+    /// row at the head, and nothing running. Built from `live_turn` with its
+    /// turn ended, so the setup is the one the other session tests use.
+    async fn between_turns(dir: &std::path::Path) -> (Arc<Shared>, Arc<Recorder>, String) {
+        let shared = super::tests::live_turn(dir).await;
+        let head = shared
+            .turn
+            .lock()
+            .unwrap()
+            .take()
+            .expect("live_turn opens a turn")
+            .row
+            .message_id;
+        crate::agent::turn_record::finish(&shared.services.db, "t1", TurnStatus::Done, None).await;
+        let recorder = Arc::new(Recorder::default());
+        shared.services.events.register(recorder.clone(), false);
+        (Arc::new(shared), recorder, head)
+    }
+
+    async fn sdk(shared: &Shared, message: serde_json::Value) {
+        shared
+            .notification(
+                "_claude/sdkMessage".into(),
+                json!({ "sessionId": "s1", "message": message }),
+            )
+            .await;
+    }
+
+    async fn state(shared: &Shared, state: &str) {
+        sdk(
+            shared,
+            json!({ "type": "system", "subtype": "session_state_changed", "state": state, "uuid": "u", "session_id": "s1" }),
+        )
+        .await;
+    }
+
+    async fn update(shared: &Shared, update: serde_json::Value) {
+        shared
+            .notification("session/update".into(), json!({ "sessionId": "s1", "update": update }))
+            .await;
+    }
+
+    fn text(chunk: &str) -> serde_json::Value {
+        json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": chunk } })
+    }
+
+    fn bash(id: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": id,
+            "title": "echo followup",
+            "kind": "execute",
+            "status": "pending",
+            "rawInput": { "command": "echo followup" },
+            "_meta": { "claudeCode": { "toolName": "Bash" } },
+        })
+    }
+
+    fn completed(id: &str, output: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            "status": "completed",
+            "content": [{ "type": "content", "content": { "type": "text", "text": output } }],
+        })
+    }
+
+    fn task_notification(task_id: &str) -> serde_json::Value {
+        json!({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": task_id,
+            "tool_use_id": "toolu_013G3XDsbHQWwBaf2CFJkoBd",
+            "status": "completed",
+            "output_file": "C:\\tmp\\bg.output",
+            "summary": "Background command \"ping\" completed (exit code 0)",
+            "uuid": "u",
+            "session_id": "s1",
+        })
+    }
+
+    fn turns(shared: &Shared) -> Vec<crate::db::models::turn::TurnRow> {
+        let mut conn = shared.services.db.get().unwrap();
+        crate::db::ops::turn::list_for_conversation(&mut conn, "c1")
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.id != "t1")
+            .collect()
+    }
+
+    fn rows(shared: &Shared, turn_id: &str) -> Vec<crate::db::models::message::MessageRow> {
+        let mut conn = shared.services.db.get().unwrap();
+        crate::db::ops::message::list_messages(&mut conn, "c1")
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.turn_id.as_deref() == Some(turn_id))
+            .collect()
+    }
+
+    fn lease_is_free(shared: &Shared) -> bool {
+        Arc::clone(&shared.services.turns)
+            .try_acquire_turn_with("c1", TurnOrigin::Desktop, "probe".into(), CancellationToken::new())
+            .is_ok()
+    }
+
+    /// **The case the whole of this exists for**, in the order 0.84.0 sends it:
+    /// the completion, `running`, prose, a call and its result, more prose,
+    /// `idle`. All of it used to fall on the floor for want of a turn.
+    #[tokio::test]
+    async fn a_background_task_finishing_after_its_turn_gets_a_turn_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, recorder, head) = between_turns(dir.path()).await;
+
+        sdk(&shared, task_notification("bg273fiw8")).await;
+        state(&shared, "running").await;
+        assert!(
+            shared.with_turn(|_| ()).is_none(),
+            "`running` opens nothing: a stopped session still reports it, with no output behind"
+        );
+        update(&shared, text("后台 ping 已完成。")).await;
+        update(&shared, bash("toolu_B")).await;
+        update(&shared, completed("toolu_B", "followup")).await;
+        update(&shared, text("done")).await;
+        assert!(!lease_is_free(&shared), "the turn holds the conversation while it runs");
+        state(&shared, "idle").await;
+
+        assert!(shared.with_turn(|_| ()).is_none(), "idle ends it");
+        assert!(lease_is_free(&shared), "and gives the conversation back");
+
+        let turns = turns(&shared);
+        assert_eq!(turns.len(), 1, "one turn for the whole cycle");
+        let turn = &turns[0];
+        assert_eq!(turn.trigger, "task_completion");
+        assert_eq!(
+            turn.trigger_ref.as_deref(),
+            Some("bg273fiw8"),
+            "and it names what woke it"
+        );
+        assert_eq!(turn.status, "done");
+        assert_eq!(
+            turn.origin, "claude_code",
+            "still Claude Code's turn, for billing and blame"
+        );
+
+        let rows = rows(&shared, &turn.id);
+        let assistants: Vec<_> = rows.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(assistants.len(), 2, "round by round, as a prompted turn is written");
+        assert_eq!(
+            assistants[0].parent_id.as_deref(),
+            Some(head.as_str()),
+            "hung off the head"
+        );
+        assert!(assistants[0].content.contains("后台 ping 已完成"));
+        assert!(assistants[1].content.contains("done"));
+        assert!(rows.iter().any(|m| m.role == "tool" && m.content.contains("followup")));
+
+        let events = recorder.0.lock().unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "message_start" && e["turn_id"] == turn.id.as_str())
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert!(
+            starts.iter().all(|e| e["trigger"] == "task_completion"),
+            "every round says what set the turn going, not only the first: {starts:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "stop" && e["turn_id"] == turn.id.as_str()),
+            "and the window is told it ended"
+        );
+    }
+
+    /// The one that was cutting work off: a permission asked with nothing
+    /// running used to be answered `cancelled` on the spot, which the adapter
+    /// reads as aborting the call. Now it opens a turn and draws a card.
+    #[tokio::test]
+    async fn a_permission_asked_with_nothing_running_is_asked_on_a_turn_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _recorder, _head) = between_turns(dir.path()).await;
+
+        let asking = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                shared
+                    .request(
+                        "session/request_permission".into(),
+                        json!({
+                            "sessionId": "s1",
+                            "toolCall": { "toolCallId": "toolu_P", "title": "git add -A", "rawInput": { "command": "git add -A" } },
+                            "options": [
+                                { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                                { "optionId": "reject", "name": "Reject", "kind": "reject_once" },
+                            ],
+                        }),
+                    )
+                    .await
+            })
+        };
+
+        let mut waited = 0;
+        while shared.services.approvals.lock().is_empty() {
+            assert!(!asking.is_finished(), "answered without anybody being asked");
+            waited += 1;
+            assert!(waited < 300, "no card was drawn");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let turn_id = shared
+            .with_turn(|t| t.turn_id.clone())
+            .expect("a turn was opened for the question");
+        assert!(
+            shared
+                .services
+                .approvals
+                .lock()
+                .values()
+                .all(|pending| pending.turn_id == turn_id),
+            "the card belongs to that turn"
+        );
+        assert_eq!(
+            turns(&shared)[0].trigger,
+            "agent_autonomous",
+            "nothing said what woke it"
+        );
+
+        shared.close_unprompted(Ending::Stopped, None).await;
+        asking.await.unwrap().unwrap();
+        assert_eq!(turns(&shared)[0].status, "cancelled");
+    }
+
+    /// A prompted turn's own `idle` comes after its reply, while `finish` is
+    /// still taking it down. Ending it here too would race `finish` for the
+    /// same state.
+    #[tokio::test]
+    async fn an_idle_ends_only_a_turn_nobody_prompted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _recorder, head) = between_turns(dir.path()).await;
+        if let Ok(mut slot) = shared.turn.lock() {
+            *slot = Some(TurnState {
+                turn_id: "t0".into(),
+                cancel: CancellationToken::new(),
+                row: OpenRow::new(head.clone()),
+                parent: head,
+                interjected: Vec::new(),
+                error_notice: None,
+                trigger: TurnTrigger::User,
+                unprompted: None,
+            });
+        }
+        state(&shared, "idle").await;
+        assert!(
+            shared.with_turn(|_| ()).is_some(),
+            "the prompted turn is `finish`'s to end"
+        );
+    }
+
+    /// Something else holds the conversation — a `!` command, a prompt being
+    /// sent. The output has nowhere to go, and taking the lease from under
+    /// its holder would be worse than losing it.
+    #[tokio::test]
+    async fn a_busy_conversation_is_not_taken_from_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _recorder, _head) = between_turns(dir.path()).await;
+        let held = Arc::clone(&shared.services.turns)
+            .try_acquire_turn_with("c1", TurnOrigin::Desktop, "other".into(), CancellationToken::new())
+            .unwrap();
+        update(&shared, text("hello")).await;
+        assert!(shared.with_turn(|_| ()).is_none());
+        assert!(turns(&shared).is_empty(), "no record of a turn that never ran");
+        drop(held);
+    }
+
+    /// A completion whose cycle said nothing opened no turn — and must not
+    /// lend its name to whatever the agent does next.
+    #[tokio::test]
+    async fn a_cycle_that_said_nothing_does_not_name_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _recorder, _head) = between_turns(dir.path()).await;
+        sdk(&shared, task_notification("bg-silent")).await;
+        state(&shared, "running").await;
+        state(&shared, "idle").await;
+        assert!(turns(&shared).is_empty(), "a cycle with no output is no turn");
+
+        update(&shared, text("something else")).await;
+        state(&shared, "idle").await;
+        let turns = turns(&shared);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].trigger, "agent_autonomous");
+        assert_eq!(turns[0].trigger_ref, None);
+    }
+
+    /// A load recites history as ordinary updates; none of it is the agent
+    /// doing anything now, and none of it may open a turn.
+    #[tokio::test]
+    async fn a_recital_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _recorder, _head) = between_turns(dir.path()).await;
+        shared.set_replay(Replay::Discard);
+        update(&shared, text("said long ago")).await;
+        assert!(shared.with_turn(|_| ()).is_none());
+        assert!(turns(&shared).is_empty());
     }
 }

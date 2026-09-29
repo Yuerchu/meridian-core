@@ -549,9 +549,9 @@ pub struct NewSessionParams {
     /// route to the same side effects. The distinction is ownership rather than
     /// the field: one of these is ours to answer for.
     pub mcp_servers: Vec<serde_json::Value>,
-    /// `None` is the second attempt — see [`SessionMeta`] for why there is one.
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    pub meta: Option<SessionMeta>,
+    /// What is passed through to the SDK — see [`SessionMeta`].
+    #[serde(rename = "_meta")]
+    pub meta: SessionMeta,
 }
 
 /// What a session-opening request asks the adapter to pass through to the SDK.
@@ -591,15 +591,93 @@ pub struct NewSessionParams {
 /// session it would otherwise cost. `--help` and `--version` are no evidence
 /// here: commander answers both before it validates anything, which is what made
 /// an unknown flag look harmless.
-#[derive(Debug, Serialize)]
-pub struct SessionMeta(serde_json::Value);
+///
+/// **The other thing it carries is not droppable, and does not need to be.**
+/// `emitRawSDKMessages` is read by the adapter itself rather than handed to the
+/// CLI, so no binary can refuse it; it is what makes the agent's own turns
+/// visible — see [`SdkMessage`]. So the retry drops the display and keeps the
+/// subscription, and `Default` is that retry: a session without the one
+/// optional ask.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SessionMeta {
+    /// Whether to ask for `--thinking-display summarized`.
+    pub thinking: bool,
+}
 
-impl Default for SessionMeta {
-    fn default() -> Self {
-        Self(serde_json::json!({
-            "claudeCode": { "options": { "extraArgs": { "thinking-display": "summarized" } } }
-        }))
+impl SessionMeta {
+    /// The first attempt: everything, the droppable ask included.
+    pub fn with_thinking() -> Self {
+        Self { thinking: true }
     }
+}
+
+impl Serialize for SessionMeta {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut claude_code = serde_json::json!({ "emitRawSDKMessages": sdk_message_filter() });
+        if self.thinking {
+            claude_code["options"] = serde_json::json!({ "extraArgs": { "thinking-display": "summarized" } });
+        }
+        serde_json::json!({ "claudeCode": claude_code }).serialize(serializer)
+    }
+}
+
+/// The raw SDK messages this client asks to be forwarded, and nothing else.
+///
+/// **Narrow on purpose.** They arrive as `_claude/sdkMessage` notifications,
+/// through the same bounded queue as `session/update`; asking for every message
+/// (`true`) would double the traffic on the one pipe a turn's own output travels
+/// through, and a full queue drops updates — which fails the turn. These two are
+/// a handful per turn.
+fn sdk_message_filter() -> serde_json::Value {
+    serde_json::json!([
+        { "type": "system", "subtype": "session_state_changed" },
+        { "type": "system", "subtype": "task_notification" },
+    ])
+}
+
+/// `_claude/sdkMessage`: one raw SDK message the adapter forwarded because
+/// [`SessionMeta`] asked for it.
+///
+/// **This is how a turn nobody asked for becomes visible.** A background
+/// command that finishes after the prompt which started it was answered makes
+/// the CLI run a cycle of its own — the model answering the completion — with
+/// no `session/prompt` open. Its output arrives as ordinary `session/update`s;
+/// what nothing else says is where it ends. Measured against 0.84.0
+/// (`tests/acp_autonomous_probe.rs`):
+///
+/// ```text
+/// user turn:  running → … → [prompt reply] → idle          (idle after the reply)
+/// later:      task_notification(completed) → running → text, tool calls → idle
+/// ```
+///
+/// So `idle` closes such a turn, and a `task_notification` just before it says
+/// what woke the agent. `running` is not what opens one — see
+/// `acp::session`'s unprompted turns for why the first real output does.
+#[derive(Debug, Deserialize)]
+pub struct SdkMessageParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub message: SdkMessage,
+}
+
+/// The two SDK messages [`sdk_message_filter`] subscribes to.
+///
+/// Everything else on them — `uuid`, `session_id`, the task's usage — is
+/// passed over: these are the CLI's own messages relayed verbatim and carry
+/// whatever the CLI version has, and none of it decides anything here.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "subtype", rename_all = "snake_case")]
+pub enum SdkMessage {
+    SessionStateChanged { state: SdkSessionState },
+    TaskNotification { task_id: String, status: String },
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum SdkSessionState {
+    Idle,
+    Running,
+    RequiresAction,
 }
 
 /// Pick a session up where it was left, instead of starting one.
@@ -623,9 +701,9 @@ pub struct LoadSessionParams {
     /// The same options a new session carries, for the same reason: a resumed
     /// session builds its query through the same call, so leaving it off here
     /// would mean thinking is shown until the app is restarted and never after.
-    /// `None` is the second attempt, as above.
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    pub meta: Option<SessionMeta>,
+    /// Without the thinking display on the second attempt, as above.
+    #[serde(rename = "_meta")]
+    pub meta: SessionMeta,
 }
 
 /// Everything the agent has on disk, optionally narrowed to one directory.
@@ -1592,18 +1670,28 @@ mod tests {
     /// **And the second attempt has to leave no trace of the first.** A `claude`
     /// that does not know the flag exits before it runs, so the retry is the
     /// only thing standing between an old binary and no hosted session at all —
-    /// which means `_meta` must be *absent* rather than `null`, since an
-    /// explicit null is a member the adapter would read.
+    /// which means `options` must be *absent* rather than `null`, since an
+    /// explicit null is a member the adapter would read. The SDK-message
+    /// subscription stays on both: it is read by the adapter, not the CLI, so
+    /// nothing can refuse it, and dropping it would make the agent's own turns
+    /// invisible again.
     #[test]
     fn a_session_asks_for_the_thinking_to_be_displayed_and_can_stop_asking() {
+        let filter = serde_json::json!([
+            { "type": "system", "subtype": "session_state_changed" },
+            { "type": "system", "subtype": "task_notification" },
+        ]);
         let expected = serde_json::json!({
-            "claudeCode": { "options": { "extraArgs": { "thinking-display": "summarized" } } }
+            "claudeCode": {
+                "emitRawSDKMessages": filter,
+                "options": { "extraArgs": { "thinking-display": "summarized" } },
+            }
         });
 
         let new = serde_json::to_value(NewSessionParams {
             cwd: "/work".into(),
             mcp_servers: Vec::new(),
-            meta: Some(SessionMeta::default()),
+            meta: SessionMeta::with_thinking(),
         })
         .unwrap();
         assert_eq!(new["_meta"], expected);
@@ -1611,7 +1699,7 @@ mod tests {
         let load = serde_json::to_value(LoadSessionParams {
             session_id: "sess-7".into(),
             cwd: "/work".into(),
-            meta: Some(SessionMeta::default()),
+            meta: SessionMeta::with_thinking(),
             ..Default::default()
         })
         .unwrap();
@@ -1630,11 +1718,61 @@ mod tests {
             })
             .unwrap(),
         ] {
-            assert!(
-                retry.get("_meta").is_none(),
-                "the retry must not send the member at all, not even as null: {retry}"
+            assert_eq!(
+                retry["_meta"],
+                serde_json::json!({ "claudeCode": { "emitRawSDKMessages": filter } }),
+                "the retry drops the flag and nothing else — not even as null: {retry}"
             );
         }
+    }
+
+    /// The two forwarded SDK messages, as 0.84.0 sent them in
+    /// `tests/acp_autonomous_probe.rs` — carrying fields this client has no
+    /// use for, which must not make them unreadable. An unreadable `idle` would
+    /// leave every unprompted turn to the watchdog.
+    #[test]
+    fn a_forwarded_sdk_message_is_read_past_what_it_does_not_need() {
+        let state: SdkMessageParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "5b47b739",
+            "message": {
+                "type": "system",
+                "subtype": "session_state_changed",
+                "state": "idle",
+                "uuid": "9e0c",
+                "session_id": "5b47b739",
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            state.message,
+            SdkMessage::SessionStateChanged {
+                state: SdkSessionState::Idle
+            }
+        );
+
+        let task: SdkMessageParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "5b47b739",
+            "message": {
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "bg273fiw8",
+                "tool_use_id": "toolu_013G3XDsbHQWwBaf2CFJkoBd",
+                "status": "completed",
+                "output_file": "C:\\Users\\x\\bg273fiw8.output",
+                "summary": "Background command \"ping\" completed (exit code 0)",
+                "usage": { "total_tokens": 0, "tool_uses": 0, "duration_ms": 13000 },
+                "uuid": "1f2a",
+                "session_id": "5b47b739",
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            task.message,
+            SdkMessage::TaskNotification {
+                task_id: "bg273fiw8".into(),
+                status: "completed".into()
+            }
+        );
     }
 
     /// An error response is still a response: the pipe is fine, the agent said

@@ -658,6 +658,12 @@ mod hosted {
         let Some(session) = services.acp.get(conversation_id).filter(|s| s.is_alive()) else {
             return;
         };
+        // The agent is answering a background task by itself. There is nothing
+        // to steer into and no prompt to send beside it; that turn's close
+        // pumps again, which is when the front of the queue goes.
+        if session.working_unprompted() {
+            return;
+        }
 
         // Which of the two modes may go depends on whether there is a turn to
         // interject into — and the answer can change under us, which is why
