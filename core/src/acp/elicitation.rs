@@ -619,6 +619,13 @@ pub async fn ask(
             sender: tx,
         },
     );
+    tracing::info!(
+        approval_id = %approval_id,
+        call_id = %call_id,
+        message_id = %turn.assistant_message_id,
+        conversation_id,
+        "ACP elicitation asked"
+    );
 
     let event = ChatStreamEvent::ToolApprovalReq {
         approval_id: approval_id.clone(),

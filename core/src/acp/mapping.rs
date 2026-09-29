@@ -182,12 +182,27 @@ pub fn notice_of(record: &SessionFailureRecord) -> Option<SessionNoticeRecord> {
 /// than results — which never settles, so every later round of the turn lands
 /// on the same row and the transcript reader draws the finished turn as
 /// `interrupted`. So the call and its result are both said here, call first.
+///
+/// **An announcement can carry the diff too**, and for an AIR client it is the
+/// only place an Edit's text is before it runs: from 0.82 its `rawInput` leaves
+/// out `old_string` and `new_string` ("the file text of an edit only in the
+/// diff"). Read as a bare call, the approval card for an edit showed nothing
+/// of what it would change. The diff is said after the call, so it lands on the
+/// call it belongs to.
 pub fn effects_of(update: SessionUpdate) -> Vec<Effect> {
-    let finished = match &update {
-        SessionUpdate::ToolCall(call) => result_of(call),
-        _ => None,
+    let (diffs, finished) = match &update {
+        SessionUpdate::ToolCall(call) => {
+            let diffs = diffs_of(call);
+            let diffs = (!diffs.is_empty()).then(|| Effect::ToolCallDiff {
+                call_id: call.tool_call_id.clone(),
+                diffs,
+            });
+            (diffs, result_of(call))
+        }
+        _ => (None, None),
     };
     let mut effects = vec![effect_of(update)];
+    effects.extend(diffs);
     effects.extend(finished);
     effects
 }
@@ -253,7 +268,8 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
             // An update carrying neither is the ordinary "still going" beat.
             _ if call.raw_input.is_some() || call.meta.is_some() || call.title.is_some() => Effect::ToolCallRevised {
                 call_id: call.tool_call_id.clone(),
-                tool_name: tool_name_of(&call),
+                // Empty is "unchanged", which is what `revise` reads it as.
+                tool_name: explicit_tool_name(&call).unwrap_or_default().to_string(),
                 arguments: arguments_of(&call),
             },
             _ => Effect::Ignored,
@@ -286,6 +302,23 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
     }
 }
 
+/// The tool's name, when this message says it — and nothing else.
+///
+/// A revision has to use this rather than [`tool_name_of`]. ACP merges an
+/// update into the call it names, a field left out means "unchanged", and from
+/// 0.82 the adapter leaves out every field and `_meta` key that has not changed
+/// for an AIR client. Falling back to `title`, `kind` and finally `"tool"`
+/// there turned every card that received an update into one called "tool".
+pub fn explicit_tool_name(call: &ToolCall) -> Option<&str> {
+    call.meta
+        .as_ref()
+        .and_then(|m| m.claude_code.as_ref())
+        .and_then(|c| c.tool_name.as_deref())
+        .or(call.name.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
 /// What to label the tool card with.
 ///
 /// ACP's own fields cannot answer this: `title` is prose written for a person
@@ -311,16 +344,7 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
 /// top-level `ExitPlanMode` — titled "Ready to code?" — never reached the plan
 /// review, and the notification stack could not recognise a `Read` as a read.
 pub fn tool_name_of(call: &ToolCall) -> String {
-    let from_meta = call
-        .meta
-        .as_ref()
-        .and_then(|m| m.claude_code.as_ref())
-        .and_then(|c| c.tool_name.as_deref())
-        .map(str::trim)
-        .filter(|t| !t.is_empty());
-
-    from_meta
-        .or(call.name.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+    explicit_tool_name(call)
         .or(call.title.as_deref())
         .map(str::trim)
         .filter(|t| !t.is_empty())
@@ -834,6 +858,24 @@ mod tests {
     /// A call announced already finished is the call *and* its result. The
     /// adapter's `memory_recall` frame, as it sends it: one `tool_call`,
     /// `completed`, never updated.
+    #[test]
+    fn an_edit_announced_with_its_diff_carries_it() {
+        // An Edit as adapter 0.84 announces it to an AIR client: the text only
+        // in the diff, none of it in `rawInput`.
+        let effects = effects_of(update(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"e-1","title":"Edit a.rs","kind":"edit",
+                "status":"pending","rawInput":{"file_path":"a.rs"},
+                "content":[{"type":"diff","path":"a.rs","oldText":"x","newText":"y"}],
+                "_meta":{"claudeCode":{"toolName":"Edit"}}}"#,
+        ));
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        let Effect::ToolCallDiff { call_id, diffs } = &effects[1] else {
+            panic!("the diff came after the call: {effects:?}");
+        };
+        assert_eq!(call_id, "e-1");
+        assert_eq!(diffs[0].new_text, "y");
+    }
+
     #[test]
     fn a_call_announced_finished_carries_its_result() {
         let effects = effects_of(update(

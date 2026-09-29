@@ -15,7 +15,7 @@
 //! server against the real adapter: POST only, no SSE, no `Mcp-Session-Id`, no
 //! GET stream, no DELETE. The client asks for a notification stream once, takes
 //! `405`, and carries on. Read that file before adding anything here — and
-//! re-run it, since the adapter is deliberately unpinned.
+//! re-run it before moving the pinned adapter version.
 //!
 //! # The two lifetimes
 //!
