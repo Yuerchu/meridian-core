@@ -3,6 +3,8 @@ pub mod apply_patch;
 pub mod ask_user;
 pub mod backend;
 #[cfg(not(target_os = "android"))]
+pub mod background;
+#[cfg(not(target_os = "android"))]
 pub mod catalog;
 pub mod command_shell;
 pub mod custom;
@@ -106,6 +108,13 @@ pub struct ToolContext {
     /// [`crate::sandbox::CommandSandbox`].
     #[cfg(not(target_os = "android"))]
     pub sandbox_policy: crate::sandbox::CommandSandbox,
+    /// What starts a command in the background. `None` everywhere it is not
+    /// offered — a sub-agent, a QQ session, a reviewer, the tool bridge — which
+    /// is how `run_in_background` is refused there: a task that outlives its
+    /// turn needs a conversation somebody returns to, and the desktop's own
+    /// turns are the only ones that have one.
+    #[cfg(not(target_os = "android"))]
+    pub background: Option<crate::background::Launcher>,
     pub tool_secrets: HashMap<String, String>,
     /// Cancelled when the owning chat turn is stopped; long-running tools must
     /// observe it and terminate their work.
@@ -617,6 +626,12 @@ impl ToolRegistry {
         ];
         #[cfg(not(target_os = "android"))]
         tools.push(Arc::new(run_command::RunCommandTool));
+        #[cfg(not(target_os = "android"))]
+        tools.extend([
+            Arc::new(background::ReadBackgroundOutputTool) as Arc<dyn Tool>,
+            Arc::new(background::StopBackgroundTaskTool),
+            Arc::new(background::ListBackgroundTasksTool),
+        ]);
         Self {
             builtin: tools,
             custom: std::sync::RwLock::new(Vec::new()),
@@ -692,6 +707,8 @@ mod tests {
             sea: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets: HashMap::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,
@@ -729,6 +746,8 @@ mod tests {
             sea: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets: HashMap::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,

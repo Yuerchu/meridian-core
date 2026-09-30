@@ -109,7 +109,10 @@ impl Tool for RunCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output (stdout and stderr). The command runs in the project's working directory. Output is truncated at 256KB. Timeout: 120 seconds."
+        "Execute a shell command and return its output (stdout and stderr). The command runs in the project's working directory. Output is truncated at 256KB. Timeout: 120 seconds. \
+         Set run_in_background for anything that takes longer or does not end on its own (a server, a watcher, a long build): \
+         it returns a task id at once, keeps running for up to 4 hours, and you are told when it finishes. \
+         Read its output with read_background_output and stop it with stop_background_task."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -121,6 +124,10 @@ impl Tool for RunCommandTool {
                     "description": "The shell command to execute"
                 },
                 "description": super::description_property(),
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Run it in the background and return a task id instead of waiting for it."
+                },
             },
             "required": ["command"]
         })
@@ -132,6 +139,10 @@ impl Tool for RunCommandTool {
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String> {
         let command = args["command"].as_str().ok_or("missing 'command' argument")?;
+
+        if args["run_in_background"].as_bool() == Some(true) {
+            return start_in_background(command, args["description"].as_str(), context).await;
+        }
 
         match execute_command(command, context).await {
             Ok(result) => Ok(result.formatted()),
@@ -177,17 +188,7 @@ async fn execute_command_inner(
     }
 
     let cwd = context.working_dir_or_current();
-
-    // `context.shell` describes this machine, and a container is not this
-    // machine: its argv resolves *inside*, where neither `C:\Program
-    // Files\Git\bin\bash.exe` nor necessarily `/bin/bash` exists — the
-    // default image is Alpine, which ships `sh` alone. So a containered
-    // command gets the one shell the POSIX image contract promises, and the
-    // host shell selection applies only where the command actually runs.
-    // `CommandShell::select` is that decision, and the base prompt tells the
-    // model about the same one.
-    let containered = context.sandbox_policy.is_container();
-    let shell_argv: Vec<String> = super::command_shell::CommandShell::select(context.shell, containered).argv(command);
+    let shell_argv = shell_argv(command, context);
 
     // With the settings unread there is no answer to where this command should
     // run, and the only one allowed to give it is the user — see
@@ -263,6 +264,60 @@ async fn execute_command_inner(
     Ok(result)
 }
 
+/// The argv that runs `command` in this context's shell.
+///
+/// `context.shell` describes this machine, and a container is not this
+/// machine: its argv resolves *inside*, where neither `C:\Program
+/// Files\Git\bin\bash.exe` nor necessarily `/bin/bash` exists — the
+/// default image is Alpine, which ships `sh` alone. So a containered
+/// command gets the one shell the POSIX image contract promises, and the
+/// host shell selection applies only where the command actually runs.
+/// `CommandShell::select` is that decision, and the base prompt tells the
+/// model about the same one.
+fn shell_argv(command: &str, context: &ToolContext) -> Vec<String> {
+    super::command_shell::CommandShell::select(context.shell, context.sandbox_policy.is_container()).argv(command)
+}
+
+/// Start `command` in the background and answer with its id.
+///
+/// The same approval already happened — this is reached through the tool, like
+/// the foreground path — and the same sandbox applies: the policy is handed to
+/// the task and the command runs through `sandbox::execute_teed`. What it does
+/// not get is the journal's command bracket: that compares tracked files before
+/// and after, and "after" is hours away, past any turn that could be told.
+async fn start_in_background(
+    command: &str,
+    description: Option<&str>,
+    context: &ToolContext,
+) -> Result<String, String> {
+    if command.trim().is_empty() {
+        return Err("command cannot be empty".into());
+    }
+    let (Some(launcher), Some(conversation_id)) = (&context.background, &context.conversation_id) else {
+        return Err("run_in_background is not available in this session; run the command in the foreground".into());
+    };
+    let policy = match context.sandbox_policy.policy() {
+        Ok(policy) => policy.cloned(),
+        Err(error) => return Err(super::encode_settings_unreadable(error)),
+    };
+    let row = launcher
+        .start(crate::background::Start {
+            conversation_id: conversation_id.clone(),
+            turn_id: context.turn_id.clone(),
+            command: command.to_string(),
+            description: description.map(str::to_string),
+            argv: shell_argv(command, context),
+            cwd: context.working_dir_or_current(),
+            policy,
+        })
+        .await?;
+    Ok(format!(
+        "Command running in background with ID: {}. You will be notified when it finishes. \
+         Read its output with read_background_output, or stop it with stop_background_task.",
+        row.id
+    ))
+}
+
 /// Heuristic ported from codex-rs/sandboxing/src/denial.rs, adjusted for
 /// Windows: a non-zero exit alone is not a denial — the output must show an
 /// access failure the restricted token would produce.
@@ -329,6 +384,8 @@ mod tests {
             db_pool: None,
             sea: None,
             sandbox_policy: crate::sandbox::CommandSandbox::Unreadable("database is locked".into()),
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets: Default::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,
@@ -432,6 +489,8 @@ mod tests {
                 conversation_id: Some("c-1".into()),
                 ..Default::default()
             })),
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets: Default::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,
@@ -445,6 +504,77 @@ mod tests {
         let argv = recorder.argv.lock().unwrap().clone().expect("the connector ran");
         assert_eq!(&argv[..2], &["sh".to_string(), "-c".to_string()], "{argv:?}");
         assert_eq!(argv[2], "echo hi");
+    }
+
+    fn host_context(dir: &std::path::Path, background: Option<crate::background::Launcher>) -> ToolContext {
+        ToolContext {
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            background,
+            ..unreadable_context(dir)
+        }
+    }
+
+    /// **Where nothing can be told, nothing runs in the background.** A
+    /// sub-agent, a QQ session and the reviewers have no launcher, because a
+    /// task that outlives its turn needs a conversation somebody comes back
+    /// to. The refusal says what to do instead, and nothing is started.
+    #[tokio::test]
+    async fn a_session_without_a_launcher_refuses_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let command = format!("echo ran > \"{}\"", marker.display().to_string().replace('\\', "/"));
+        let err = RunCommandTool
+            .execute(
+                serde_json::json!({ "command": command, "run_in_background": true }),
+                &host_context(dir.path(), None),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("foreground"), "{err}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!marker.exists());
+    }
+
+    /// With one, the call answers at once with the id the other tools take.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_background_answers_with_an_id_straight_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::services::bare_services(dir.path()).await;
+        crate::db::sea::execute_for_tests(
+            &services.sea,
+            "INSERT INTO conversations (id, title, is_pinned, is_archived, message_count, created_at, updated_at, fast_mode)
+             VALUES ('c-1', 't', 0, 0, 0, 0, 0, 0)",
+        )
+        .await
+        .unwrap();
+        let launcher = crate::background::Launcher::new(services.clone());
+        let context = host_context(dir.path(), Some(launcher));
+        let sleeper = if cfg!(windows) {
+            "ping -n 20 127.0.0.1 >NUL"
+        } else {
+            "sleep 20"
+        };
+        let started = std::time::Instant::now();
+        let answer = RunCommandTool
+            .execute(
+                serde_json::json!({ "command": sleeper, "run_in_background": true }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "did not wait for the command"
+        );
+        let id = answer
+            .strip_prefix("Command running in background with ID: ")
+            .and_then(|rest| rest.split('.').next())
+            .expect(&answer);
+        assert!(
+            services
+                .background_tasks
+                .stop("c-1", id, crate::background::StoppedBy::Model)
+        );
     }
 
     fn exec_res(exit_code: i32, stderr: &str, sandboxed: bool, timed_out: bool) -> ExecResult {

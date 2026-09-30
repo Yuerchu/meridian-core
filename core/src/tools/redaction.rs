@@ -358,6 +358,8 @@ mod tests {
             sea: Some(db.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets: HashMap::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,

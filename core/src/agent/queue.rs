@@ -439,8 +439,10 @@ where
 mod tests {
     use super::*;
 
+    /// Counts ordinary starts, and separately the turns started for a
+    /// background task.
     #[derive(Default)]
-    struct CountingStarter(std::sync::atomic::AtomicUsize);
+    struct CountingStarter(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
     impl crate::services::StartTurn for CountingStarter {
@@ -452,6 +454,96 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+
+        async fn start_unprompted(&self, _conversation_id: &str) -> Result<(), String> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A background task that ended goes ahead of the queue, and goes even
+    /// when the queue is held: it is something that happened, not an
+    /// instruction resting on the step that failed. One a person stopped, or
+    /// one lost to a restart, starts nothing.
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn an_ended_background_task_wakes_ahead_of_a_held_queue() {
+        use crate::db::entity::background_task::{BackgroundKind, BackgroundRunner, BackgroundState};
+        use crate::db::sea::ops::background_task as tasks;
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::services::bare_services(dir.path()).await;
+        let starter = std::sync::Arc::new(CountingStarter::default());
+        services.turn_starter.set(starter.clone()).ok().unwrap();
+        let task = async |id: &str, state: BackgroundState| {
+            services
+                .sea
+                .write(async |tx| {
+                    tasks::insert(
+                        tx,
+                        &tasks::BackgroundTaskInsert {
+                            id,
+                            conversation_id: "c1",
+                            runner: BackgroundRunner::Native,
+                            kind: BackgroundKind::Command,
+                            spawned_turn_id: None,
+                            command: Some("x"),
+                            description: None,
+                            cwd: None,
+                            sandbox: None,
+                            output_path: None,
+                            started_at: 1,
+                        },
+                    )
+                    .await?;
+                    tasks::finish(
+                        tx,
+                        id,
+                        &tasks::BackgroundTaskChangeset {
+                            state,
+                            exit_code: None,
+                            ended_reason: None,
+                            output_bytes: 0,
+                            output_truncated: false,
+                            ended_at: 2,
+                        },
+                    )
+                    .await
+                })
+                .await
+                .unwrap();
+        };
+        // A conversation with one follow-up queued and the queue held, as a
+        // failed turn leaves it.
+        crate::db::sea::execute_for_tests(
+            &services.sea,
+            "INSERT INTO conversations (id, title, is_pinned, is_archived, message_count, created_at, updated_at, fast_mode)
+             VALUES ('c1', 't', 0, 0, 0, 1, 1, 0);
+             INSERT INTO queued_prompts (id, conversation_id, content, delivery, position, created_at, held_at)
+             VALUES ('q1', 'c1', 'next', 'follow_up', 0, 3, 4);",
+        )
+        .await
+        .unwrap();
+        task("stopped", BackgroundState::Stopped).await;
+        task("lost", BackgroundState::Lost).await;
+        pump(&services, "c1").await;
+        assert_eq!(
+            starter.1.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a stop and a loss wake nothing"
+        );
+
+        task("done", BackgroundState::Completed).await;
+        pump(&services, "c1").await;
+        assert_eq!(
+            starter.1.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "held queue or not"
+        );
+        assert_eq!(
+            starter.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and ahead of the queue"
+        );
     }
 
     #[tokio::test]

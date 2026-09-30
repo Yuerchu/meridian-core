@@ -157,6 +157,8 @@ fn build_context(
         sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
         // None of the four read a credential. An empty map is the honest
         // description of that rather than an oversight.
+        #[cfg(not(target_os = "android"))]
+        background: None,
         tool_secrets: HashMap::new(),
         cancel: cancel.clone(),
         journal: None,

@@ -278,6 +278,8 @@ pub async fn bootstrap_with_secrets(
         #[cfg(not(target_os = "android"))]
         acp: crate::acp::AcpRegistry::new(),
         #[cfg(not(target_os = "android"))]
+        background_tasks: crate::background::BackgroundTasks::new(),
+        #[cfg(not(target_os = "android"))]
         containers: crate::container::DockerConnector::new(Default::default()),
         // Filled by the shell, which is the only half that knows how to run a
         // turn. Left empty a follow-up is never delivered, which is the right
@@ -457,6 +459,19 @@ pub(crate) async fn startup_recovery(
         Ok(0) => {}
         Ok(n) => tracing::warn!(deliveries = n, "reconciled plan review deliveries after restart"),
         Err(error) => tracing::error!(error = %error, "could not reconcile plan review deliveries"),
+    }
+    // Background commands run only inside the process that started them, so a
+    // native task still `running` here was being watched by a process that is
+    // gone. Marked lost rather than failed — the command may well have
+    // finished; nobody saw how — and it wakes nothing: the next turn in its
+    // conversation says so. Before anything can start a task of its own.
+    match sea
+        .write(async |tx| db::sea::ops::background_task::reconcile_lost(tx, now).await)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(tasks = n, "background commands left running by the previous session"),
+        Err(error) => tracing::error!(%error, "could not reconcile background commands"),
     }
     // Each its own write, as each was its own statement: one failing leaves the
     // others done, and the next startup retries it.

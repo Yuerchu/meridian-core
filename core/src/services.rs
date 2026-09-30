@@ -95,6 +95,9 @@ pub struct ServicesInner {
     /// child process — cannot exist.
     #[cfg(not(target_os = "android"))]
     pub acp: Arc<crate::acp::AcpRegistry>,
+    /// Background commands this process is running. See [`crate::background`].
+    #[cfg(not(target_os = "android"))]
+    pub background_tasks: Arc<crate::background::BackgroundTasks>,
     /// Where a conversation's commands run, when that is not this machine.
     ///
     /// Held here because a container outlives every command that enters it and
@@ -149,6 +152,11 @@ pub trait StartTurn: Send + Sync {
         conversation_id: &str,
         queued: &crate::db::models::queue::QueuedPromptRow,
     ) -> Result<(), String>;
+
+    /// Run one turn with nothing typed, to tell the model a background task
+    /// ended. The notices are claimed inside the turn, in the transaction
+    /// that writes them — see `crate::background::claim_notices`.
+    async fn start_unprompted(&self, conversation_id: &str) -> Result<(), String>;
 }
 
 impl Services {
@@ -209,6 +217,8 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         plan_files: Arc::new(crate::plan_files::PlanFileStore::new(dir)),
         #[cfg(not(target_os = "android"))]
         acp: crate::acp::AcpRegistry::new(),
+        #[cfg(not(target_os = "android"))]
+        background_tasks: crate::background::BackgroundTasks::new(),
         #[cfg(not(target_os = "android"))]
         containers: crate::container::DockerConnector::new(Default::default()),
         turn_starter: std::sync::OnceLock::new(),

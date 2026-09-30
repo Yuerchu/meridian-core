@@ -11,6 +11,7 @@
 
 pub mod assistant;
 pub mod assistant_emoji_pack;
+pub mod background_task;
 pub mod cached_model;
 pub mod composer_draft;
 pub mod conversation;
@@ -114,6 +115,7 @@ pub fn registered() -> Vec<EntityShape> {
     vec![
         shape_of::<assistant::Entity>(),
         shape_of::<assistant_emoji_pack::Entity>(),
+        shape_of::<background_task::Entity>(),
         shape_of::<cached_model::Entity>(),
         shape_of::<conversation::Entity>(),
         shape_of::<composer_draft::Entity>(),

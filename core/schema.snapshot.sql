@@ -393,3 +393,7 @@ CREATE INDEX "idx_skills_llm_name" ON "skills" ("llm_name" ASC);
 
 CREATE TABLE "skill_bindings_global" ( "dir_name" text NOT NULL PRIMARY KEY, FOREIGN KEY ("dir_name") REFERENCES "skills" ("dir_name") ON DELETE CASCADE );
 
+CREATE TABLE "background_tasks" ( "id" text NOT NULL PRIMARY KEY, "conversation_id" text NOT NULL, "runner" text NOT NULL, "external_id" text, "spawned_turn_id" text, "spawned_call_id" text, "kind" text NOT NULL, "command" text, "description" text, "cwd" text, "sandbox" text, "state" text NOT NULL, "exit_code" integer, "ended_reason" text, "output_path" text, "output_bytes" integer NOT NULL DEFAULT 0, "output_truncated" integer NOT NULL DEFAULT 0, "started_at" integer NOT NULL, "ended_at" integer, "notified_at" integer, "notified_turn_id" text, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE CASCADE, CHECK (runner IN ('native', 'claude_code')), CHECK (kind IN ('command', 'agent')), CHECK (state IN ('running', 'completed', 'failed', 'stopped', 'lost')), CHECK (output_truncated IN (0, 1)) );
+
+CREATE INDEX "idx_background_tasks_conversation" ON "background_tasks" ("conversation_id" ASC, "started_at" ASC);
+

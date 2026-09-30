@@ -467,6 +467,14 @@ fn append_capped(dst: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
     }
 }
 
+/// Every chunk of a command's output as it arrives, stdout and stderr alike.
+///
+/// What a background command writes its log with. Called from the threads that
+/// drain the pipes, in arrival order per stream, and on top of the bounded
+/// capture rather than instead of it — the capture still decides what the
+/// result carries.
+pub type OutputTee = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 /// Unified command execution entry point. On Windows with a restricting policy
 /// the command runs under the restricted-token sandbox; everywhere else it runs
 /// unsandboxed — but always with a bounded capture, a timeout that kills the
@@ -477,6 +485,24 @@ pub async fn execute(
     policy: Option<&SandboxPolicy>,
     timeout: Duration,
     cancel: &CancellationToken,
+) -> Result<ExecResult, ExecError> {
+    execute_teed(command, cwd, policy, timeout, cancel, None).await
+}
+
+/// [`execute`], with every chunk of output also handed to `tee` as it arrives.
+///
+/// **The same path, not a second one.** A background command is confined,
+/// timed and cancelled exactly as a foreground one is; the only difference is
+/// that somebody reads its output before it ends. A container cannot do that —
+/// the connector returns its output whole — so it is refused rather than run
+/// without the log it was started for.
+pub async fn execute_teed(
+    command: &[String],
+    cwd: &Path,
+    policy: Option<&SandboxPolicy>,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    tee: Option<OutputTee>,
 ) -> Result<ExecResult, ExecError> {
     if command.is_empty() {
         return Err(ExecError::Spawn("empty command".into()));
@@ -491,9 +517,9 @@ pub async fn execute(
         Some(SandboxBackend::WindowsRestrictedToken) => {
             let policy = policy.expect("matched on its own backend");
             if policy.allow_fs_write_outside_project {
-                execute_unsandboxed(command, cwd, timeout, cancel).await
+                execute_unsandboxed(command, cwd, timeout, cancel, tee).await
             } else {
-                execute_windows_sandboxed(command, cwd, policy, timeout, cancel).await
+                execute_windows_sandboxed(command, cwd, policy, timeout, cancel, tee).await
             }
         }
         // A policy asking for a backend this platform has no implementation
@@ -502,10 +528,17 @@ pub async fn execute(
         #[cfg(not(target_os = "windows"))]
         Some(SandboxBackend::WindowsRestrictedToken) => {
             tracing::warn!("a command asked for the Windows sandbox on a platform without one; running unconfined");
-            execute_unsandboxed(command, cwd, timeout, cancel).await
+            execute_unsandboxed(command, cwd, timeout, cancel, tee).await
         }
         Some(SandboxBackend::Container) => {
             let policy = policy.expect("matched on its own backend");
+            if tee.is_some() {
+                return Err(ExecError::Spawn(
+                    "a command in a container cannot run in the background: its output only comes back \
+                     once it has finished. Nothing was run."
+                        .into(),
+                ));
+            }
             // **Fails closed.** A policy that asks for a container and has no
             // connector, no conversation to place the command in, or no project
             // directory to mount is misconfigured — and running it on the host
@@ -528,7 +561,7 @@ pub async fn execute(
                 .execute(command, cwd, workspace, conversation_id, timeout, cancel)
                 .await
         }
-        Some(SandboxBackend::Host) | None => execute_unsandboxed(command, cwd, timeout, cancel).await,
+        Some(SandboxBackend::Host) | None => execute_unsandboxed(command, cwd, timeout, cancel, tee).await,
     }
 }
 
@@ -548,7 +581,7 @@ pub(crate) async fn run_client(
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(program.to_string());
     argv.extend_from_slice(args);
-    execute_unsandboxed(&argv, Path::new("."), timeout, cancel).await
+    execute_unsandboxed(&argv, Path::new("."), timeout, cancel, None).await
 }
 
 #[cfg(unix)]
@@ -564,7 +597,7 @@ fn kill_group(pid: Option<u32>, signal: i32) {
     }
 }
 
-async fn read_capped<R>(reader: Option<R>) -> (Vec<u8>, bool)
+async fn read_capped<R>(reader: Option<R>, tee: Option<OutputTee>) -> (Vec<u8>, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -579,6 +612,9 @@ where
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if let Some(tee) = &tee {
+                    tee(&chunk[..n]);
+                }
                 if append_capped(&mut buf, &chunk[..n], MAX_CAPTURE_BYTES) {
                     truncated = true;
                 }
@@ -606,6 +642,7 @@ async fn execute_unsandboxed(
     cwd: &Path,
     timeout: Duration,
     cancel: &CancellationToken,
+    tee: Option<OutputTee>,
 ) -> Result<ExecResult, ExecError> {
     let mut cmd = tokio::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
@@ -641,8 +678,8 @@ async fn execute_unsandboxed(
         }
     };
 
-    let stdout_task = tokio::spawn(read_capped(child.stdout.take()));
-    let stderr_task = tokio::spawn(read_capped(child.stderr.take()));
+    let stdout_task = tokio::spawn(read_capped(child.stdout.take(), tee.clone()));
+    let stderr_task = tokio::spawn(read_capped(child.stderr.take(), tee));
 
     enum Outcome {
         Exited(std::process::ExitStatus),
@@ -711,6 +748,7 @@ async fn execute_windows_sandboxed(
     policy: &SandboxPolicy,
     timeout: Duration,
     cancel: &CancellationToken,
+    tee: Option<OutputTee>,
 ) -> Result<ExecResult, ExecError> {
     use sandbox_windows::{acl, cap, process, token};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -733,7 +771,7 @@ async fn execute_windows_sandboxed(
             has_project_dir = policy.project_dir.is_some(),
             "sandbox requested but no writable root could be determined; running unsandboxed"
         );
-        return execute_unsandboxed(command, cwd, timeout, cancel).await;
+        return execute_unsandboxed(command, cwd, timeout, cancel, tee).await;
     }
 
     let sandbox_home = dirs::data_local_dir()
@@ -802,7 +840,11 @@ async fn execute_windows_sandboxed(
         let stdout_thread = {
             let buf = stdout_buf.clone();
             let trunc = truncated.clone();
+            let tee = tee.clone();
             process::read_handle_loop(spawned.stdout_read, move |chunk| {
+                if let Some(tee) = &tee {
+                    tee(chunk);
+                }
                 if append_capped(&mut buf.lock().unwrap(), chunk, MAX_CAPTURE_BYTES) {
                     trunc.store(true, Ordering::Relaxed);
                 }
@@ -812,7 +854,11 @@ async fn execute_windows_sandboxed(
         let stderr_thread = spawned.stderr_read.map(|h| {
             let buf = stderr_buf.clone();
             let trunc = truncated.clone();
+            let tee = tee.clone();
             process::read_handle_loop(h, move |chunk| {
+                if let Some(tee) = &tee {
+                    tee(chunk);
+                }
                 if append_capped(&mut buf.lock().unwrap(), chunk, MAX_CAPTURE_BYTES) {
                     trunc.store(true, Ordering::Relaxed);
                 }

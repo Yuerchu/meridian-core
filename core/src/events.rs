@@ -24,6 +24,7 @@ use tracing::debug;
 pub const CHAT_STREAM_CHANNEL: &str = "chat-stream";
 pub const CONVERSATION_UPDATED_CHANNEL: &str = "conversation-updated";
 pub const QUEUE_UPDATED_CHANNEL: &str = "queue-updated";
+pub const BACKGROUND_TASKS_UPDATED_CHANNEL: &str = "background-tasks-updated";
 pub const COMPACT_START_CHANNEL: &str = "compact-start";
 pub const COMPACT_DONE_CHANNEL: &str = "compact-done";
 pub const USER_COMMAND_CHANNEL: &str = "user-command";
@@ -62,6 +63,24 @@ impl QueueUpdatedEvent {
         Self {
             conversation_id: conversation_id.into(),
             delivered,
+        }
+    }
+}
+
+/// A conversation's background tasks changed: one started, ended or was
+/// stopped. Only an invalidation key, like the queue's — the list is read back
+/// with `list_background_tasks`, so a missed event costs a stale row until the
+/// next one rather than a state nothing can correct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundTasksUpdatedEvent {
+    pub conversation_id: String,
+}
+
+impl BackgroundTasksUpdatedEvent {
+    pub fn new(conversation_id: impl Into<String>) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
         }
     }
 }
@@ -813,6 +832,10 @@ impl EventBus {
 
     pub fn emit_queue_updated(&self, event: &QueueUpdatedEvent) -> Result<(), String> {
         self.emit_typed(QUEUE_UPDATED_CHANNEL, event)
+    }
+
+    pub fn emit_background_tasks_updated(&self, event: &BackgroundTasksUpdatedEvent) -> Result<(), String> {
+        self.emit_typed(BACKGROUND_TASKS_UPDATED_CHANNEL, event)
     }
 
     pub fn emit_compact_start(&self, event: &CompactStartEvent) -> Result<(), String> {
