@@ -1,0 +1,25 @@
+error[E0603]: module `sealed` is private
+ --> tests/ui/cap/connection_outside_db.rs:2:34
+  |
+2 | use meridian_core::db::sea::cap::sealed::Access;
+  |                                  ^^^^^^  ------ trait `Access` is not publicly re-exported
+  |                                  |
+  |                                  private module
+  |
+note: the module `sealed` is defined here
+ --> src/db/sea/cap.rs
+  |
+  | pub(in crate::db) mod sealed {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `conn` found for reference `&Db` in the current scope
+ --> tests/ui/cap/connection_outside_db.rs:6:16
+  |
+6 |     let _ = db.conn();
+  |                ^^^^ method not found in `&Db`
+  |
+  = help: items from traits can only be used if the trait is in scope
+help: trait `Access` which provides `conn` is implemented but not in scope; perhaps you want to import it
+  |
+2 + use meridian_core::db::sea::cap::sealed::Access;
+  |

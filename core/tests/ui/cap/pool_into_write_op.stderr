@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/cap/pool_into_write_op.rs:7:14
+  |
+7 |     write_op(db).await;
+  |     -------- ^^ expected `&WriteTx`, found `&Db`
+  |     |
+  |     arguments to this function are incorrect
+  |
+  = note: expected reference `&WriteTx`
+             found reference `&Db`
+note: function defined here
+ --> tests/ui/cap/pool_into_write_op.rs:4:10
+  |
+4 | async fn write_op(_: &WriteTx) {}
+  |          ^^^^^^^^ -----------

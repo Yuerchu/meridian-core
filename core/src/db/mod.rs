@@ -1,6 +1,7 @@
 pub mod models;
 pub mod ops;
 pub mod schema;
+pub mod sea;
 
 use diesel::RunQueryDsl;
 use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};

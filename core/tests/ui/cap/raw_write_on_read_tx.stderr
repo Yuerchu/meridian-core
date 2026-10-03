@@ -1,0 +1,23 @@
+error[E0277]: the trait bound `ReadTx: ConnectionTrait` is not satisfied
+ --> tests/ui/cap/raw_write_on_read_tx.rs:8:49
+  |
+8 |             ConnectionTrait::execute_unprepared(tx, "DELETE FROM conversations").await?;
+  |             ----------------------------------- ^^ the trait `ConnectionTrait` is not implemented for `ReadTx`
+  |             |
+  |             required by a bound introduced by this call
+  |
+help: the following other types implement trait `ConnectionTrait`
+ --> $CARGO/sea-orm-$VERSION/src/database/db_connection.rs
+  |
+  | impl ConnectionTrait for DatabaseConnection {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `DatabaseConnection`
+  |
+ ::: $CARGO/sea-orm-$VERSION/src/database/executor.rs
+  |
+  | impl ConnectionTrait for DatabaseExecutor<'_> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `DatabaseExecutor<'_>`
+  |
+ ::: $CARGO/sea-orm-$VERSION/src/database/transaction.rs
+  |
+  | impl ConnectionTrait for DatabaseTransaction {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `DatabaseTransaction`
