@@ -61,29 +61,46 @@ pub fn enqueue_with_context(
     now: i64,
 ) -> QueryResult<QueuedPromptRow> {
     conn.immediate_transaction(|conn| {
-        let last: Option<i32> = queued_prompts::table
-            .filter(queued_prompts::conversation_id.eq(conversation_id))
-            .select(diesel::dsl::max(queued_prompts::position))
-            .first(conn)?;
-
-        diesel::insert_into(queued_prompts::table)
-            .values(&QueuedPromptInsert {
-                id,
-                conversation_id,
-                content,
-                delivery: delivery.as_str(),
-                position: last.unwrap_or(-1) + 1,
-                created_at: now,
-            })
-            .execute(conn)?;
-
-        crate::db::ops::queued_prompt_context_item::insert_prepared(conn, id, context, now)?;
-
-        queued_prompts::table
-            .find(id)
-            .select(QueuedPromptRow::as_select())
-            .first(conn)
+        enqueue_with_context_in_transaction(conn, id, conversation_id, content, delivery, context, now)
     })
+}
+
+/// Enqueue within the caller's immediate transaction. The plan-review guard
+/// holds that lock across its barrier check and this write; opening another
+/// immediate transaction here would fail with `AlreadyInTransaction`.
+/// The caller must propagate errors so a failed context write rolls back the
+/// prompt alongside its snapshots.
+pub fn enqueue_with_context_in_transaction(
+    conn: &mut SqliteConnection,
+    id: &str,
+    conversation_id: &str,
+    content: &str,
+    delivery: Delivery,
+    context: &[crate::workspace::reference::PreparedContextItem],
+    now: i64,
+) -> QueryResult<QueuedPromptRow> {
+    let last: Option<i32> = queued_prompts::table
+        .filter(queued_prompts::conversation_id.eq(conversation_id))
+        .select(diesel::dsl::max(queued_prompts::position))
+        .first(conn)?;
+
+    diesel::insert_into(queued_prompts::table)
+        .values(&QueuedPromptInsert {
+            id,
+            conversation_id,
+            content,
+            delivery: delivery.as_str(),
+            position: last.unwrap_or(-1) + 1,
+            created_at: now,
+        })
+        .execute(conn)?;
+
+    crate::db::ops::queued_prompt_context_item::insert_prepared(conn, id, context, now)?;
+
+    queued_prompts::table
+        .find(id)
+        .select(QueuedPromptRow::as_select())
+        .first(conn)
 }
 
 /// Drop one that has not been delivered.
