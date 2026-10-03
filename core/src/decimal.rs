@@ -257,6 +257,62 @@ impl FromSql<Text, Sqlite> for Decimal {
     }
 }
 
+// The same TEXT contract for SeaORM, written by hand rather than through its
+// `with-bigdecimal` feature: on SQLite that feature binds a string but reads the
+// column back as `f64`, which keeps the first fifteen-odd digits of a price and
+// says nothing about the rest. Reading goes through `String` instead, and a
+// value that is not canonical fails the row exactly as the Diesel mapping does.
+
+impl From<Decimal> for sea_orm::Value {
+    fn from(value: Decimal) -> Self {
+        sea_orm::Value::String(Some(value.canonical()))
+    }
+}
+
+impl sea_orm::TryGetable for Decimal {
+    fn try_get_by<I: sea_orm::ColIdx>(res: &sea_orm::QueryResult, index: I) -> Result<Self, sea_orm::TryGetError> {
+        let raw = String::try_get_by(res, index)?;
+        Decimal::from_canonical_str(&raw)
+            .map_err(|error| sea_orm::TryGetError::DbErr(sea_orm::DbErr::Type(error.to_string())))
+    }
+}
+
+impl sea_orm::sea_query::ValueType for Decimal {
+    fn try_from(value: sea_orm::Value) -> Result<Self, sea_orm::sea_query::ValueTypeErr> {
+        match value {
+            sea_orm::Value::String(Some(raw)) => {
+                Decimal::from_canonical_str(&raw).map_err(|_| sea_orm::sea_query::ValueTypeErr)
+            }
+            _ => Err(sea_orm::sea_query::ValueTypeErr),
+        }
+    }
+
+    fn type_name() -> String {
+        "Decimal".to_owned()
+    }
+
+    fn array_type() -> sea_orm::sea_query::ArrayType {
+        sea_orm::sea_query::ArrayType::String
+    }
+
+    fn column_type() -> sea_orm::sea_query::ColumnType {
+        sea_orm::sea_query::ColumnType::Text
+    }
+}
+
+impl sea_orm::sea_query::Nullable for Decimal {
+    fn null() -> sea_orm::Value {
+        sea_orm::Value::String(None)
+    }
+}
+
+// SeaORM's own macro for this is private to the crate.
+impl sea_orm::IntoActiveValue<Decimal> for Decimal {
+    fn into_active_value(self) -> sea_orm::ActiveValue<Decimal> {
+        sea_orm::ActiveValue::Set(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

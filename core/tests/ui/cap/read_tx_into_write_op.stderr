@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/cap/read_tx_into_write_op.rs:9:22
+  |
+9 |             write_op(tx).await;
+  |             -------- ^^ expected `&WriteTx`, found `&ReadTx`
+  |             |
+  |             arguments to this function are incorrect
+  |
+  = note: expected reference `&WriteTx`
+             found reference `&ReadTx`
+note: function defined here
+ --> tests/ui/cap/read_tx_into_write_op.rs:4:10
+  |
+4 | async fn write_op(_: &WriteTx) {}
+  |          ^^^^^^^^ -----------
