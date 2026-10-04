@@ -79,17 +79,29 @@ pub const MAX_INLINE_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 /// model-influenced, so an unrestricted URI here would let a response exfiltrate
 /// arbitrary local files on the next request.
 pub fn resolve_attachment_uri(uri: &str, files_root: &Path) -> Option<PathBuf> {
+    let canonical = resolve_managed_file(uri, files_root)?;
+    let meta = std::fs::metadata(&canonical).ok()?;
+    if meta.len() > MAX_INLINE_ATTACHMENT_BYTES {
+        return None;
+    }
+    Some(canonical)
+}
+
+/// The same containment, without the size cap: a regular file inside the
+/// app-managed attachment root, whatever its size.
+///
+/// For a caller that never reads the file into a request — a hosted agent
+/// handed a *link* opens the file itself — where the cap would refuse exactly
+/// the large documents a link exists for. Anything that inlines bytes uses
+/// [`resolve_attachment_uri`] or a tighter limit of its own.
+pub fn resolve_managed_file(uri: &str, files_root: &Path) -> Option<PathBuf> {
     let path = resolve_file_uri(uri)?;
     let canonical = std::fs::canonicalize(&path).ok()?;
     let root = std::fs::canonicalize(files_root).ok()?;
     if !canonical.starts_with(&root) {
         return None;
     }
-    let meta = std::fs::metadata(&canonical).ok()?;
-    if !meta.is_file() || meta.len() > MAX_INLINE_ATTACHMENT_BYTES {
-        return None;
-    }
-    Some(canonical)
+    std::fs::metadata(&canonical).ok()?.is_file().then_some(canonical)
 }
 
 pub fn file_to_base64_data_uri(path: &Path, mime_type: &str) -> Result<String, String> {
@@ -121,6 +133,12 @@ mod tests {
         assert!(resolve_attachment_uri(&to_uri(&outside), &root).is_none());
         assert!(resolve_attachment_uri("file:///definitely/not/here.bin", &root).is_none());
         assert!(resolve_attachment_uri("https://example.com/a.txt", &root).is_none());
+
+        // The uncapped resolver keeps the containment and the regular-file
+        // check; only the size cap is gone.
+        assert!(resolve_managed_file(&to_uri(&inside), &root).is_some());
+        assert!(resolve_managed_file(&to_uri(&outside), &root).is_none());
+        assert!(resolve_managed_file(&to_uri(&root.join("conv1")), &root).is_none());
     }
 
     #[test]

@@ -79,6 +79,14 @@ pub fn enqueue_with_context_in_transaction(
     context: &[crate::workspace::reference::PreparedContextItem],
     now: i64,
 ) -> QueryResult<QueuedPromptRow> {
+    // The same rule `set_delivery` keeps for the steer button, kept where the
+    // row is written so it holds for every caller rather than for the one
+    // command that happens to check first.
+    if delivery == Delivery::Interject && carries_attachments(content)? {
+        return Err(contract_error(
+            "attachments can only be queued as follow-up messages".into(),
+        ));
+    }
     let last: Option<i32> = queued_prompts::table
         .filter(queued_prompts::conversation_id.eq(conversation_id))
         .select(diesel::dsl::max(queued_prompts::position))
@@ -659,6 +667,14 @@ mod tests {
         assert_eq!(
             set_delivery(&mut conn, "c1", &referenced.id, Delivery::Interject).unwrap(),
             DeliveryChange::CarriesContext
+        );
+
+        // Nor may one be queued as an interjection in the first place, and the
+        // refusal writes nothing.
+        assert!(enqueue(&mut conn, "q-direct", "c1", parts, Delivery::Interject, 0).is_err());
+        assert!(
+            list(&mut conn, "c1").unwrap().iter().all(|i| i.id != "q-direct"),
+            "a refused enqueue leaves no row"
         );
 
         // The refusals changed nothing, and going the other way is never refused.

@@ -147,8 +147,11 @@ fn label(ordinal: usize, name: &str) -> PromptBlock {
     PromptBlock::text(format!("[Attachment {ordinal}: {name}]"))
 }
 
+/// Containment without the 20 MiB inlining cap: a link reads nothing, so a
+/// large PDF is exactly what it is for, and the two inline kinds below carry
+/// limits of their own well under that cap.
 fn resolve(uri: &str, files_root: &Path, ordinal: usize) -> Result<PathBuf, Refusal> {
-    crate::files::resolve_attachment_uri(uri, files_root).ok_or(Refusal::Unreadable { ordinal })
+    crate::files::resolve_managed_file(uri, files_root).ok_or(Refusal::Unreadable { ordinal })
 }
 
 fn file_name(path: &Path) -> String {
@@ -387,6 +390,25 @@ mod tests {
         let prepared = prepare(&content, BOTH, &root.reach(&none, false)).unwrap();
         assert!(matches!(prepared.attachments[1], PromptBlock::Resource { .. }));
         assert!(matches!(prepared.attachments[3], PromptBlock::ResourceLink { .. }));
+    }
+
+    /// A file past the 20 MiB inlining cap is still linked: a link reads
+    /// nothing, and big documents are what it is for.
+    #[test]
+    fn a_file_past_the_inlining_cap_is_still_linked() {
+        let root = Root::new();
+        let none = MountMap::default();
+        let big = root.put(
+            "h.pdf",
+            &vec![0u8; (crate::files::MAX_INLINE_ATTACHMENT_BYTES + 1) as usize],
+        );
+        let prepared = prepare(
+            &envelope(vec![file(&big, "application/pdf", "manual.pdf")]),
+            BOTH,
+            &root.reach(&none, false),
+        )
+        .unwrap();
+        assert!(matches!(prepared.attachments[1], PromptBlock::ResourceLink { .. }));
     }
 
     /// Text past the embedding limit, and anything that is not UTF-8 without
