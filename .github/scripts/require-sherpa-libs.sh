@@ -12,42 +12,55 @@
 #
 #   ld: library 'sherpa-onnx-c-api' not found
 #
-# — or, on Windows, our own build script panicking over the DLLs it stages.
+# — or, on Windows, our own build script panicking over the DLLs it stages, or
+# the crate's own "No shared runtime libraries found".
 #
 # So check the pairing the crate assumes and never verifies: if Cargo thinks
 # the script has run, the libraries have to be there. When they are not, remove
 # both halves so the script runs again and downloads afresh.
+#
+# **Every unpack, not the first one found.** There is one per target directory,
+# and there is more than one target directory: plain `cargo test` uses
+# target/, `--target <triple>` moves it under target/<triple>/, and trybuild
+# compiles its cases in a target of its own under target/tests/trybuild/. This
+# script used to stop at the first library it found — the main target's, kept
+# by `cache-directories` — and so passed while trybuild's unpack sat restored
+# and empty, failing `cap_compile_fail` on every run after the first.
 set -euo pipefail
 
 target="target"
 [ -d "$target" ] || { echo "no target directory yet"; exit 0; }
 
-# Two possible homes for the unpack, and which one is used depends on how the
-# job invokes cargo: plain `cargo test` puts it at target/sherpa-onnx-prebuilt,
-# while `--target <triple>` moves it under target/<triple>/. Match both rather
-# than assuming, which is the mistake this script previously made.
-libs() {
-  find "$target" -maxdepth 5 -type f -path '*/sherpa-onnx-prebuilt/*/lib/*' -print -quit 2>/dev/null
+cleared=0
+clear_root() {
+  local root=$1
+  echo "cargo has a record of the build script under $root but its libraries are gone — clearing both"
+  rm -rf "$root/sherpa-onnx-prebuilt"
+  # Cargo splits its record in two — the fingerprint that decides whether to
+  # re-run, and the recorded output of the last run — both keyed per crate,
+  # under a profile directory whose depth varies with --target.
+  find "$root" -type d -name 'sherpa-onnx-sys-*' -prune -exec rm -rf {} + 2>/dev/null || true
+  cleared=1
 }
 
-# Cargo splits its record in two — the fingerprint that decides whether to
-# re-run, and the recorded output of the last run. Both are keyed per crate,
-# and both sit under a profile directory whose depth varies with --target.
-records() {
-  find "$target" -type d -name 'sherpa-onnx-sys-*' -print -quit 2>/dev/null
-}
+found=0
+while IFS= read -r -d '' lib; do
+  found=1
+  [ -d "$lib" ] || continue # cleared with an enclosing root already
+  if [ -z "$(find "$lib" -maxdepth 1 -type f -print -quit 2>/dev/null)" ]; then
+    # .../<root>/sherpa-onnx-prebuilt/<archive>/lib -> <root>
+    clear_root "${lib%/sherpa-onnx-prebuilt/*}"
+  fi
+done < <(find "$target" -type d -path '*/sherpa-onnx-prebuilt/*/lib' -print0 2>/dev/null)
 
-if [ -n "$(libs)" ]; then
-  echo "sherpa-onnx libraries present, leaving the cache alone"
-  exit 0
+# No unpack anywhere, yet a record that the script ran: the libraries went
+# with their whole directory.
+if [ "$found" -eq 0 ] && [ -n "$(find "$target" -type d -name 'sherpa-onnx-sys-*' -print -quit 2>/dev/null)" ]; then
+  clear_root "$target"
 fi
 
-if [ -z "$(records)" ]; then
-  echo "nothing built yet; the build script will download on its own"
-  exit 0
+if [ "$cleared" -eq 0 ]; then
+  echo "every sherpa-onnx unpack has its libraries, leaving the cache alone"
+else
+  echo "cleared"
 fi
-
-echo "cargo has a record of the build script but the libraries are gone — clearing both"
-find "$target" -maxdepth 2 -type d -name sherpa-onnx-prebuilt -print0 2>/dev/null | xargs -0 -r rm -rf
-find "$target" -type d -name 'sherpa-onnx-sys-*' -print0 2>/dev/null | xargs -0 -r rm -rf
-echo "cleared"

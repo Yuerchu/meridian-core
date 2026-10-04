@@ -324,7 +324,7 @@ fn describe(items: &[QueuedPromptRow]) -> String {
     // which is worse to read and no safer.
     let quoted: Vec<String> = items
         .iter()
-        .map(|i| format!("<message>\n{}\n</message>", i.content))
+        .map(|i| format!("<message>\n{}\n</message>", spoken(&i.content)))
         .collect();
     let opening = match items.len() {
         1 => "A message you had queued was sent to you and never acknowledged, so it may have \
@@ -342,6 +342,45 @@ fn describe(items: &[QueuedPromptRow]) -> String {
          rather than silently repeating anything.\n</undelivered_queue>",
         quoted.join("\n")
     )
+}
+
+/// What a queued message said, as the person would describe it: the text, and
+/// what was attached by name.
+///
+/// Not the stored envelope. That is JSON carrying local `file:///` paths, which
+/// is neither what anybody wrote nor anything the agent should be handed as
+/// though it were; an attachment it may already have seen is named so that it
+/// can be recognised, not sent again.
+fn spoken(content: &str) -> String {
+    use crate::provider::MessageContentPart;
+    match crate::provider::decode_message_parts(content) {
+        Ok(None) => content.to_string(),
+        Ok(Some(parts)) => {
+            let mut text = Vec::new();
+            let mut attached = Vec::new();
+            for part in parts {
+                match part {
+                    MessageContentPart::Text { text: t } => text.push(t),
+                    MessageContentPart::ImageUrl { .. } => attached.push("an image".to_string()),
+                    MessageContentPart::File { file } => attached.push(file.name),
+                    MessageContentPart::Sticker { name, .. } => {
+                        attached.push(name.map_or_else(|| "a sticker".to_string(), |n| format!("sticker {n}")))
+                    }
+                }
+            }
+            let mut out = text.join("\n");
+            if !attached.is_empty() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("(attached: {})", attached.join(", ")));
+            }
+            out
+        }
+        // Damaged parts are not a message anyone can quote; the warning
+        // still stands, without words to attach to it.
+        Err(_) => "(this message could not be read back)".to_string(),
+    }
 }
 
 /// The next item, asked for the way the runner's state allows.
@@ -579,6 +618,19 @@ mod tests {
         assert!(text.contains("2 messages"));
         assert!(text.contains("Oldest first"));
         assert!(text.find("first") < text.find("second"));
+    }
+
+    /// A message with attachments is quoted as words and names, never as the
+    /// stored envelope with its local paths.
+    #[test]
+    fn attachments_are_named_not_quoted_as_json() {
+        let parts = r#"[{"type":"text","text":"compare these"},{"type":"image_url","image_url":{"url":"file:///C:/data/files/c1/a.png"}},{"type":"file","file":{"url":"file:///C:/data/files/c1/b.pdf","mime_type":"application/pdf","name":"report.pdf"}}]"#;
+        let text = describe(&[doubtful(parts)]);
+        assert!(
+            text.contains("<message>\ncompare these\n(attached: an image, report.pdf)\n</message>"),
+            "{text}"
+        );
+        assert!(!text.contains("file:///"), "no local path reaches the agent: {text}");
     }
 }
 
