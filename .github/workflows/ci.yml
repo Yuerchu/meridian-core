@@ -38,8 +38,11 @@ jobs:
           # `sherpa-onnx-sys` unpacks its prebuilt libraries here and returns
           # early if the directory exists. Without this the cache restores the
           # build script's fingerprint but not its output, and the linker is
-          # handed a `-L` for a path that is gone.
-          cache-directories: target/sherpa-onnx-prebuilt
+          # handed a `-L` for a path that is gone. trybuild compiles its cases
+          # in a target of its own, with its own unpack.
+          cache-directories: |
+            target/sherpa-onnx-prebuilt
+            target/tests/trybuild/sherpa-onnx-prebuilt
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
