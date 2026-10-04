@@ -170,22 +170,77 @@ pub fn reorder(conn: &mut SqliteConnection, conversation_id: &str, ids: &[String
     })
 }
 
+/// What became of a request to change an item's delivery mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryChange {
+    Changed,
+    /// Already delivered, in doubt, or never this conversation's.
+    NotWaiting,
+    /// It carries attachments, and an interjection is text only.
+    CarriesAttachments,
+    /// It carries frozen `@` context, which only a new turn has a place for.
+    CarriesContext,
+}
+
+/// Whether a queued message carries anything besides text.
+///
+/// An interjection goes in mid-turn as text — `_session/steering` on a hosted
+/// session, a steered message on a native one — and neither has anywhere to
+/// put an image or a file. Damaged parts are an error, never "no attachments".
+pub fn carries_attachments(content: &str) -> QueryResult<bool> {
+    let parts = crate::provider::decode_message_parts(content).map_err(contract_error)?;
+    Ok(parts.is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|part| !matches!(part, crate::provider::MessageContentPart::Text { .. }))
+    }))
+}
+
 /// Change one item's delivery mode while it is still waiting.
+///
+/// **Switching to `interject` is refused for what only a follow-up can carry**
+/// — attachments, and the `@` context frozen at enqueue — in the same
+/// transaction as the write. Enqueue refuses both for an interjection already,
+/// and that is not enough on its own: the queue's steer button arrives here,
+/// not at enqueue, so a check made only there is a check the button steps
+/// round. A frozen snapshot switched to `interject` would be delivered without
+/// it, the reference in the text pointing at nothing.
 pub fn set_delivery(
     conn: &mut SqliteConnection,
     conversation_id: &str,
     id: &str,
     delivery: Delivery,
-) -> QueryResult<usize> {
-    diesel::update(
-        queued_prompts::table
+) -> QueryResult<DeliveryChange> {
+    conn.immediate_transaction(|conn| {
+        let waiting = queued_prompts::table
             .find(id)
             .filter(queued_prompts::conversation_id.eq(conversation_id))
             .filter(queued_prompts::dispatched_at.is_null())
-            .filter(queued_prompts::settled_at.is_null()),
-    )
-    .set(queued_prompts::delivery.eq(delivery.as_str()))
-    .execute(conn)
+            .filter(queued_prompts::settled_at.is_null());
+        if delivery == Delivery::Interject {
+            let Some(content) = waiting
+                .select(queued_prompts::content)
+                .first::<String>(conn)
+                .optional()?
+            else {
+                return Ok(DeliveryChange::NotWaiting);
+            };
+            if carries_attachments(&content)? {
+                return Ok(DeliveryChange::CarriesAttachments);
+            }
+            if !crate::db::ops::queued_prompt_context_item::list_prepared(conn, id)?.is_empty() {
+                return Ok(DeliveryChange::CarriesContext);
+            }
+        }
+        let updated = diesel::update(waiting)
+            .set(queued_prompts::delivery.eq(delivery.as_str()))
+            .execute(conn)?;
+        Ok(if updated == 0 {
+            DeliveryChange::NotWaiting
+        } else {
+            DeliveryChange::Changed
+        })
+    })
 }
 
 /// The front of the queue, whatever mode it is in.
@@ -542,6 +597,81 @@ mod tests {
         mark_settled(&mut conn, &item.id, Some("m1"), 2).unwrap();
         let item = list(&mut conn, "c1").unwrap().remove(0);
         assert_eq!(item.state(), QueueState::Settled);
+    }
+
+    /// An interjection is text only, and the steer button reaches this write
+    /// without passing enqueue — so this is where an item carrying an
+    /// attachment or a frozen snapshot is kept a follow-up.
+    #[test]
+    fn only_what_text_can_carry_may_become_an_interjection() {
+        let pool = test_db();
+        let mut conn = pool.get().unwrap();
+        conversation(&mut conn, "c1");
+
+        let plain = add(&mut conn, "c1", "then rename it", Delivery::FollowUp);
+        assert_eq!(
+            set_delivery(&mut conn, "c1", &plain.id, Delivery::Interject).unwrap(),
+            DeliveryChange::Changed
+        );
+
+        let parts = r#"[{"type":"text","text":"and this"},{"type":"image_url","image_url":{"url":"file:///x.png"}}]"#;
+        let attached = add(&mut conn, "c1", parts, Delivery::FollowUp);
+        assert_eq!(
+            set_delivery(&mut conn, "c1", &attached.id, Delivery::Interject).unwrap(),
+            DeliveryChange::CarriesAttachments
+        );
+        // Text-only parts are still text.
+        let text_parts = add(
+            &mut conn,
+            "c1",
+            r#"[{"type":"text","text":"only words"}]"#,
+            Delivery::FollowUp,
+        );
+        assert_eq!(
+            set_delivery(&mut conn, "c1", &text_parts.id, Delivery::Interject).unwrap(),
+            DeliveryChange::Changed
+        );
+
+        let snapshot = crate::workspace::reference::PreparedContextItem {
+            id: "ctx".into(),
+            kind: crate::workspace::reference::MessageContextKind::ProjectFile,
+            content: "frozen bytes".into(),
+            display_path: Some("src/lib.rs".into()),
+            line_start: None,
+            line_end: None,
+            content_hash: "hash".into(),
+            byte_count: 12,
+            line_count: 1,
+            token_count: 3,
+            truncated: 0,
+            metadata: None,
+        };
+        let referenced = enqueue_with_context(
+            &mut conn,
+            "q-ctx",
+            "c1",
+            "look at @src/lib.rs",
+            Delivery::FollowUp,
+            &[snapshot],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            set_delivery(&mut conn, "c1", &referenced.id, Delivery::Interject).unwrap(),
+            DeliveryChange::CarriesContext
+        );
+
+        // The refusals changed nothing, and going the other way is never refused.
+        let modes: Vec<_> = list(&mut conn, "c1").unwrap().into_iter().map(|i| i.delivery).collect();
+        assert_eq!(modes, ["interject", "follow_up", "interject", "follow_up"]);
+        assert_eq!(
+            set_delivery(&mut conn, "c1", &attached.id, Delivery::FollowUp).unwrap(),
+            DeliveryChange::Changed
+        );
+        assert_eq!(
+            set_delivery(&mut conn, "c1", "no-such-row", Delivery::Interject).unwrap(),
+            DeliveryChange::NotWaiting
+        );
     }
 
     /// The reason the queue is a table.
