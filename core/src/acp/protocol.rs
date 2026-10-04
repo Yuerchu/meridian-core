@@ -509,6 +509,27 @@ pub struct AgentCapabilities {
     /// — so the two have to be asked separately.
     #[serde(default)]
     pub session_capabilities: SessionCapabilities,
+    /// Which content blocks beyond text and `resource_link` a prompt may carry.
+    #[serde(default)]
+    pub prompt_capabilities: PromptCapabilities,
+}
+
+/// What a `session/prompt` may carry besides the two kinds every agent takes.
+///
+/// Booleans, unlike the session capabilities below: the schema types each as
+/// `boolean` with `false` as its default, so an absent field *is* the answer
+/// and `default` here restates the protocol rather than guessing at it. Sending
+/// `image` or `resource` to an agent that did not say yes is a protocol error
+/// on our side, which is why the prompt builder asks rather than tries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptCapabilities {
+    #[serde(default)]
+    pub image: bool,
+    #[serde(default)]
+    pub audio: bool,
+    #[serde(default)]
+    pub embedded_context: bool,
 }
 
 /// Presence is the answer. Each of these is `{}` when supported and absent or
@@ -856,7 +877,55 @@ pub struct SetConfigOptionResult {
 #[serde(rename_all = "camelCase")]
 pub struct PromptParams {
     pub session_id: String,
-    pub prompt: Vec<ContentBlock>,
+    pub prompt: Vec<PromptBlock>,
+}
+
+/// One piece of an outbound prompt.
+///
+/// Separate from [`ContentBlock`], which is what arrives: inbound keeps the
+/// kind as a string so an unfamiliar block does not break the text beside it,
+/// while outbound is exactly the four shapes this app produces, each spelled as
+/// the schema spells it. `image` and `resource` may only go to an agent whose
+/// [`PromptCapabilities`] said so; `text` and `resource_link` go to any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptBlock {
+    Text {
+        text: String,
+    },
+    /// `data` is bare base64, not a `data:` URI.
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    /// A file's text, embedded. Only the text variant: the blob one exists in
+    /// the schema, but `claude-agent-acp` drops it without a word.
+    Resource {
+        resource: TextResource,
+    },
+    /// A file the agent reads itself, by path.
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+}
+
+impl PromptBlock {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text { text: s.into() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextResource {
+    pub uri: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -978,7 +1047,8 @@ pub enum SteerOutcome {
 
 /// One piece of a message.
 ///
-/// Outbound this app only produces text. Inbound the `kind` is kept rather than
+/// Outbound prompts are [`PromptBlock`]; this type still carries a steer's
+/// text, which is only ever text. Inbound the `kind` is kept rather than
 /// matched, so an agent that starts sending images does not break the text
 /// arriving beside them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1734,6 +1804,87 @@ mod tests {
         // And the two capabilities are independent: `loadSession` is top-level
         // by the schema's own admission, so neither implies the other.
         assert!(silent.agent_capabilities.load_session);
+    }
+
+    /// The greeting `claude-agent-acp` 0.84.0 sends, trimmed to the members
+    /// beside the one under test — `_meta`, `mcpCapabilities`, `providers` —
+    /// so a strict parse of any of them would show here. `audio` is not
+    /// advertised and has to read as no.
+    #[test]
+    fn prompt_capabilities_are_read_from_the_greeting() {
+        let raw = r#"{"protocolVersion":1,"agentCapabilities":{
+            "_meta":{"claudeCode":{"promptQueueing":true},"authStatus":{}},
+            "promptCapabilities":{"image":true,"embeddedContext":true},
+            "mcpCapabilities":{"http":true,"sse":true},"auth":{"logout":{}},"providers":{},
+            "loadSession":true,"sessionCapabilities":{"list":{},"resume":{}}}}"#;
+        let caps = serde_json::from_str::<InitializeResult>(raw)
+            .unwrap()
+            .agent_capabilities
+            .prompt_capabilities;
+        assert_eq!(
+            caps,
+            PromptCapabilities {
+                image: true,
+                audio: false,
+                embedded_context: true
+            }
+        );
+
+        // Absent is the schema's own default, all three false.
+        let silent = serde_json::from_str::<InitializeResult>(r#"{"protocolVersion":1}"#).unwrap();
+        assert_eq!(
+            silent.agent_capabilities.prompt_capabilities,
+            PromptCapabilities::default()
+        );
+    }
+
+    /// Each outbound block, spelled as the schema spells it: the tag in `type`,
+    /// `mimeType` in camelCase, `data` bare, and an absent optional left out
+    /// rather than sent as `null`.
+    #[test]
+    fn prompt_blocks_serialise_to_the_schema_shapes() {
+        let params = PromptParams {
+            session_id: "s1".into(),
+            prompt: vec![
+                PromptBlock::text("look"),
+                PromptBlock::Image {
+                    data: "iVBORw0K".into(),
+                    mime_type: "image/png".into(),
+                },
+                PromptBlock::Resource {
+                    resource: TextResource {
+                        uri: "file:///work/a.ts".into(),
+                        text: "let a = 1".into(),
+                        mime_type: Some("text/typescript".into()),
+                    },
+                },
+                PromptBlock::ResourceLink {
+                    uri: "file:///data/files/c/report.pdf".into(),
+                    name: "report.pdf".into(),
+                    mime_type: Some("application/pdf".into()),
+                },
+                PromptBlock::ResourceLink {
+                    uri: "file:///data/files/c/blob".into(),
+                    name: "blob".into(),
+                    mime_type: None,
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&params).unwrap(),
+            serde_json::json!({
+                "sessionId": "s1",
+                "prompt": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "data": "iVBORw0K", "mimeType": "image/png"},
+                    {"type": "resource", "resource": {
+                        "uri": "file:///work/a.ts", "text": "let a = 1", "mimeType": "text/typescript"}},
+                    {"type": "resource_link", "uri": "file:///data/files/c/report.pdf",
+                        "name": "report.pdf", "mimeType": "application/pdf"},
+                    {"type": "resource_link", "uri": "file:///data/files/c/blob", "name": "blob"},
+                ]
+            })
+        );
     }
 
     /// A session with no title or timestamp is still a session worth offering.

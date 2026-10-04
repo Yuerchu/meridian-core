@@ -2644,7 +2644,7 @@ impl AcpSession {
                 let payload_text = prompt_with_workspace_context(text, &context);
                 serde_json::to_value(protocol::PromptParams {
                     session_id: self.acp_session_id.clone(),
-                    prompt: vec![protocol::ContentBlock::text(owed.in_front_of(&payload_text))],
+                    prompt: vec![protocol::PromptBlock::text(owed.in_front_of(&payload_text))],
                 })
                 .map(|params| (owed, params))
                 .map_err(|e| e.to_string())
