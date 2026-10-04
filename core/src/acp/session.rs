@@ -1396,6 +1396,29 @@ fn prompt_with_workspace_context(text: &str, context: &[crate::workspace::refere
     payload
 }
 
+/// The blocks of one prompt: what has to be explained, the message and its
+/// `@` context as one text block, then each attachment behind its label.
+///
+/// The text block is first and holds all three in the order it always has —
+/// the owed notices are context for reading the message, and the attachments
+/// are things the message refers to. An attachment-only message with nothing
+/// owed has no text to send, and an empty text block is one the Messages API
+/// refuses, so it is left out; a message with no attachments keeps its single
+/// block whatever it holds, which is the bytes this sent before attachments.
+fn assemble_prompt(
+    owed: &Owed,
+    prepared: super::attachments::Prepared,
+    context: &[crate::workspace::reference::PreparedContextItem],
+) -> Vec<protocol::PromptBlock> {
+    let lead = owed.in_front_of(&prompt_with_workspace_context(&prepared.text, context));
+    let mut prompt = Vec::with_capacity(1 + prepared.attachments.len());
+    if !lead.is_empty() || prepared.attachments.is_empty() {
+        prompt.push(protocol::PromptBlock::text(lead));
+    }
+    prompt.extend(prepared.attachments);
+    prompt
+}
+
 /// Whether the prompt carrying an [`Owed`] ever reached the adapter.
 ///
 /// [`AcpSession::finish`] used to read this off the outcome — a reply means the
@@ -1496,7 +1519,12 @@ impl Owed {
         if parts.is_empty() {
             return text.to_string();
         }
-        parts.push(text);
+        // Empty when the message is only attachments, which follow as blocks
+        // of their own; joined in, it would leave the notices trailing a
+        // blank line that introduces nothing.
+        if !text.is_empty() {
+            parts.push(text);
+        }
         parts.join("\n\n")
     }
 
@@ -1553,6 +1581,14 @@ pub struct AcpSession {
     /// wait for the turn to end and go as an ordinary prompt, which is what
     /// Claude Code did before the extension existed.
     steering: bool,
+    /// What a prompt may carry besides text and links, also said once, at the
+    /// handshake. See [`super::attachments`] for what is refused without it.
+    prompt_capabilities: protocol::PromptCapabilities,
+    /// How the agent names a host path, and whether it sees only what its
+    /// container mounts — the two facts the working directory is translated
+    /// with, kept because an attachment link is a path too.
+    mounts: super::mounts::MountMap,
+    containerised: bool,
     /// Whether the agent picked up the session it had rather than starting one.
     ///
     /// The caller writes the id back either way — a resume answers with
@@ -1571,6 +1607,7 @@ pub struct AcpSession {
 struct Handshook {
     acp_session_id: String,
     steering: bool,
+    prompt_capabilities: protocol::PromptCapabilities,
     resumed: bool,
 }
 
@@ -1728,6 +1765,7 @@ impl AcpSession {
             Ok(Handshook {
                 acp_session_id,
                 steering,
+                prompt_capabilities,
                 resumed,
             }) => {
                 // Only now, because only now is it true. A conversation with a
@@ -1742,6 +1780,8 @@ impl AcpSession {
                     conversation_id = %conversation_id,
                     acp_session_id = %acp_session_id,
                     steering,
+                    images = prompt_capabilities.image,
+                    embedded_context = prompt_capabilities.embedded_context,
                     resumed,
                     "ACP session opened"
                 );
@@ -1752,6 +1792,9 @@ impl AcpSession {
                     acp_session_id,
                     cwd: opening.cwd.to_string(),
                     steering,
+                    prompt_capabilities,
+                    mounts,
+                    containerised,
                     resumed,
                     bridge,
                 }))
@@ -1964,6 +2007,7 @@ impl AcpSession {
 
         let init: protocol::InitializeResult = serde_json::from_value(init).map_err(|e| e.to_string())?;
         let steering = init.steering_supported();
+        let prompt_capabilities = init.agent_capabilities.prompt_capabilities;
         tracing::info!(
             protocol_version = init.protocol_version,
             // The default command pins a version, but `acp.args` can name any
@@ -1998,6 +2042,7 @@ impl AcpSession {
                     return Ok(Handshook {
                         acp_session_id: session,
                         steering,
+                        prompt_capabilities,
                         resumed: true,
                     });
                 }
@@ -2069,6 +2114,7 @@ impl AcpSession {
         Ok(Handshook {
             acp_session_id: session.session_id,
             steering,
+            prompt_capabilities,
             resumed: false,
         })
     }
@@ -2510,6 +2556,43 @@ impl AcpSession {
             .await
     }
 
+    /// Whether a message's attachments can go to this agent as they are.
+    ///
+    /// For the queue, which takes a message long before it is sent: asked at
+    /// enqueue, the refusal reaches the person who attached the file rather
+    /// than turning up later as a held queue.
+    pub async fn check_attachments(&self, services: &Services, content: &str) -> Result<(), String> {
+        self.prepare_attachments(services, content).await.map(|_| ())
+    }
+
+    /// Split a stored message into its text and its attachment blocks, reading
+    /// the files off the runtime. See [`super::attachments`].
+    async fn prepare_attachments(
+        &self,
+        services: &Services,
+        content: &str,
+    ) -> Result<super::attachments::Prepared, String> {
+        let content = content.to_string();
+        let caps = self.prompt_capabilities;
+        let mounts = self.mounts.clone();
+        let containerised = self.containerised;
+        let files_root = crate::files::files_dir(&services.paths.data_dir);
+        tokio::task::spawn_blocking(move || {
+            super::attachments::prepare(
+                &content,
+                caps,
+                &super::attachments::Reach {
+                    files_root: &files_root,
+                    mounts: &mounts,
+                    containerised,
+                },
+            )
+            .map_err(|refusal| refusal.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     /// Deliver a queued item as a turn of its own.
     ///
     /// The item is settled in the same transaction that writes its message row
@@ -2527,6 +2610,23 @@ impl AcpSession {
         })
         .await
         .map_err(|e| e.to_string())??;
+        // Checked before the turn as well as inside it, for what a refusal
+        // does here. A direct send hands the refusal to the person who pressed
+        // send; a queued item has nobody waiting on it, and returned as an
+        // error it would stay at the front, unclaimed, refused again on every
+        // pump and blocking everything behind it with nothing on screen. Held,
+        // the queue says it has stopped and offers the release, and the
+        // person can take the item out.
+        if let Err(refusal) = self.prepare_attachments(services, &item.content).await {
+            tracing::error!(
+                error = %refusal,
+                conversation_id = %self.conversation_id,
+                queue_id = %item.id,
+                "a queued prompt's attachments cannot go to this agent; holding the queue"
+            );
+            crate::agent::queue::hold(services, &self.conversation_id).await;
+            return Err(refusal);
+        }
         self.prompt_with(
             services,
             &item.content,
@@ -2589,6 +2689,12 @@ impl AcpSession {
         // the gap between durable submission and entering the select loop.
         let mut review_pause = self.shared.plan_reviews.subscribe();
 
+        // Before the row, so that a refusal leaves nothing behind: no message
+        // for an attachment the agent was never sent, no turn to unwind. The
+        // row itself keeps the envelope as it came — the transcript draws the
+        // attachments from it — and only the payload is split.
+        let prepared = self.prepare_attachments(services, text).await?;
+
         let user_message_id = self
             .write_prompt_row(services, &turn_id, text, queued, &context)
             .await?;
@@ -2641,10 +2747,10 @@ impl AcpSession {
         // stop. A failure here is a turn that ended before its prompt went out.
         let assembled = match self.owed_explanations(services, &turn_id).await {
             Ok(owed) => {
-                let payload_text = prompt_with_workspace_context(text, &context);
+                let prompt = assemble_prompt(&owed, prepared, &context);
                 serde_json::to_value(protocol::PromptParams {
                     session_id: self.acp_session_id.clone(),
-                    prompt: vec![protocol::PromptBlock::text(owed.in_front_of(&payload_text))],
+                    prompt,
                 })
                 .map(|params| (owed, params))
                 .map_err(|e| e.to_string())
@@ -3859,6 +3965,61 @@ mod tests {
 
         assert!(payload.starts_with("<untrusted_context>\ncommand result"));
         assert!(payload.ends_with("next question"));
+    }
+
+    fn attached(text: &str, attachments: Vec<protocol::PromptBlock>) -> super::super::attachments::Prepared {
+        super::super::attachments::Prepared {
+            text: text.into(),
+            attachments,
+        }
+    }
+
+    /// A message without attachments is still exactly one text block, whatever
+    /// it holds — empty included — so nothing about the wire moved for it.
+    #[test]
+    fn a_prompt_without_attachments_is_one_text_block() {
+        let owed = Owed::default();
+        assert_eq!(
+            assemble_prompt(&owed, attached("fix the queue", Vec::new()), &[]),
+            vec![protocol::PromptBlock::text("fix the queue")]
+        );
+        assert_eq!(
+            assemble_prompt(&owed, attached("", Vec::new()), &[]),
+            vec![protocol::PromptBlock::text("")]
+        );
+    }
+
+    /// The notices, the message and its context stay one block, first; the
+    /// attachments follow in their order. An attachment-only message with
+    /// nothing owed sends no empty text block, which the Messages API refuses.
+    #[test]
+    fn attachments_follow_the_text_block_and_an_empty_one_is_left_out() {
+        let image = vec![
+            protocol::PromptBlock::text("[Attachment 1: image]"),
+            protocol::PromptBlock::Image {
+                data: "iVBORw0K".into(),
+                mime_type: "image/png".into(),
+            },
+        ];
+        let owed = Owed {
+            memory_lost: true,
+            ..Owed::default()
+        };
+        let prompt = assemble_prompt(&owed, attached("what is this", image.clone()), &[]);
+        assert_eq!(prompt.len(), 3);
+        let protocol::PromptBlock::Text { text } = &prompt[0] else {
+            panic!("the text block has to lead, got {:?}", prompt[0]);
+        };
+        assert!(text.starts_with(NO_MEMORY) && text.ends_with("what is this"));
+        assert_eq!(prompt[1..], image[..]);
+
+        assert_eq!(
+            assemble_prompt(&Owed::default(), attached("", image.clone()), &[]),
+            image
+        );
+        // Owed with no message still has something to say, and says it first.
+        let alone = assemble_prompt(&owed, attached("", image.clone()), &[]);
+        assert_eq!(alone[0], protocol::PromptBlock::text(NO_MEMORY));
     }
 
     #[test]
