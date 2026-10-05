@@ -39,9 +39,9 @@ fn parse_tool_preset_names(preset_id: &str, json: &str) -> Result<Vec<String>, S
 /// The secrets manager is the OS keychain one, which is right wherever there is
 /// a login session to hold it. [`bootstrap_with_secrets`] is the same startup
 /// for a machine that has none.
-pub fn bootstrap(data_dir: PathBuf, events: EventBus) -> Result<Services, String> {
+pub async fn bootstrap(data_dir: PathBuf, events: EventBus) -> Result<Services, String> {
     let secrets = Arc::new(SecretsManager::new(data_dir.clone()));
-    bootstrap_with_secrets(data_dir, events, secrets)
+    bootstrap_with_secrets(data_dir, events, secrets).await
 }
 
 /// The same startup, told where the secrets come from.
@@ -54,7 +54,12 @@ pub fn bootstrap(data_dir: PathBuf, events: EventBus) -> Result<Services, String
 /// What differs is only where the secrets-file passphrase comes from, and only
 /// because a server has no keychain to keep it in. See
 /// [`crate::keyring::SuppliedPassphraseStore`].
-pub fn bootstrap_with_secrets(
+///
+/// Async because the SeaORM pool opens asynchronously; the Diesel work below is
+/// still blocking, which is fine for the one call that happens before anything
+/// else is running. Core never blocks on a future itself: the shell and
+/// meridiand each cross from sync to async once, at their own top.
+pub async fn bootstrap_with_secrets(
     data_dir: PathBuf,
     events: EventBus,
     mgr: Arc<SecretsManager>,
@@ -70,18 +75,11 @@ pub fn bootstrap_with_secrets(
     let db_path = data_dir.join("meridian.db");
     let pool = db::init_db(db_path.to_str().expect("invalid db path"));
     let plan_files = Arc::new(crate::plan_files::PlanFileStore::new(&data_dir));
-    {
-        let mut conn = pool.get().expect("db connection");
-        match plan_files.reconcile_all(&mut conn, now_ms()) {
-            Ok(reports) => {
-                let conflicts = reports.iter().filter(|(_, report)| report.conflict.is_some()).count();
-                if conflicts > 0 {
-                    tracing::warn!(documents = conflicts, "plan files require explicit conflict recovery");
-                }
-            }
-            Err(error) => tracing::error!(error = %error, "could not reconcile durable plan files"),
-        }
-    }
+    startup_recovery(&pool, &plan_files);
+    // After the migrations, which Diesel still runs; the file is WAL by now.
+    let sea = db::sea::open(&db_path)
+        .await
+        .map_err(|error| format!("could not open the database through SeaORM: {error}"))?;
     // The preference lives in the database, so the first few lines above
     // are recorded at the default level.
     crate::logging::apply_saved_level(&pool)?;
@@ -383,6 +381,7 @@ pub fn bootstrap_with_secrets(
 
     Ok(Services::new(ServicesInner {
         db: pool,
+        sea,
         secrets: mgr,
         tools: Arc::new(registry),
         mcp: mcp::McpRegistry::new(),
@@ -412,6 +411,74 @@ pub fn bootstrap_with_secrets(
         redaction,
         redaction_mappings: crate::redaction::RedactionMappings::new(),
     }))
+}
+
+/// Repairs and housekeeping that need the migrated schema and have to happen
+/// before anything can enqueue or start a turn, in the order they ran when they
+/// lived in `init_db`, followed by the plan files. Each one logs and carries on:
+/// none of them is a reason to keep the app from starting.
+///
+/// A list, not a loop over anything, so a change of order or a dropped item
+/// shows up in review; `a_turn_killed_by_a_crash_holds_its_queue_at_the_next_start`
+/// fails if the interrupted-turn reconciliation stops running at startup.
+pub(crate) fn startup_recovery(pool: &db::DbPool, plan_files: &crate::plan_files::PlanFileStore) {
+    let mut conn = pool.get().expect("db connection");
+    let now = now_ms();
+
+    // Memories no longer hang off projects by foreign key, and migrations run
+    // with foreign keys off anyway, so a table rebuild can leave orphans behind.
+    match db::ops::plan_review::backfill_legacy_artifacts(&mut conn, now) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(documents = n, "backfilled legacy plan artifacts"),
+        // The old rows remain readable through their existing path, so this is
+        // diagnosable degradation rather than a reason to make the database
+        // unavailable. The next startup retries the idempotent backfill.
+        Err(error) => tracing::error!(error = %error, "could not backfill legacy plan artifacts"),
+    }
+    match db::ops::plan_review::reconcile_dispatched_deliveries(&mut conn, now) {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(deliveries = n, "reconciled plan review deliveries after restart"),
+        Err(error) => tracing::error!(error = %error, "could not reconcile plan review deliveries"),
+    }
+    let orphans = db::ops::memory::purge_orphan_project_memories(&mut conn).unwrap_or(0);
+    let proposals = db::ops::memory::expire_proposals(&mut conn, now).unwrap_or(0);
+    // Bounded-growth housekeeping. Kept off the write path: neither sweep
+    // depends on what was just written, and the trash purge has no usable index
+    // (both are partial on `deleted_at IS NULL`), so doing it per write meant a
+    // full table scan each time.
+    let swept = db::ops::memory::sweep_untracked_subjects(&mut conn, now).unwrap_or(0);
+    // Startup housekeeping deletes rows the user may later go looking for. When
+    // it removed nothing there is nothing to say, but when it did, this is the
+    // only record that it happened.
+    if orphans > 0 || proposals > 0 || swept > 0 {
+        tracing::info!(
+            orphan_memories_deleted = orphans,
+            proposals_expired = proposals,
+            subjects_swept = swept,
+            "startup housekeeping removed rows"
+        );
+    }
+
+    // Turns only ever run inside the process that recorded them, so anything
+    // still marked running was killed rather than finished. This is the only
+    // moment that fact is knowable — after this the row would just look like a
+    // turn that has been going for a very long time.
+    match db::ops::turn::reconcile_interrupted(&mut conn, now) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(turns = n, "turns left running by the previous session"),
+        // Not fatal: it costs the diagnosis, not the conversation.
+        Err(e) => tracing::error!(error = %e, "could not reconcile interrupted turns"),
+    }
+
+    match plan_files.reconcile_all(&mut conn, now_ms()) {
+        Ok(reports) => {
+            let conflicts = reports.iter().filter(|(_, report)| report.conflict.is_some()).count();
+            if conflicts > 0 {
+                tracing::warn!(documents = conflicts, "plan files require explicit conflict recovery");
+            }
+        }
+        Err(error) => tracing::error!(error = %error, "could not reconcile durable plan files"),
+    }
 }
 
 /// Reconnect whatever the user marked for auto-connect.
@@ -543,6 +610,51 @@ mod tests {
         assert!(parse_tool_preset_names("preset", "{").is_err());
         assert!(parse_tool_preset_names("preset", r#"{"tool":"read_file"}"#).is_err());
         assert!(parse_tool_preset_names("preset", r#"["read_file",1]"#).is_err());
+    }
+
+    /// A crash leaves a turn marked running and a follow-up queued behind it.
+    /// The next start must hold that queue before anything can deliver it: the
+    /// follow-up was written against a turn that never finished. This goes
+    /// through the real startup, so it fails if the reconciliation stops being
+    /// part of it, wherever it lives.
+    #[tokio::test]
+    async fn a_turn_killed_by_a_crash_holds_its_queue_at_the_next_start() {
+        use std::sync::Arc;
+
+        use crate::db::models::queue::{Delivery, QueueState};
+        use crate::db::ops::{conversation, queue, turn};
+        use crate::keyring::SuppliedPassphraseStore;
+        use crate::secrets::SecretsManager;
+
+        // As the shell and meridiand do before bootstrapping: the saved log level
+        // is applied during startup and needs the subscriber in place.
+        crate::logging::init_early();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // The previous session: migrated, a turn running, a follow-up
+            // queued behind it, and then the process was killed.
+            let pool = crate::db::init_db(dir.path().join("meridian.db").to_str().unwrap());
+            let mut conn = pool.get().unwrap();
+            conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1000).unwrap();
+            turn::begin(&mut conn, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).unwrap();
+            queue::enqueue(&mut conn, "q1", "c1", "now rename it", Delivery::FollowUp, 1).unwrap();
+        }
+
+        let store = SuppliedPassphraseStore::new("a passphrase for the test only", "test").unwrap();
+        let secrets = Arc::new(SecretsManager::new_with_keyring_store(
+            dir.path().to_path_buf(),
+            Arc::new(store),
+        ));
+        let services = super::bootstrap_with_secrets(dir.path().to_path_buf(), crate::events::EventBus::new(), secrets)
+            .await
+            .unwrap();
+
+        let mut conn = services.db.get().unwrap();
+        assert_eq!(queue::list(&mut conn, "c1").unwrap()[0].state(), QueueState::Held);
+        assert!(
+            queue::next_pending(&mut conn, "c1").unwrap().is_none(),
+            "nothing is delivered on the premise of a turn that never finished",
+        );
     }
 
     #[test]

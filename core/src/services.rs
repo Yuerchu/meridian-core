@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::CompactCircuitBreaker;
 use crate::db::DbPool;
+use crate::db::sea::cap::Db;
 use crate::events::EventBus;
 use crate::mcp;
 use crate::secrets::SecretsManager;
@@ -43,6 +44,10 @@ pub struct Services(Arc<ServicesInner>);
 
 pub struct ServicesInner {
     pub db: DbPool,
+    /// The same database through SeaORM, open beside the Diesel pool while
+    /// modules move over one transaction root at a time. Nothing reaches the
+    /// database through it yet.
+    pub sea: Db,
     pub secrets: Arc<SecretsManager>,
     pub tools: Arc<tools::ToolRegistry>,
     /// No outer mutex: the registry locks internally and never across I/O.
@@ -167,15 +172,19 @@ impl std::ops::Deref for Services {
 ///
 /// Every part of it is lazy — the secrets manager does not reach the keyring
 /// until asked, the MCP registry has no servers, the sleep inhibitor nothing to
-/// inhibit — so this costs an in-memory database and whatever `dir` is.
+/// inhibit — so this costs one database file in `dir`, migrated, and open
+/// through both pools: `db` and `sea` see the same rows, which two separate
+/// in-memory databases would not.
 ///
 /// It lived in `acp::session`'s tests while that was the only module driving
 /// these directly, with a note saying the second caller should move it here.
 /// `acp::bridge` is the second caller.
 #[cfg(test)]
-pub fn bare_services(dir: &std::path::Path) -> Services {
+pub async fn bare_services(dir: &std::path::Path) -> Services {
+    let (db, sea) = crate::db::sea::shared_test_db(dir).await;
     Services::new(ServicesInner {
-        db: crate::db::diesel_test_db(),
+        db,
+        sea,
         secrets: Arc::new(crate::secrets::SecretsManager::new(dir.to_path_buf())),
         tools: Arc::new(tools::ToolRegistry::new(
             dir.join("skills"),

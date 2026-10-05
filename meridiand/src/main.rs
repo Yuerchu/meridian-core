@@ -134,7 +134,17 @@ fn run() -> Result<(), String> {
     // No sinks, and that is correct rather than tolerated: `EventBus::emit`
     // treats an empty registry as success, precisely so a headless run is not
     // failed by having no window to miss anything.
-    let services = meridian_core::bootstrap::bootstrap_with_secrets(data_dir, EventBus::new(), secrets.clone())?;
+    // Built before bootstrap, which is async; the one place this binary crosses
+    // from sync to async, so nothing below ever nests a second `block_on`.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start the runtime: {error}"))?;
+    let services = runtime.block_on(meridian_core::bootstrap::bootstrap_with_secrets(
+        data_dir,
+        EventBus::new(),
+        secrets.clone(),
+    ))?;
 
     let report = apply::apply(&services.db, &services.secrets, &config)?;
     tracing::info!(
@@ -144,11 +154,6 @@ fn run() -> Result<(), String> {
         webhooks_disabled = report.webhooks_disabled,
         "configuration applied"
     );
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("could not start the runtime: {error}"))?;
 
     // Both run *after* the configuration has been applied, so what they exercise
     // is the endpoint as configured rather than whatever a previous run left in

@@ -457,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn a_plan_review_blocks_then_acknowledgement_starts_the_queued_follow_up() {
         let dir = tempfile::tempdir().unwrap();
-        let services = crate::services::bare_services(dir.path());
+        let services = crate::services::bare_services(dir.path()).await;
         let starter = std::sync::Arc::new(CountingStarter::default());
         services.turn_starter.set(starter.clone()).ok().unwrap();
         {
@@ -558,7 +558,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_review_never_marks_an_ordinary_queued_prompt_held() {
         let dir = tempfile::tempdir().unwrap();
-        let services = crate::services::bare_services(dir.path());
+        let services = crate::services::bare_services(dir.path()).await;
         {
             let mut conn = services.db.get().unwrap();
             crate::db::ops::conversation::create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();

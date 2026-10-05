@@ -269,9 +269,9 @@ mod tests {
         rx
     }
 
-    fn services() -> (tempfile::TempDir, Services) {
+    async fn services() -> (tempfile::TempDir, Services) {
         let dir = tempfile::tempdir().unwrap();
-        let services = bare_services(dir.path());
+        let services = bare_services(dir.path()).await;
         (dir, services)
     }
 
@@ -280,9 +280,9 @@ mod tests {
         crate::db::ops::preference::set_preference(&mut conn, TTL_PREFERENCE, raw, 1).unwrap();
     }
 
-    #[test]
-    fn stored_ttl_is_strict_and_errors_are_not_defaulted() {
-        let (_dir, services) = services();
+    #[tokio::test]
+    async fn stored_ttl_is_strict_and_errors_are_not_defaulted() {
+        let (_dir, services) = services().await;
         assert_eq!(ttl(&services).unwrap(), Some(Duration::from_secs(30 * 60)));
 
         set_ttl(&services, "0");
@@ -316,9 +316,12 @@ mod tests {
     }
 
     /// An answer is an answer, and the deadline never fires.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn an_answered_question_comes_back_with_its_decision() {
-        let (_dir, services) = services();
+        let (_dir, services) = services().await;
+        // Paused after the database is open: sqlx opens it on a blocking thread,
+        // and a paused clock would run its acquire timeout out meanwhile.
+        tokio::time::pause();
         let rx = register(&services, "a-1", "t-1");
 
         let answered = services.approvals.claim("a-1").expect("still registered");
@@ -338,9 +341,12 @@ mod tests {
     /// The contract the whole feature rests on: nobody answering is `None`, and
     /// `None` is not a denial. A `Denied` here would tell the model the user
     /// refused, which nobody did.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn expiring_produces_no_answer_rather_than_a_refusal() {
-        let (_dir, services) = services();
+        let (_dir, services) = services().await;
+        // Paused after the database is open: sqlx opens it on a blocking thread,
+        // and a paused clock would run its acquire timeout out meanwhile.
+        tokio::time::pause();
         let rx = register(&services, "a-1", "t-1");
 
         let got = wait(
@@ -361,9 +367,12 @@ mod tests {
 
     /// No deadline means no deadline. Time moves a long way and the wait is
     /// still there.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_zero_ttl_means_the_question_stands() {
-        let (_dir, services) = services();
+        let (_dir, services) = services().await;
+        // Paused after the database is open: sqlx opens it on a blocking thread,
+        // and a paused clock would run its acquire timeout out meanwhile.
+        tokio::time::pause();
         let rx = register(&services, "a-1", "t-1");
         let cancel = CancellationToken::new();
 
@@ -382,9 +391,12 @@ mod tests {
 
     /// Stopping the turn ends the wait, and the entry goes with it — otherwise
     /// a late answer lands on a turn that has moved on.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn cancelling_the_turn_ends_the_wait() {
-        let (_dir, services) = services();
+        let (_dir, services) = services().await;
+        // Paused after the database is open: sqlx opens it on a blocking thread,
+        // and a paused clock would run its acquire timeout out meanwhile.
+        tokio::time::pause();
         let rx = register(&services, "a-1", "t-1");
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -395,9 +407,9 @@ mod tests {
 
     /// The single-owner rule, as behaviour. Two parties try to end one
     /// question; exactly one of them gets to.
-    #[test]
-    fn only_one_party_can_retire_a_question() {
-        let (_dir, services) = services();
+    #[tokio::test]
+    async fn only_one_party_can_retire_a_question() {
+        let (_dir, services) = services().await;
         let _rx = register(&services, "a-1", "t-1");
 
         assert!(retire(&services, "a-1", RetireCause::Expired));
@@ -410,9 +422,9 @@ mod tests {
 
     /// And the sweep is the same rule at scale: only this turn's questions, and
     /// only the ones nobody has already claimed.
-    #[test]
-    fn a_turn_sweep_takes_its_own_and_leaves_the_rest() {
-        let (_dir, services) = services();
+    #[tokio::test]
+    async fn a_turn_sweep_takes_its_own_and_leaves_the_rest() {
+        let (_dir, services) = services().await;
         let _a = register(&services, "a-1", "t-1");
         let _b = register(&services, "a-2", "t-1");
         let _c = register(&services, "a-3", "t-2");
@@ -432,9 +444,9 @@ mod tests {
     /// The listing guard. It is not what ends a question — the waiter is — but
     /// between the deadline and the waiter's next tick a list must not hand back
     /// a card whose buttons are about to stop working.
-    #[test]
-    fn a_question_past_its_deadline_reads_as_expired() {
-        let (_dir, services) = services();
+    #[tokio::test]
+    async fn a_question_past_its_deadline_reads_as_expired() {
+        let (_dir, services) = services().await;
         let _rx = register(&services, "a-1", "t-1");
 
         let mut map = services.approvals.lock();
@@ -451,9 +463,9 @@ mod tests {
     /// A delegated run's question is asked on the parent, so it has to be
     /// withdrawn from the parent. Announcing the sub-agent's conversation would
     /// leave the card that is actually on screen untouched.
-    #[test]
-    fn an_expiry_is_announced_where_the_card_was_drawn() {
-        let (_dir, services) = services();
+    #[tokio::test]
+    async fn an_expiry_is_announced_where_the_card_was_drawn() {
+        let (_dir, services) = services().await;
         let (tx, _rx) = oneshot::channel();
         services.approvals.lock().insert(
             "a-1".into(),
@@ -494,9 +506,9 @@ mod tests {
 
     /// Only expiry is announced. The other two ride the turn's own `stop`, and
     /// a second event would be one more thing to keep in step with it.
-    #[test]
-    fn ending_with_the_turn_is_not_separately_announced() {
-        let (_dir, services) = services();
+    #[tokio::test]
+    async fn ending_with_the_turn_is_not_separately_announced() {
+        let (_dir, services) = services().await;
         let seen = recording(&services);
 
         let _a = register(&services, "a-1", "t-1");
