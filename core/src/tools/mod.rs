@@ -18,6 +18,7 @@ pub mod redaction;
 pub mod run_command;
 pub mod search_files;
 pub mod skill;
+pub mod spec;
 pub mod sticker;
 pub mod sub_agent;
 pub mod todo;
@@ -518,6 +519,10 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> serde_json::Value;
     fn default_permission(&self) -> Permission;
 
+    /// What this tool is: its effect and which agents may hold it. Required,
+    /// with no default and no `Default` to spread — see [`spec`].
+    fn spec(&self) -> spec::ToolSpec;
+
     /// What this particular call would touch.
     ///
     /// The default is the conservative answer: a tool that has not worked out
@@ -531,9 +536,9 @@ pub trait Tool: Send + Sync {
     /// Whether this tool is safe to run concurrently with other parallel-safe
     /// tools in the same batch. Only meaningful when the call also needs no
     /// approval — a tool that requires a prompt is never dispatched in parallel
-    /// regardless of this flag.
+    /// regardless of this flag. Read off [`Self::spec`].
     fn supports_parallel(&self) -> bool {
-        false
+        self.spec().parallel
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String>;
@@ -623,6 +628,22 @@ impl ToolRegistry {
         let mut out: Vec<_> = self.builtin.iter().map(def).collect();
         out.extend(self.custom.read().unwrap().iter().map(def));
         out
+    }
+
+    /// The built-in tools whose spec answers yes, in registry order. Built-ins
+    /// only: a custom tool is the user's program and is never handed to an
+    /// agent by a classification it did not make.
+    pub fn builtin_names_where(&self, pred: impl Fn(&spec::ToolSpec) -> bool) -> Vec<&str> {
+        self.builtin
+            .iter()
+            .filter(|t| pred(&t.spec()))
+            .map(|t| t.name())
+            .collect()
+    }
+
+    /// A built-in tool's spec, by name.
+    pub fn builtin_spec(&self, name: &str) -> Option<spec::ToolSpec> {
+        self.builtin.iter().find(|t| t.name() == name).map(|t| t.spec())
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {

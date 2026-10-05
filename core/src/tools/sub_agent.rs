@@ -12,6 +12,17 @@ pub struct RunAgentTool;
 
 #[async_trait]
 impl Tool for RunAgentTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Delegate,
+            loop_handled: true,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         crate::agent::sub_agents::RUN_AGENT_TOOL
     }

@@ -54,6 +54,17 @@ fn extract_domain(url: &str) -> Option<String> {
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Network,
+            loop_handled: false,
+            plan_mode: true,
+            explore: true,
+            reviewer: false,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "web_search"
     }
@@ -87,10 +98,6 @@ impl Tool for WebSearchTool {
     // Queries are model-generated and leave the machine — require confirmation.
     fn default_permission(&self) -> Permission {
         Permission::Ask
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String> {

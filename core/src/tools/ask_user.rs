@@ -5,6 +5,17 @@ pub struct AskUserTool;
 
 #[async_trait]
 impl Tool for AskUserTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Interactive,
+            loop_handled: true,
+            plan_mode: true,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "ask_user"
     }

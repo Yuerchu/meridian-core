@@ -159,6 +159,10 @@ struct ProjectScoped {
 
 #[async_trait::async_trait]
 impl Tool for ProjectScoped {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        self.inner.spec()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -206,6 +210,10 @@ const BRIDGE_LOG_MINUTES: i64 = 24 * 60;
 
 #[async_trait::async_trait]
 impl Tool for ConversationScopedLogs {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        self.inner.spec()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -897,6 +905,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for Spy {
+        fn spec(&self) -> crate::tools::spec::ToolSpec {
+            crate::tools::spec::ToolSpec {
+                effect: crate::tools::spec::Effect::Read,
+                loop_handled: false,
+                plan_mode: false,
+                explore: false,
+                reviewer: false,
+                parallel: false,
+            }
+        }
+
         fn name(&self) -> &str {
             "read_app_logs"
         }
@@ -990,6 +1009,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for ProjectSpy {
+        fn spec(&self) -> crate::tools::spec::ToolSpec {
+            crate::tools::spec::ToolSpec {
+                effect: crate::tools::spec::Effect::Read,
+                loop_handled: false,
+                plan_mode: false,
+                explore: false,
+                reviewer: false,
+                parallel: false,
+            }
+        }
+
         fn name(&self) -> &str {
             "recall_memory"
         }
@@ -1046,6 +1076,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for Ran {
+        fn spec(&self) -> crate::tools::spec::ToolSpec {
+            crate::tools::spec::ToolSpec {
+                effect: crate::tools::spec::Effect::Read,
+                loop_handled: false,
+                plan_mode: false,
+                explore: false,
+                reviewer: false,
+                parallel: false,
+            }
+        }
+
         fn name(&self) -> &str {
             "conversation_usage"
         }

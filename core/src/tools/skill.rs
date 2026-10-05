@@ -23,6 +23,17 @@ impl LoadSkillTool {
 
 #[async_trait]
 impl Tool for LoadSkillTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: false,
+            plan_mode: true,
+            explore: false,
+            reviewer: false,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "load_skill"
     }
@@ -56,10 +67,6 @@ impl Tool for LoadSkillTool {
     /// everything up front.
     fn default_permission(&self) -> Permission {
         Permission::Always
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {

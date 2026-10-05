@@ -38,6 +38,17 @@ pub struct SaveMemoryTool;
 
 #[async_trait]
 impl Tool for SaveMemoryTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::AppState,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "save_memory"
     }
@@ -136,6 +147,17 @@ pub struct RecallMemoryTool;
 
 #[async_trait]
 impl Tool for RecallMemoryTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: false,
+            plan_mode: true,
+            explore: true,
+            reviewer: false,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "recall_memory"
     }
@@ -159,10 +181,6 @@ impl Tool for RecallMemoryTool {
 
     fn default_permission(&self) -> Permission {
         Permission::Always
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
@@ -191,6 +209,17 @@ pub struct ListMemoriesTool;
 
 #[async_trait]
 impl Tool for ListMemoriesTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: false,
+            plan_mode: true,
+            explore: true,
+            reviewer: false,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "list_memories"
     }
@@ -208,10 +237,6 @@ impl Tool for ListMemoriesTool {
 
     fn default_permission(&self) -> Permission {
         Permission::Always
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, _args: Value, context: &ToolContext) -> Result<String, String> {
@@ -243,6 +268,17 @@ pub struct DeleteMemoryTool;
 
 #[async_trait]
 impl Tool for DeleteMemoryTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::AppState,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "delete_memory"
     }
