@@ -2,6 +2,8 @@ pub mod app_logs;
 pub mod apply_patch;
 pub mod ask_user;
 pub mod backend;
+#[cfg(not(target_os = "android"))]
+pub mod catalog;
 pub mod custom;
 pub mod delete_file;
 pub mod edit_file;

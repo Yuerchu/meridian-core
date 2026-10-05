@@ -968,6 +968,30 @@ impl QqToolExecutor {
     }
 }
 
+/// What the generated tool catalog (`tools::catalog`) says about each QQ tool:
+/// the flags, plus its effect read off [`has_effects`] — the same rule that
+/// decides which calls describe themselves. Separate from [`catalog`], whose
+/// shape is an IPC contract the settings page validates exactly.
+pub fn spec_catalog() -> Vec<serde_json::Value> {
+    QqTool::all()
+        .map(|t| {
+            let s = t.spec();
+            let scope = match s.scope {
+                Scope::Any => "any",
+                Scope::GroupOnly => "group",
+                Scope::PrivateOnly => "private",
+            };
+            serde_json::json!({
+                "name": t.name(),
+                "effect": if has_effects(t.name()) { "messaging" } else { "read" },
+                "admin_only": s.admin_only,
+                "needs_approval": s.needs_approval,
+                "scope": scope,
+            })
+        })
+        .collect()
+}
+
 /// Static catalog for the settings UI: tool names plus the flags that drive
 /// the availability badges. Display names/descriptions are localized on the
 /// frontend by tool name.

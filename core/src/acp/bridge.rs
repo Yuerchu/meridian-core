@@ -110,7 +110,7 @@ const MAX_RESULT_BYTES: usize = 64 * 1024;
 /// The name the agent sees. Tools arrive at the model as
 /// `mcp__meridian__<tool>` and appear that way in its permission prompts, so it
 /// wants to read as the app rather than as a mechanism.
-const SERVER_NAME: &str = "meridian";
+pub(crate) const SERVER_NAME: &str = "meridian";
 
 /// The version this client speaks. Echoed from the request when the client
 /// proposes one, which is what the probe measured happening.
@@ -281,7 +281,11 @@ impl Tool for ConversationScopedLogs {
 /// change under a session, so the list is stable, and a model that cannot see a
 /// tool will not keep trying it or tell the user about a capability it does not
 /// have.
-fn tools_for(conversation_id: &str, project_id: Option<&str>, logs_dir: std::path::PathBuf) -> Vec<Arc<dyn Tool>> {
+pub(crate) fn tools_for(
+    conversation_id: &str,
+    project_id: Option<&str>,
+    logs_dir: std::path::PathBuf,
+) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ConversationScopedLogs {
             inner: Arc::new(crate::tools::app_logs::ReadAppLogsTool::new(logs_dir)),

@@ -29,6 +29,7 @@ use crate::util::{get_conn, now_ms};
 
 use protocol::{OneBotAction, OneBotFrame, OneBotResponse};
 pub use qq_tools::catalog as qq_tool_catalog;
+pub use qq_tools::spec_catalog as qq_tool_spec_catalog;
 use session::{SessionKey, SessionManager};
 
 pub struct SharedState {
