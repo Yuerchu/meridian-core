@@ -518,7 +518,7 @@ mod search_tests {
 
     #[test]
     fn search_speaks_once_per_conversation_and_only_for_speech() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", Some("消息树聊天"), None, None, 1).unwrap();
         create_conversation(&mut conn, "c2", Some("别的"), None, None, 2).unwrap();
@@ -536,7 +536,7 @@ mod search_tests {
 
     #[test]
     fn a_zero_search_limit_returns_no_rows() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", Some("match"), None, None, 1).unwrap();
         say(&mut conn, "m1", "c1", "user", "needle", 10);
@@ -546,7 +546,7 @@ mod search_tests {
 
     #[test]
     fn search_skips_delegated_transcripts() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "parent", None, None, None, 1).unwrap();
         insert(
@@ -567,7 +567,7 @@ mod search_tests {
 
     #[test]
     fn search_treats_like_wildcards_as_characters() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         say(&mut conn, "m1", "c1", "user", "进度到 50% 了", 10);
@@ -588,7 +588,7 @@ mod search_tests {
     /// decoder. This test goes red if that branch is dropped.
     #[test]
     fn search_survives_json_escaping_in_block_arrays() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         say(
@@ -612,7 +612,7 @@ mod search_tests {
     /// that goes red if the scan is capped instead of paged.
     #[test]
     fn search_scans_past_a_talkative_conversation() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "chatty", None, None, None, 1).unwrap();
         create_conversation(&mut conn, "quiet", None, None, None, 2).unwrap();
@@ -640,7 +640,7 @@ mod search_tests {
     /// This is the test that goes red if the recheck is dropped.
     #[test]
     fn search_never_matches_inside_a_data_uri() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         say(
@@ -661,7 +661,7 @@ mod search_tests {
 
     #[test]
     fn update_project_refiles_and_unfiles() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::project::create_project(
             &mut conn,
@@ -820,13 +820,13 @@ pub fn delete_conversation(conn: &mut SqliteConnection, id: &str) -> QueryResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     /// Migrations are plain SQL and Diesel does not check them at compile time,
     /// so this is the only place a broken ALTER TABLE surfaces before runtime.
     #[test]
     fn migrations_apply_and_reasoning_prefs_round_trip() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         let conv = create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
@@ -920,7 +920,7 @@ mod tests {
     /// turn one delegated errand into a second entry they never started.
     #[test]
     fn a_delegated_conversation_stays_out_of_the_lists() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::project::create_project(
             &mut conn,
@@ -960,7 +960,7 @@ mod tests {
     /// call ids are equal and whose cards are not.
     #[test]
     fn two_runs_with_the_same_call_id_stay_apart() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "parent", Some("t"), None, None, 1).unwrap();
         spawn(&mut conn, "first", "parent", "m1", "0", "t-first");
@@ -986,7 +986,7 @@ mod tests {
     /// looks like.
     #[test]
     fn the_card_reads_the_delegated_turn_and_not_the_latest_one() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "parent", Some("t"), None, None, 1).unwrap();
         spawn(&mut conn, "child", "parent", "m1", "0", "t-run");
@@ -1014,7 +1014,7 @@ mod tests {
     /// tools is still one step.
     #[test]
     fn steps_count_assistant_iterations_of_the_delegated_turn() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "parent", Some("t"), None, None, 1).unwrap();
         spawn(&mut conn, "child", "parent", "m1", "0", "t-run");
@@ -1030,7 +1030,7 @@ mod tests {
     /// Two connections toggling one row at the same time must each land their
     /// toggle. Read-then-write on autocommit does not: both read the same
     /// value, both write the same inverse, and one of the two presses is gone.
-    /// Not `test_db()`, whose pool holds one connection to a private in-memory
+    /// Not `diesel_test_db()`, whose pool holds one connection to a private in-memory
     /// database — the race needs two connections to one file, which is what
     /// the desktop's pool is. This is the test that goes red without the
     /// `immediate_transaction`.
@@ -1092,7 +1092,7 @@ mod tests {
     /// behaving exactly as they did.
     #[test]
     fn conversations_that_predate_delegation_are_ordinary() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let conv = create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
 
@@ -1114,7 +1114,7 @@ mod tests {
     /// ever reach.
     #[test]
     fn a_delegated_run_pins_the_model_its_transcript_was_written_by() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "parent", Some("t"), None, None, 1).unwrap();
         spawn(&mut conn, "child", "parent", "m1", "0", "t-a");
@@ -1182,7 +1182,7 @@ mod tests {
     /// that could have opened it went with its parent.
     #[test]
     fn deleting_a_conversation_takes_its_delegated_runs_with_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "parent", Some("t"), None, None, 1).unwrap();
         create_conversation(&mut conn, "bystander", Some("t"), None, None, 1).unwrap();
@@ -1205,7 +1205,7 @@ mod tests {
     /// one query because depth is a property of the tool set, not of the schema.
     #[test]
     fn descendants_walks_and_cannot_be_trapped_by_a_cycle() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "parent", Some("t"), None, None, 1).unwrap();
         spawn(&mut conn, "child", "parent", "m1", "0", "t-a");

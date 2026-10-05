@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn enqueue_commits_the_prompt_and_its_frozen_snapshot_together() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::conversation::create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         let frozen = prepared("old bytes");

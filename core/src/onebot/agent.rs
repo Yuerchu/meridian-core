@@ -1233,14 +1233,14 @@ mod tests {
     mod approvals {
         use super::*;
         use crate::agent::engine::{ApprovalDecision, Approvals};
-        use crate::db::test_db;
+        use crate::db::diesel_test_db;
         use crate::turn::TurnOrigin;
 
         /// `said` of `None` is nobody answering: the minute ran out, or the turn
         /// was swept out from under the question.
         fn asked(said: Option<&str>, tool: &str) -> Option<ApprovalDecision> {
             let said = said.map(str::to_string);
-            let pool = test_db();
+            let pool = diesel_test_db();
             {
                 let mut conn = pool.get().unwrap();
                 crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
@@ -1276,7 +1276,7 @@ mod tests {
         #[test]
         fn unreadable_settings_are_refused_without_asking_the_chat() {
             let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let pool = test_db();
+            let pool = diesel_test_db();
             let counter = asked.clone();
             let approval_fn: ApprovalFn = Box::new(move |_, _| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

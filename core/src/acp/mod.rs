@@ -622,7 +622,7 @@ fn title_for(cwd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     /// A stop pressed while a send is still reopening its session reaches the
     /// send, with no session in the registry at all — the case that used to
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn absent_acp_preferences_use_fresh_install_defaults() {
-        let loaded = AcpConfig::load(&test_db()).unwrap();
+        let loaded = AcpConfig::load(&diesel_test_db()).unwrap();
         let expected = AcpConfig::default();
         assert_eq!(loaded.command, expected.command);
         assert_eq!(loaded.args, expected.args);
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn malformed_stored_acp_arguments_are_not_defaulted() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::preference::set_preference(&mut conn, "acp.args", "npx -y adapter", 1).unwrap();
         drop(conn);

@@ -400,8 +400,8 @@ pub fn reconcile_interrupted(conn: &mut SqliteConnection, now: i64) -> QueryResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::ops::conversation::create_conversation;
-    use crate::db::test_db;
 
     fn conv(conn: &mut SqliteConnection, id: &str) {
         create_conversation(conn, id, Some("t"), None, None, 1000).unwrap();
@@ -415,7 +415,7 @@ mod tests {
     /// being asked: every caller of `begin` is one.
     #[test]
     fn a_turn_records_what_set_it_going() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
 
@@ -442,7 +442,7 @@ mod tests {
     /// is read.
     #[test]
     fn an_unknown_trigger_is_refused_by_the_table() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         let refused = diesel::sql_query(
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn a_turn_starts_running_and_streaming() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
 
@@ -472,7 +472,7 @@ mod tests {
     /// doing — including going back to streaming once a tool returns.
     #[test]
     fn the_phase_follows_the_turn() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -500,7 +500,7 @@ mod tests {
     /// the phase.
     #[test]
     fn a_turn_left_running_is_interrupted_at_the_next_launch() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -532,7 +532,7 @@ mod tests {
         use crate::db::models::queue::{Delivery, QueueState};
         use crate::db::ops::queue;
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "crashed");
         conv(&mut conn, "idle");
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn reconciliation_leaves_finished_turns_alone() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         for (id, status) in [
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn a_failed_turn_keeps_what_went_wrong() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn unreported_turns_come_back_newest_first_within_their_conversation() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         conv(&mut conn, "c2");
@@ -647,7 +647,7 @@ mod tests {
     /// already see it.
     #[test]
     fn a_turn_that_reached_an_ending_owes_nothing() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         for (id, status) in [
@@ -673,7 +673,7 @@ mod tests {
     /// turn that read it dies on the way to the provider.
     #[test]
     fn a_reported_turn_leaves_the_queue_and_keeps_its_first_telling() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -706,7 +706,7 @@ mod tests {
     /// Turns belong to their conversation and go with it.
     #[test]
     fn deleting_a_conversation_takes_its_turns() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -722,7 +722,7 @@ mod tests {
     /// says side effects may have happened.
     #[test]
     fn a_finished_turn_no_longer_moves() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -746,7 +746,7 @@ mod tests {
     /// sends the caller down the failure path with the same turn id.
     #[test]
     fn a_turn_cannot_end_twice() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -767,7 +767,7 @@ mod tests {
     /// not say it did — the stop event on the same turn says `loop_detected`.
     #[test]
     fn a_turn_the_loop_guard_stopped_is_not_recorded_as_done() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -792,7 +792,7 @@ mod tests {
     /// has nothing to do with when it was written. Insertion order does.
     #[test]
     fn turns_from_the_same_millisecond_still_have_an_order() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         // Ids chosen so that ordering by `id` would put them the wrong way
@@ -821,7 +821,7 @@ mod tests {
     /// filed themselves under it.
     #[test]
     fn a_second_turn_cannot_claim_an_id_that_is_already_on_record() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -852,7 +852,7 @@ mod tests {
     /// value silently reinterpreted as no status.
     #[test]
     fn an_unknown_status_is_rejected() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn an_unknown_phase_is_rejected() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conv(&mut conn, "c1");
         begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();

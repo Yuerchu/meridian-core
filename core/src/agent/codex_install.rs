@@ -58,7 +58,7 @@ mod tests {
     /// report a new installation on every round of the same turn.
     #[test]
     fn the_installation_id_is_stable_once_minted() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         let first = installation_id(&mut conn).expect("an id is minted on first use");

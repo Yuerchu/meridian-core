@@ -71,7 +71,7 @@ pub fn find_name_clashes(conn: &mut SqliteConnection, llm_name: &str) -> QueryRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn make_skill<'a>(dir_name: &'a str, llm_name: &'a str) -> SkillInsert<'a> {
         SkillInsert {
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn upsert_inserts_then_updates() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         let created = upsert_skill(&mut conn, &make_skill("my-skill", "my-skill")).unwrap();
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn upsert_preserves_user_toggled_enabled_state() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         upsert_skill(&mut conn, &make_skill("s", "s")).unwrap();
         update_skill(
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn list_is_sorted_by_dir_name() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         upsert_skill(&mut conn, &make_skill("zebra", "zebra")).unwrap();
         upsert_skill(&mut conn, &make_skill("alpha", "alpha")).unwrap();
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn delete_missing_removes_only_absent_dirs() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         upsert_skill(&mut conn, &make_skill("kept", "kept")).unwrap();
         upsert_skill(&mut conn, &make_skill("gone", "gone")).unwrap();
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn find_name_clashes_reports_every_dir_sharing_a_name() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         upsert_skill(&mut conn, &make_skill("mine-pdf", "pdf-tools")).unwrap();
         upsert_skill(&mut conn, &make_skill("theirs-pdf", "pdf-tools")).unwrap();

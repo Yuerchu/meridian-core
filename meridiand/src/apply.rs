@@ -298,7 +298,7 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::db::test_db;
+    use meridian_core::db::diesel_test_db;
 
     fn secrets(dir: &std::path::Path) -> SecretsManager {
         use meridian_core::keyring::SuppliedPassphraseStore;
@@ -336,7 +336,7 @@ mod tests {
         // SAFETY: single-threaded test; the variable is read by `apply` below.
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         let secrets = secrets(dir.path());
         let config = DaemonConfig::parse(ONE_OF_EACH).unwrap();
 
@@ -360,7 +360,7 @@ mod tests {
     fn what_the_file_stops_naming_is_switched_off_but_kept() {
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         let secrets = secrets(dir.path());
 
         apply(&pool, &secrets, &DaemonConfig::parse(ONE_OF_EACH).unwrap()).unwrap();
@@ -411,7 +411,7 @@ mod tests {
 
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         let secrets = secrets(dir.path());
 
         let entry = |vendor: &str, url: &str| {
@@ -461,7 +461,7 @@ mod tests {
     fn a_missing_environment_variable_writes_nothing_at_all() {
         unsafe { std::env::remove_var("TEST_ABSENT_KEY") };
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         let secrets = secrets(dir.path());
         let config = DaemonConfig::parse(
             r#"
@@ -496,7 +496,7 @@ mod tests {
     /// file does not name.
     #[test]
     fn a_populated_unclaimed_data_directory_is_refused() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             ops::provider::create_provider(
@@ -528,7 +528,7 @@ mod tests {
         assert!(error.contains("not marked as the daemon's"), "{error}");
 
         // An empty one is claimed, and stays claimed once it has rows.
-        let fresh = test_db();
+        let fresh = diesel_test_db();
         claim_data_dir(&fresh).unwrap();
         {
             let mut conn = fresh.get().unwrap();

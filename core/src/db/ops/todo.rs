@@ -166,7 +166,7 @@ pub fn format_todo_block(view: &TodoListView) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     /// Lists hang off a real conversation row: foreign keys are enforced on
     /// every pooled connection, which is what makes the cascade below real.
@@ -194,7 +194,7 @@ mod tests {
     /// so this is the only place a broken CREATE TABLE surfaces before runtime.
     #[test]
     fn migrations_apply_and_tables_are_queryable() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         assert!(get_active_view(&mut conn, "c1").unwrap().is_none());
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn first_call_opens_a_list() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn same_title_replaces_items_in_place() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn new_title_archives_the_previous_list() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn finishing_every_step_archives_the_list() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -304,7 +304,7 @@ mod tests {
         use crate::db::models::plan_review::PlanDocumentState;
         use crate::db::schema::plan_documents;
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         let document = crate::db::ops::plan_review::create_or_resume_document(&mut conn, "c1", 1).unwrap();
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn only_one_list_can_be_in_progress() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         replace_active_list(&mut conn, "c1", "Phase one", &[input("a", ItemStatus::Pending)], 10).unwrap();
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn deleting_a_conversation_cascades_to_lists_and_items() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         let view =
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn empty_list_renders_no_block() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         let view = replace_active_list(&mut conn, "c1", "Empty", &[], 10).unwrap();
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn block_lists_every_step_with_its_state() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         let view = replace_active_list(

@@ -623,8 +623,8 @@ mod tests {
         assert!(scan_skills(&dir.path().join("does-not-exist")).is_empty());
     }
 
+    use crate::db::diesel_test_db;
     use crate::db::models::skill::SkillChangeset;
-    use crate::db::test_db;
 
     #[test]
     fn sync_indexes_disk_and_drops_vanished_skills() {
@@ -632,7 +632,7 @@ mod tests {
         write_skill_file(dir.path(), "one", "one", "First", "b").unwrap();
         write_skill_file(dir.path(), "two", "two", "Second", "b").unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let indexed = sync_index(&mut conn, dir.path()).unwrap();
         assert_eq!(indexed.len(), 2);
@@ -651,7 +651,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "one", "one", "First", "b").unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         assert_eq!(sync_index(&mut conn, dir.path()).unwrap().len(), 1);
 
@@ -669,7 +669,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "one", "one", "First", "b").unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         sync_index(&mut conn, dir.path()).unwrap();
 
@@ -684,7 +684,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "s", "s", "Before", "b").unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         sync_index(&mut conn, dir.path()).unwrap();
 
@@ -698,7 +698,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "s", "s", "D", "b").unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         sync_index(&mut conn, dir.path()).unwrap();
         db::ops::skill::update_skill(
@@ -720,7 +720,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::agent::manual::write_manual(dir.path(), &[]).unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let indexed = sync_index(&mut conn, dir.path()).unwrap();
 
@@ -734,7 +734,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::agent::diagnostics::write_diagnostics(dir.path()).unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let indexed = sync_index(&mut conn, dir.path()).unwrap();
 
@@ -748,7 +748,7 @@ mod tests {
         crate::agent::manual::write_manual(dir.path(), &[]).unwrap();
         crate::agent::diagnostics::write_diagnostics(dir.path()).unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         sync_index(&mut conn, dir.path()).unwrap();
         seed_builtin_bindings(&mut conn);
@@ -766,7 +766,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::agent::diagnostics::write_diagnostics(dir.path()).unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         sync_index(&mut conn, dir.path()).unwrap();
         seed_builtin_bindings(&mut conn);
@@ -792,7 +792,7 @@ mod tests {
     /// never be seeded again.
     #[test]
     fn a_failed_bind_is_retried_on_the_next_launch() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         // No sync_index, so there is no skills row for the foreign key.

@@ -138,7 +138,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "content").unwrap();
 
         let journal = crate::journal::capture::JournalCtx::new(
-            crate::db::test_db(),
+            crate::db::diesel_test_db(),
             tempfile::tempdir().unwrap().keep(),
             "conv".into(),
             "turn".into(),

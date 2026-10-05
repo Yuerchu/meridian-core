@@ -79,7 +79,7 @@ pub fn upsert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn conversation(conn: &mut SqliteConnection, id: &str) {
         crate::db::ops::conversation::create_conversation(conn, id, Some("hosted"), None, None, 0).unwrap();
@@ -89,7 +89,7 @@ mod tests {
     /// then given a different one when a resume lands somewhere else.
     #[test]
     fn a_conversations_session_is_rewritten_in_place() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -117,7 +117,7 @@ mod tests {
     /// transcripts written from the same place.
     #[test]
     fn one_session_cannot_belong_to_two_conversations() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         conversation(&mut conn, "c2");
@@ -136,7 +136,7 @@ mod tests {
     /// listed session in that directory would be reported as already taken.
     #[test]
     fn the_owner_list_names_only_conversations_that_hold_a_session() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         conversation(&mut conn, "c2");
@@ -162,7 +162,7 @@ mod tests {
     /// a conversation that legitimately resumes it later.
     #[test]
     fn deleting_the_conversation_takes_the_row() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         upsert(&mut conn, "c1", Some("sess-1"), "/a", 1).unwrap();

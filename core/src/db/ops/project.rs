@@ -92,7 +92,7 @@ pub fn delete_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn project(conn: &mut SqliteConnection, id: &str, path: Option<&str>) {
         create_project(
@@ -120,7 +120,7 @@ mod tests {
     /// spellings tried are the platform's own.
     #[test]
     fn a_path_matches_despite_separators_and_trailing_slash() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let (stored, asked): (&str, Vec<&str>) = if cfg!(windows) {
             (
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn a_different_directory_is_not_a_match() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         project(&mut conn, "p1", Some("C:/Code/repo"));
 
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn a_project_without_a_path_never_matches() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         project(&mut conn, "p1", None);
 

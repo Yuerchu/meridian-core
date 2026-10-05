@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn sticker_parts_become_semantics_and_old_unknowns_do_not_resend_pixels() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::emoji_pack::create_pack(
             &mut conn,

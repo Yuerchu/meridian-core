@@ -1211,10 +1211,10 @@ pub async fn plan_injection_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::memory::{MemoryInsert, Origin};
     use crate::db::models::project::ProjectInsert;
     use crate::db::ops::memory::upsert_memory;
-    use crate::db::test_db;
 
     fn project(conn: &mut SqliteConnection, id: &str) {
         crate::db::ops::project::create_project(
@@ -1289,7 +1289,7 @@ mod tests {
     fn invalid_stored_visibility_aborts_injection() {
         use diesel::prelude::*;
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         project(conn, "p1");
         add(
@@ -1409,7 +1409,7 @@ mod tests {
         /// is still in the history and the model can still read it.
         #[test]
         fn an_unchanged_turn_injects_nothing() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100);
@@ -1431,7 +1431,7 @@ mod tests {
         /// it goes. Reading the upsert side alone loses this entirely.
         #[test]
         fn an_old_row_deleted_today_is_still_reported() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             add_at(conn, "old", MemoryScope::OnebotUser, &alice, "coffee", 10);
@@ -1460,7 +1460,7 @@ mod tests {
         /// would ever say otherwise.
         #[test]
         fn a_restored_memory_comes_back() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             add_at(conn, "old", MemoryScope::OnebotUser, &alice, "coffee", 10);
@@ -1487,7 +1487,7 @@ mod tests {
         /// budget that fits only some of them re-reads the same prefix forever.
         #[test]
         fn rows_sharing_a_millisecond_all_get_through() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             for i in 0..5 {
@@ -1525,7 +1525,7 @@ mod tests {
         /// newest thing I sent" would jump straight over it.
         #[test]
         fn a_dropped_entry_is_not_stepped_over() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             // `aaa` sorts first and is kept; `zzz` sorts last and is dropped —
@@ -1552,7 +1552,7 @@ mod tests {
         /// memories the model can no longer see.
         #[test]
         fn a_history_with_no_full_row_starts_over() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100);
@@ -1577,7 +1577,7 @@ mod tests {
         /// evidence expired" are the same answer.
         #[test]
         fn a_cursor_past_the_retention_horizon_starts_over() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100);
@@ -1597,7 +1597,7 @@ mod tests {
         /// it exactly once.
         #[test]
         fn a_write_in_the_starting_millisecond_waits_for_the_next_round() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100);
@@ -1625,7 +1625,7 @@ mod tests {
         /// this is allowed to be wrong in.
         #[test]
         fn a_newcomer_left_half_delivered_is_not_stepped_over() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             let bob = onebot_user_scope_id(2);
@@ -1674,7 +1674,7 @@ mod tests {
         /// Everyone already accounted for gets nothing.
         #[test]
         fn a_newcomer_gets_their_whole_history_and_nobody_else_does() {
-            let pool = test_db();
+            let pool = diesel_test_db();
             let conn = &mut pool.get().unwrap();
             let alice = onebot_user_scope_id(1);
             let bob = onebot_user_scope_id(2);
@@ -1695,7 +1695,7 @@ mod tests {
     /// Desktop output must not change: existing assistants are tuned against it.
     #[test]
     fn desktop_block_is_unchanged_from_the_legacy_format() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         project(conn, "p1");
         add(
@@ -1722,7 +1722,7 @@ mod tests {
     /// never seen again. Still no policy preamble: one speaker, nothing to leak.
     #[test]
     fn desktop_reads_global_memories_without_the_policy_preamble() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         add(
             conn,
@@ -1748,7 +1748,7 @@ mod tests {
     /// prefix.
     #[test]
     fn desktop_renders_global_before_project() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         project(conn, "p1");
         add(
@@ -1784,7 +1784,7 @@ mod tests {
     /// over QQ is not background for a desktop chat, and vice versa.
     #[test]
     fn the_two_global_layers_do_not_leak_into_each_other() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         add(
             conn,
@@ -1827,7 +1827,7 @@ mod tests {
     /// The privacy boundary, end to end through the renderer.
     #[test]
     fn group_block_omits_private_memories() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let alice = onebot_user_scope_id(1);
         add(
@@ -1867,7 +1867,7 @@ mod tests {
 
     #[test]
     fn owner_notes_are_a_separate_section() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let alice = onebot_user_scope_id(1);
         add(
@@ -1925,7 +1925,7 @@ mod tests {
     /// cannot address — worst for whoever just arrived.
     #[test]
     fn everyone_present_appears_even_without_memories() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let known = onebot_user_scope_id(1);
         add(
@@ -1960,7 +1960,7 @@ mod tests {
     /// is what turns the id on each message into a name.
     #[test]
     fn a_roster_ships_when_nothing_is_remembered_yet() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let req = group_req(None, &[7], 8_000);
         let req = MemoryRequest {
@@ -2017,7 +2017,7 @@ mod tests {
     /// Order must not depend on anything that changes between turns.
     #[test]
     fn subject_order_follows_scope_id_not_request_order() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         for uid in [2i64, 1] {
             let scope = onebot_user_scope_id(uid);
@@ -2062,7 +2062,7 @@ mod tests {
 
     #[test]
     fn every_layer_is_capped_including_the_bot_layer() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         for i in 0..40 {
             add(
@@ -2087,7 +2087,7 @@ mod tests {
 
     #[test]
     fn nothing_to_say_yields_no_block() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         assert!(block(conn, &MemoryRequest::desktop(None, 8_000)).is_none());
     }
@@ -2097,7 +2097,7 @@ mod tests {
     /// out, while its subject still cannot see or delete it.
     #[test]
     fn owner_only_rows_are_sectioned_from_every_layer() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         project(conn, "p1");
         add(
@@ -2145,7 +2145,7 @@ mod tests {
     /// Desktop keeps the legacy block only while there is nothing to protect.
     #[test]
     fn desktop_owner_notes_force_the_sectioned_path() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         project(conn, "p1");
         add(
@@ -2169,7 +2169,7 @@ mod tests {
     /// the only thing bounding them.
     #[test]
     fn owner_notes_are_bounded_by_the_budget() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         project(conn, "p1");
         for i in 0..40 {

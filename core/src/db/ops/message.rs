@@ -717,8 +717,8 @@ pub fn deepest_descendant(history: &[MessageRow], from: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::ops::conversation::{create_conversation, get_conversation};
-    use crate::db::test_db;
 
     fn row<'a>(id: &'a str, conv: &'a str, role: &'a str) -> MessageInsert<'a> {
         MessageInsert {
@@ -777,7 +777,7 @@ mod tests {
     /// each time — while the other calls' entries on the row are kept.
     #[test]
     fn record_tool_diffs_replaces_one_call_and_keeps_the_others() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
@@ -805,7 +805,7 @@ mod tests {
     /// write over — overwriting would discard another call's diff.
     #[test]
     fn record_tool_diffs_rejects_corrupt_stored_json_without_overwriting_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
@@ -826,7 +826,7 @@ mod tests {
     /// for a call in another turn is not this turn's to file.
     #[test]
     fn record_tool_diffs_for_call_finds_the_row_within_the_turn() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         let mut with_call = row("m1", "c1", "assistant");
@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn record_auto_review_rejects_corrupt_stored_json_without_overwriting_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn record_auto_review_rejects_noncanonical_nested_verdicts_without_overwriting_them() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn record_auto_review_writes_the_typed_required_null_shape() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn record_auto_review_rejects_an_empty_call_id() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
@@ -933,7 +933,7 @@ mod tests {
     /// their earlier text is still there, just unreachable.
     #[test]
     fn a_frozen_memory_row_does_not_hide_the_other_version() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 0).unwrap();
 
@@ -966,7 +966,7 @@ mod tests {
     /// they were put.
     #[test]
     fn injected_background_is_not_audited() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 0).unwrap();
 
@@ -1006,7 +1006,7 @@ mod tests {
     /// `Queryable` mapping makes possible.
     #[test]
     fn append_message_keeps_every_field_it_was_given() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         let root = append_message(&mut conn, &row("root", "c1", "user"), None).unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
 
     #[test]
     fn append_links_each_row_to_the_last_and_moves_the_head() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
 
@@ -1143,7 +1143,7 @@ mod tests {
     /// whichever was written last.
     #[test]
     fn a_second_child_forks_the_branch() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
 
@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn resolve_head_prefers_the_stored_head() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         let q = append_message(&mut conn, &row("q", "c1", "user"), None).unwrap();
@@ -1174,7 +1174,7 @@ mod tests {
     /// a leaf, since a child of it would have been inserted later still.
     #[test]
     fn resolve_head_falls_back_to_the_newest_row() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         let a = append_message(&mut conn, &row("a", "c1", "user"), None).unwrap();
@@ -1192,7 +1192,7 @@ mod tests {
     /// end" would hang the next turn off something that is not conversation.
     #[test]
     fn resolve_head_ignores_compaction_summaries() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         let a = append_message(&mut conn, &row("a", "c1", "user"), None).unwrap();
@@ -1230,7 +1230,7 @@ mod tests {
 
     #[test]
     fn active_context_follows_one_branch_and_ignores_the_other() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(
@@ -1260,7 +1260,7 @@ mod tests {
     /// A corrupt parent link must not spin forever.
     #[test]
     fn active_context_stops_on_a_cycle() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("a", None), ("b", Some("a"))]);
@@ -1276,7 +1276,7 @@ mod tests {
 
     #[test]
     fn a_summary_anchored_on_the_path_takes_effect() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("m1", None), ("m2", Some("m1")), ("m3", Some("m2"))]);
@@ -1302,7 +1302,7 @@ mod tests {
     /// a summary of a history it never had.
     #[test]
     fn a_summary_anchored_off_the_path_is_ignored() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("q", None), ("a1", Some("q")), ("a2", Some("q"))]);
@@ -1322,7 +1322,7 @@ mod tests {
 
     #[test]
     fn the_deepest_anchored_summary_wins() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("m1", None), ("m2", Some("m1")), ("m3", Some("m2"))]);
@@ -1347,7 +1347,7 @@ mod tests {
     /// roots are two versions of it, not one sequence.
     #[test]
     fn parentless_rows_are_not_stitched_together() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("m1", None), ("m2", None), ("m3", Some("m2"))]);
@@ -1361,7 +1361,7 @@ mod tests {
     /// gives back exactly what ordering by sort_order gave.
     #[test]
     fn a_linear_conversation_reads_back_identically() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
 
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[test]
     fn a_conversation_that_never_branched_has_no_branch_points() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("q", None), ("a", Some("q"))]);
@@ -1392,7 +1392,7 @@ mod tests {
 
     #[test]
     fn a_branch_point_reports_the_active_version_and_its_siblings() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(
@@ -1414,7 +1414,7 @@ mod tests {
     /// same step and must page against each other.
     #[test]
     fn sibling_roots_are_a_branch_point() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("q1", None), ("q2", None)]);
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn switching_lands_on_the_branch_tip() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(
@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn switching_to_an_unknown_message_is_rejected() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("q", None)]);
@@ -1459,7 +1459,7 @@ mod tests {
 
     #[test]
     fn deleting_a_subtree_takes_the_descendants_and_spares_the_siblings() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(
@@ -1479,7 +1479,7 @@ mod tests {
 
     #[test]
     fn deleting_the_active_branch_moves_the_head_to_the_parent() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("q", None), ("a", Some("q"))]);
@@ -1500,7 +1500,7 @@ mod tests {
     /// point it was last written.
     #[test]
     fn the_head_follows_a_surviving_sibling_to_its_tip() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(
@@ -1516,7 +1516,7 @@ mod tests {
 
     #[test]
     fn deleting_the_root_empties_the_conversation() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("q", None), ("a", Some("q"))]);
@@ -1529,7 +1529,7 @@ mod tests {
 
     #[test]
     fn deleting_a_subtree_leaves_other_conversations_alone() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         create_conversation(&mut conn, "c2", None, None, None, 1).unwrap();
@@ -1548,7 +1548,7 @@ mod tests {
     /// this fails.
     #[test]
     fn deleting_a_deep_chain_does_not_hit_the_recursion_limit() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
 
@@ -1568,7 +1568,7 @@ mod tests {
     /// Flattening a real fork would splice two branches into one transcript.
     #[test]
     fn a_forked_history_is_never_flattened() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         tree(&mut conn, &[("q", None), ("a1", Some("q")), ("a2", Some("q"))]);

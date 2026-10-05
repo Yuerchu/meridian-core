@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn freezing_carries_title_id_and_excerpt() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed(&pool);
         let mut conn = pool.get().unwrap();
         let out = freeze_conversation_refs(&mut conn, "c-cur", &["c-ref".to_string()], 4_000).unwrap();
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn freezing_refuses_self_reference_and_missing_threads() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed(&pool);
         let mut conn = pool.get().unwrap();
         let self_ref = freeze_conversation_refs(&mut conn, "c-cur", &["c-cur".to_string()], 4_000).unwrap_err();
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn freezing_deduplicates_and_caps_the_count() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed(&pool);
         let mut conn = pool.get().unwrap();
         let twice = vec!["c-ref".to_string(), "c-ref".to_string()];

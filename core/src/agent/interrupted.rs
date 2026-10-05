@@ -321,15 +321,15 @@ fn subject(candidate: &InterruptedCandidate) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::turn::ERROR_LOOP_DETECTED;
     use crate::db::ops::conversation::create_conversation;
     use crate::db::ops::turn;
-    use crate::db::test_db;
     use crate::turn::TurnOrigin;
     use std::sync::Arc;
 
     fn setup() -> (crate::db::DbPool, Arc<TurnCoordinator>) {
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();

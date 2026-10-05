@@ -175,7 +175,7 @@ impl std::ops::Deref for Services {
 #[cfg(test)]
 pub fn bare_services(dir: &std::path::Path) -> Services {
     Services::new(ServicesInner {
-        db: crate::db::test_db(),
+        db: crate::db::diesel_test_db(),
         secrets: Arc::new(crate::secrets::SecretsManager::new(dir.to_path_buf())),
         tools: Arc::new(tools::ToolRegistry::new(
             dir.join("skills"),

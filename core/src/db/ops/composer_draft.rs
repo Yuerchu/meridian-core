@@ -116,8 +116,8 @@ pub fn clear(conn: &mut SqliteConnection, slot: &DraftSlot, revision: i64, now: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::composer_draft::DraftAttachment;
-    use crate::db::test_db;
 
     fn conversation(conn: &mut SqliteConnection, id: &str) {
         crate::db::ops::conversation::create_conversation(conn, id, Some("draft"), None, None, 0).unwrap();
@@ -138,7 +138,7 @@ mod tests {
     /// with every part intact.
     #[test]
     fn a_draft_round_trips_and_is_rewritten_in_place() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         conversation(&mut conn, "c2");
@@ -174,7 +174,7 @@ mod tests {
     /// is a replay rather than something new.
     #[test]
     fn an_older_or_equal_revision_is_refused() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -203,7 +203,7 @@ mod tests {
     /// that was emptied reads back as having no draft at all.
     #[test]
     fn an_empty_draft_deletes_the_row() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -232,7 +232,7 @@ mod tests {
     /// than a line in `delete_conversation`.
     #[test]
     fn deleting_the_conversation_takes_its_draft() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         save(&mut conn, &slot("c1"), &text("unsent"), 1, 100).unwrap();
@@ -248,7 +248,7 @@ mod tests {
     /// does not exist.
     #[test]
     fn the_welcome_slot_is_separate_and_conversation_slots_need_a_conversation() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -266,7 +266,7 @@ mod tests {
     /// thing; a row written around `save` must not be able to split them.
     #[test]
     fn the_slot_and_the_conversation_cannot_disagree() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         conversation(&mut conn, "c2");
@@ -305,7 +305,7 @@ mod tests {
     /// delete; the rest of the draft stays.
     #[test]
     fn deleting_the_sticker_takes_it_off_the_draft() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         crate::db::ops::emoji_pack::create_pack(
@@ -364,7 +364,7 @@ mod tests {
     /// A stored column that does not decode is an error, not an empty list.
     #[test]
     fn a_malformed_column_fails_to_decode() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         diesel::insert_into(composer_drafts::table)

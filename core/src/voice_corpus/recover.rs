@@ -144,8 +144,8 @@ fn sweep_stray_files(conn: &mut diesel::SqliteConnection, app_data_dir: &Path, k
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::voice_corpus::blob_status;
-    use crate::db::test_db;
 
     /// 行**照着字节来**：sha 和大小都从 `bytes` 算，所以 fixture 本身是自洽的,
     /// 一条测试要制造"对不上"就得明确地去改磁盘。
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn a_reader_without_the_lock_touches_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             blob(&mut conn, "a", blob_status::PENDING, b"abc");
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn what_a_crash_left_behind_is_cleared() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             blob(&mut conn, "a", blob_status::PENDING, b"abc");
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn a_ready_row_whose_file_is_wrong_is_marked_not_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         let b = {
             let mut conn = pool.get().unwrap();
             let b = blob(&mut conn, "a", blob_status::READY, b"the real bytes");
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn a_file_of_the_right_length_but_the_wrong_bytes_is_still_wrong() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         let b = {
             let mut conn = pool.get().unwrap();
             let b = blob(&mut conn, "a", blob_status::READY, b"aaaaa");
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn an_orphan_takes_its_file_with_it() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         let b = {
             let mut conn = pool.get().unwrap();
             blob(&mut conn, "a", blob_status::READY, b"hello")
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn a_file_nobody_claims_is_swept() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         let stray = super::super::session_dir(dir.path(), "deadbeefdeadbeef");
         std::fs::create_dir_all(&stray).unwrap();
         let path = stray.join("nobody.amr");

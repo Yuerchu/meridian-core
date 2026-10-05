@@ -135,9 +135,9 @@ pub fn resolve_available(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::skill::SkillInsert;
     use crate::db::ops::skill::upsert_skill;
-    use crate::db::test_db;
 
     fn seed_skill(conn: &mut SqliteConnection, dir_name: &str) {
         upsert_skill(
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn global_binding_resolves_without_any_anchor() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_skill(&mut conn, "a");
         bind(&mut conn, SkillLayer::Global, None, "a").unwrap();
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn layers_union_and_dedupe() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         for name in ["a", "b", "c"] {
             seed_skill(&mut conn, name);
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn other_anchors_do_not_leak() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_skill(&mut conn, "mine");
         seed_skill(&mut conn, "theirs");
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn disabled_skills_are_excluded_even_when_bound() {
         use crate::db::models::skill::SkillChangeset;
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_skill(&mut conn, "off");
         bind(&mut conn, SkillLayer::Global, None, "off").unwrap();
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn resolve_is_deterministically_ordered() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         for name in ["zulu", "alpha", "mike"] {
             seed_skill(&mut conn, name);
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn bind_is_idempotent_and_unbind_removes() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_skill(&mut conn, "a");
         seed_assistant(&mut conn, "as1");
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn deleting_a_skill_cascades_to_bindings() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_skill(&mut conn, "doomed");
         seed_assistant(&mut conn, "as1");

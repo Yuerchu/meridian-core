@@ -386,8 +386,8 @@ pub fn untranscribed_counts(pool: &DbPool) -> Result<HashMap<String, i64>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::voice_corpus::{VoiceBlobInsert, blob_status};
-    use crate::db::test_db;
     use diesel::prelude::*;
 
     fn ready(conn: &mut diesel::SqliteConnection, id: &str, session: &str) -> VoiceBlobRow {
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn management_rejects_an_unknown_persisted_source_type() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             let blob = ready(&mut conn, "a", "123");
@@ -456,7 +456,7 @@ mod tests {
     fn an_export_says_how_much_it_left_out() {
         let dir = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             let a = ready(&mut conn, "a", "123");
@@ -496,7 +496,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         std::fs::write(out.path().join("leftover.txt"), b"old").unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
 
         let err = export(&pool, dir.path(), out.path(), false, false).unwrap_err();
         assert!(err.contains("not empty"), "{err}");
@@ -509,7 +509,7 @@ mod tests {
     fn asking_for_real_sender_ids_is_a_separate_decision() {
         let dir = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             let a = ready(&mut conn, "a", "123");

@@ -718,8 +718,8 @@ pub fn format_memory_section(memories: &[MemoryRow], tag: &str, attrs: Option<&s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::memory::onebot_user_scope_id;
-    use crate::db::test_db;
 
     fn mem(conn: &mut SqliteConnection, id: &str, subject: i64, origin: Origin, vis: Visibility) {
         let scope_id = onebot_user_scope_id(subject);
@@ -747,7 +747,7 @@ mod tests {
     /// resurface in a group.
     #[test]
     fn group_view_excludes_private_memories() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         mem(conn, "p", 1, Origin::Private, Visibility::Normal);
         mem(conn, "g", 1, Origin::Group, Visibility::Normal);
@@ -764,7 +764,7 @@ mod tests {
     /// the operator's private notes about them.
     #[test]
     fn self_view_hides_owner_only_rows() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         mem(conn, "note", 1, Origin::Admin, Visibility::OwnerOnly);
         mem(conn, "pref", 1, Origin::Group, Visibility::Normal);
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn soft_deleted_rows_disappear_then_come_back() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         mem(conn, "a", 1, Origin::Group, Visibility::Normal);
         let scope = onebot_user_scope_id(1);
@@ -797,7 +797,7 @@ mod tests {
     /// theirs to lose.
     #[test]
     fn eviction_spares_owner_only_rows() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         mem(conn, "normal", 7, Origin::Group, Visibility::Normal);
         mem(conn, "note", 7, Origin::Admin, Visibility::OwnerOnly);
@@ -813,7 +813,7 @@ mod tests {
     /// start being remembered again the next time they spoke.
     #[test]
     fn tracked_sweep_keeps_opted_out_rows() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         for i in 0..(MAX_TRACKED_SUBJECTS as i64 + 5) {
             touch_subject(conn, &onebot_user_scope_id(i), None, false, i).unwrap();
@@ -835,7 +835,7 @@ mod tests {
     /// which provably returned nothing.
     #[test]
     fn trimming_touches_only_the_written_subject() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
 
         // Two people, each already at their cap.
@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn quota_and_length_are_enforced_for_every_writer() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let scope = onebot_user_scope_id(3);
 
@@ -885,7 +885,7 @@ mod tests {
     /// anything that changes between turns.
     #[test]
     fn multi_subject_order_is_stable() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         mem(conn, "b", 2, Origin::Group, Visibility::Normal);
         mem(conn, "a", 1, Origin::Group, Visibility::Normal);
@@ -906,7 +906,7 @@ mod tests {
     /// A resolved proposal must never be actionable twice.
     #[test]
     fn proposal_resolves_exactly_once() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let p = create_proposal(
             conn,
@@ -935,7 +935,7 @@ mod tests {
 
     #[test]
     fn expired_proposal_cannot_be_approved() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let p = create_proposal(
             conn,
@@ -968,7 +968,7 @@ mod tests {
         assert!(MemoryScope::parse("workspace").is_err());
         assert!(Visibility::parse("public").is_err());
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let invalid_scope = MemoryInsert {
             id: "bad-scope",
@@ -1001,15 +1001,15 @@ mod tests {
 #[cfg(test)]
 mod origin_visibility_tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::memory::onebot_user_scope_id;
-    use crate::db::test_db;
 
     /// Whatever origin the desktop writes for a per-person memory has to be one
     /// that group injection accepts. `Desktop` is not, so a row written with it
     /// was stored, shown as active in the UI, and silently never injected.
     #[test]
     fn operator_written_person_memories_reach_groups() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let scope = onebot_user_scope_id(1);
         upsert_memory(
@@ -1048,7 +1048,7 @@ mod origin_visibility_tests {
 #[cfg(test)]
 mod legacy_length_tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     /// Rows written under the old 10k ceiling stay readable and stay editable,
     /// as long as the edit brings them within the current limit. Only saving a
@@ -1056,7 +1056,7 @@ mod legacy_length_tests {
     /// not a row becoming stuck.
     #[test]
     fn oversized_legacy_rows_can_be_shortened() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         crate::db::ops::project::create_project(
             conn,

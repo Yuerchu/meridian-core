@@ -100,7 +100,7 @@ pub fn list_for_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn conversation(conn: &mut SqliteConnection, id: &str) {
         crate::db::ops::conversation::create_conversation(conn, id, Some("hosted"), None, None, 0).unwrap();
@@ -135,7 +135,7 @@ mod tests {
     /// a higher revision saying it became the failure — one row throughout.
     #[test]
     fn a_higher_revision_updates_the_incident_in_place() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -170,7 +170,7 @@ mod tests {
     /// nothing: the same revision again, or an older one arriving late.
     #[test]
     fn an_equal_or_lower_revision_is_ignored() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -198,7 +198,7 @@ mod tests {
     /// conversations is two incidents.
     #[test]
     fn the_same_notice_id_in_two_conversations_is_two_rows() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         conversation(&mut conn, "c2");
@@ -212,7 +212,7 @@ mod tests {
     /// Incidents go with the conversation they were about.
     #[test]
     fn deleting_the_conversation_takes_its_incidents() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         upsert_if_newer(&mut conn, insert("n1", "c1", "x", 1, "gone", 100)).unwrap();

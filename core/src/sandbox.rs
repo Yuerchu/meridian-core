@@ -1426,7 +1426,7 @@ mod tests {
 
         #[test]
         fn absent_preferences_are_the_documented_defaults() {
-            let pool = crate::db::test_db();
+            let pool = crate::db::diesel_test_db();
             assert_eq!(
                 CommandSettings::read(&pool),
                 Ok(CommandSettings::Read {
@@ -1438,7 +1438,7 @@ mod tests {
 
         #[test]
         fn stored_preferences_are_read_as_stored() {
-            let pool = crate::db::test_db();
+            let pool = crate::db::diesel_test_db();
             set(&pool, "shell", "powershell");
             set(&pool, "sandbox.enabled", "container");
             assert_eq!(
@@ -1455,7 +1455,7 @@ mod tests {
         /// `Read { mode: Auto }`.
         #[test]
         fn a_failed_read_is_unreadable_and_never_the_default() {
-            let pool = crate::db::test_db();
+            let pool = crate::db::diesel_test_db();
             set(&pool, "sandbox.enabled", "container");
             diesel::sql_query("DROP TABLE preferences")
                 .execute(&mut pool.get().unwrap())
@@ -1491,7 +1491,7 @@ mod tests {
         /// question for the user: they chose something, and the data is wrong.
         #[test]
         fn a_stored_value_that_is_not_ours_fails_loudly() {
-            let pool = crate::db::test_db();
+            let pool = crate::db::diesel_test_db();
             set(&pool, "sandbox.enabled", "docker");
             assert!(CommandSettings::read(&pool).is_err());
         }

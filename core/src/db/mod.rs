@@ -2,6 +2,7 @@ pub mod models;
 pub mod ops;
 pub mod schema;
 pub mod sea;
+pub mod types;
 
 use diesel::RunQueryDsl;
 use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
@@ -18,7 +19,7 @@ pub type PooledConn = PooledConnection<ConnectionManager<SqliteConnection>>;
 /// Long enough to sit through any write this app makes — they are single-row
 /// inserts and updates — while still failing rather than hanging if something
 /// holds the write lock indefinitely.
-const BUSY_TIMEOUT_MS: u32 = 5_000;
+pub(crate) const BUSY_TIMEOUT_MS: u32 = 5_000;
 
 /// How long `pool.get()` waits for a free connection.
 ///
@@ -26,7 +27,7 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 /// pool reads as the app having frozen rather than as an error. Every caller
 /// here either reports the failure or falls back within a request, so failing
 /// fast is strictly better than waiting.
-const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// SQLite pragmas are per-connection, so they must run on every connection the
 /// pool hands out — running them once on a single connection leaves the other
@@ -151,7 +152,7 @@ mod pool_tests {
     /// which is what "database is locked" in the log was.
     #[test]
     fn test_pooled_connections_wait_for_locks() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let rows: Vec<BusyTimeout> = diesel::sql_query("PRAGMA busy_timeout").load(&mut conn).unwrap();
         assert_eq!(rows[0].timeout, BUSY_TIMEOUT_MS as i32);
@@ -247,7 +248,7 @@ mod migration_tests {
 
     /// Bring a database up to migration 18 only, so migration 19 can be tested
     /// against realistic pre-existing rows rather than against an empty schema.
-    /// Running the whole migration set (as `test_db` does) would never exercise
+    /// Running the whole migration set (as `diesel_test_db` does) would never exercise
     /// the data-mapping half of the migration.
     fn conn_at_18() -> SqliteConnection {
         conn_before("00000000000019")
@@ -1222,7 +1223,7 @@ mod migration_tests {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn test_db() -> DbPool {
+pub fn diesel_test_db() -> DbPool {
     let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
     let pool = Pool::builder()
         .max_size(1)

@@ -64,9 +64,9 @@ pub fn delete_if_unreferenced(conn: &mut SqliteConnection, id: &str) -> QueryRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::model_config::ModelConfigInsert;
     use crate::db::models::provider::ProviderInsert;
-    use crate::db::test_db;
 
     fn profile<'a>(id: &'a str, name: &'a str) -> ModelProfileInsert<'a> {
         ModelProfileInsert {
@@ -133,7 +133,7 @@ mod tests {
     /// The count is the whole reason the list is not a plain `load`.
     #[test]
     fn a_profile_carries_how_many_providers_reach_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_provider(&mut conn, "p1");
         seed_provider(&mut conn, "p2");
@@ -151,7 +151,7 @@ mod tests {
     /// that is still somebody's only description of a model.
     #[test]
     fn a_profile_is_collected_only_once_nothing_points_at_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_provider(&mut conn, "p1");
         insert(&mut conn, &profile("held", "Held")).unwrap();
@@ -169,7 +169,7 @@ mod tests {
     /// billing at a rate the user just deleted.
     #[test]
     fn an_edit_can_empty_a_price_again() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         insert(
             &mut conn,

@@ -545,7 +545,7 @@ pub fn mark_reported(conn: &mut SqliteConnection, ids: &[String], now: i64) -> Q
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn conversation(conn: &mut SqliteConnection, id: &str) {
         crate::db::ops::conversation::create_conversation(conn, id, Some("q"), None, None, 0).unwrap();
@@ -591,7 +591,7 @@ mod tests {
     /// The state machine, stated once.
     #[test]
     fn which_timestamps_are_set_is_the_state() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -612,7 +612,7 @@ mod tests {
     /// attachment or a frozen snapshot is kept a follow-up.
     #[test]
     fn only_what_text_can_carry_may_become_an_interjection() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -698,7 +698,7 @@ mod tests {
     /// There is no third outcome for a repair to have to guess at.
     #[test]
     fn taking_an_item_and_writing_its_message_cannot_come_apart() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         add(&mut conn, "c1", "do the thing", Delivery::FollowUp);
@@ -728,7 +728,7 @@ mod tests {
     /// making the message write fail on a duplicate id.
     #[test]
     fn a_failed_take_leaves_the_item_deliverable_and_writes_no_row() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         add(&mut conn, "c1", "first", Delivery::FollowUp);
@@ -762,7 +762,7 @@ mod tests {
     /// the thing this design exists to refuse.
     #[test]
     fn an_item_in_doubt_blocks_the_queue_and_is_never_redelivered() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let first = add(&mut conn, "c1", "first", Delivery::FollowUp);
@@ -789,7 +789,7 @@ mod tests {
     /// queue promises.
     #[test]
     fn reordering_cannot_move_anything_in_front_of_an_unresolved_item() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let doubtful = add(&mut conn, "c1", "delete the old migration", Delivery::FollowUp);
@@ -826,7 +826,7 @@ mod tests {
     /// delivery mode.
     #[test]
     fn a_claim_is_refused_once_the_item_stops_being_deliverable() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
 
@@ -874,7 +874,7 @@ mod tests {
     /// having been asked and not yet answered.
     #[test]
     fn reordering_cannot_move_anything_in_front_of_a_held_item() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let first = add(&mut conn, "c1", "first", Delivery::FollowUp);
@@ -891,7 +891,7 @@ mod tests {
     /// telling repeats the warning rather than losing it.
     #[test]
     fn a_doubtful_item_stays_owed_until_it_is_marked_reported() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let item = add(&mut conn, "c1", "one", Delivery::FollowUp);
@@ -909,7 +909,7 @@ mod tests {
     /// rest on the step that failed.
     #[test]
     fn holding_stops_everything_behind_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         add(&mut conn, "c1", "first", Delivery::FollowUp);
@@ -937,7 +937,7 @@ mod tests {
     /// barrier.
     #[test]
     fn a_hold_during_a_claim_is_not_lost_when_the_claim_comes_back() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let steered = add(&mut conn, "c1", "actually, stop", Delivery::Interject);
@@ -988,7 +988,7 @@ mod tests {
     /// in [`QueueState`], which is what keeps the two apart.
     #[test]
     fn releasing_a_held_queue_leaves_an_unresolved_item_unresolved() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let claimed = add(&mut conn, "c1", "delete the old migration", Delivery::Interject);
@@ -1007,7 +1007,7 @@ mod tests {
     /// correct; delivering the follow-up early is not.
     #[test]
     fn the_head_belongs_to_one_mode_and_does_not_let_the_other_past() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         add(&mut conn, "c1", "after you finish", Delivery::FollowUp);
@@ -1031,7 +1031,7 @@ mod tests {
     /// leaving — but never blocks or is re-taken.
     #[test]
     fn settled_items_are_stepped_over() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         add(&mut conn, "c1", "first", Delivery::FollowUp);
@@ -1063,7 +1063,7 @@ mod tests {
     /// destroying the only reason anyone would find out.
     #[test]
     fn an_item_already_sent_cannot_be_deleted() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let item = add(&mut conn, "c1", "one", Delivery::FollowUp);
@@ -1081,7 +1081,7 @@ mod tests {
     /// block the queue waiting to interrupt something that will never happen.
     #[test]
     fn an_idle_runner_takes_the_front_of_the_queue_whatever_mode_it_is() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         add(&mut conn, "c1", "actually, stop", Delivery::Interject);
@@ -1104,7 +1104,7 @@ mod tests {
     /// evidence and stays in doubt for ever.
     #[test]
     fn a_refused_delivery_is_returned_to_the_queue() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let item = add(&mut conn, "c1", "one", Delivery::Interject);
@@ -1126,7 +1126,7 @@ mod tests {
     /// has demonstrably read while a tool call finishes.
     #[test]
     fn a_row_can_be_attached_after_the_doubt_is_already_resolved() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let first = add(&mut conn, "c1", "one", Delivery::Interject);
@@ -1150,7 +1150,7 @@ mod tests {
     /// one. A second settle with `None` must not wipe that id.
     #[test]
     fn settling_without_a_row_does_not_erase_one_already_attached() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let first = add(&mut conn, "c1", "one", Delivery::Interject);
@@ -1168,7 +1168,7 @@ mod tests {
         assert_eq!(Delivery::parse("follow_up").unwrap(), Delivery::FollowUp);
         assert!(Delivery::parse("pre_empt_everything").is_err());
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conversation(&mut conn, "c1");
         let first = add(&mut conn, "c1", "one", Delivery::FollowUp);

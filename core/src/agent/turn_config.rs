@@ -289,7 +289,7 @@ fn enabled_tools(conn: &mut SqliteConnection, assistant: Option<&AssistantRow>) 
 mod tests {
     use super::*;
     use crate::db::models::tool_preset::ToolPresetInsert;
-    use crate::db::{DbPool, test_db};
+    use crate::db::{DbPool, diesel_test_db};
     use diesel::prelude::*;
 
     fn registry() -> ToolRegistry {
@@ -378,7 +378,7 @@ mod tests {
     }
 
     fn setup() -> (DbPool, ToolRegistry) {
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             seed_conversation(&mut conn, "c1");

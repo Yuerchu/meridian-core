@@ -1801,12 +1801,12 @@ pub struct AppOneBot(pub Arc<Mutex<OneBotServer>>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
     use crate::turn::{Busy, TurnOrigin};
 
     #[test]
     fn stored_onebot_config_rejects_malformed_values() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::preference::set_preference(&mut conn, "onebot.admin_users", "not json", 1).unwrap();
         drop(conn);
