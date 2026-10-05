@@ -73,10 +73,21 @@ pub async fn bootstrap_with_secrets(
     std::fs::create_dir_all(&skills_root).expect("failed to create skills dir");
 
     let db_path = data_dir.join("meridian.db");
+    // The schema first, on a connection of its own: a database Diesel migrated
+    // is bridged to the SeaORM baseline, a new one is built from it. Nothing
+    // below opens the file before this has returned.
+    let ledger = db::sea::bridge::migrate_file(&db_path)
+        .await
+        .map_err(|error| format!("could not migrate the database: {error}"))?;
+    if let db::sea::bridge::Ledger::Diesel { applied } = ledger {
+        tracing::info!(
+            diesel_migrations = applied,
+            "bridged the database to the SeaORM baseline"
+        );
+    }
     let pool = db::init_db(db_path.to_str().expect("invalid db path"));
     let plan_files = Arc::new(crate::plan_files::PlanFileStore::new(&data_dir));
     startup_recovery(&pool, &plan_files);
-    // After the migrations, which Diesel still runs; the file is WAL by now.
     let sea = db::sea::open(&db_path)
         .await
         .map_err(|error| format!("could not open the database through SeaORM: {error}"))?;
@@ -631,9 +642,15 @@ mod tests {
         crate::logging::init_early();
         let dir = tempfile::tempdir().unwrap();
         {
-            // The previous session: migrated, a turn running, a follow-up
-            // queued behind it, and then the process was killed.
-            let pool = crate::db::init_db(dir.path().join("meridian.db").to_str().unwrap());
+            // The previous session, on the previous release: migrated by
+            // Diesel, a turn running, a follow-up queued behind it, and then
+            // the process was killed. Today's start has to bridge the file
+            // before it can reconcile it.
+            let path = dir.path().join("meridian.db");
+            crate::db::sea::bridge::previous_release_file(&path, crate::db::sea::legacy::LEGACY.len())
+                .await
+                .unwrap();
+            let pool = crate::db::init_db(path.to_str().unwrap());
             let mut conn = pool.get().unwrap();
             conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1000).unwrap();
             turn::begin(&mut conn, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).unwrap();

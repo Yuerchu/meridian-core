@@ -9,7 +9,7 @@
 
 use sea_orm::{ConnectionTrait, DbErr};
 
-pub(crate) const LEGACY: &[(&str, &str)] = &[
+pub const LEGACY: &[(&str, &str)] = &[
     (
         "00000000000001_initial",
         include_str!("../../../migrations/00000000000001_initial/up.sql"),
@@ -279,9 +279,49 @@ pub(crate) const LEGACY: &[(&str, &str)] = &[
 /// notice if a file stopped short. The caller decides the foreign-key
 /// pragma: table rebuilds must not fire `ON DELETE` actions, so production and
 /// `sea_test_db` both replay with foreign keys off.
-pub(crate) async fn replay_all(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
-    for (_, sql) in LEGACY {
+pub async fn replay_all(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
+    replay(conn, 0..LEGACY.len()).await
+}
+
+/// Runs the embedded migrations at `range` (indexes into [`LEGACY`]), in order,
+/// without recording anything. For the tests of a migration's data mapping,
+/// which stop just before it, seed rows, and then run it.
+pub async fn replay(conn: &impl ConnectionTrait, range: std::ops::Range<usize>) -> Result<(), DbErr> {
+    for (_, sql) in &LEGACY[range] {
         conn.execute_unprepared(sql).await?;
     }
     Ok(())
+}
+
+/// Runs the migrations at `range` the way Diesel ran them: each in a
+/// transaction of its own, so one that fails part-way leaves the rows it had
+/// started on untouched. The tests of a migration that must refuse bad data
+/// depend on that rollback.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn replay_in_transactions(
+    conn: &sea_orm::DatabaseConnection,
+    range: std::ops::Range<usize>,
+) -> Result<(), DbErr> {
+    use sea_orm::TransactionTrait;
+
+    for (_, sql) in &LEGACY[range] {
+        let tx = conn.begin().await?;
+        match tx.execute_unprepared(sql).await {
+            Ok(_) => tx.commit().await?,
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The position in [`LEGACY`] of the migration with this 14-digit version.
+#[cfg(any(test, feature = "test-support"))]
+pub fn index_of(version: &str) -> usize {
+    LEGACY
+        .iter()
+        .position(|(name, _)| name.starts_with(version) && name[version.len()..].starts_with('_'))
+        .unwrap_or_else(|| panic!("no legacy migration has version {version}"))
 }

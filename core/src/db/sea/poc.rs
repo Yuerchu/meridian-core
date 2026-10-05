@@ -62,9 +62,10 @@ async fn toggle_archive(tx: &WriteTx, id: &str, now: i64) -> Result<flags::Model
     active.update(conn).await
 }
 
-/// A migrated file with one conversation in it, through today's Diesel path.
-fn diesel_file(dir: &Path) -> (std::path::PathBuf, crate::db::DbPool) {
+/// A migrated file with one conversation in it, written through Diesel.
+async fn diesel_file(dir: &Path) -> (std::path::PathBuf, crate::db::DbPool) {
     let path = dir.join("poc.sqlite");
+    super::bridge::migrate_file(&path).await.unwrap();
     let pool = crate::db::init_db(path.to_str().unwrap());
     diesel_conversation::create_conversation(&mut pool.get().unwrap(), "c1", None, None, None, 1).unwrap();
     (path, pool)
@@ -129,7 +130,7 @@ async fn flags_of(db: &Db) -> (i32, i32) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_toggles_are_each_applied() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _diesel) = diesel_file(dir.path());
+    let (path, _diesel) = diesel_file(dir.path()).await;
     let db = Db::new(SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_file(&path).await));
 
     const ROUNDS: i64 = 2000;
@@ -165,7 +166,7 @@ async fn concurrent_toggles_are_each_applied() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_holds_the_lock_from_its_first_read() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _diesel) = diesel_file(dir.path());
+    let (path, _diesel) = diesel_file(dir.path()).await;
     let pool = sqlx_file(&path).await;
     let db = Db::new(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool.clone()));
     let read_done = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -202,7 +203,7 @@ async fn a_write_holds_the_lock_from_its_first_read() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_savepoint_in_a_deferred_read_fails_once_another_connection_commits() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _diesel) = diesel_file(dir.path());
+    let (path, _diesel) = diesel_file(dir.path()).await;
     let conn = SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_file(&path).await);
 
     let deferred = TransactionOptions {
@@ -234,7 +235,7 @@ async fn a_savepoint_in_a_deferred_read_fails_once_another_connection_commits() 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_savepoint_in_an_immediate_transaction_keeps_the_lock() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _diesel) = diesel_file(dir.path());
+    let (path, _diesel) = diesel_file(dir.path()).await;
     let conn = SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_file(&path).await);
 
     let immediate = TransactionOptions {
@@ -410,7 +411,7 @@ async fn diesel_and_seaorm_writers_on_one_file_do_not_lose_each_others_writes() 
     use diesel::RunQueryDsl;
 
     let dir = tempfile::tempdir().unwrap();
-    let (path, diesel) = diesel_file(dir.path());
+    let (path, diesel) = diesel_file(dir.path()).await;
     let pool = sqlx_file(&path).await;
     let db = Db::new(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool.clone()));
 
