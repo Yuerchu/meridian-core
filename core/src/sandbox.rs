@@ -309,6 +309,25 @@ impl CommandSettings {
             Self::Unreadable(_) => crate::tools::ShellType::default_for_platform(),
         }
     }
+
+    /// What `run_command` would run under, for the base prompt, decided from the
+    /// settings alone. Legitimate because `resolve_sandbox_policy` hands out the
+    /// container backend for `ExecutionMode::Container` and for nothing else —
+    /// `Off` and `Auto` never resolve to one, and a `Container` that cannot be
+    /// resolved fails the turn rather than running elsewhere — so "the mode is
+    /// `Container`" and "the policy is a container" are the same statement, and
+    /// a caller with no connector in hand (the token estimator) can still say
+    /// which shell the model will be told about. `None` for `Unreadable`: no
+    /// command runs under that, so there is no shell to describe.
+    pub fn command_shell(&self) -> Option<crate::tools::command_shell::CommandShell> {
+        match self {
+            Self::Read { shell, mode } => Some(crate::tools::command_shell::CommandShell::select(
+                *shell,
+                *mode == ExecutionMode::Container,
+            )),
+            Self::Unreadable(_) => None,
+        }
+    }
 }
 
 /// What confines a turn's commands, including "nobody could find out".
@@ -892,6 +911,43 @@ async fn execute_windows_sandboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CommandSettings::command_shell` decides the container case from the
+    /// mode alone. That is sound only while the container backend comes from
+    /// `ExecutionMode::Container` and from nothing else — which this pins.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_resolved_container_is_the_container_mode_and_nothing_else() {
+        use crate::tools::ShellType;
+        use crate::tools::command_shell::CommandShell;
+
+        for mode in [ExecutionMode::Off, ExecutionMode::Auto] {
+            let policy = resolve_sandbox_policy(mode, Some("C:\\proj"), "c1", None).unwrap();
+            assert!(
+                !policy.as_ref().is_some_and(|p| p.backend == SandboxBackend::Container),
+                "{mode:?} never resolves to a container"
+            );
+            let shell = CommandSettings::Read {
+                shell: ShellType::Bash,
+                mode,
+            }
+            .command_shell();
+            assert_ne!(shell, Some(CommandShell::ContainerSh), "{mode:?}");
+        }
+        assert!(
+            resolve_sandbox_policy(ExecutionMode::Container, Some("C:\\proj"), "c1", None).is_err(),
+            "a container that cannot be resolved fails the turn rather than running elsewhere"
+        );
+        assert_eq!(
+            CommandSettings::Read {
+                shell: ShellType::PowerShell,
+                mode: ExecutionMode::Container,
+            }
+            .command_shell(),
+            Some(CommandShell::ContainerSh),
+        );
+        assert_eq!(CommandSettings::Unreadable("x".into()).command_shell(), None);
+    }
 
     #[test]
     fn execution_mode_accepts_only_canonical_values() {

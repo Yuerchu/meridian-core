@@ -1,4 +1,4 @@
-use super::{Permission, ShellType, Tool, ToolContext};
+use super::{Permission, Tool, ToolContext};
 use crate::sandbox::{ExecError, ExecResult, SandboxBackend};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -184,25 +184,10 @@ async fn execute_command_inner(
     // default image is Alpine, which ships `sh` alone. So a containered
     // command gets the one shell the POSIX image contract promises, and the
     // host shell selection applies only where the command actually runs.
+    // `CommandShell::select` is that decision, and the base prompt tells the
+    // model about the same one.
     let containered = context.sandbox_policy.is_container();
-    let shell_argv: Vec<String> = if containered {
-        vec!["sh".into(), "-c".into(), command.into()]
-    } else {
-        match context.shell {
-            ShellType::Cmd => vec!["cmd".into(), "/C".into(), command.into()],
-            ShellType::PowerShell => {
-                vec![
-                    find_powershell().into(),
-                    "-NoProfile".into(),
-                    "-Command".into(),
-                    command.into(),
-                ]
-            }
-            ShellType::Bash => {
-                vec![find_bash().into(), "-c".into(), command.into()]
-            }
-        }
-    };
+    let shell_argv: Vec<String> = super::command_shell::CommandShell::select(context.shell, containered).argv(command);
 
     // With the settings unread there is no answer to where this command should
     // run, and the only one allowed to give it is the user — see
@@ -327,37 +312,10 @@ fn structured_output(res: &ExecResult, duration_ms: u64) -> CommandExecution {
     }
 }
 
-fn find_powershell() -> &'static str {
-    if cfg!(target_os = "windows") {
-        if std::path::Path::new("C:\\Program Files\\PowerShell\\7\\pwsh.exe").exists() {
-            "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
-        } else {
-            "powershell"
-        }
-    } else {
-        "pwsh"
-    }
-}
-
-pub(crate) fn find_bash() -> &'static str {
-    if cfg!(target_os = "windows") {
-        let git_bash = "C:\\Program Files\\Git\\bin\\bash.exe";
-        if std::path::Path::new(git_bash).exists() {
-            return git_bash;
-        }
-        let git_bash_x86 = "C:\\Program Files (x86)\\Git\\bin\\bash.exe";
-        if std::path::Path::new(git_bash_x86).exists() {
-            return git_bash_x86;
-        }
-        "bash"
-    } else {
-        "/bin/bash"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ShellType;
 
     fn unreadable_context(dir: &std::path::Path) -> ToolContext {
         ToolContext {

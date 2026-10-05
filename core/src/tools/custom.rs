@@ -127,7 +127,7 @@ impl Tool for CustomToolExecutor {
         let argv: Vec<String> = if !containered && cfg!(target_os = "windows") {
             // Reuse run_command's Git Bash discovery instead of a bare "bash"
             // that depends on PATH.
-            vec![super::run_command::find_bash().to_string(), "-c".into(), shell_cmd]
+            vec![super::command_shell::find_bash().to_string(), "-c".into(), shell_cmd]
         } else {
             vec!["sh".into(), "-c".into(), shell_cmd]
         };

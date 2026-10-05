@@ -1,17 +1,30 @@
 use crate::provider::ToolDefinition;
+use crate::tools::command_shell::CommandShell;
 
 /// Built-in agent baseline injected ahead of the user-configurable assistant
-/// prompt whenever file-editing tools are enabled for the session. The
-/// assistant prompt is a persona layer on top of this; agent discipline must
-/// not depend on the user writing (or keeping) it. Only lines for tools that
-/// are actually enabled are emitted, so the model is never pointed at a tool
-/// it cannot call.
-pub fn base_prompt(tool_defs: &[ToolDefinition]) -> Option<String> {
+/// prompt, keyed on the tool set. The assistant prompt is a persona layer on
+/// top of this; agent discipline must not depend on the user writing (or
+/// keeping) it. Only lines for tools that are actually enabled are emitted, so
+/// the model is never pointed at a tool it cannot call.
+///
+/// Everything here is static for a session: it changes when a tool is switched
+/// on or a machine-wide setting changes, and never between two turns of the
+/// same conversation, because this is the front of the cached prefix. Anything
+/// that does change per turn goes after the message instead (`roster_block`),
+/// or is frozen into the history (`memory_context`, `todo_context`).
+///
+/// `command_shell` is what `run_command` would run under, from the same
+/// decision the executor makes (`CommandShell::select`); `None` where there is
+/// no command executor at all, in which case `run_command` is not in the set
+/// either.
+pub fn base_prompt(tool_defs: &[ToolDefinition], command_shell: Option<&CommandShell>) -> Option<String> {
     let has = |name: &str| tool_defs.iter().any(|t| t.name == name);
     let has_editing = has("write_file") || has("edit_file") || has("apply_patch");
     let has_todos = has("update_todos");
+    let shell = command_shell.filter(|_| has("run_command"));
+    let has_stickers = has("send_sticker");
 
-    if !has_editing && !has_todos {
+    if !has_editing && !has_todos && shell.is_none() && !has_stickers {
         return None;
     }
 
@@ -22,7 +35,27 @@ pub fn base_prompt(tool_defs: &[ToolDefinition]) -> Option<String> {
     if has_todos {
         sections.push(checklist_section());
     }
+    if let Some(shell) = shell {
+        sections.push(format!("# Shell\n\n{}", shell.summary()));
+    }
+    if has_stickers {
+        sections.push(sticker_section());
+    }
     Some(sections.join("\n\n"))
+}
+
+/// The one thing the sticker tools' own descriptions do not say: what *not* to
+/// do. The mechanics (pick an id with `list_stickers`, send it with
+/// `send_sticker`) are on the definitions themselves; the invented inline tag
+/// was the failure this line exists for.
+fn sticker_section() -> String {
+    [
+        "# Stickers",
+        "",
+        "Stickers are sent with `send_sticker` after picking an id from `list_stickers`; never \
+         write `[emoji:...]` tags or sticker names into your text.",
+    ]
+    .join("\n")
 }
 
 fn file_editing_section(has: &dyn Fn(&str) -> bool) -> String {
@@ -108,13 +141,13 @@ mod tests {
 
     #[test]
     fn no_file_editing_tools_means_no_prompt() {
-        assert!(base_prompt(&[]).is_none());
-        assert!(base_prompt(&[def("read_file"), def("web_search"), def("qq_send_poke")]).is_none());
+        assert!(base_prompt(&[], None).is_none());
+        assert!(base_prompt(&[def("read_file"), def("web_search"), def("qq_send_poke")], None).is_none());
     }
 
     #[test]
     fn any_editing_tool_enables_the_prompt() {
-        let p = base_prompt(&[def("edit_file")]).unwrap();
+        let p = base_prompt(&[def("edit_file")], None).unwrap();
         assert!(p.contains("# Agent guidelines"));
         assert!(p.contains("edit_file"));
         // Lines for tools that are not enabled must not appear.
@@ -126,18 +159,18 @@ mod tests {
     #[test]
     fn checklist_discipline_stands_on_its_own() {
         // An assistant with the checklist but no editing tools still needs the rules.
-        let p = base_prompt(&[def("update_todos")]).unwrap();
+        let p = base_prompt(&[def("update_todos")], None).unwrap();
         assert!(p.contains("# Task checklist"));
         assert!(!p.contains("# Agent guidelines"));
 
-        let both = base_prompt(&[def("edit_file"), def("update_todos")]).unwrap();
+        let both = base_prompt(&[def("edit_file"), def("update_todos")], None).unwrap();
         assert!(both.contains("# Agent guidelines"));
         assert!(both.contains("# Task checklist"));
     }
 
     #[test]
     fn editing_tools_alone_leave_out_the_checklist() {
-        let p = base_prompt(&[def("edit_file")]).unwrap();
+        let p = base_prompt(&[def("edit_file")], None).unwrap();
         assert!(!p.contains("# Task checklist"));
     }
 
@@ -146,8 +179,31 @@ mod tests {
     /// told which one is current, or it may act on a step it already finished.
     #[test]
     fn the_checklist_section_points_at_the_latest_block() {
-        let p = base_prompt(&[def("update_todos")]).unwrap();
+        let p = base_prompt(&[def("update_todos")], None).unwrap();
         assert!(p.contains("most recent `<todo_list>` block"), "{p}");
+    }
+
+    /// The shell line needs both halves: a `run_command` to describe, and a
+    /// decision about what it runs under. One without the other says nothing.
+    #[test]
+    fn run_command_gets_the_shell_line_only_with_a_shell() {
+        let shell = CommandShell::Cmd;
+        let p = base_prompt(&[def("run_command")], Some(&shell)).unwrap();
+        assert!(p.contains("# Shell"), "{p}");
+        assert!(p.contains("cmd.exe"), "{p}");
+
+        assert!(base_prompt(&[def("run_command")], None).is_none());
+        assert!(base_prompt(&[def("read_file")], Some(&shell)).is_none());
+    }
+
+    /// Gated on the tool that sends, not the one that lists: a session that can
+    /// only look at the roster has nothing to be told not to do.
+    #[test]
+    fn send_sticker_adds_the_sticker_guidance() {
+        let p = base_prompt(&[def("send_sticker")], None).unwrap();
+        assert!(p.contains("# Stickers"), "{p}");
+        assert!(p.contains("`[emoji:...]`"), "{p}");
+        assert!(base_prompt(&[def("list_stickers")], None).is_none());
     }
 
     #[test]
@@ -158,7 +214,7 @@ mod tests {
             def("edit_file"),
             def("apply_patch"),
         ];
-        let p = base_prompt(&defs).unwrap();
+        let p = base_prompt(&defs, None).unwrap();
         assert!(p.contains("Read a file before modifying"));
         assert!(p.contains("old_string"));
         assert!(p.contains("*** Begin Patch"));

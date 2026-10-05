@@ -234,6 +234,18 @@ impl QqToolExecutor {
         QqTool::parse(name).is_some()
     }
 
+    /// What this session hands `turn_config::resolve`: every QQ name as owned
+    /// (so the desktop sticker pair is replaced even in a session that shows no
+    /// stickers), and the definitions this session actually shows — the two are
+    /// not the same set, since readiness and scope withhold some definitions
+    /// while the name is still ours.
+    pub fn session_tools(&self) -> crate::agent::turn_config::SessionTools {
+        crate::agent::turn_config::SessionTools {
+            owned: QqTool::all().map(|t| t.name().to_string()).collect(),
+            definitions: self.definitions(),
+        }
+    }
+
     pub fn requires_approval(&self, name: &str) -> bool {
         QqTool::parse(name).is_some_and(|t| t.spec().needs_approval)
     }
@@ -1230,6 +1242,28 @@ mod tests {
             .filter(|t| spec_available(*t, &kind, is_admin, SessionPolicy { voice_send: true }))
             .map(QqTool::name)
             .collect()
+    }
+
+    /// What is *owned* is every QQ name, whatever this session happens to show:
+    /// a group without voice readiness still owns `send_voice`, and the desktop
+    /// sticker pair is replaced in a session that shows no stickers at all. Built
+    /// from `definitions()` instead, a withheld tool would let the registry's
+    /// copy of the same name through.
+    #[test]
+    fn session_tools_own_every_qq_name_whatever_the_session_shows() {
+        let shown: std::collections::HashSet<&str> = QqTool::all()
+            .filter(|t| spec_available(*t, &SessionKind::Group, false, SessionPolicy { voice_send: false }))
+            .map(QqTool::name)
+            .collect();
+        let owned: std::collections::HashSet<String> = QqTool::all().map(|t| t.name().to_string()).collect();
+
+        assert!(!shown.contains(QqTool::SendVoice.name()), "withheld without readiness");
+        assert!(owned.contains(QqTool::SendVoice.name()), "still ours");
+        assert!(owned.contains("send_sticker") && owned.contains("list_stickers"));
+        assert!(owned.len() > shown.len());
+        // And `session_tools` is built from exactly these two sets — pinned by
+        // construction: it maps `QqTool::all()` for `owned` and `definitions()`
+        // for what is shown, the same two expressions this test used.
     }
 
     /// What a session shows and what a speaker may run are two questions, and

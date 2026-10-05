@@ -45,7 +45,6 @@ pub mod secrets;
 pub mod services;
 pub mod sleep_inhibitor;
 pub mod state;
-pub mod template;
 pub mod tools;
 pub mod tts;
 pub mod turn;

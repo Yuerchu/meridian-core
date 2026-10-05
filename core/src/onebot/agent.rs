@@ -754,6 +754,37 @@ async fn headless_chat_inner(
         tracing::info!(model = %effective_model, "the model cannot take tools; none are offered this turn");
     }
 
+    // A read that fails is its own answer, never "unset": unset is `auto`, and
+    // guessing `auto` for somebody who chose a container runs their commands on
+    // the host. See `CommandSettings`; the escalation it leads to is refused in
+    // QQ by `ChatApprovals`, because nobody there may answer it. Read here,
+    // ahead of the turn config, because the prompt says which shell commands
+    // run under — the same decision `run_command` executes.
+    let command_settings = {
+        let pool2 = pool.clone();
+        tokio::task::spawn_blocking(move || crate::sandbox::CommandSettings::read(&pool2))
+            .await
+            .map_err(|e| e.to_string())??
+    };
+    // Headless sessions have no project directory. A requested container is
+    // therefore refused explicitly instead of being downgraded to the platform
+    // default; there is no honest answer to what the container should mount.
+    #[cfg(not(target_os = "android"))]
+    let sandbox_policy = crate::sandbox::resolve_command_sandbox(
+        &command_settings,
+        None,
+        conversation_id,
+        services.map(|services| services.containers.clone() as std::sync::Arc<dyn crate::container::CommandConnector>),
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(not(target_os = "android"))]
+    let command_shell = Some(crate::tools::command_shell::CommandShell::select(
+        command_settings.shell(),
+        sandbox_policy.is_container(),
+    ));
+    #[cfg(target_os = "android")]
+    let command_shell = None;
+
     let turn = {
         let pool2 = pool.clone();
         let registry = tool_registry.clone();
@@ -790,6 +821,15 @@ async fn headless_chat_inner(
             persona: assistant.as_ref().map(|a| a.system_prompt.clone()).unwrap_or_default(),
             // Memory is absent on purpose — it ships as a user-role message.
             context_blocks: Vec::new(),
+            // Session-scoped QQ tools are available to everyone (read-only,
+            // scope-locked) -- but not to a model that cannot take a tools field
+            // at all. Handed to the resolver rather than spliced in afterwards so
+            // the base prompt is built against the final array: the desktop
+            // registry also owns the two generic sticker tools, and on QQ the
+            // session-scoped implementation must replace them (duplicate names
+            // are rejected by providers, and only this one actually sends).
+            session_tools: qq_tools.filter(|_| supports_tools).map(|q| q.session_tools()),
+            command_shell,
         };
         tokio::task::spawn_blocking(move || {
             let mut conn = pool2.get().map_err(|e| e.to_string())?;
@@ -798,7 +838,7 @@ async fn headless_chat_inner(
         .await
         .map_err(|e| e.to_string())??
     };
-    let mut tool_defs = turn.tool_defs;
+    let tool_defs = turn.tool_defs;
     let system_prompt = turn.system_prompt;
 
     // Who this turn may recall. A private chat is about the one person on the
@@ -909,17 +949,6 @@ async fn headless_chat_inner(
 
     let params = turn_params.params;
 
-    // Session-scoped QQ tools are available to everyone (read-only,
-    // scope-locked) -- but not to a model that cannot take a tools field at
-    // all. This used to be covered by the clear() that followed; with the check
-    // moved into the resolver, these are the one set it does not reach.
-    if let Some(qq) = qq_tools.filter(|_| supports_tools) {
-        // The desktop registry also owns the two generic sticker tools. On QQ
-        // the session-scoped implementation must replace them: duplicate tool
-        // names are rejected by providers, and only this one actually sends.
-        tool_defs.retain(|definition| !qq.owns(&definition.name));
-        tool_defs.extend(qq.definitions());
-    }
     // What may actually execute, which is where this turn's speaker is
     // weighed. An ordinary member in a group is held to the scope-locked
     // read-only QQ tools exactly as before; what changed is that the refusal
@@ -1026,28 +1055,8 @@ async fn headless_chat_inner(
         .map_err(|e| e.to_string())??;
     }
 
-    // Build tool context
-    // A read that fails is its own answer, never "unset": unset is `auto`, and
-    // guessing `auto` for somebody who chose a container runs their commands on
-    // the host. See `CommandSettings`; the escalation it leads to is refused in
-    // QQ by `ChatApprovals`, because nobody there may answer it.
-    let command_settings = {
-        let pool2 = pool.clone();
-        tokio::task::spawn_blocking(move || crate::sandbox::CommandSettings::read(&pool2))
-            .await
-            .map_err(|e| e.to_string())??
-    };
-    // Headless sessions have no project directory. A requested container is
-    // therefore refused explicitly instead of being downgraded to the platform
-    // default; there is no honest answer to what the container should mount.
-    #[cfg(not(target_os = "android"))]
-    let sandbox_policy = crate::sandbox::resolve_command_sandbox(
-        &command_settings,
-        None,
-        conversation_id,
-        services.map(|services| services.containers.clone() as std::sync::Arc<dyn crate::container::CommandConnector>),
-    )
-    .map_err(|error| error.to_string())?;
+    // Build tool context. The command settings and the sandbox policy were
+    // read ahead of the turn config above, which needed them for the prompt.
     let tool_context = tools::ToolContext {
         working_directory: None,
         shell: command_settings.shell(),

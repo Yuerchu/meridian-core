@@ -15,8 +15,10 @@ discipline (read a file before editing it, don't repeat a failed tool call) is
 built into Meridian and applies whether or not the user writes a system prompt.
 An empty system prompt is a perfectly good configuration.
 
-System prompts support `{{variable}}` placeholders, substituted when the message
-is sent. The available variables are listed at the end of this document.
+A system prompt is sent exactly as written: there are no placeholders or
+variables, and text like `{{name}}` reaches the model literally. What the model
+needs to know about the moment — when each message was sent, who sent it —
+travels with the messages themselves, not in the prompt.
 
 Settings → Assistants is where the user picks the provider, model, temperature,
 context limit, and which tools the assistant may call.
