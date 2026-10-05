@@ -14,8 +14,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use sea_orm::{DbErr, SqlxSqliteConnector};
-use sqlx::ConnectOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{ConnectOptions, Connection};
 
 use self::cap::Db;
 use super::{BUSY_TIMEOUT_MS, POOL_ACQUIRE_TIMEOUT};
@@ -44,14 +44,32 @@ fn options(filename: impl AsRef<Path>) -> SqliteConnectOptions {
 
 /// Opens the database file as the SeaORM pool. Migrations are not run here;
 /// until the baseline lands, Diesel's `init_db` still owns the schema.
+///
+/// WAL is set once, on a connection of its own, as `init_db` does, and the
+/// pool's connections do not ask for it. The mode is stored in the file and
+/// every later connection inherits it. Asking again on each new connection is
+/// a no-op while the file is WAL, and the file cannot leave WAL while any
+/// connection has it open (both measured, SQLite 3.51) — so with the pool
+/// holding one connection this placement changes nothing observable. It only
+/// keeps a new connection from trying to switch the mode back, which takes a
+/// lock `busy_timeout` does not wait for, should something outside ever switch
+/// the file while the pool happened to hold no connection at all.
 pub async fn open(path: &Path) -> Result<Db, DbErr> {
+    let conn_err = |error: sqlx::Error| DbErr::Conn(sea_orm::RuntimeErr::SqlxError(error.into()));
+    let setup = options(path)
+        .journal_mode(SqliteJournalMode::Wal)
+        .connect()
+        .await
+        .map_err(conn_err)?;
+    setup.close().await.map_err(conn_err)?;
+
     let pool = SqlitePoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
         .min_connections(1)
         .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-        .connect_with(options(path).journal_mode(SqliteJournalMode::Wal))
+        .connect_with(options(path))
         .await
-        .map_err(|error| DbErr::Conn(sea_orm::RuntimeErr::SqlxError(error.into())))?;
+        .map_err(conn_err)?;
     Ok(Db::new(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool)))
 }
 
