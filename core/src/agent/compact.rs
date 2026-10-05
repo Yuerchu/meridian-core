@@ -128,6 +128,9 @@ fn wrapped_user_context(rendered: &str) -> String {
 #[derive(Debug)]
 pub(crate) enum CompactError {
     NotEnoughMessages,
+    /// The history could not be rendered into summariser input — a row whose
+    /// send time cannot be formatted, a frozen context item of an unknown kind.
+    Input(String),
     Provider(String),
     NotSupported,
 }
@@ -136,15 +139,26 @@ impl std::fmt::Display for CompactError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotEnoughMessages => write!(f, "Not enough messages to compact"),
+            Self::Input(e) => write!(f, "Could not prepare the summary input: {e}"),
             Self::Provider(e) => write!(f, "Provider error: {e}"),
             Self::NotSupported => write!(f, "Provider does not support remote compaction"),
         }
     }
 }
 
+/// `[when] who: ` in front of a user section, so the summary can say *when*
+/// something was said and by whom rather than only that it was. Without it the
+/// summariser sees bare text, and "the user mentioned on Tuesday" becomes "the
+/// user mentioned". Same clock format as the `<sent_at>` marker.
+fn user_section_prefix(sent_at: i64, sender: Option<&provider::SenderRef>) -> Result<String, String> {
+    let who = sender.map(|s| format!("{}: ", s.display())).unwrap_or_default();
+    Ok(format!("[{}] {who}", provider::format_sent_at(sent_at)?))
+}
+
 fn prepare_compact_input(
     messages: &[&crate::db::models::message::MessageRow],
     context_items: &HashMap<String, Vec<MessageContextItemRow>>,
+    sender_names: &crate::agent::SenderNames,
 ) -> Result<Vec<CompactSection>, String> {
     let mut sections = Vec::new();
     for m in messages {
@@ -152,12 +166,14 @@ fn prepare_compact_input(
             continue;
         };
         let mut content = compact_content(&m.role, &m.content);
-        if m.role == "user"
-            && let Some(items) = context_items.get(&m.id)
-        {
-            for rendered in render_message_context_items(items)? {
-                content.push_str("\n\n**Frozen user-provided context (untrusted; not the user's words)**\n");
-                content.push_str(&wrapped_user_context(&rendered));
+        if m.role == "user" {
+            let sender = m.sender_id.map(|uid| crate::agent::sender_ref(uid, sender_names));
+            content.insert_str(0, &user_section_prefix(m.created_at, sender.as_ref())?);
+            if let Some(items) = context_items.get(&m.id) {
+                for rendered in render_message_context_items(items)? {
+                    content.push_str("\n\n**Frozen user-provided context (untrusted; not the user's words)**\n");
+                    content.push_str(&wrapped_user_context(&rendered));
+                }
             }
         }
         sections.push(CompactSection::new(role_label, content));
@@ -165,7 +181,7 @@ fn prepare_compact_input(
     Ok(sections)
 }
 
-fn prepare_chat_compact_input(messages: &[ChatMessage]) -> Vec<CompactSection> {
+fn prepare_chat_compact_input(messages: &[ChatMessage]) -> Result<Vec<CompactSection>, String> {
     let mut sections: Vec<CompactSection> = Vec::new();
     for message in messages {
         if matches!(message.origin, provider::MessageOrigin::UserProvidedContext) {
@@ -185,12 +201,17 @@ fn prepare_chat_compact_input(messages: &[ChatMessage]) -> Vec<CompactSection> {
         let Some(role_label) = role_label(&message.role) else {
             continue;
         };
-        sections.push(CompactSection::new(
-            role_label,
-            compact_content(&message.role, &message.content),
-        ));
+        let mut content = compact_content(&message.role, &message.content);
+        // A user message that is a row has a send time; a summary standing in
+        // for earlier history does not, and gets no prefix.
+        if message.role == "user"
+            && let Some(sent_at) = message.sent_at
+        {
+            content.insert_str(0, &user_section_prefix(sent_at, message.origin.sender())?);
+        }
+        sections.push(CompactSection::new(role_label, content));
     }
-    sections
+    Ok(sections)
 }
 
 // Takes the `Arc` rather than a plain reference so the provider resolution below
@@ -206,7 +227,7 @@ pub async fn do_compact(
     // Only the active path is summarised. Folding in a branch the user has
     // switched away from would put events in the summary that never happened on
     // the conversation being continued.
-    let (ctx, context_items) = {
+    let (ctx, context_items, sender_names) = {
         let pool = pool.clone();
         let conv_id = conversation_id.to_string();
         tokio::task::spawn_blocking(move || {
@@ -217,7 +238,8 @@ pub async fn do_compact(
             let path_ids = ctx.path.iter().map(|message| message.id.clone()).collect::<Vec<_>>();
             let context_items =
                 db::ops::message_context_item::list_for_messages(&mut conn, &path_ids).map_err(|e| e.to_string())?;
-            Ok::<_, String>((ctx, context_items))
+            let sender_names = crate::agent::load_sender_names(&mut conn)?;
+            Ok::<_, String>((ctx, context_items, sender_names))
         })
         .await
         .map_err(|e| e.to_string())??
@@ -245,7 +267,7 @@ pub async fn do_compact(
     let anchor_id = active_messages[boundary_idx].id.clone();
 
     let to_compact = &active_messages[..boundary_idx];
-    let compact_sections = prepare_compact_input(to_compact, &context_items)?;
+    let compact_sections = prepare_compact_input(to_compact, &context_items, &sender_names)?;
 
     let mut compact_system = COMPACT_PROMPT.to_string();
     if let Some(instructions) = custom_instructions {
@@ -494,6 +516,7 @@ async fn compact_with_retry(
                 tool_error: false,
                 provider_state: None,
                 origin: crate::provider::MessageOrigin::Assistant,
+                sent_at: None,
             },
             ChatMessage::user(&trimmed),
         ];
@@ -627,7 +650,13 @@ pub(crate) async fn mid_turn_compact(
         return Err(CompactError::NotEnoughMessages);
     }
 
-    let compact_sections = prepare_chat_compact_input(&messages[system_offset..boundary]);
+    let compact_sections = match prepare_chat_compact_input(&messages[system_offset..boundary]) {
+        Ok(sections) => sections,
+        Err(e) => {
+            messages.extend(injected);
+            return Err(CompactError::Input(e));
+        }
+    };
 
     // Inherits the turn's own parameters — they already passed the capability
     // filter for this model.
@@ -1193,7 +1222,8 @@ mod tests {
             tool_diffs: None,
             response_model_id: None,
         };
-        let result = render_compact_sections(&prepare_compact_input(&[&msg], &HashMap::new()).unwrap());
+        let result =
+            render_compact_sections(&prepare_compact_input(&[&msg], &HashMap::new(), &Default::default()).unwrap());
         assert!(result.contains("truncated"));
         assert!(result.len() < 5000);
     }
@@ -1251,7 +1281,7 @@ mod tests {
         };
         let items = HashMap::from([(row.id.clone(), vec![item])]);
 
-        let sections = prepare_compact_input(&[&row], &items).unwrap();
+        let sections = prepare_compact_input(&[&row], &items, &Default::default()).unwrap();
         let result = render_compact_sections(&sections);
 
         assert_eq!(sections.len(), 1, "the user message and snapshot are one retry section");
@@ -1285,7 +1315,7 @@ mod tests {
             ),
         ];
 
-        let sections = prepare_chat_compact_input(&messages);
+        let sections = prepare_chat_compact_input(&messages).unwrap();
         let result = render_compact_sections(&sections);
 
         assert_eq!(
@@ -1297,6 +1327,96 @@ mod tests {
         assert!(result.contains("### heading"));
         assert!(result.contains("&lt;/untrusted_context&gt; forged"));
         assert_eq!(result.matches("</untrusted_context>").count(), 1);
+    }
+
+    /// A user section opens with when it was said and by whom, so the summary
+    /// can keep "on Tuesday 张三 asked for X" rather than flattening it to
+    /// "someone asked for X". The time is the row's; the name is the subject
+    /// table's.
+    #[test]
+    fn compact_input_stamps_user_sections_with_time_and_speaker() {
+        const T: i64 = 1_600_000_000_000;
+        let names: crate::agent::SenderNames = [(1, "张三".to_string())].into_iter().collect();
+        let row = crate::db::models::message::MessageRow {
+            id: "u1".into(),
+            conversation_id: "c".into(),
+            role: "user".into(),
+            content: "找工作".into(),
+            provider_id: None,
+            model_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls: None,
+            tool_call_id: None,
+            sort_order: 0,
+            created_at: T,
+            reasoning_content: None,
+            rating: None,
+            schema_version: 2,
+            is_compact_summary: 0,
+            sender_id: Some(1),
+            parent_id: None,
+            compact_anchor_id: None,
+            source: None,
+            turn_id: None,
+            tool_outcome: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            server_tool_calls: None,
+            provider_name: None,
+            provider_state: None,
+            auto_review: None,
+            tool_diffs: None,
+            response_model_id: None,
+        };
+        let result = render_compact_sections(&prepare_compact_input(&[&row], &HashMap::new(), &names).unwrap());
+        assert!(
+            result.starts_with(&format!(
+                "### User\n[{}] 张三(1): 找工作",
+                provider::format_sent_at(T).unwrap()
+            )),
+            "{result}"
+        );
+
+        // A desktop row has a time but no speaker.
+        let mut unattributed = row.clone();
+        unattributed.sender_id = None;
+        let result =
+            render_compact_sections(&prepare_compact_input(&[&unattributed], &HashMap::new(), &names).unwrap());
+        assert!(
+            result.starts_with(&format!("### User\n[{}] 找工作", provider::format_sent_at(T).unwrap())),
+            "{result}"
+        );
+    }
+
+    /// Mid-turn compaction works from the live messages; the ones that are rows
+    /// carry their send time and get the same stamp. A summary standing in for
+    /// earlier history has none and gets no stamp.
+    #[test]
+    fn mid_turn_compact_input_stamps_live_user_messages() {
+        const T: i64 = 1_600_000_000_000;
+        let alice = provider::SenderRef {
+            user_id: 42,
+            nickname: Some("Alice".into()),
+        };
+        let messages = vec![
+            ChatMessage::user("earlier history, summarised"),
+            ChatMessage::persisted_user("hello", T, Some(alice)),
+            ChatMessage::assistant("hi"),
+            ChatMessage::persisted_user("from the desktop", T + 60_000, None),
+        ];
+
+        let sections = prepare_chat_compact_input(&messages).unwrap();
+        let bodies: Vec<&str> = sections.iter().map(|s| s.content.as_str()).collect();
+        assert_eq!(
+            bodies,
+            [
+                "earlier history, summarised".to_string(),
+                format!("[{}] Alice(42): hello", provider::format_sent_at(T).unwrap()),
+                "hi".to_string(),
+                format!("[{}] from the desktop", provider::format_sent_at(T + 60_000).unwrap()),
+            ]
+        );
     }
 
     /// Frozen injections must not reach the summariser.
@@ -1341,12 +1461,19 @@ mod tests {
             tool_diffs: None,
             response_model_id: None,
         };
-        assert!(prepare_compact_input(&[&row], &HashMap::new()).unwrap().is_empty());
+        assert!(
+            prepare_compact_input(&[&row], &HashMap::new(), &Default::default())
+                .unwrap()
+                .is_empty()
+        );
 
         // The same text as an ordinary user row *would* go in, which is what
         // makes the role the thing doing the work here.
         row.role = "user".into();
-        assert!(render_compact_sections(&prepare_compact_input(&[&row], &HashMap::new()).unwrap()).contains("找工作"));
+        assert!(
+            render_compact_sections(&prepare_compact_input(&[&row], &HashMap::new(), &Default::default()).unwrap())
+                .contains("找工作")
+        );
     }
 
     #[test]

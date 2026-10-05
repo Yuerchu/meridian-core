@@ -236,6 +236,57 @@ struct InboxSteering<'a> {
     /// Set by `drain`, read by `narrowed`. Atomic rather than `Cell` because
     /// the port is held across an await and must stay `Sync`.
     demoted: std::sync::atomic::AtomicBool,
+    /// Display names off the subject table, so a message steered in mid-turn
+    /// is attributed the way its row is replayed next turn — not off the event,
+    /// whose nickname can be empty where the table's is not.
+    sender_names: &'a crate::agent::SenderNames,
+}
+
+/// One inbound message as the row it is about to become and the payload message
+/// it is sent as, built from the same fields so the two cannot drift apart.
+pub(super) struct IncomingRow {
+    pub(super) id: String,
+    pub(super) text: String,
+    pub(super) sender_id: Option<i64>,
+    pub(super) created_at: i64,
+    pub(super) live: provider::ChatMessage,
+}
+
+/// `first_id` is the id the first row gets: the caller announces it before the
+/// rows exist. Each message keeps the instant it arrived — a queued one waited
+/// through the previous round, and its row should say when it came in, not
+/// when the turn got round to it. Speakers resolve through `names` (the subject
+/// table) rather than the event's nickname, because that is the map the replay
+/// uses, and the live message has to render the same `<sender>` as its replay.
+pub(super) fn incoming_rows(
+    incoming: &[super::IncomingMessage],
+    first_id: &str,
+    names: &crate::agent::SenderNames,
+) -> Vec<IncomingRow> {
+    incoming
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let id = if i == 0 {
+                first_id.to_string()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            let sender_id = m.sender.as_ref().map(|s| s.user_id);
+            IncomingRow {
+                id,
+                text: m.text.clone(),
+                sender_id,
+                created_at: m.received_at,
+                live: crate::agent::persisted_user_message(
+                    &m.text,
+                    None,
+                    sender_id.map(|uid| crate::agent::sender_ref(uid, names)),
+                    m.received_at,
+                ),
+            }
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -262,9 +313,13 @@ impl crate::agent::engine::Steering for InboxSteering<'_> {
                     // something a person said, and it travels as context instead
                     // of as a user message.
                     match item.sender.as_ref() {
-                        Some(s) => crate::agent::engine::SteeredOrigin::User(Some(s.into())),
+                        Some(s) => crate::agent::engine::SteeredOrigin::User(Some(crate::agent::sender_ref(
+                            s.user_id,
+                            self.sender_names,
+                        ))),
                         None => crate::agent::engine::SteeredOrigin::System,
                     },
+                    item.created_at,
                 )
             })
             .collect()
@@ -389,6 +444,7 @@ pub(super) async fn oneshot_completion(
             tool_error: false,
             provider_state: None,
             origin: provider::MessageOrigin::Assistant,
+            sent_at: None,
         },
         // The transcript is data being analysed, not an instruction being
         // followed, and it carries no speaker of its own.
@@ -698,6 +754,37 @@ async fn headless_chat_inner(
         tracing::info!(model = %effective_model, "the model cannot take tools; none are offered this turn");
     }
 
+    // A read that fails is its own answer, never "unset": unset is `auto`, and
+    // guessing `auto` for somebody who chose a container runs their commands on
+    // the host. See `CommandSettings`; the escalation it leads to is refused in
+    // QQ by `ChatApprovals`, because nobody there may answer it. Read here,
+    // ahead of the turn config, because the prompt says which shell commands
+    // run under — the same decision `run_command` executes.
+    let command_settings = {
+        let pool2 = pool.clone();
+        tokio::task::spawn_blocking(move || crate::sandbox::CommandSettings::read(&pool2))
+            .await
+            .map_err(|e| e.to_string())??
+    };
+    // Headless sessions have no project directory. A requested container is
+    // therefore refused explicitly instead of being downgraded to the platform
+    // default; there is no honest answer to what the container should mount.
+    #[cfg(not(target_os = "android"))]
+    let sandbox_policy = crate::sandbox::resolve_command_sandbox(
+        &command_settings,
+        None,
+        conversation_id,
+        services.map(|services| services.containers.clone() as std::sync::Arc<dyn crate::container::CommandConnector>),
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(not(target_os = "android"))]
+    let command_shell = Some(crate::tools::command_shell::CommandShell::select(
+        command_settings.shell(),
+        sandbox_policy.is_container(),
+    ));
+    #[cfg(target_os = "android")]
+    let command_shell = None;
+
     let turn = {
         let pool2 = pool.clone();
         let registry = tool_registry.clone();
@@ -734,6 +821,15 @@ async fn headless_chat_inner(
             persona: assistant.as_ref().map(|a| a.system_prompt.clone()).unwrap_or_default(),
             // Memory is absent on purpose — it ships as a user-role message.
             context_blocks: Vec::new(),
+            // Session-scoped QQ tools are available to everyone (read-only,
+            // scope-locked) -- but not to a model that cannot take a tools field
+            // at all. Handed to the resolver rather than spliced in afterwards so
+            // the base prompt is built against the final array: the desktop
+            // registry also owns the two generic sticker tools, and on QQ the
+            // session-scoped implementation must replace them (duplicate names
+            // are rejected by providers, and only this one actually sends).
+            session_tools: qq_tools.filter(|_| supports_tools).map(|q| q.session_tools()),
+            command_shell,
         };
         tokio::task::spawn_blocking(move || {
             let mut conn = pool2.get().map_err(|e| e.to_string())?;
@@ -742,7 +838,7 @@ async fn headless_chat_inner(
         .await
         .map_err(|e| e.to_string())??
     };
-    let mut tool_defs = turn.tool_defs;
+    let tool_defs = turn.tool_defs;
     let system_prompt = turn.system_prompt;
 
     // Who this turn may recall. A private chat is about the one person on the
@@ -771,6 +867,9 @@ async fn headless_chat_inner(
     let t0 = now_ms();
     let roster = crate::agent::roster_block(&memory_request);
     let injection = crate::agent::plan_injection_async(pool, memory_request, ctx.live().to_vec(), t0).await?;
+    // The checklist, frozen the same way and placed right after memory. A QQ
+    // group never has one and this is a no-op there; a private admin chat can.
+    let todo = crate::agent::plan_todo_injection_async(pool, conversation_id.to_string(), ctx.live().to_vec()).await?;
     let keep_recent = assistant.as_ref().map(|a| a.compact_keep_recent as usize).unwrap_or(10);
 
     let budget = TokenBudget::new(
@@ -820,6 +919,7 @@ async fn headless_chat_inner(
     let mut trailing: Vec<provider::ChatMessage> = Vec::new();
     for block in [
         injection.as_ref().and_then(|i| i.text.as_deref()),
+        todo.as_ref().map(|t| t.text.as_str()),
         interrupted.as_ref().map(|r| r.text()),
     ]
     .into_iter()
@@ -829,10 +929,12 @@ async fn headless_chat_inner(
             trailing.push(provider::ChatMessage::system_context(block.trim_start()));
         }
     }
-    trailing.extend(incoming.iter().map(|m| match m.sender.as_ref() {
-        Some(s) => provider::ChatMessage::user_from(&m.text, s.into()),
-        None => provider::ChatMessage::user(&m.text),
-    }));
+    // The rows this turn will write, and the live messages built from the same
+    // fields — see `incoming_rows`. Persisted further down, once the request
+    // has been assembled.
+    let user_msg_id = uuid::Uuid::new_v4().to_string();
+    let rows = incoming_rows(incoming, &user_msg_id, &sender_names);
+    trailing.extend(rows.iter().map(|r| r.live.clone()));
     if let Some(roster) = roster.as_deref().filter(|r| !r.trim().is_empty()) {
         trailing.push(provider::ChatMessage::system_context(roster.trim_start()));
     }
@@ -847,17 +949,6 @@ async fn headless_chat_inner(
 
     let params = turn_params.params;
 
-    // Session-scoped QQ tools are available to everyone (read-only,
-    // scope-locked) -- but not to a model that cannot take a tools field at
-    // all. This used to be covered by the clear() that followed; with the check
-    // moved into the resolver, these are the one set it does not reach.
-    if let Some(qq) = qq_tools.filter(|_| supports_tools) {
-        // The desktop registry also owns the two generic sticker tools. On QQ
-        // the session-scoped implementation must replace them: duplicate tool
-        // names are rejected by providers, and only this one actually sends.
-        tool_defs.retain(|definition| !qq.owns(&definition.name));
-        tool_defs.extend(qq.definitions());
-    }
     // What may actually execute, which is where this turn's speaker is
     // weighed. An ordinary member in a group is held to the scope-locked
     // read-only QQ tools exactly as before; what changed is that the refusal
@@ -886,11 +977,14 @@ async fn headless_chat_inner(
     };
 
     // Persist this turn's inbound messages, one row each so every speaker keeps
-    // their own attribution. They share one timestamp because they were drained
-    // as a single batch; every row written later in the turn stamps its own
-    // now_ms() so relative times differ and the turn's elapsed time is derivable.
-    let now = now_ms();
-    let user_msg_id = uuid::Uuid::new_v4().to_string();
+    // their own attribution. Each row is stamped with the instant its message
+    // arrived — the same value its live `ChatMessage` already carries, so the
+    // `<sent_at>` the provider cached this turn is the one the replay renders
+    // next turn. Every row written later in the turn stamps its own now_ms().
+    //
+    // The injection row takes the first message's instant rather than a fresh
+    // one, so that it does not post-date the messages chained after it.
+    let now = rows.first().map(|r| r.created_at).unwrap_or_else(now_ms);
     // Walks down the branch as the turn writes. A group turn can open with
     // several user rows, and steering can add more mid-flight, so this has to be
     // a cursor rather than one precomputed parent.
@@ -901,35 +995,27 @@ async fn headless_chat_inner(
         parent_cursor =
             crate::agent::persist_injection(pool, injection, conversation_id, turn_id, parent_cursor, now).await;
     }
+    // After memory, before the messages: the order `trailing` sent them in.
+    if let Some(ref todo) = todo {
+        parent_cursor =
+            crate::agent::persist_todo_injection(pool, todo, conversation_id, turn_id, parent_cursor, now).await;
+    }
     {
         let pool = pool.clone();
         let conv_id = conversation_id.to_string();
-        let first_id = user_msg_id.clone();
-        let rows: Vec<(String, String, Option<i64>)> = incoming
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let id = if i == 0 {
-                    first_id.clone()
-                } else {
-                    uuid::Uuid::new_v4().to_string()
-                };
-                (id, m.text.clone(), m.sender.as_ref().map(|s| s.user_id))
-            })
-            .collect();
         let mut parent = parent_cursor.clone();
-        parent_cursor = rows.last().map(|(id, _, _)| id.clone()).or(parent_cursor);
+        parent_cursor = rows.last().map(|r| r.id.clone()).or(parent_cursor);
         let turn = turn_id.to_string();
         tokio::task::spawn_blocking(move || {
             let mut conn = get_conn(&pool)?;
-            for (msg_id, msg, sender_id) in &rows {
+            for row in &rows {
                 crate::db::ops::message::append_message(
                     &mut conn,
                     &MessageInsert {
-                        id: msg_id,
+                        id: &row.id,
                         conversation_id: &conv_id,
                         role: "user",
-                        content: msg,
+                        content: &row.text,
                         provider_id: None,
                         model_id: None,
                         input_tokens: None,
@@ -937,12 +1023,12 @@ async fn headless_chat_inner(
                         tool_calls: None,
                         tool_call_id: None,
                         sort_order: 0,
-                        created_at: now,
+                        created_at: row.created_at,
                         reasoning_content: None,
                         rating: None,
                         schema_version: 2,
                         is_compact_summary: 0,
-                        sender_id: *sender_id,
+                        sender_id: row.sender_id,
                         parent_id: None,
                         compact_anchor_id: None,
                         source: None,
@@ -958,9 +1044,10 @@ async fn headless_chat_inner(
                     parent.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
-                crate::db::ops::emoji::link_stickers_in_content(&mut conn, msg_id, msg).map_err(|e| e.to_string())?;
+                crate::db::ops::emoji::link_stickers_in_content(&mut conn, &row.id, &row.text)
+                    .map_err(|e| e.to_string())?;
                 // Queued messages chain to each other, not all to the same parent.
-                parent = Some(msg_id.clone());
+                parent = Some(row.id.clone());
             }
             Ok::<_, String>(())
         })
@@ -968,28 +1055,8 @@ async fn headless_chat_inner(
         .map_err(|e| e.to_string())??;
     }
 
-    // Build tool context
-    // A read that fails is its own answer, never "unset": unset is `auto`, and
-    // guessing `auto` for somebody who chose a container runs their commands on
-    // the host. See `CommandSettings`; the escalation it leads to is refused in
-    // QQ by `ChatApprovals`, because nobody there may answer it.
-    let command_settings = {
-        let pool2 = pool.clone();
-        tokio::task::spawn_blocking(move || crate::sandbox::CommandSettings::read(&pool2))
-            .await
-            .map_err(|e| e.to_string())??
-    };
-    // Headless sessions have no project directory. A requested container is
-    // therefore refused explicitly instead of being downgraded to the platform
-    // default; there is no honest answer to what the container should mount.
-    #[cfg(not(target_os = "android"))]
-    let sandbox_policy = crate::sandbox::resolve_command_sandbox(
-        &command_settings,
-        None,
-        conversation_id,
-        services.map(|services| services.containers.clone() as std::sync::Arc<dyn crate::container::CommandConnector>),
-    )
-    .map_err(|error| error.to_string())?;
+    // Build tool context. The command settings and the sandbox policy were
+    // read ahead of the turn config above, which needed them for the prompt.
     let tool_context = tools::ToolContext {
         working_directory: None,
         shell: command_settings.shell(),
@@ -1073,6 +1140,7 @@ async fn headless_chat_inner(
             .map(|q| super::qq_tools::ordinary_offered(q.ordinary_names(), &tool_defs))
             .unwrap_or_default(),
         demoted: std::sync::atomic::AtomicBool::new(false),
+        sender_names: &sender_names,
     });
 
     let outcome = engine::run_turn(
@@ -1175,6 +1243,110 @@ mod tests {
     #[test]
     fn a_round_that_failed_ends_as_an_error() {
         assert_eq!(outcome(Err("no api key".into()), false).stop_reason(), "error");
+    }
+
+    /// The live message a turn sends and the row it writes come out of one
+    /// function, from one set of fields, so the row's replay next turn renders
+    /// the same bytes the provider cached this turn. Three things this pins:
+    /// each message keeps its own arrival instant (a queued one is not stamped
+    /// with the round's), the speaker is resolved through the subject table and
+    /// not the event's nickname (which here is empty where the table's is not),
+    /// and the replay goes through `push_history_message` like any other row.
+    #[test]
+    fn an_inbound_message_renders_the_same_live_and_replayed() {
+        use crate::provider::{SenderRendering, format_sent_at, render_message};
+        const T: i64 = 1_600_000_000_000;
+
+        let names: crate::agent::SenderNames = [(1, "张三".to_string())].into_iter().collect();
+        let blank_nickname = crate::onebot::SenderContext {
+            user_id: 1,
+            nickname: Some(String::new()),
+            role: None,
+            title: None,
+            is_admin: false,
+            is_group: true,
+        };
+        let incoming = vec![
+            crate::onebot::IncomingMessage::new("你好", Some(blank_nickname), T),
+            crate::onebot::IncomingMessage::new("[系统提示] 2 加入了群聊", None, T + 60_000),
+        ];
+
+        let rows = incoming_rows(&incoming, "first", &names);
+        assert_eq!(rows[0].id, "first", "the announced id is the first row's");
+        assert_eq!(
+            (rows[0].created_at, rows[1].created_at),
+            (T, T + 60_000),
+            "each row keeps the instant its message arrived",
+        );
+
+        for row in &rows {
+            let stored = crate::db::models::message::MessageRow {
+                id: row.id.clone(),
+                conversation_id: "c".into(),
+                role: "user".into(),
+                content: row.text.clone(),
+                provider_id: None,
+                model_id: None,
+                input_tokens: None,
+                output_tokens: None,
+                tool_calls: None,
+                tool_call_id: None,
+                sort_order: 0,
+                created_at: row.created_at,
+                reasoning_content: None,
+                rating: None,
+                schema_version: 2,
+                is_compact_summary: 0,
+                sender_id: row.sender_id,
+                parent_id: None,
+                compact_anchor_id: None,
+                source: None,
+                turn_id: None,
+                tool_outcome: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                server_tool_calls: None,
+                provider_name: None,
+                provider_state: None,
+                auto_review: None,
+                tool_diffs: None,
+                response_model_id: None,
+            };
+            let replay = crate::db::ops::message::ActiveContext {
+                path: vec![stored],
+                summary: None,
+                anchor_index: None,
+                head_id: None,
+            };
+            let rebuilt = crate::agent::build_messages_with_senders("", &replay, vec![], &names).unwrap();
+            let replayed = rebuilt.iter().find(|m| m.role == "user").unwrap();
+            for rendering in [SenderRendering::NameField, SenderRendering::Prefix] {
+                assert_eq!(
+                    render_message(replayed, rendering).unwrap().content,
+                    render_message(&row.live, rendering).unwrap().content,
+                    "{}: live and replayed renderings must be byte-identical",
+                    row.text,
+                );
+            }
+        }
+
+        let first = render_message(&rows[0].live, SenderRendering::Prefix).unwrap().content;
+        assert_eq!(
+            first,
+            format!(
+                "<sent_at>{}</sent_at> <sender>张三(1)</sender>: 你好",
+                format_sent_at(T).unwrap()
+            ),
+            "the name comes off the table, not the event",
+        );
+        let notice = render_message(&rows[1].live, SenderRendering::Prefix).unwrap().content;
+        assert_eq!(
+            notice,
+            format!(
+                "<sent_at>{}</sent_at> [系统提示] 2 加入了群聊",
+                format_sent_at(T + 60_000).unwrap()
+            )
+        );
     }
 
     #[test]

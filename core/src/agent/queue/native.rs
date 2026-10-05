@@ -89,8 +89,11 @@ impl Steering for Interjections {
             let mut conn = get_conn(&pool)?;
             let mut out = Vec::new();
             loop {
-                match take_one(&mut conn, &conversation_id, &turn_id, now_ms()) {
-                    Ok(Some(item)) => out.push(item),
+                // One instant per item: the row's `created_at` and the live
+                // message's `received_at` are the same value by construction.
+                let now = now_ms();
+                match take_one(&mut conn, &conversation_id, &turn_id, now) {
+                    Ok(Some((row, text))) => out.push((row, text, now)),
                     Ok(None) => break,
                     // Stop rather than skip. The queue is a sequence, and the
                     // right response to not being able to read it is to deliver
@@ -120,7 +123,7 @@ impl Steering for Interjections {
 
         taken
             .into_iter()
-            .map(|(row, text)| Steered {
+            .map(|(row, text, received_at)| Steered {
                 text,
                 // Typed by the person watching, who has no chat identity. Not
                 // `System`: sent as context it would reach the model as ambient
@@ -130,6 +133,7 @@ impl Steering for Interjections {
                 // queue item. The loop adopts it as the cursor rather than
                 // writing a second row.
                 row: Some(row),
+                received_at,
             })
             .collect()
     }

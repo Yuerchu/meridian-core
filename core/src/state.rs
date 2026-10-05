@@ -196,6 +196,7 @@ impl SubAgentInbox {
                     // chat identity, which is not the same as there being nobody
                     // — see `SteeredOrigin`.
                     crate::agent::engine::SteeredOrigin::User(None),
+                    crate::util::now_ms(),
                 ));
                 Accept::Queued
             }

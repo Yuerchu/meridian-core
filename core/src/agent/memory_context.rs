@@ -726,17 +726,26 @@ pub(crate) fn load_memory_block_sync(
 /// in `<injected_context>` and announces itself — `<roster>` is a list of who is
 /// present, which is not a thing anybody could be asking about.
 ///
+/// `todo` is the checklist, frozen the same way memory is (`todo_context`), and
+/// so placed the same way: after memory, before the message, in the order the
+/// two rows are written.
+///
 /// `interrupted` says how the previous turn stopped, when it did not stop
 /// cleanly. It is not persisted either, but it is genuinely about the message
 /// that follows it, and it is absent on every turn but the one after a crash.
+///
+/// `user` is the message itself, already built by the caller through
+/// `persisted_user_message` with the instant its row will carry. Taking the
+/// built message rather than its text leaves one way to construct it.
 pub fn trailing_with_memory(
     memory: Option<&str>,
+    todo: Option<&str>,
     interrupted: Option<&str>,
-    user_message: &str,
+    user: Option<crate::provider::ChatMessage>,
     roster: Option<&str>,
 ) -> Vec<crate::provider::ChatMessage> {
     let mut out = Vec::new();
-    for block in [memory, interrupted].into_iter().flatten() {
+    for block in [memory, todo, interrupted].into_iter().flatten() {
         if !block.trim().is_empty() {
             out.push(crate::provider::ChatMessage::system_context(block.trim_start()));
         }
@@ -747,8 +756,8 @@ pub fn trailing_with_memory(
     // empty `user` message here was accepted by OpenAI and refused by Kimi
     // (`Invalid request: text content is empty`), which held every plan-review
     // continuation on that provider at `held` with an identical retry.
-    if !user_message.is_empty() {
-        out.push(crate::provider::ChatMessage::user(user_message));
+    if let Some(user) = user.filter(|u| !u.content.is_empty()) {
+        out.push(user);
     }
     if let Some(roster) = roster.filter(|r| !r.trim().is_empty()) {
         out.push(crate::provider::ChatMessage::system_context(roster.trim_start()));
@@ -1130,8 +1139,38 @@ pub async fn persist_injection(
     let Some(text) = injection.text.as_ref() else {
         return parent;
     };
-    let text = text.trim_start().to_string();
-    let source = injection.source();
+    persist_context_row(
+        pool,
+        text.trim_start().to_string(),
+        injection.source(),
+        "memory",
+        conversation_id,
+        turn_id,
+        parent,
+        now,
+    )
+    .await
+}
+
+/// Write one frozen context row — the memory block, the checklist — and answer
+/// with the row the next write should hang off. Shared by every block that is
+/// frozen into the history, so they are all written the same way and replayed
+/// the same way (`push_history_message` renders every `context` row alike).
+///
+/// `text` goes in exactly as it was sent: the row is only worth writing if the
+/// turn after this one can reproduce it byte for byte. A failed write is not a
+/// failed turn (see `persist_injection`); `label` names the block in the warning.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_context_row(
+    pool: &DbPool,
+    text: String,
+    source: String,
+    label: &'static str,
+    conversation_id: &str,
+    turn_id: &str,
+    parent: Option<String>,
+    now: i64,
+) -> Option<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let (pool2, conv, turn, hang_on) = (
         pool.clone(),
@@ -1186,8 +1225,9 @@ pub async fn persist_injection(
     };
     tracing::warn!(
         conversation_id = %conversation_id,
+        block = label,
         error = %reason,
-        "the memory block could not be recorded; the next turn will send it again",
+        "the {label} block could not be recorded; the next turn will send it again",
     );
     parent
 }
@@ -1283,6 +1323,8 @@ mod tests {
         assert!(parse_source("memory|full|broken|-|").is_err());
         assert!(parse_source("memory|full|-|-||extra").is_err());
         assert!(parse_source("shell").unwrap().is_none());
+        // The checklist's rows sit beside ours on the path and are not ours.
+        assert!(parse_source("todo|list").unwrap().is_none());
     }
 
     #[test]
@@ -2196,11 +2238,19 @@ mod placement_tests {
     use super::*;
     use crate::provider::MessageOrigin;
 
+    fn hi() -> Option<crate::provider::ChatMessage> {
+        Some(crate::provider::ChatMessage::persisted_user(
+            "hi",
+            1_600_000_000_000,
+            None,
+        ))
+    }
+
     /// The block must sit before the message it provides background for, and it
     /// must not be attributed to anyone: it is not something a user said.
     #[test]
     fn memory_precedes_the_current_message_and_has_no_speaker() {
-        let msgs = trailing_with_memory(Some("\n\n<bot_memories>\n- x\n</bot_memories>"), None, "hi", None);
+        let msgs = trailing_with_memory(Some("\n\n<bot_memories>\n- x\n</bot_memories>"), None, None, hi(), None);
 
         assert_eq!(msgs.len(), 2);
         assert!(matches!(msgs[0].origin, MessageOrigin::SystemContext));
@@ -2211,8 +2261,8 @@ mod placement_tests {
 
     #[test]
     fn no_memory_means_no_extra_message() {
-        assert_eq!(trailing_with_memory(None, None, "hi", None).len(), 1);
-        assert_eq!(trailing_with_memory(Some("   "), None, "hi", None).len(), 1);
+        assert_eq!(trailing_with_memory(None, None, None, hi(), None).len(), 1);
+        assert_eq!(trailing_with_memory(Some("   "), None, None, hi(), None).len(), 1);
     }
 
     /// A continuation resumes from a tool result and has no new message. The
@@ -2220,15 +2270,55 @@ mod placement_tests {
     /// Kimi refuses it, and OpenAI accepting it is what hid that.
     #[test]
     fn no_message_means_no_user_row() {
-        assert!(trailing_with_memory(None, None, "", None).is_empty());
+        assert!(trailing_with_memory(None, None, None, None, None).is_empty());
+        let empty = Some(crate::provider::ChatMessage::user(""));
+        assert!(trailing_with_memory(None, None, None, empty.clone(), None).is_empty());
         let msgs = trailing_with_memory(
             Some("<bot_memories>\n- x\n</bot_memories>"),
             None,
-            "",
+            None,
+            empty,
             Some("<roster/>"),
         );
         assert_eq!(msgs.len(), 2);
         assert!(msgs.iter().all(|m| matches!(m.origin, MessageOrigin::SystemContext)));
+    }
+
+    /// The message goes out exactly as the caller built it: with the send time
+    /// its row will carry. Rebuilding it here from text would be a second way to
+    /// construct the same message, and the two ways would eventually differ.
+    #[test]
+    fn the_message_is_passed_through_as_built() {
+        let msgs = trailing_with_memory(None, None, None, hi(), None);
+        assert_eq!(msgs[0].sent_at, Some(1_600_000_000_000));
+    }
+
+    /// Five slots, in the order the persisted ones are written: memory, then the
+    /// checklist, then the (unpersisted) interruption, the message, and the
+    /// (unpersisted) roster. Memory and todo are rows and stay where they land,
+    /// so their relative order on the wire has to be the order on disk.
+    #[test]
+    fn trailing_blocks_keep_their_order() {
+        let msgs = trailing_with_memory(
+            Some("<bot_memories>\n- x\n</bot_memories>"),
+            Some("<todo_list>\n- [ ] y\n</todo_list>"),
+            Some("<interrupted_turn>cut off</interrupted_turn>"),
+            hi(),
+            Some("<roster>\n- qq=\"1\" name=\"甲\"\n</roster>"),
+        );
+
+        let heads: Vec<&str> = msgs
+            .iter()
+            .map(|m| m.content.split(['>', ' ', '\n']).next().unwrap())
+            .collect();
+        assert_eq!(
+            heads,
+            ["<bot_memories", "<todo_list", "<interrupted_turn", "hi", "<roster"]
+        );
+        for (i, m) in msgs.iter().enumerate() {
+            let expected_context = i != 3;
+            assert_eq!(m.origin.is_system_context(), expected_context, "slot {i}");
+        }
     }
 
     /// The roster goes *after* the message, and that is the whole reason the
@@ -2244,7 +2334,8 @@ mod placement_tests {
         let msgs = trailing_with_memory(
             Some("<bot_memories>\n- x\n</bot_memories>"),
             None,
-            "hi",
+            None,
+            hi(),
             Some("<roster>\n- qq=\"1\" name=\"甲\"\n</roster>"),
         );
 
@@ -2256,7 +2347,7 @@ mod placement_tests {
             matches!(msgs[2].origin, MessageOrigin::SystemContext),
             "background, not something anyone said",
         );
-        assert_eq!(trailing_with_memory(None, None, "hi", Some("  ")).len(), 1);
+        assert_eq!(trailing_with_memory(None, None, None, hi(), Some("  ")).len(), 1);
     }
 
     /// The interrupted block travels the same way the memory block does, and
@@ -2265,8 +2356,9 @@ mod placement_tests {
     fn an_interrupted_turn_is_reported_as_background_too() {
         let msgs = trailing_with_memory(
             Some("<bot_memories>\n- x\n</bot_memories>"),
+            None,
             Some("<interrupted_turn>\ncut off\n</interrupted_turn>"),
-            "hi",
+            hi(),
             None,
         );
 
@@ -2284,7 +2376,7 @@ mod placement_tests {
     /// With no memory it still lands, and still ahead of the message.
     #[test]
     fn an_interrupted_turn_does_not_need_memory_to_come_with_it() {
-        let msgs = trailing_with_memory(None, Some("<interrupted_turn>x</interrupted_turn>"), "hi", None);
+        let msgs = trailing_with_memory(None, None, Some("<interrupted_turn>x</interrupted_turn>"), hi(), None);
         assert_eq!(msgs.len(), 2);
         assert!(msgs[0].content.starts_with("<interrupted_turn>"));
         assert_eq!(msgs[1].content, "hi");

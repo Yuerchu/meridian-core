@@ -23,6 +23,7 @@ pub mod queue;
 pub mod skills;
 mod stream;
 pub mod sub_agents;
+pub(crate) mod todo_context;
 pub(crate) mod tokenizer;
 // `pub(crate)` for `acp::session`, which writes the same `messages.tool_calls`
 // column a native turn does and must encode it identically — two encoders would
@@ -45,12 +46,13 @@ pub(crate) fn is_builtin_skill_dir(dir_name: &str) -> bool {
 pub use base_prompt::base_prompt;
 pub use compact::{CompactCircuitBreaker, CompactCircuitBreakerState, do_compact};
 pub(crate) use compact::{CompactError, mid_turn_compact, mid_turn_compact_remote};
-pub(crate) use context::SenderNames;
+pub use context::SenderNames;
 #[cfg(any(test, feature = "test-support"))]
 pub use context::build_messages;
+pub(crate) use context::sender_ref;
 pub use context::{
-    build_messages_with_context_items, build_messages_with_senders, microcompact, resolve_file_uris_in_messages,
-    resolve_sticker_parts_in_messages, trim_to_context_limit,
+    build_messages_with_context_items, build_messages_with_senders, load_sender_names, microcompact,
+    persisted_user_message, resolve_file_uris_in_messages, resolve_sticker_parts_in_messages, trim_to_context_limit,
 };
 pub use file_access::{build_file_access, file_access_prompt};
 pub(crate) use inline_tag::{InlineHiddenTagParser, InlineTagSpec};
@@ -68,6 +70,10 @@ pub use provider_config::{
 pub(crate) use stream::{
     MAX_STREAM_RETRIES, STREAM_RETRY_BASE, StreamResult, is_context_window_error, is_retryable_stream_error,
     parse_retry_after,
+};
+pub use todo_context::{
+    TODO_CLEARED_MARKER, TodoInjection, TodoKind, persist_todo_injection, plan_todo_injection,
+    plan_todo_injection_async,
 };
 pub use tokenizer::{TokenBudget, TokenCounter, TokenizerKind};
 pub(crate) use tool_calls::serialize_tool_calls_openai;

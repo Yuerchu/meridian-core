@@ -1665,19 +1665,27 @@ mod tests {
             { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,QUJD" } }
         ])
         .to_string();
-        let message = ChatMessage::user_from(
+        const T: i64 = 1_600_000_000_000;
+        let message = ChatMessage::persisted_user(
             &body,
-            crate::provider::SenderRef {
+            T,
+            Some(crate::provider::SenderRef {
                 user_id: 42,
                 nickname: Some("Alice".into()),
-            },
+            }),
         );
 
         let (_, input) = serialize_responses_input(&[message], None).expect("serialize multimodal user input");
         let content = input[0]["content"].as_array().expect("message content array");
         assert_eq!(content.len(), 3);
         assert_eq!(content[0]["type"], "input_text");
-        assert_eq!(content[0]["text"], "<sender>Alice(42)</sender>: ");
+        assert_eq!(
+            content[0]["text"],
+            format!(
+                "<sent_at>{}</sent_at> <sender>Alice(42)</sender>: ",
+                crate::provider::format_sent_at(T).unwrap()
+            )
+        );
         assert_eq!(
             content[1],
             serde_json::json!({ "type": "input_text", "text": "look here" })

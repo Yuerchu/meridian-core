@@ -147,9 +147,11 @@ fn archive(conn: &mut SqliteConnection, list_id: &str, now: i64) -> QueryResult<
     Ok(())
 }
 
-/// Render the running checklist for the system prompt. Empty lists yield
-/// `None` so an idle conversation does not carry a hollow tag around, and the
-/// leading blank lines match the other prompt blocks' spacing contract.
+/// Render the running checklist. It is frozen into the history as a context
+/// row by `agent::todo_context` when it changes, rather than re-sent in the
+/// system prompt every turn. Empty lists yield `None` so an idle conversation
+/// does not carry a hollow tag around; the leading blank lines are trimmed by
+/// the freezer, the way every injected block is.
 pub fn format_todo_block(view: &TodoListView) -> Option<String> {
     if view.items.is_empty() {
         return None;

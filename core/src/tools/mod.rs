@@ -4,6 +4,7 @@ pub mod ask_user;
 pub mod backend;
 #[cfg(not(target_os = "android"))]
 pub mod catalog;
+pub mod command_shell;
 pub mod custom;
 pub mod delete_file;
 pub mod edit_file;

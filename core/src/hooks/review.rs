@@ -755,6 +755,9 @@ async fn build_config(
         exposure: crate::agent::turn_config::ToolExposure::when(params.caps.supports_tools),
         persona: assistant.system_prompt.clone(),
         context_blocks: Vec::new(),
+        session_tools: None,
+        // No shell either — see `hook-gates.md`.
+        command_shell: None,
     };
     let pool = state.services.db.clone();
     let tools = state.services.tools.clone();

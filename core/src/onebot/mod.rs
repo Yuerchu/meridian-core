@@ -277,13 +277,19 @@ pub struct InboxItem {
 pub struct IncomingMessage {
     pub text: String,
     pub sender: Option<SenderContext>,
+    /// When it reached this process, in epoch milliseconds. Becomes the row's
+    /// `created_at` and the `<sent_at>` the model is shown, so a message that
+    /// waited in the inbox through a long turn keeps the time it actually came
+    /// in rather than the time the turn got round to it.
+    pub received_at: i64,
 }
 
 impl IncomingMessage {
-    pub fn new(text: impl Into<String>, sender: Option<SenderContext>) -> Self {
+    pub fn new(text: impl Into<String>, sender: Option<SenderContext>, received_at: i64) -> Self {
         Self {
             text: text.into(),
             sender,
+            received_at,
         }
     }
 }
@@ -293,6 +299,7 @@ impl From<&InboxItem> for IncomingMessage {
         Self {
             text: i.text.clone(),
             sender: i.sender.clone(),
+            received_at: i.created_at,
         }
     }
 }

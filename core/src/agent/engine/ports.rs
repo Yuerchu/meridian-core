@@ -212,15 +212,22 @@ pub struct Steered {
     /// exists and the item is spent. So it arrives already written and says
     /// where, rather than getting a second row for the same message.
     pub row: Option<String>,
+    /// When it arrived, in epoch milliseconds. For a message that already has a
+    /// row this is that row's `created_at`; for one the loop will write, it is
+    /// the instant the row gets. Either way it is also what the model is shown
+    /// as the send time, so the row and the live message cannot disagree.
+    pub received_at: i64,
 }
 
 impl Steered {
-    /// A message with no row of its own, which the loop will write.
-    pub fn typed(text: String, origin: SteeredOrigin) -> Self {
+    /// A message with no row of its own, which the loop will write, stamped
+    /// with the instant it arrived.
+    pub fn typed(text: String, origin: SteeredOrigin, received_at: i64) -> Self {
         Self {
             text,
             origin,
             row: None,
+            received_at,
         }
     }
 }

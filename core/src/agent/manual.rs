@@ -1,10 +1,9 @@
 //! The official `meridian-manual` skill.
 //!
 //! Written to disk at startup rather than shipped as a static file, because the
-//! volatile half is generated from the same registries the app actually uses:
-//! the tool list comes from `ToolRegistry`, the variable list from
-//! `template::available_variables()`. Delete a tool or a variable and it leaves
-//! the manual on the next launch — there is no hand-maintained copy to forget.
+//! volatile half is generated from the same registry the app actually uses:
+//! the tool list comes from `ToolRegistry`. Delete a tool and it leaves the
+//! manual on the next launch — there is no hand-maintained copy to forget.
 
 use std::path::Path;
 
@@ -41,11 +40,6 @@ pub fn render(tool_defs: &[ToolDefinition]) -> String {
         for (name, summary) in names {
             out.push_str(&format!("- `{name}` — {summary}\n"));
         }
-    }
-
-    out.push_str("\n## System prompt variables\n\n");
-    for v in crate::template::available_variables() {
-        out.push_str(&format!("- `{{{{{}}}}}` — {}\n", v.name, v.description_en));
     }
 
     out
@@ -107,16 +101,15 @@ mod tests {
         assert!(!without.contains("`run_command`"));
     }
 
+    /// The template variables are gone, and the manual has to say so rather than
+    /// keep advertising a list that resolves nothing: a `{{current_time}}` in a
+    /// system prompt now reaches the model as those characters.
     #[test]
-    fn variables_come_from_the_template_registry() {
+    fn the_manual_promises_no_prompt_variables() {
         let rendered = render(&[]);
-        for v in crate::template::available_variables() {
-            assert!(
-                rendered.contains(&format!("{{{{{}}}}}", v.name)),
-                "variable {} missing from manual",
-                v.name
-            );
-        }
+        assert!(!rendered.contains("System prompt variables"));
+        assert!(!rendered.contains("{{current_time}}"));
+        assert!(rendered.contains("sent exactly as written"), "{rendered}");
     }
 
     #[test]

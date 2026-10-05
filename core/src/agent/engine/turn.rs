@@ -1678,6 +1678,7 @@ async fn inject_steering(
                         SteeredOrigin::System => SteeringRole::Context,
                         SteeredOrigin::User(_) => SteeringRole::User,
                     },
+                    item.received_at,
                 )
                 .await
             }
@@ -1687,11 +1688,15 @@ async fn inject_steering(
         }
         // The turn's first resolve pass ran before this existed, so any image
         // parts inside it need their own.
+        //
+        // Built with the same `received_at` the row was written with (or already
+        // carried), through the same function the next turn replays it with.
         let mut injected = vec![match item.origin {
-            SteeredOrigin::User(Some(s)) => ChatMessage::user_from(&item.text, s),
             // A person with no chat identity is still a person. Sending this as
             // context would have the model weigh it as ambient noise.
-            SteeredOrigin::User(None) => ChatMessage::user(&item.text),
+            SteeredOrigin::User(sender) => {
+                crate::agent::persisted_user_message(&item.text, None, sender, item.received_at)
+            }
             SteeredOrigin::System => ChatMessage::system_context(&item.text),
         }];
         crate::agent::resolve_file_uris_in_messages(&mut injected, files_root)?;
@@ -2878,11 +2883,13 @@ mod tests {
                     nickname: None,
                 })),
                 row: None,
+                received_at: 1_600_000_000_000,
             },
             Steered {
                 text: "they left the group".into(),
                 origin: SteeredOrigin::System,
                 row: None,
+                received_at: 1_600_000_000_000,
             },
         ]));
 
@@ -2924,6 +2931,47 @@ mod tests {
         };
         assert_eq!(role_of("one more thing"), "user");
         assert_eq!(role_of("they left the group"), "context");
+
+        // And the row replays as the bytes that were sent. The provider cached
+        // the live message, with its `<sent_at>` and `<sender>`; next turn the
+        // row is what it is asked to match, so the two renderings have to be
+        // identical — which they are only if the row was stamped with the same
+        // instant the live message was built from, and the speaker resolved the
+        // same way. A fixed, far-past instant: at minute resolution a `now_ms()`
+        // on either side would otherwise render the same string by luck.
+        use crate::provider::{SenderRendering, format_sent_at, render_message};
+        let row = stored
+            .iter()
+            .find(|r| r.content == "one more thing")
+            .expect("the steered message has a row")
+            .clone();
+        assert_eq!(
+            row.created_at, 1_600_000_000_000,
+            "the row carries the instant it arrived"
+        );
+        let replay = crate::db::ops::message::ActiveContext {
+            path: vec![row],
+            summary: None,
+            anchor_index: None,
+            head_id: None,
+        };
+        let rebuilt =
+            crate::agent::build_messages_with_senders("", &replay, vec![], &crate::agent::SenderNames::new()).unwrap();
+        let replayed = rebuilt
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("the row replays as a user message");
+        let live = &requests[1].0[requests[1].0.len() - 2];
+        for rendering in [SenderRendering::NameField, SenderRendering::Prefix] {
+            assert_eq!(
+                render_message(replayed, rendering).unwrap().content,
+                render_message(live, rendering).unwrap().content,
+                "live and replayed renderings must be byte-identical",
+            );
+        }
+        let wire = render_message(live, SenderRendering::Prefix).unwrap().content;
+        assert!(wire.contains(&format_sent_at(1_600_000_000_000).unwrap()), "{wire}");
+        assert!(wire.contains("<sender>7</sender>: one more thing"), "{wire}");
     }
 
     /// Who opened a turn is not who gets to finish it.
@@ -2964,6 +3012,7 @@ mod tests {
                 nickname: None,
             })),
             row: None,
+            received_at: 1_600_000_000_000,
         }]));
 
         run_turn(
@@ -3002,6 +3051,7 @@ mod tests {
             text: "wait, use the other approach".into(),
             origin: SteeredOrigin::User(None),
             row: None,
+            received_at: 1_600_000_000_000,
         }]));
 
         let outcome = run_turn(
@@ -3054,16 +3104,24 @@ mod tests {
         let approvals = Answers::nobody();
 
         // What the queue would have written, in its own transaction.
-        let existing =
-            crate::agent::engine::transcript::write_steering(&pool, "c1", "t1", "already on the record", None, None)
-                .await
-                .expect("the queue wrote it");
+        let existing = crate::agent::engine::transcript::write_steering(
+            &pool,
+            "c1",
+            "t1",
+            "already on the record",
+            None,
+            None,
+            1_600_000_000_000,
+        )
+        .await
+        .expect("the queue wrote it");
 
         let before = rows(&pool).len();
         let inbox = Inbox(Mutex::new(vec![Steered {
             text: "already on the record".into(),
             origin: SteeredOrigin::User(None),
             row: Some(existing.clone()),
+            received_at: 1_600_000_000_000,
         }]));
 
         let outcome = run_turn(
@@ -3116,6 +3174,7 @@ mod tests {
                     text: "and another".into(),
                     origin: SteeredOrigin::User(None),
                     row: None,
+                    received_at: 1_600_000_000_000,
                 }]
             }
         }

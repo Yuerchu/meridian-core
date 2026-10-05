@@ -285,8 +285,20 @@ pub(crate) async fn append_steering(
     sender_id: Option<i64>,
     parent: Option<&str>,
     role: SteeringRole,
+    created_at: i64,
 ) -> Option<String> {
-    match write_steering_as(pool, conversation_id, turn_id, content, sender_id, parent, role).await {
+    match write_steering_as(
+        pool,
+        conversation_id,
+        turn_id,
+        content,
+        sender_id,
+        parent,
+        role,
+        created_at,
+    )
+    .await
+    {
         Ok(id) => Some(id),
         Err(e) => {
             tracing::error!("failed to persist steered message: {e}");
@@ -308,6 +320,7 @@ pub async fn write_steering(
     content: &str,
     sender_id: Option<i64>,
     parent: Option<&str>,
+    created_at: i64,
 ) -> Result<String, String> {
     write_steering_as(
         pool,
@@ -317,6 +330,7 @@ pub async fn write_steering(
         sender_id,
         parent,
         SteeringRole::User,
+        created_at,
     )
     .await
 }
@@ -340,6 +354,11 @@ impl SteeringRole {
     }
 }
 
+/// `created_at` is passed in rather than read here because the caller has
+/// already built the live `ChatMessage` with it: the row and the message must
+/// carry the same instant, or the next turn's replay renders a different
+/// `<sent_at>` from the one the provider cached.
+#[allow(clippy::too_many_arguments)]
 async fn write_steering_as(
     pool: &DbPool,
     conversation_id: &str,
@@ -348,6 +367,7 @@ async fn write_steering_as(
     sender_id: Option<i64>,
     parent: Option<&str>,
     role: SteeringRole,
+    created_at: i64,
 ) -> Result<String, String> {
     let pool = pool.clone();
     let conv_id = conversation_id.to_string();
@@ -372,7 +392,7 @@ async fn write_steering_as(
                 tool_calls: None,
                 tool_call_id: None,
                 sort_order: 0,
-                created_at: now_ms(),
+                created_at,
                 reasoning_content: None,
                 rating: None,
                 schema_version: 2,

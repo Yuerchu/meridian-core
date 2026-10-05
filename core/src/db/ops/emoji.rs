@@ -175,25 +175,6 @@ pub fn is_referenced(conn: &mut SqliteConnection, sticker_id: &str) -> QueryResu
     .get_result(conn)
 }
 
-/// Value of the `{{emoji_list}}` template variable for an assistant. The actual
-/// roster is exposed lazily through `list_stickers`, keeping large packs out of
-/// the system prompt.
-/// `None` when nothing is assigned, so the variable is left unresolved rather
-/// than expanded into an instruction pointing at an empty set.
-pub fn format_emoji_list_block(conn: &mut SqliteConnection, assistant_id: &str) -> Option<String> {
-    let pack_ids = crate::db::ops::emoji_pack::list_assigned_pack_ids(conn, assistant_id).ok()?;
-    if pack_ids.is_empty() {
-        return None;
-    }
-    let emojis = list_confirmed_for_packs(conn, &pack_ids).ok()?;
-    if emojis.is_empty() {
-        return None;
-    }
-    Some(
-        "You can send a sticker as a separate message part. Use list_stickers to inspect the current roster, then send_sticker with its id. Do not write [emoji:...] tags.".into(),
-    )
-}
-
 pub fn count_by_pack(conn: &mut SqliteConnection, pack_id: &str) -> QueryResult<i64> {
     use diesel::dsl::count_star;
     emojis::table

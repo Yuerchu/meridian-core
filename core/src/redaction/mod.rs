@@ -856,6 +856,7 @@ mod tests {
             tool_error: false,
             provider_state: None,
             origin: crate::provider::MessageOrigin::LegacyUser,
+            sent_at: None,
         }];
         engine.scrub_for_conversation(&mut msgs1, None, "conv1", &mappings);
 
@@ -868,6 +869,7 @@ mod tests {
             tool_error: false,
             provider_state: None,
             origin: crate::provider::MessageOrigin::LegacyUser,
+            sent_at: None,
         }];
         engine.scrub_for_conversation(&mut msgs2, None, "conv1", &mappings);
 

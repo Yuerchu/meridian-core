@@ -6,6 +6,10 @@
 //! assistant configured with a preset silently got the wrong tools, and the
 //! estimator left the checklist block out of its count. Resolving it once, here,
 //! is what stops modes from becoming a fourth thing to keep in sync.
+//!
+//! The checklist has since left the prompt altogether: it is a frozen context
+//! row (`agent::todo_context`), so the loops and the estimator agree on it by
+//! construction rather than by sharing this function.
 
 use std::collections::HashSet;
 
@@ -65,11 +69,32 @@ pub struct TurnConfigResolveRequest {
     /// narrowed by `resolve_turn_params`. Each one that supersedes a local tool
     /// takes it out of the set below.
     pub server_tools: Vec<ServerToolKind>,
-    /// The assistant's own prompt, template variables already resolved.
+    /// The assistant's own prompt, sent exactly as written. There are no
+    /// template variables: a `{{…}}` in it reaches the model as those characters.
     pub persona: String,
     /// Slotted in after the persona: project instructions, file access notes.
     /// Each carries its own leading blank line.
     pub context_blocks: Vec<String>,
+    /// Tools the runner supplies for this session, on top of (and in place of
+    /// some of) the registry's. OneBot's QQ tools, which replace the desktop
+    /// sticker pair with the implementation that actually sends. Applied in
+    /// here rather than by the caller afterwards, so that `base_prompt` sees the
+    /// final array — a sticker section gated on `send_sticker` never fired on QQ
+    /// while the swap happened after the prompt was built.
+    pub session_tools: Option<SessionTools>,
+    /// What `run_command` would run under this turn, for the base prompt's
+    /// shell line. `None` where there is no command executor (the reviewer,
+    /// Android), in which case the line is absent along with the tool.
+    pub command_shell: Option<crate::tools::command_shell::CommandShell>,
+}
+
+/// A runner's own tools: the names it owns (removed from the registry set even
+/// when it does not define all of them this session) and the definitions it
+/// shows. Session-scoped, like everything that reaches the tool array — see the
+/// cache note on `QqToolExecutor::definitions`.
+pub struct SessionTools {
+    pub owned: HashSet<String>,
+    pub definitions: Vec<ToolDefinition>,
 }
 
 pub struct TurnConfig {
@@ -98,6 +123,8 @@ pub fn resolve(
         server_tools,
         persona,
         context_blocks,
+        session_tools,
+        command_shell,
     } = input;
 
     let tool_defs = if exposure != ToolExposure::None {
@@ -163,6 +190,15 @@ pub fn resolve(
         if let ToolExposure::Only(allowed) = exposure {
             defs.retain(|definition| allowed.contains(&definition.name.as_str()));
         }
+        // The runner's own tools, after the narrowing: exposure limits what the
+        // *registry* may show a session, and these are the runner's fixed prose
+        // about the room the reader is already in. Owned names go first, since
+        // a provider rejects two tools with one name and only the runner's copy
+        // actually does the thing.
+        if let Some(session) = session_tools {
+            defs.retain(|definition| !session.owned.contains(&definition.name));
+            defs.extend(session.definitions);
+        }
         defs
     } else {
         Vec::new()
@@ -176,7 +212,7 @@ pub fn resolve(
         prompt.push_str(instructions);
         prompt.push_str("\n\n");
     }
-    if let Some(base) = super::base_prompt(&tool_defs) {
+    if let Some(base) = super::base_prompt(&tool_defs, command_shell.as_ref()) {
         prompt.push_str(&base);
         prompt.push_str("\n\n");
     }
@@ -184,27 +220,24 @@ pub fn resolve(
     for block in &context_blocks {
         prompt.push_str(block);
     }
-    // State blocks last, and re-derived from the database rather than read back
-    // out of the transcript, which is what carries them across compaction.
-    // Anything appended after them would be evicted from the provider's prompt
-    // cache every time they change.
+    // The one state block, last, and re-derived from the database rather than
+    // read back out of the transcript, which is what carries it across
+    // compaction. Anything appended after it would be evicted from the
+    // provider's prompt cache every time it changes — which for an approved plan
+    // is once per implementation, so it can afford to be here. The checklist,
+    // which changes several times a turn, cannot, and is not: see the note at
+    // the end of this function.
     //
-    // The same reasoning orders these two against each other: an approved plan
-    // does not change for the whole of an implementation, while the checklist
-    // changes several times per turn. Plan first keeps it inside the cached
-    // prefix instead of behind every checkbox tick.
-    //
-    // Both are per-conversation and deliberately do not follow branch switches:
-    // paging back to an earlier answer still shows the plan and checklist as
-    // they stand now. They describe the work in progress rather than the
+    // The plan is per-conversation and deliberately does not follow branch
+    // switches: paging back to an earlier answer still shows the plan as it
+    // stands now. It describes the work in progress rather than the
     // transcript, and the rest of that work — files edited, commands run,
     // memories written — cannot be rewound by switching branches either. Making
-    // these two alone branch-aware would imply the whole world rewinds, which
-    // is a harder model to explain than "branches switch the transcript only".
+    // it alone branch-aware would imply the whole world rewinds, which is a
+    // harder model to explain than "branches switch the transcript only".
     // A read failure drops the block from the prompt, and the model then ignores
-    // a plan it agreed to or forgets the checklist — read as "it went off the
-    // rails again" rather than as an error. `Ok(None)` is the ordinary case and
-    // stays quiet.
+    // a plan it agreed to — read as "it went off the rails again" rather than as
+    // an error. `Ok(None)` is the ordinary case and stays quiet.
     let has_versioned_plan =
         match crate::db::ops::plan_review::get_approved_revision_for_conversation(conn, &conversation_id) {
             Ok(Some(revision)) => {
@@ -236,18 +269,10 @@ pub fn resolve(
             ),
         }
     }
-    match crate::db::ops::todo::get_active_view(conn, &conversation_id) {
-        Ok(Some(view)) => {
-            if let Some(block) = crate::db::ops::todo::format_todo_block(&view) {
-                prompt.push_str(&block);
-            }
-        }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(
-            conversation_id = %conversation_id, block = "todo", error = %e,
-            "could not read the todo list; it will be missing from this turn"
-        ),
-    }
+    // The checklist is not here. It changes several times a turn, and anything
+    // in the system prompt is the front of the cached prefix, so it is frozen
+    // into the history as a context row instead — see `agent::todo_context`.
+    // The approved plan is the one state block left; it could go the same way.
 
     let offered = tool_defs.iter().map(|d| d.name.clone()).collect();
     Ok(TurnConfig {
@@ -374,6 +399,8 @@ mod tests {
             exposure: ToolExposure::All,
             persona: "You are a test.".into(),
             context_blocks: Vec::new(),
+            session_tools: None,
+            command_shell: None,
         }
     }
 
@@ -670,10 +697,15 @@ mod tests {
         let persona = cfg.system_prompt.find("You are a test.").unwrap();
         let instructions = cfg.system_prompt.find("# Project instructions").unwrap();
         let plan_at = cfg.system_prompt.find("<approved_plan>").unwrap();
-        let todo = cfg.system_prompt.find("<todo_list>").unwrap();
-        // Plan before checklist: the checklist churns several times a turn and
-        // would otherwise push the stable plan out of the cached prefix.
-        assert!(persona < instructions && instructions < plan_at && plan_at < todo);
+        assert!(persona < instructions && instructions < plan_at);
+        // The checklist churns several times a turn, and the prompt is the front
+        // of the cached prefix. It is a frozen context row now (`todo_context`),
+        // and a list seeded above must not find its way back in here.
+        assert!(
+            !cfg.system_prompt.contains("<todo_list>\nTitle:"),
+            "{}",
+            cfg.system_prompt
+        );
     }
 
     #[test]
@@ -742,6 +774,9 @@ mod tests {
     fn the_estimator_and_the_chat_loop_see_the_same_prompt() {
         // Previously the estimator built its own prompt and left the checklist
         // out, so its token count ran low exactly when the context was tightest.
+        // The checklist is a frozen row now and both sides plan it through
+        // `todo_context`; what this still pins is that two resolutions of the
+        // same state are the same bytes, and that neither smuggles the list back.
         let (pool, reg) = setup();
         let mut conn = pool.get().unwrap();
         crate::db::ops::todo::replace_active_list(
@@ -760,7 +795,164 @@ mod tests {
         let a = resolve_ok(&mut conn, &reg, input(switchable(None), None));
         let b = resolve_ok(&mut conn, &reg, input(switchable(None), None));
         assert_eq!(a.system_prompt, b.system_prompt);
-        assert!(a.system_prompt.contains("<todo_list>"));
+        assert!(!a.system_prompt.contains("<todo_list>\nTitle:"));
+    }
+
+    /// The runner's tools replace the registry's of the same name *inside* the
+    /// resolver, so the base prompt is built against what the model will see.
+    /// Spliced in afterwards, the sticker section never fired on QQ.
+    #[test]
+    fn session_tools_replace_the_registry_pair_before_the_prompt_is_built() {
+        let (pool, reg) = setup();
+        let mut conn = pool.get().unwrap();
+        let mut i = input(switchable(None), None);
+        i.session_tools = Some(SessionTools {
+            owned: ["list_stickers", "send_sticker"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+            definitions: vec![ToolDefinition {
+                name: "send_sticker".into(),
+                description: "QQ".into(),
+                parameters: serde_json::json!({}),
+            }],
+        });
+        let cfg = resolve_ok(&mut conn, &reg, i);
+
+        let senders: Vec<&ToolDefinition> = cfg.tool_defs.iter().filter(|d| d.name == "send_sticker").collect();
+        assert_eq!(senders.len(), 1, "one definition per name, the runner's");
+        assert_eq!(senders[0].description, "QQ");
+        assert!(
+            !cfg.tool_defs.iter().any(|d| d.name == "list_stickers"),
+            "an owned name the runner does not define this session is gone, not the registry's"
+        );
+        assert!(cfg.system_prompt.contains("# Stickers"), "{}", cfg.system_prompt);
+        assert!(cfg.offered.contains("send_sticker"));
+    }
+
+    /// A confirmed sticker roster puts the pair into the set even when the
+    /// assistant's own list predates stickers, and the prompt gains the one
+    /// sentence the definitions do not carry. Without a roster, neither.
+    #[test]
+    fn a_confirmed_roster_adds_the_sticker_guidance() {
+        let (pool, reg) = setup();
+        let mut conn = pool.get().unwrap();
+        {
+            use crate::db::schema::assistants;
+            diesel::insert_into(assistants::table)
+                .values((
+                    assistants::id.eq("a1"),
+                    assistants::name.eq("A"),
+                    assistants::system_prompt.eq(""),
+                    assistants::is_default.eq(0),
+                    assistants::sort_order.eq(0),
+                    assistants::created_at.eq(1),
+                    assistants::updated_at.eq(1),
+                    assistants::context_limit.eq(128000),
+                    assistants::compact_keep_recent.eq(10),
+                    assistants::enabled_tools.eq(r#"["read_file"]"#),
+                    assistants::thinking_enabled.eq(0),
+                    assistants::auto_compact_enabled.eq(0),
+                ))
+                .execute(&mut conn)
+                .unwrap();
+        }
+        let assistant = || assistant_with(None, Some(r#"["read_file"]"#));
+
+        let before = resolve_ok(&mut conn, &reg, input(switchable(None), Some(assistant())));
+        assert!(!before.offered.contains("send_sticker"));
+        assert!(!before.system_prompt.contains("# Stickers"));
+
+        crate::db::ops::emoji_pack::create_pack(
+            &mut conn,
+            &crate::db::models::emoji_pack::EmojiPackInsert {
+                id: "p1",
+                name: "pack",
+                description: None,
+                cover_image: None,
+                is_builtin: 0,
+                sort_order: 0,
+                created_at: 1,
+                updated_at: 1,
+                kind: "manual",
+                source_account_id: None,
+            },
+        )
+        .unwrap();
+        crate::db::ops::emoji::create_emoji(
+            &mut conn,
+            &crate::db::models::emoji::EmojiInsert {
+                id: "e1",
+                pack_id: "p1",
+                name: "wave",
+                tags: None,
+                file_name: "wave.png",
+                file_format: "png",
+                sort_order: 0,
+                created_at: 1,
+                source: "local",
+                source_key: None,
+                native_payload: None,
+                semantic_status: "confirmed",
+                suggested_name: None,
+                suggested_tags: None,
+                file_size: 0,
+                seen_count: 1,
+                last_seen_at: Some(1),
+            },
+        )
+        .unwrap();
+        crate::db::ops::emoji_pack::assign_pack(&mut conn, "a1", "p1", 1).unwrap();
+
+        let after = resolve_ok(&mut conn, &reg, input(switchable(None), Some(assistant())));
+        assert!(after.offered.contains("send_sticker"));
+        assert!(after.system_prompt.contains("# Stickers"), "{}", after.system_prompt);
+    }
+
+    /// Session tools are not narrowed by exposure: a group that sees only
+    /// `web_search` from the registry still sees the QQ tools it was handed.
+    #[test]
+    fn session_tools_survive_a_narrowed_exposure() {
+        let (pool, reg) = setup();
+        let mut conn = pool.get().unwrap();
+        let mut i = input(switchable(None), None);
+        i.exposure = ToolExposure::Only(&["web_search"]);
+        i.session_tools = Some(SessionTools {
+            owned: HashSet::new(),
+            definitions: vec![ToolDefinition {
+                name: "qq_get_chat_history".into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            }],
+        });
+        let cfg = resolve_ok(&mut conn, &reg, i);
+        let names: HashSet<&str> = cfg.tool_defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, HashSet::from(["web_search", "qq_get_chat_history"]));
+    }
+
+    /// The shell line comes from the request, and only when there is a
+    /// `run_command` for it to describe.
+    #[test]
+    fn the_shell_line_follows_the_request() {
+        let (pool, reg) = setup();
+        let mut conn = pool.get().unwrap();
+
+        let mut i = input(switchable(None), None);
+        i.command_shell = Some(crate::tools::command_shell::CommandShell::ContainerSh);
+        let cfg = resolve_ok(&mut conn, &reg, i);
+        assert!(cfg.offered.contains("run_command"));
+        assert!(cfg.system_prompt.contains("# Shell"), "{}", cfg.system_prompt);
+        assert!(cfg.system_prompt.contains("container"), "{}", cfg.system_prompt);
+
+        let cfg = resolve_ok(&mut conn, &reg, input(switchable(None), None));
+        assert!(!cfg.system_prompt.contains("# Shell"), "no shell decided, no line");
+
+        // The reviewer's shape: a shell decided but no `run_command` to describe.
+        let mut i = input(switchable(None), Some(assistant_with(None, Some(r#"["read_file"]"#))));
+        i.command_shell = Some(crate::tools::command_shell::CommandShell::ContainerSh);
+        let cfg = resolve_ok(&mut conn, &reg, i);
+        assert!(!cfg.offered.contains("run_command"));
+        assert!(!cfg.system_prompt.contains("# Shell"), "{}", cfg.system_prompt);
     }
 
     #[test]
