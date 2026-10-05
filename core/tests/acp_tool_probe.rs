@@ -242,11 +242,30 @@ fn dunce_like(path: &std::path::Path) -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs node, a signed-in claude, and spends quota"]
 async fn record_what_the_adapter_sends_for_each_tool() {
-    let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe()).await;
+    let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe(Air::Declared, "tool-probe.jsonl")).await;
     assert!(outcome.is_ok(), "the probe timed out after {PROBE_TIMEOUT:?}");
 }
 
-async fn probe() {
+/// The same script for a client that does not declare the AIR envelope — the
+/// upstream contract Zed gets. Declaring `_meta.jetbrains.air` at all makes the
+/// adapter treat the client as JetBrains AIR and apply AIR's display rules
+/// (a read shown as a list of viewed files, so its text is dropped), while
+/// Meridian declared it only for `sessionFailure`. This is the other half of
+/// that comparison.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs node, a signed-in claude, and spends quota"]
+async fn record_the_same_without_the_air_envelope() {
+    let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe(Air::Undeclared, "tool-probe-no-air.jsonl")).await;
+    assert!(outcome.is_ok(), "the probe timed out after {PROBE_TIMEOUT:?}");
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Air {
+    Declared,
+    Undeclared,
+}
+
+async fn probe(air: Air, fixture_name: &str) {
     use meridian_core::acp::protocol;
     let workspace = seed();
     let mut adapter = Adapter::spawn().await;
@@ -260,6 +279,13 @@ async fn probe() {
         },
     })
     .unwrap();
+    let mut init = init;
+    if air == Air::Undeclared {
+        init["clientCapabilities"]
+            .as_object_mut()
+            .expect("capabilities are an object")
+            .remove("_meta");
+    }
     adapter
         .call("initialize", init)
         .await
@@ -278,7 +304,9 @@ async fn probe() {
         .await;
     println!("\n=== session/prompt replied ===\n{reply:?}");
 
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acp/tool-probe.jsonl");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/acp")
+        .join(fixture_name);
     std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
     std::fs::write(&fixture, scrub(&adapter.transcript, workspace.path())).unwrap();
     println!("wrote {} lines to {}", adapter.transcript.len(), fixture.display());
