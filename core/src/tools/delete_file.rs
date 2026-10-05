@@ -5,6 +5,17 @@ pub struct DeleteFileTool;
 
 #[async_trait]
 impl Tool for DeleteFileTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::WriteFiles,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "delete_file"
     }
@@ -82,7 +93,7 @@ impl Tool for DeleteFileTool {
         // tombstones only the files the journal already tracks — an untracked
         // file's disappearance is the external-labelling path's to notice,
         // never something to guess at.
-        let journal = context.journal_record("delete_file", crate::journal::capture::Op::Delete);
+        let journal = context.journal_record(self.name(), crate::journal::capture::Op::Delete);
         let mut observations = Vec::new();
         if let (Some(j), ResolvedTarget::Real(p)) = (&journal, &target) {
             let is_dir = tokio::fs::symlink_metadata(p)

@@ -1023,6 +1023,52 @@ mod tests {
             assert!(!peer.is_alive());
         }
 
+        /// What the app sends now — no AIR envelope — gets the plain contract:
+        /// a failed prompt is a JSON-RPC rejection, which `finish` reports as
+        /// the turn's error. The typed record is not sent at all.
+        #[tokio::test]
+        async fn without_the_air_envelope_a_failure_rejects_the_prompt() {
+            let Some(args) = adapter() else {
+                eprintln!("skipping: node is not available");
+                return;
+            };
+            let process = AdapterProcess::spawn("node", &args).await.expect("spawn the adapter");
+            let probe = Arc::new(Probe::default());
+            let peer = Peer::start(process, probe.clone() as Arc<dyn Handler>);
+            peer.request(
+                "initialize",
+                serde_json::to_value(protocol::InitializeParams {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    client_capabilities: protocol::ClientCapabilities::default(),
+                    client_info: protocol::Implementation {
+                        name: "meridian".into(),
+                        title: None,
+                        version: "test".into(),
+                    },
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("initialize");
+            let session = peer
+                .request("session/new", serde_json::json!({ "cwd": ".", "mcpServers": [] }))
+                .await
+                .expect("session/new");
+            let session: protocol::NewSessionResult = serde_json::from_value(session).unwrap();
+            let err = peer
+                .request(
+                    "session/prompt",
+                    serde_json::json!({
+                        "sessionId": session.session_id,
+                        "prompt": [{ "type": "text", "text": "air-fail" }],
+                    }),
+                )
+                .await
+                .expect_err("without the envelope a failure rejects");
+            assert!(err.to_string().contains("could not complete"), "{err}");
+            peer.stop().await;
+        }
+
         /// The AIR `sessionFailure` extension on the wire, both carriers.
         ///
         /// Declaring it is what changes the shape of a failed prompt: with the
@@ -1043,22 +1089,23 @@ mod tests {
             let probe = Arc::new(Probe::default());
             let peer = Peer::start(process, probe.clone() as Arc<dyn Handler>);
 
-            // The capabilities this app actually sends, AIR opt-in included.
-            peer.request(
-                "initialize",
-                serde_json::to_value(protocol::InitializeParams {
-                    protocol_version: protocol::PROTOCOL_VERSION,
-                    client_capabilities: protocol::ClientCapabilities::default(),
-                    client_info: protocol::Implementation {
-                        name: "meridian".into(),
-                        title: None,
-                        version: "test".into(),
-                    },
-                })
-                .unwrap(),
-            )
-            .await
-            .expect("initialize");
+            // The app no longer declares AIR (see `protocol::ClientCapabilities`),
+            // so these readers are dormant in production. The envelope is added
+            // here by hand to keep them honest for the day an opt-in brings
+            // them back.
+            let mut init = serde_json::to_value(protocol::InitializeParams {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                client_capabilities: protocol::ClientCapabilities::default(),
+                client_info: protocol::Implementation {
+                    name: "meridian".into(),
+                    title: None,
+                    version: "test".into(),
+                },
+            })
+            .unwrap();
+            init["clientCapabilities"]["_meta"] =
+                serde_json::json!({ "jetbrains": { "air": { "version": 1, "capabilities": ["sessionFailure"] } } });
+            peer.request("initialize", init).await.expect("initialize");
             let session = peer
                 .request("session/new", serde_json::json!({ "cwd": ".", "mcpServers": [] }))
                 .await

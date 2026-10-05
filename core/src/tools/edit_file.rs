@@ -5,6 +5,17 @@ pub struct EditFileTool;
 
 #[async_trait]
 impl Tool for EditFileTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::WriteFiles,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "edit_file"
     }
@@ -67,7 +78,7 @@ impl Tool for EditFileTool {
         // `old_string` is the text being replaced. `open_edit` also refuses
         // to create the file: a failed match must not leave an empty one.
         let target = context.open_edit(file_path)?;
-        let journal = context.journal_record("edit_file", crate::journal::capture::Op::Edit);
+        let journal = context.journal_record(self.name(), crate::journal::capture::Op::Edit);
         let mut replaced = 0usize;
         super::backend::edit_opened(
             target,

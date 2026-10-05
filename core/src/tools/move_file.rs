@@ -5,6 +5,17 @@ pub struct MoveFileTool;
 
 #[async_trait]
 impl Tool for MoveFileTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::WriteFiles,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "move_file"
     }
@@ -63,7 +74,7 @@ impl Tool for MoveFileTool {
             ));
         }
 
-        let journal = context.journal_record("move_file", crate::journal::capture::Op::RenameFrom);
+        let journal = context.journal_record(self.name(), crate::journal::capture::Op::RenameFrom);
         let observed = match (&journal, &from, &to) {
             // Files only: a directory move re-homes whole chains, which is a
             // per-file history rewrite the journal does not attempt — the

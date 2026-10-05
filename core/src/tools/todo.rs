@@ -67,6 +67,17 @@ pub struct UpdateTodosTool;
 
 #[async_trait]
 impl Tool for UpdateTodosTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::AppState,
+            loop_handled: false,
+            plan_mode: true,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "update_todos"
     }

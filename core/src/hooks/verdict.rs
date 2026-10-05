@@ -12,19 +12,20 @@ use serde::Deserialize;
 
 use crate::util::extract_last_json_object;
 
-/// The four tools the reviewer gets.
-///
-/// Shared with the approval reviewer (`agent::auto_review::investigate`), which
-/// needs exactly the same thing for the same reason. One list rather than two:
-/// a tool added to a copy of this would give one reviewer a capability the
-/// other was deliberately denied, and nothing would notice.
-pub(crate) use crate::tools::READ_ONLY_TOOLS as REVIEW_TOOLS;
+/// The reviewer's tools, as the prompt names them. The list is
+/// `tools::reviewer_tools` — shared with the approval reviewer
+/// (`agent::auto_review::investigate`) — and the prompt is handed it rather
+/// than spelling it out, so the two cannot drift apart.
+fn tool_list(tools: &[&str]) -> String {
+    format!("{} 个只读工具：{}", tools.len(), tools.join("、"))
+}
 
 /// Built per request because the round number and the repository path belong in
 /// it: a reviewer that does not know it is on its third look keeps finding new
 /// things to say, and one that does not know which directory it is in cannot
 /// tell a path that is missing from a path it simply has not looked for.
-pub(crate) fn prompt(cwd: &str, round: u32, max_rounds: u32, stagnant: bool) -> String {
+pub(crate) fn prompt(cwd: &str, round: u32, max_rounds: u32, stagnant: bool, tools: &[&str]) -> String {
+    let tools = tool_list(tools);
     let repeat = if stagnant {
         "\n这一版和上一版实质相同 —— 上一轮的意见没有被处理。如果你上一轮的意见仍然成立，\
          照原样重申，不要为了显得有进展而换一批新问题。\n"
@@ -44,7 +45,7 @@ pub(crate) fn prompt(cwd: &str, round: u32, max_rounds: u32, stagnant: bool) -> 
     format!(
         r#"你在审查另一个 AI agent 为仓库 `{cwd}` 写的实施计划。这是第 {round} 轮{budget}。
 {repeat}
-你有四个只读工具：read_file、search_files、glob、list_directory。你改不了任何东西，
+你有{tools}。你改不了任何东西，
 也不要给出改好的计划 —— 只说哪里必须改。
 
 ## 先核实，再判断
@@ -110,7 +111,8 @@ approve 时 issues 可以为空数组，message 可以省略。"#
 ///
 /// The reviewer has not seen the plan. That is deliberate: it judges the code
 /// on the code, without being anchored by an intention it already agreed to.
-pub(crate) fn implementation_prompt(cwd: &str, round: u32, max_rounds: u32, stagnant: bool) -> String {
+pub(crate) fn implementation_prompt(cwd: &str, round: u32, max_rounds: u32, stagnant: bool, tools: &[&str]) -> String {
+    let tools = tool_list(tools);
     let repeat = if stagnant {
         "\n这一版和上一版实质相同 —— 上一轮的意见没有被处理。如果你上一轮的意见仍然成立，\
          照原样重申，不要为了显得有进展而换一批新问题。\n"
@@ -126,8 +128,8 @@ pub(crate) fn implementation_prompt(cwd: &str, round: u32, max_rounds: u32, stag
     format!(
         r#"你在审查另一个 AI agent 刚在仓库 `{cwd}` 里写完的改动。这是第 {round} 轮{budget}。
 {repeat}
-你拿到的是完整的未提交 diff。你有四个只读工具：read_file、search_files、glob、
-list_directory —— **diff 只告诉你改了什么，改得对不对要靠读周围的代码**。你改不了
+你拿到的是完整的未提交 diff。你有{tools} —— **diff 只告诉你改了什么，改得对不对要靠
+读周围的代码**。你改不了
 任何东西，也不要给出改好的代码，只说哪里必须改。
 
 ## 先核实，再判断
@@ -415,7 +417,7 @@ mod tests {
     /// repository's own conventions silently stop being reviewed.
     #[test]
     fn the_implementation_brief_points_at_the_repository_checklist() {
-        let brief = implementation_prompt("C:\\work\\repo", 1, 3, false);
+        let brief = implementation_prompt("C:\\work\\repo", 1, 3, false, &["read_file"]);
         // The whole instruction, not the file name: the name also appears under
         // criterion 3, so a bare `contains` stayed green with the instruction
         // gone.
@@ -424,6 +426,21 @@ mod tests {
             "{brief}"
         );
         assert!(brief.contains("没有这个文件就跳过"), "{brief}");
+    }
+
+    /// Both briefs name the tools they are handed, and only those: the list
+    /// is `tools::reviewer_tools`, and a brief that spelled it out by hand
+    /// would go on promising four tools after the set changed.
+    #[test]
+    fn the_briefs_name_exactly_the_reviewer_tools_they_are_given() {
+        let tools = ["read_file", "glob"];
+        for brief in [
+            prompt("C:\\work\\repo", 1, 3, false, &tools),
+            implementation_prompt("C:\\work\\repo", 1, 3, false, &tools),
+        ] {
+            assert!(brief.contains("2 个只读工具：read_file、glob"), "{brief}");
+            assert!(!brief.contains("search_files") && !brief.contains("四个"), "{brief}");
+        }
     }
 
     #[test]

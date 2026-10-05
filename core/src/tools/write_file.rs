@@ -5,6 +5,17 @@ pub struct WriteFileTool;
 
 #[async_trait]
 impl Tool for WriteFileTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::WriteFiles,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "write_file"
     }
@@ -49,7 +60,7 @@ impl Tool for WriteFileTool {
         // The write may run without a prompt, so it goes through the handle it
         // verified rather than resolving the name again.
         let target = context.open_write(path_str)?;
-        let journal = context.journal_record("write_file", crate::journal::capture::Op::Write);
+        let journal = context.journal_record(self.name(), crate::journal::capture::Op::Write);
         super::backend::write_opened(target, content, journal).await?;
         Ok(format!("Successfully wrote {} bytes to {}", content.len(), path_str))
     }

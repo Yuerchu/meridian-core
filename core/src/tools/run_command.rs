@@ -93,6 +93,17 @@ impl std::fmt::Display for CommandExecutionError {
 
 #[async_trait]
 impl Tool for RunCommandTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Exec,
+            loop_handled: false,
+            plan_mode: true,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "run_command"
     }

@@ -1233,7 +1233,7 @@ async fn run(
                     // Nobody answered — not a denial. See `UNANSWERED_APPROVAL`.
                     _ => (UNANSWERED_APPROVAL.to_string(), "denied"),
                 }
-            } else if tc.name == "ask_user" {
+            } else if tc.name == crate::tools::ask_user::ASK_USER_TOOL {
                 match ports.approvals.ask(&assistant_msg_id, tc, None).await? {
                     Some(ApprovalDecision::Response(text)) => (text, "success"),
                     _ => ("User did not respond.".to_string(), "denied"),

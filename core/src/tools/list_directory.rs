@@ -5,6 +5,17 @@ pub struct ListDirectoryTool;
 
 #[async_trait]
 impl Tool for ListDirectoryTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: false,
+            plan_mode: true,
+            explore: true,
+            reviewer: true,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "list_directory"
     }
@@ -40,10 +51,6 @@ impl Tool for ListDirectoryTool {
             Some(p) => super::reach::locate(context, p, false),
             None => super::reach::Reach::Outside,
         }
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String> {

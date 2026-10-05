@@ -13,8 +13,19 @@ pub struct EnterPlanTool;
 
 #[async_trait]
 impl Tool for EnterPlanTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::ModeTransition,
+            loop_handled: true,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
-        "enter_plan"
+        crate::agent::modes::ENTER_PLAN_TOOL
     }
 
     fn description(&self) -> &str {
@@ -61,8 +72,19 @@ pub struct ExitPlanTool;
 
 #[async_trait]
 impl Tool for ExitPlanTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::ModeTransition,
+            loop_handled: true,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
-        "exit_plan"
+        crate::agent::modes::EXIT_PLAN_TOOL
     }
 
     fn description(&self) -> &str {
@@ -96,8 +118,19 @@ pub struct ReadPlanTool;
 
 #[async_trait]
 impl Tool for ReadPlanTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: true,
+            plan_mode: true,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
-        "read_plan"
+        crate::agent::modes::READ_PLAN_TOOL
     }
 
     fn description(&self) -> &str {
@@ -129,8 +162,19 @@ pub struct UpdatePlanTool;
 
 #[async_trait]
 impl Tool for UpdatePlanTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::AppState,
+            loop_handled: true,
+            plan_mode: true,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
-        "update_plan"
+        crate::agent::modes::UPDATE_PLAN_TOOL
     }
 
     fn description(&self) -> &str {

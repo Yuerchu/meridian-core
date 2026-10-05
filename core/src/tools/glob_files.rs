@@ -5,6 +5,17 @@ pub struct GlobFilesTool;
 
 #[async_trait]
 impl Tool for GlobFilesTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: false,
+            plan_mode: true,
+            explore: true,
+            reviewer: true,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "glob"
     }
@@ -44,10 +55,6 @@ impl Tool for GlobFilesTool {
             None if context.working_directory.is_some() => super::reach::Reach::ReadsProject,
             None => super::reach::Reach::Outside,
         }
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String> {

@@ -2,6 +2,8 @@ pub mod app_logs;
 pub mod apply_patch;
 pub mod ask_user;
 pub mod backend;
+#[cfg(not(target_os = "android"))]
+pub mod catalog;
 pub mod custom;
 pub mod delete_file;
 pub mod edit_file;
@@ -18,6 +20,7 @@ pub mod redaction;
 pub mod run_command;
 pub mod search_files;
 pub mod skill;
+pub mod spec;
 pub mod sticker;
 pub mod sub_agent;
 pub mod todo;
@@ -60,18 +63,21 @@ impl Permission {
     }
 }
 
-/// What an agent that must not change anything is allowed to call.
+/// What an agent that must not change anything is allowed to call: the
+/// built-in tools whose [`spec::ToolSpec::reviewer`] is true.
 ///
 /// Both reviewers use it — the one looking at a plan or a diff (`hooks`) and
 /// the one deciding an approval (`agent::auto_review`) — and neither may hold
-/// anything else. `EXPLORE_TOOLS` minus `web_search` and the memory and log
+/// anything else. The Explore set minus `web_search` and the memory and log
 /// readers: consulting memories means reading opinions formed in other
 /// conversations about other work, and `read_app_logs` reads this app's own log
 /// rather than anything about the repository in front of it.
 ///
-/// A whitelist rather than a filter over `Permission::Always`, so a tool added
-/// to the registry tomorrow is not handed to a reviewer by default.
-pub const READ_ONLY_TOOLS: &[&str] = &["read_file", "search_files", "glob", "list_directory"];
+/// Still a whitelist: `reviewer` is `false` until somebody writes `true`
+/// beside a tool, so one added tomorrow is not handed to a reviewer by default.
+pub fn reviewer_tools(registry: &ToolRegistry) -> Vec<&str> {
+    registry.builtin_names_where(|s| s.reviewer)
+}
 
 #[derive(Clone)]
 pub struct ToolContext {
@@ -518,6 +524,10 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> serde_json::Value;
     fn default_permission(&self) -> Permission;
 
+    /// What this tool is: its effect and which agents may hold it. Required,
+    /// with no default and no `Default` to spread — see [`spec`].
+    fn spec(&self) -> spec::ToolSpec;
+
     /// What this particular call would touch.
     ///
     /// The default is the conservative answer: a tool that has not worked out
@@ -531,9 +541,9 @@ pub trait Tool: Send + Sync {
     /// Whether this tool is safe to run concurrently with other parallel-safe
     /// tools in the same batch. Only meaningful when the call also needs no
     /// approval — a tool that requires a prompt is never dispatched in parallel
-    /// regardless of this flag.
+    /// regardless of this flag. Read off [`Self::spec`].
     fn supports_parallel(&self) -> bool {
-        false
+        self.spec().parallel
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String>;
@@ -623,6 +633,22 @@ impl ToolRegistry {
         let mut out: Vec<_> = self.builtin.iter().map(def).collect();
         out.extend(self.custom.read().unwrap().iter().map(def));
         out
+    }
+
+    /// The built-in tools whose spec answers yes, in registry order. Built-ins
+    /// only: a custom tool is the user's program and is never handed to an
+    /// agent by a classification it did not make.
+    pub fn builtin_names_where(&self, pred: impl Fn(&spec::ToolSpec) -> bool) -> Vec<&str> {
+        self.builtin
+            .iter()
+            .filter(|t| pred(&t.spec()))
+            .map(|t| t.name())
+            .collect()
+    }
+
+    /// A built-in tool's spec, by name.
+    pub fn builtin_spec(&self, name: &str) -> Option<spec::ToolSpec> {
+        self.builtin.iter().find(|t| t.name() == name).map(|t| t.spec())
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {

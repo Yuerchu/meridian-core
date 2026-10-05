@@ -6,6 +6,17 @@ pub struct SearchFilesTool;
 
 #[async_trait]
 impl Tool for SearchFilesTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: false,
+            plan_mode: true,
+            explore: true,
+            reviewer: true,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "search_files"
     }
@@ -47,10 +58,6 @@ impl Tool for SearchFilesTool {
             Some(p) => super::reach::locate(context, p, false),
             None => super::reach::Reach::Outside,
         }
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String> {

@@ -18,6 +18,17 @@ fn join_base(p: &str, base: Option<&str>) -> String {
 
 #[async_trait]
 impl Tool for ApplyPatchTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::WriteFiles,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "apply_patch"
     }
@@ -115,7 +126,7 @@ impl Tool for ApplyPatchTool {
                             e
                         }
                     })?;
-                    let journal = context.journal_record("apply_patch", crate::journal::capture::Op::Patch);
+                    let journal = context.journal_record(self.name(), crate::journal::capture::Op::Patch);
                     super::backend::write_opened(target, content, journal).await?;
                     added.push(path.clone());
                 }
@@ -124,7 +135,7 @@ impl Tool for ApplyPatchTool {
                         return Err(format!("refusing to delete '{path}': it is an authorized access root"));
                     }
                     let target = resolve(path)?;
-                    let journal = context.journal_record("apply_patch", crate::journal::capture::Op::Delete);
+                    let journal = context.journal_record(self.name(), crate::journal::capture::Op::Delete);
                     let observed = match (&journal, &target) {
                         (Some(j), ResolvedTarget::Real(p)) => Some(j.observe(p).await),
                         _ => None,
@@ -145,7 +156,7 @@ impl Tool for ApplyPatchTool {
                     // resolve by path instead.
                     if update.move_to.is_none() && !update.is_new_file {
                         let target = context.open_edit(&join(&update.path))?;
-                        let journal = context.journal_record("apply_patch", crate::journal::capture::Op::Patch);
+                        let journal = context.journal_record(self.name(), crate::journal::capture::Op::Patch);
                         super::backend::edit_opened(target, apply, journal).await?;
                         updated.push(update.path.clone());
                         continue;
@@ -160,7 +171,7 @@ impl Tool for ApplyPatchTool {
                     let result = apply(&original)?;
                     match &update.move_to {
                         None => {
-                            let journal = context.journal_record("apply_patch", crate::journal::capture::Op::Patch);
+                            let journal = context.journal_record(self.name(), crate::journal::capture::Op::Patch);
                             let observed = match (&journal, &target) {
                                 (Some(j), ResolvedTarget::Real(p)) => Some(j.observe(p).await),
                                 _ => None,
@@ -178,7 +189,7 @@ impl Tool for ApplyPatchTool {
                             {
                                 return Err(format!("Move to: '{dst}' already exists"));
                             }
-                            let journal = context.journal_record("apply_patch", crate::journal::capture::Op::Patch);
+                            let journal = context.journal_record(self.name(), crate::journal::capture::Op::Patch);
                             let observed = match (&journal, &target, &dst_target) {
                                 (Some(j), ResolvedTarget::Real(src), ResolvedTarget::Real(dstp)) => {
                                     Some(j.observe_pair(src, dstp).await)

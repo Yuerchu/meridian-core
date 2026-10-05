@@ -88,6 +88,17 @@ fn granted_targets(
 
 #[async_trait]
 impl Tool for ReadConversationTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "read_conversation"
     }
@@ -125,10 +136,6 @@ impl Tool for ReadConversationTool {
     /// nothing for a person to weigh.
     fn default_permission(&self) -> Permission {
         Permission::Always
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {

@@ -46,7 +46,7 @@ fn is_parallel_eligible(
     }
 
     // Special-cased dispatch paths that are always serial.
-    if tc.name == "ask_user" || tc.name.starts_with("mcp__") {
+    if tc.name == crate::tools::ask_user::ASK_USER_TOOL || tc.name.starts_with("mcp__") {
         return false;
     }
 

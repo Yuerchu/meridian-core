@@ -75,11 +75,11 @@ impl<'a> DeniedMemory<'a> {
         }
     }
 
-    /// Calls whose refusal says nothing about whether to run something.
-    ///
-    /// The same list `auto_review` passes through, for the same reasons.
+    /// Calls whose refusal says nothing about whether to run something: the
+    /// ones `auto_review` passes through, for the same reasons — asked of it
+    /// rather than copied, so the two cannot come to disagree.
     fn passthrough(name: &str) -> bool {
-        name == "ask_user" || crate::agent::modes::transition_tools().any(|t| t == name)
+        crate::agent::auto_review::AutoReviewed::passthrough(name)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<CallIdentity, Option<String>>> {

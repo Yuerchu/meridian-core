@@ -21,6 +21,17 @@ impl AddRedactionRuleTool {
 
 #[async_trait]
 impl Tool for AddRedactionRuleTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::AppState,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "add_redaction_rule"
     }
@@ -184,6 +195,17 @@ impl ListRedactionRulesTool {
 
 #[async_trait]
 impl Tool for ListRedactionRulesTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Read,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "list_redaction_rules"
     }
@@ -198,10 +220,6 @@ impl Tool for ListRedactionRulesTool {
 
     fn default_permission(&self) -> Permission {
         Permission::Always
-    }
-
-    fn supports_parallel(&self) -> bool {
-        true
     }
 
     async fn execute(&self, _args: serde_json::Value, context: &ToolContext) -> Result<String, String> {
@@ -236,6 +254,17 @@ impl RemoveRedactionRuleTool {
 
 #[async_trait]
 impl Tool for RemoveRedactionRuleTool {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::AppState,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         "remove_redaction_rule"
     }

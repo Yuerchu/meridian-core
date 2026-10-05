@@ -37,7 +37,7 @@ use crate::util::{get_conn, now_ms};
 
 use super::SharedState;
 use super::protocol::{Kind, ReviewJob, ReviewResponse};
-use super::verdict::{self, Outcome, REVIEW_TOOLS};
+use super::verdict::{self, Outcome};
 
 /// Progress goes to a window that may not be open, and that is fine.
 ///
@@ -277,9 +277,10 @@ async fn effective_assistant(
     // reviewer honest when an older plugin sends nothing.
     let max_rounds = job.max_rounds.unwrap_or(state.config.max_rounds);
     let round = job.round.max(1);
+    let tools = crate::tools::reviewer_tools(&state.services.tools);
     let system_prompt = match job.kind {
-        Kind::Plan => verdict::prompt(cwd, round, max_rounds, job.stagnant),
-        Kind::Implementation => verdict::implementation_prompt(cwd, round, max_rounds, job.stagnant),
+        Kind::Plan => verdict::prompt(cwd, round, max_rounds, job.stagnant, &tools),
+        Kind::Implementation => verdict::implementation_prompt(cwd, round, max_rounds, job.stagnant, &tools),
     };
     Ok(AssistantRow {
         provider_id: Some(provider_id.to_string()),
@@ -287,7 +288,7 @@ async fn effective_assistant(
         context_limit: 0,
         max_tokens: None,
         tool_preset_id: None,
-        enabled_tools: serde_json::to_string(REVIEW_TOOLS).ok(),
+        enabled_tools: serde_json::to_string(&tools).ok(),
         system_prompt,
         ..base
     })

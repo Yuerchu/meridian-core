@@ -50,6 +50,17 @@ fn shell_escape(value: &str) -> String {
 
 #[async_trait]
 impl Tool for CustomToolExecutor {
+    fn spec(&self) -> crate::tools::spec::ToolSpec {
+        crate::tools::spec::ToolSpec {
+            effect: crate::tools::spec::Effect::Exec,
+            loop_handled: false,
+            plan_mode: false,
+            explore: false,
+            reviewer: false,
+            parallel: false,
+        }
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }

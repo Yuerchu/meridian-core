@@ -296,53 +296,24 @@ pub struct ClientCapabilities {
     pub fs: FsCapabilities,
     pub terminal: bool,
     pub elicitation: ElicitationCapabilities,
-    /// Extensions this client opts into, under the AIR envelope
-    /// (`_meta.jetbrains.air`). See [`ClientCapabilitiesMeta`].
-    #[serde(rename = "_meta")]
-    pub meta: ClientCapabilitiesMeta,
 }
 
-/// The AIR capability list, which is how `claude-agent-acp` gates its
-/// experimental extensions.
-///
-/// **Opting into `sessionFailure` changes what a failed prompt looks like on
-/// the wire**, and that is the reason it is declared beside the code that
-/// reads it. Without it a failure is a JSON-RPC error and the prompt rejects.
-/// With it the adapter answers `stopReason: end_turn` and puts a typed record
-/// in `_meta`, so a client that declares this and then reads only
-/// `stopReason` reports every failure as a finished turn. `AcpSession::finish`
-/// reads the record; this is the other half of one decision.
-#[derive(Debug, Serialize)]
-pub struct ClientCapabilitiesMeta {
-    pub jetbrains: JetbrainsClientMeta,
-}
-
-#[derive(Debug, Serialize)]
-pub struct JetbrainsClientMeta {
-    pub air: AirClientCapabilities,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AirClientCapabilities {
-    pub version: u32,
-    pub capabilities: Vec<&'static str>,
-}
-
-/// The one AIR capability this client declares.
-pub const AIR_SESSION_FAILURE: &str = "sessionFailure";
-
-impl Default for ClientCapabilitiesMeta {
-    fn default() -> Self {
-        Self {
-            jetbrains: JetbrainsClientMeta {
-                air: AirClientCapabilities {
-                    version: 1,
-                    capabilities: vec![AIR_SESSION_FAILURE],
-                },
-            },
-        }
-    }
-}
+// **No AIR envelope, on purpose.** This client used to declare
+// `_meta.jetbrains.air` with the `sessionFailure` capability, for the typed
+// failure records it buys (`AirMetaEnvelope`, still parsed below). But
+// `claude-agent-acp` reads the presence of that block as "this client is
+// JetBrains AIR" and then reports every tool call the way AIR's UI wants it —
+// measured by `tests/acp_tool_probe.rs` against 0.84.0: a successful `Read`,
+// and a `Grep` or `Glob` given a `path`, arrive with no text at all (AIR draws
+// them as a list of viewed files), and Edit and Write lose their file text
+// from `rawInput`. Without the block the same calls carry their text, a clean
+// `rawOutput` and a structured `toolResponse`. Every turn's tool cards are
+// worth more than a category on the rare failed prompt, which now arrives as
+// the JSON-RPC error it was before.
+//
+// The failure readers stay, dormant: upstream is splitting AIR's extensions
+// into per-capability opt-ins for non-AIR clients (`async-tasks`, `goal`),
+// and a `sessionFailure` opt-in would bring them back without the rest.
 
 // ------------------------------------------------------------- AIR inbound
 
@@ -1171,6 +1142,13 @@ pub struct ToolCall {
     pub raw_input: Option<serde_json::Value>,
     #[serde(default)]
     pub content: Vec<ToolCallContent>,
+    /// What the tool returned, as the model saw it. A string for most tools
+    /// (Read with its line numbers, a command's bare output), structured for a
+    /// few (`ToolSearch` sends its references as an array). `content` is the
+    /// same result dressed for display — fenced, prettified — and an AIR
+    /// client gets this only when `content` carries nothing.
+    #[serde(default)]
+    pub raw_output: Option<serde_json::Value>,
     #[serde(default)]
     pub locations: Vec<ToolCallLocation>,
     /// The tool's real name, as `claude-agent-acp` sends it beside the ACP
@@ -1199,6 +1177,11 @@ pub struct ToolCallMeta {
 pub struct ClaudeCodeMeta {
     #[serde(default)]
     pub tool_name: Option<String>,
+    /// Why a `failed` call never ran: `user-rejected`, `permission-rule`,
+    /// `interrupted`, `cancelled`, … An open set by the adapter's own
+    /// account — new kinds ship ahead of any schema — so it stays a string.
+    #[serde(default)]
+    pub non_execution_kind: Option<String>,
 }
 
 /// One block of a call's `content`. `content` blocks carry text; `diff`
@@ -1804,6 +1787,22 @@ mod tests {
         // And the two capabilities are independent: `loadSession` is top-level
         // by the schema's own admission, so neither implies the other.
         assert!(silent.agent_capabilities.load_session);
+    }
+
+    /// The client declares no AIR envelope. Its presence alone makes the
+    /// adapter report tool calls the way JetBrains AIR draws them — a Read with
+    /// no text — so declaring it again for some other capability has to be a
+    /// decision made here, against this test, not a field added in passing.
+    #[test]
+    fn the_client_does_not_declare_itself_jetbrains_air() {
+        let caps = serde_json::to_value(ClientCapabilities::default()).unwrap();
+        assert!(caps.get("_meta").is_none(), "{caps}");
+        assert!(!caps.to_string().contains("jetbrains"), "{caps}");
+        assert_eq!(
+            caps["elicitation"]["form"],
+            serde_json::json!({}),
+            "the form capability stays"
+        );
     }
 
     /// The greeting `claude-agent-acp` 0.84.0 sends, trimmed to the members

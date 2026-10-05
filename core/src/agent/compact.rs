@@ -702,6 +702,29 @@ pub(crate) async fn mid_turn_compact_remote(
     Ok(before.saturating_sub(after))
 }
 
+/// What a file tool did, for the "recently accessed" list, and which file.
+///
+/// One answer for both extractors below, which had each spelled it out. Both
+/// read only `path`, so `edit_file` — whose argument is `file_path`, Claude
+/// Code's spelling — was never listed: a summary of a session spent editing
+/// a file did not mention the file.
+fn recent_file_of(tool: &str, arguments: &str) -> Option<(String, &'static str)> {
+    let op = match tool {
+        "read_file" => "read",
+        "write_file" => "written",
+        "edit_file" => "edited",
+        "search_files" => "searched",
+        _ => return None,
+    };
+    let args = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let path = args
+        .get("path")
+        .or_else(|| args.get("file_path"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|p| !p.is_empty())?;
+    Some((path.to_string(), op))
+}
+
 fn extract_recent_files_from_chat(messages: &[ChatMessage]) -> String {
     let mut files: Vec<(String, &str)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -709,18 +732,10 @@ fn extract_recent_files_from_chat(messages: &[ChatMessage]) -> String {
     for m in messages.iter().rev() {
         if let Some(ref tcs) = m.tool_calls {
             for tc in tcs {
-                let op = match tc.name.as_str() {
-                    "read_file" => "read",
-                    "write_file" => "written",
-                    "edit_file" => "edited",
-                    "search_files" => "searched",
-                    _ => continue,
-                };
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    && let Some(path) = args.get("path").and_then(|p| p.as_str())
-                    && seen.insert(path.to_string())
+                if let Some((path, op)) = recent_file_of(&tc.name, &tc.arguments)
+                    && seen.insert(path.clone())
                 {
-                    files.push((path.to_string(), op));
+                    files.push((path, op));
                 }
             }
         }
@@ -754,21 +769,9 @@ fn extract_recent_files_from_db_messages(
         let tcs = crate::agent::tool_calls::parse_stored_tool_calls(m.schema_version, m.tool_calls.as_deref())
             .map_err(|error| format!("message {} has invalid persisted tool_calls: {error}", m.id))?;
         for tc in &tcs {
-            let op = match tc.name.as_str() {
-                "read_file" => "read",
-                "write_file" => "written",
-                "edit_file" => "edited",
-                "search_files" => "searched",
-                _ => continue,
+            let Some((path, op)) = recent_file_of(&tc.name, &tc.arguments) else {
+                continue;
             };
-            let path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                .ok()
-                .as_ref()
-                .and_then(|v| v.get("path"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|p| !p.is_empty())
-                .map(String::from);
-            let Some(path) = path else { continue };
             if seen.insert(path.clone()) {
                 files.push((path, op));
             }
@@ -1363,5 +1366,21 @@ mod tests {
         let result = extract_recent_files_from_chat(&msgs);
         assert!(result.contains("src/main.rs"));
         assert!(result.contains("read"));
+    }
+
+    /// `edit_file` names its file `file_path`. Read for `path` alone it was
+    /// never listed, so a summary of an editing session left out the file.
+    #[test]
+    fn an_edited_file_is_listed_under_its_file_path() {
+        let msgs = vec![ChatMessage::assistant_with_tools(
+            "editing",
+            None,
+            vec![provider::ToolCall {
+                id: "c1".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"file_path":"src/lib.rs","old_string":"a","new_string":"b"}"#.into(),
+            }],
+        )];
+        assert!(extract_recent_files_from_chat(&msgs).contains("- src/lib.rs (edited)"));
     }
 }
