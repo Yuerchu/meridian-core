@@ -1119,9 +1119,9 @@ mod tests {
 
     /// A bridge holding one spy and no socket. `start` binds a port and spawns
     /// an accept loop, neither of which any of these need.
-    fn bridge_with(tool: Arc<dyn Tool>, dir: &std::path::Path) -> Arc<Bridge> {
+    async fn bridge_with(tool: Arc<dyn Tool>, dir: &std::path::Path) -> Arc<Bridge> {
         Arc::new(Bridge {
-            services: crate::services::bare_services(dir),
+            services: crate::services::bare_services(dir).await,
             conversation_id: "c-1".into(),
             tools: vec![tool],
             turn: RwLock::new(None),
@@ -1172,7 +1172,7 @@ mod tests {
     async fn a_call_on_an_idle_session_is_refused_and_the_tool_does_not_run() {
         let dir = tempfile::tempdir().unwrap();
         let Watched { ran, tool, .. } = spy();
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
 
         let reply = bridge.call(&json!({ "name": "conversation_usage" })).await;
         assert!(is_error(&reply), "{reply}");
@@ -1187,7 +1187,7 @@ mod tests {
     async fn an_idle_session_still_lists_its_tools() {
         let dir = tempfile::tempdir().unwrap();
         let Watched { tool, .. } = spy();
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
         assert!(bridge.snapshot().is_none());
         assert_eq!(bridge.tool_definitions()["tools"].as_array().unwrap().len(), 1);
     }
@@ -1196,7 +1196,7 @@ mod tests {
     async fn a_call_inside_a_turn_runs() {
         let dir = tempfile::tempdir().unwrap();
         let Watched { ran, tool, .. } = spy();
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
         bridge.begin_turn("t-1", Some("m-1"), CancellationToken::new());
 
         let reply = bridge.call(&json!({ "name": "conversation_usage" })).await;
@@ -1216,7 +1216,7 @@ mod tests {
             tool,
             ..
         } = spy();
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
         let cancel = CancellationToken::new();
         bridge.begin_turn("t-1", None, cancel.clone());
 
@@ -1250,7 +1250,7 @@ mod tests {
                 }
             })),
         });
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
         *ended.lock().unwrap() = Some(bridge.clone());
 
         bridge.begin_turn("t-1", None, CancellationToken::new());
@@ -1269,7 +1269,7 @@ mod tests {
     async fn a_late_ending_turn_does_not_close_the_next_ones_window() {
         let dir = tempfile::tempdir().unwrap();
         let Watched { ran, tool, .. } = spy();
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
 
         bridge.begin_turn("t-1", None, CancellationToken::new());
         bridge.begin_turn("t-2", None, CancellationToken::new());
@@ -1291,7 +1291,7 @@ mod tests {
     async fn a_tool_this_session_does_not_offer_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let Watched { tool, .. } = spy();
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
         bridge.begin_turn("t-1", None, CancellationToken::new());
 
         let reply = bridge
@@ -1315,7 +1315,7 @@ mod tests {
     async fn a_delayed_call_from_an_earlier_turn_cannot_be_told_apart() {
         let dir = tempfile::tempdir().unwrap();
         let Watched { ran, tool, .. } = spy();
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
 
         bridge.begin_turn("t-1", None, CancellationToken::new());
         // The whole of what turn A's caller sent. There is nothing else in it.
@@ -1338,7 +1338,7 @@ mod tests {
     async fn the_descriptor_is_the_shape_the_adapter_takes() {
         let dir = tempfile::tempdir().unwrap();
         let Watched { tool, .. } = spy();
-        let bridge = bridge_with(tool, dir.path());
+        let bridge = bridge_with(tool, dir.path()).await;
 
         let descriptor = bridge.descriptor();
         assert_eq!(descriptor["type"], json!("http"));

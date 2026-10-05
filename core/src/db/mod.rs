@@ -87,52 +87,10 @@ pub fn init_db(db_path: &str) -> DbPool {
         tracing::error!(error = %e, "could not re-enable foreign keys after migrating");
     }
 
-    // Memories no longer hang off projects by foreign key, and migrations run
-    // with foreign keys off anyway, so a table rebuild can leave orphans behind.
-    let now = crate::util::now_ms();
-    match ops::plan_review::backfill_legacy_artifacts(&mut conn, now) {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(documents = n, "backfilled legacy plan artifacts"),
-        // The old rows remain readable through their existing path, so this is
-        // diagnosable degradation rather than a reason to make the database
-        // unavailable. The next startup retries the idempotent backfill.
-        Err(error) => tracing::error!(error = %error, "could not backfill legacy plan artifacts"),
-    }
-    match ops::plan_review::reconcile_dispatched_deliveries(&mut conn, now) {
-        Ok(0) => {}
-        Ok(n) => tracing::warn!(deliveries = n, "reconciled plan review deliveries after restart"),
-        Err(error) => tracing::error!(error = %error, "could not reconcile plan review deliveries"),
-    }
-    let orphans = ops::memory::purge_orphan_project_memories(&mut conn).unwrap_or(0);
-    let proposals = ops::memory::expire_proposals(&mut conn, now).unwrap_or(0);
-    // Bounded-growth housekeeping. Kept off the write path: neither sweep
-    // depends on what was just written, and the trash purge has no usable index
-    // (both are partial on `deleted_at IS NULL`), so doing it per write meant a
-    // full table scan each time.
-    let swept = ops::memory::sweep_untracked_subjects(&mut conn, now).unwrap_or(0);
-    // Startup housekeeping deletes rows the user may later go looking for. When
-    // it removed nothing there is nothing to say, but when it did, this is the
-    // only record that it happened.
-    if orphans > 0 || proposals > 0 || swept > 0 {
-        tracing::info!(
-            orphan_memories_deleted = orphans,
-            proposals_expired = proposals,
-            subjects_swept = swept,
-            "startup housekeeping removed rows"
-        );
-    }
-
-    // Turns only ever run inside the process that recorded them, so anything
-    // still marked running was killed rather than finished. This is the only
-    // moment that fact is knowable — after this the row would just look like a
-    // turn that has been going for a very long time.
-    match ops::turn::reconcile_interrupted(&mut conn, now) {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(turns = n, "turns left running by the previous session"),
-        // Not fatal: it costs the diagnosis, not the conversation.
-        Err(e) => tracing::error!(error = %e, "could not reconcile interrupted turns"),
-    }
-
+    // What used to follow here — repairs and housekeeping that need the
+    // migrated schema — is `bootstrap::startup_recovery`, which runs right
+    // after this returns. A test or tool that opens a file through `init_db`
+    // gets the schema and nothing else.
     pool
 }
 

@@ -3774,7 +3774,7 @@ mod tests {
     #[tokio::test]
     async fn a_resumed_session_advertises_the_same_bridge_as_a_new_one() {
         let dir = tempfile::tempdir().unwrap();
-        let services = bare_services(dir.path());
+        let services = bare_services(dir.path()).await;
         let bridge = bridge::Bridge::start(services, "c-1", None, dir.path().join("logs"))
             .await
             .expect("the bridge binds");
@@ -3801,7 +3801,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_conversations_bridge_does_not_need_its_row() {
         let dir = tempfile::tempdir().unwrap();
-        let services = bare_services(dir.path());
+        let services = bare_services(dir.path()).await;
 
         let bridge = AcpSession::start_bridge(&services, "not-written-yet", ProjectOf::Known(None))
             .await
@@ -4105,7 +4105,7 @@ mod tests {
     async fn a_repeated_tool_call_is_not_a_second_card_once_its_round_has_closed() {
         let dir = std::env::temp_dir().join(format!("meridian-acp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let services = bare_services(&dir);
+        let services = bare_services(&dir).await;
 
         {
             let mut conn = services.db.get().unwrap();
@@ -4217,7 +4217,7 @@ mod tests {
     async fn a_thought_between_parallel_results_stays_on_the_same_round() {
         let dir = std::env::temp_dir().join(format!("meridian-acp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let services = bare_services(&dir);
+        let services = bare_services(&dir).await;
 
         {
             let mut conn = services.db.get().unwrap();
@@ -4305,7 +4305,7 @@ mod tests {
     /// open — the state `prompt_with` leaves a session in once the prompt is
     /// out.
     async fn live_turn(dir: &std::path::Path) -> Shared {
-        let services = bare_services(dir);
+        let services = bare_services(dir).await;
         {
             let mut conn = services.db.get().unwrap();
             crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();

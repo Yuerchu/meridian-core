@@ -311,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn the_event_and_the_register_agree_on_when_it_was_asked() {
         let dir = tempfile::tempdir().unwrap();
-        let services = crate::services::bare_services(dir.path());
+        let services = crate::services::bare_services(dir.path()).await;
         let recorder = Arc::new(Recorder::default());
         services.events.register(recorder.clone(), false);
         let turn = TurnContext {
