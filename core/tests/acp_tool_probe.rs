@@ -210,6 +210,16 @@ fn scrub(transcript: &[Value], workspace: &std::path::Path) -> String {
         if method.starts_with("_auth/") {
             continue;
         }
+        // The adapter announces every skill and slash command the signed-in
+        // user has installed, descriptions included — private, and nothing to
+        // do with tools. The list is emptied; the update itself stays.
+        let mut entry = entry.clone();
+        if let Some(update) = entry
+            .pointer_mut("/msg/params/update")
+            .filter(|u| u["sessionUpdate"] == "available_commands_update")
+        {
+            update["availableCommands"] = json!([]);
+        }
         let mut line = entry.to_string();
         for (needle, replacement) in &needles {
             if !needle.is_empty() {
