@@ -447,7 +447,7 @@ pub struct AppHooks(pub Arc<Mutex<HookServer>>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
     use diesel::RunQueryDsl;
 
     fn set_preference(pool: &DbPool, key: &str, value: &str) {
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn absent_hook_preferences_keep_the_documented_defaults() {
-        let config = load_config(&test_db()).unwrap();
+        let config = load_config(&diesel_test_db()).unwrap();
         let expected = HookConfig::default();
 
         assert_eq!(config.enabled, expected.enabled);
@@ -475,7 +475,7 @@ mod tests {
             ("hooks.plan_review.timeout_secs", "ten"),
             ("hooks.plan_review.max_rounds", "-1"),
         ] {
-            let pool = test_db();
+            let pool = diesel_test_db();
             set_preference(&pool, key, value);
             let error = load_config(&pool).expect_err("malformed stored preference must fail");
             assert!(error.contains(key), "{key}: {error}");
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn hook_preference_read_errors_are_not_defaulted() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         diesel::sql_query("DROP TABLE preferences").execute(&mut conn).unwrap();
         drop(conn);

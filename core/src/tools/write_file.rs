@@ -160,7 +160,7 @@ mod tests {
 
     fn ctx_with_journal(wd: &std::path::Path) -> (ToolContext, std::sync::Arc<crate::journal::capture::JournalCtx>) {
         let journal = crate::journal::capture::JournalCtx::new(
-            crate::db::test_db(),
+            crate::db::diesel_test_db(),
             tempfile::tempdir().unwrap().keep(),
             "conv".into(),
             "turn".into(),

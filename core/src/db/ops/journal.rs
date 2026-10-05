@@ -485,7 +485,7 @@ fn like_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
     use crate::journal::blobs::StoredBlob;
 
     fn blob(content: &str) -> StoredBlob {
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn a_matching_observation_appends_without_an_external_row() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let (a, b) = (blob("v1"), blob("v2"));
 
@@ -547,7 +547,7 @@ mod tests {
     /// only credited with the delta it performed.
     #[test]
     fn a_mismatched_observation_interposes_an_external_version() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let (a, hand_edit, b) = (blob("v1"), blob("hand-edited"), blob("v2"));
 
@@ -576,7 +576,7 @@ mod tests {
     /// cannot record an external change under a conversation's name.
     #[test]
     fn the_schema_refuses_an_attributed_external_row() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let a = blob("v1");
         let out = append(&mut conn, "c:/p/a.rs", None, Some(&a), Some("conv"), 1);
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn deletion_and_recreation_stay_on_one_chain() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let (a, b) = (blob("v1"), blob("v2"));
 
@@ -625,7 +625,7 @@ mod tests {
     /// rather than racing the `(file_id, seq)` unique index.
     #[test]
     fn concurrent_appends_do_not_collide_on_seq() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             let a = blob("v1");
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn tracked_files_reports_only_living_heads_under_the_prefix() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let a = blob("v1");
 
@@ -681,7 +681,7 @@ mod tests {
     /// the run_command bracket scan the wrong files.
     #[test]
     fn tracked_files_prefix_is_literal_and_case_exact() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let a = blob("v1");
 
@@ -705,7 +705,7 @@ mod tests {
     /// must not evict the tracked file the scan exists to watch.
     #[test]
     fn tracked_files_cap_is_applied_after_the_liveness_filter() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let a = blob("v1");
 
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn unreferenced_blobs_spares_everything_a_version_names() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let (a, b) = (blob("v1"), blob("v2"));
         append(&mut conn, "c:/p/a.rs", None, Some(&a), Some("conv"), 1);

@@ -183,7 +183,7 @@ pub fn clear_alert(conn: &mut SqliteConnection, alert_key: &str) -> QueryResult<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn insert(conn: &mut SqliteConnection, id: &str) -> NotificationWebhookRow {
         create_webhook(
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn a_failure_keeps_the_last_success_and_counts_up() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         insert(&mut conn, "hook-1");
 
@@ -232,7 +232,7 @@ mod tests {
     /// The invariant the whole feature rests on: raising is not reporting.
     #[test]
     fn raising_an_alert_does_not_mark_it_reported() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         let state = record_raised(&mut conn, "balance:p1", "low:CNY:3", 100).unwrap();

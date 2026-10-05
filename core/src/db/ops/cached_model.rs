@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn nothing_fetched_yet_is_an_empty_list() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         provider(&mut conn, "p1");
         assert!(list_cached_for_provider(&mut conn, "p1").unwrap().is_empty());
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn an_unknown_provider_is_an_error_and_not_an_empty_cache() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         assert_eq!(
             list_cached_for_provider(&mut conn, "missing").unwrap_err(),
@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn the_cache_is_read_for_that_provider_only_in_model_order() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         provider(&mut conn, "p1");
         provider(&mut conn, "p2");

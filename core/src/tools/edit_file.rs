@@ -139,7 +139,7 @@ mod tests {
 
         let blob_root = tempfile::tempdir().unwrap().keep();
         let journal = crate::journal::capture::JournalCtx::new(
-            crate::db::test_db(),
+            crate::db::diesel_test_db(),
             blob_root,
             "conv".into(),
             "turn".into(),
@@ -193,7 +193,7 @@ mod tests {
         let bad_root = dir.path().join("not-a-dir");
         std::fs::write(&bad_root, "x").unwrap();
         let journal = crate::journal::capture::JournalCtx::new(
-            crate::db::test_db(),
+            crate::db::diesel_test_db(),
             bad_root,
             "conv".into(),
             "turn".into(),

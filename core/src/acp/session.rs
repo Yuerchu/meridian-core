@@ -3645,7 +3645,7 @@ mod tests {
         assert!(plain.is_empty());
         assert_eq!(plain.in_front_of("do the thing"), "do the thing");
 
-        let mut conn = crate::db::test_db().get().unwrap();
+        let mut conn = crate::db::diesel_test_db().get().unwrap();
         crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();
         crate::db::ops::turn::begin(&mut conn, "dead", "c1", crate::turn::TurnOrigin::ClaudeCode, None, 1000).unwrap();
         crate::db::ops::turn::set_phase(&mut conn, "dead", TurnPhase::RunningTool, Some("Bash"), 1001).unwrap();

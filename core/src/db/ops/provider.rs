@@ -73,7 +73,7 @@ mod tests {
     /// this field exists to end.
     #[test]
     fn the_catalog_identity_changeset_says_clear_and_keep_apart() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         seeded(&mut conn);
 
@@ -123,7 +123,7 @@ mod tests {
     /// picker showed the default as selected.
     #[test]
     fn the_chosen_logo_can_be_set_changed_and_put_back_to_the_default() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let seed = seeded(&mut conn);
         assert_eq!(seed.icon, None, "a new row follows the catalog");

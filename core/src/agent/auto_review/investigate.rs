@@ -339,10 +339,10 @@ mod tests {
     }
 
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn context_under(access: FileAccess, cwd: Option<&str>) -> ToolContext {
-        build_context(cwd, &access, "c1", "t1", test_db(), &CancellationToken::new())
+        build_context(cwd, &access, "c1", "t1", diesel_test_db(), &CancellationToken::new())
     }
 
     /// The escalating pass must not be able to read anything the turn could

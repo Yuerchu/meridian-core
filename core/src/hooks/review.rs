@@ -841,7 +841,7 @@ mod tests {
     /// conversations would get the reviewer to append to it.
     #[tokio::test]
     async fn a_users_own_conversation_is_never_written_to() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         conversation(&pool, "private", None);
 
         let (id, is_new) = open_or_reuse(&pool, &claiming(Some("private"))).await;
@@ -851,7 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sub_agent_conversation_is_not_ours_either() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         conversation(&pool, "delegated", Some("sub_agent"));
 
         let (id, is_new) = open_or_reuse(&pool, &claiming(Some("delegated"))).await;
@@ -861,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_plan_review_conversation_is_reused() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         conversation(&pool, "ours", Some(Kind::Plan.agent_kind()));
 
         let (id, is_new) = open_or_reuse(&pool, &claiming(Some("ours"))).await;
@@ -875,7 +875,7 @@ mod tests {
     /// exactly the independence the split was for.
     #[tokio::test]
     async fn the_two_gates_do_not_share_a_conversation() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         conversation(&pool, "planning", Some(Kind::Plan.agent_kind()));
 
         let asking = ReviewJob {
@@ -892,7 +892,7 @@ mod tests {
     /// beats no review.
     #[tokio::test]
     async fn an_unknown_id_opens_a_new_conversation() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let (id, is_new) = open_or_reuse(&pool, &claiming(Some("gone"))).await;
         assert_ne!(id, "gone");
         assert!(is_new);
@@ -900,7 +900,7 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_claimed_opens_a_new_conversation() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         for claimed in [None, Some(""), Some("   ")] {
             let (id, is_new) = open_or_reuse(&pool, &claiming(claimed)).await;
             assert!(!id.is_empty());

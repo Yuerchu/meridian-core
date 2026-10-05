@@ -343,7 +343,7 @@ fn announce(emit: Option<&dyn Emit>, conversation_id: &str) {
 mod tests {
     use super::*;
     use crate::agent::modes::{PLAN_MODE, WORK_MODE};
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
     use crate::provider::ChatMessage;
     use std::sync::Mutex;
 
@@ -483,7 +483,7 @@ mod tests {
     /// The whole reason the effect is one value: all four move, or none do.
     #[tokio::test]
     async fn entering_moves_the_mode_the_tools_the_authorisation_and_the_prompt() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let rebuild = FakeRebuild::giving("# Plan mode\n\nyou are planning", &["read_file"]);
         let emit = Recorder::default();
@@ -520,7 +520,7 @@ mod tests {
     /// the top of the next iteration.
     #[tokio::test]
     async fn the_next_request_carries_the_new_tools_without_asking_again() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let rebuild = FakeRebuild::giving("planning", &["read_file", "run_command"]);
         let mut state = Loop::in_work();
@@ -552,7 +552,7 @@ mod tests {
     /// does not have.
     #[tokio::test]
     async fn a_switch_that_only_half_happened_does_not_move_the_tool_set() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let rebuild = FakeRebuild::refusing();
         let emit = Recorder::default();
@@ -586,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_entry_carries_the_reason_back_and_changes_nothing() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let rebuild = FakeRebuild::giving("planning", &["read_file"]);
         let mut state = Loop::in_work();
@@ -614,7 +614,7 @@ mod tests {
     /// not be read as one that said yes.
     #[tokio::test]
     async fn an_unanswered_entry_is_a_refusal() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let rebuild = FakeRebuild::giving("planning", &["read_file"]);
 

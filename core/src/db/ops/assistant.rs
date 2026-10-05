@@ -45,7 +45,7 @@ pub fn delete_assistant(conn: &mut SqliteConnection, id: &str) -> QueryResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn make_new_assistant<'a>(id: &'a str, name: &'a str, sort_order: i32) -> AssistantInsert<'a> {
         AssistantInsert {
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_create_and_get() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let new = make_new_assistant("a1", "Test Assistant", 0);
         let created = create_assistant(&mut conn, &new).unwrap();
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_list_ordered() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_assistant(&mut conn, &make_new_assistant("a2", "Second", 2)).unwrap();
         create_assistant(&mut conn, &make_new_assistant("a1", "First", 1)).unwrap();
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_get_default() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let mut new = make_new_assistant("a1", "Default One", 0);
         new.is_default = 1;
@@ -116,14 +116,14 @@ mod tests {
 
     #[test]
     fn test_get_default_returns_none_when_empty() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         assert!(get_default_assistant(&mut conn).unwrap().is_none());
     }
 
     #[test]
     fn test_update() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_assistant(&mut conn, &make_new_assistant("a1", "Old Name", 0)).unwrap();
 
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_assistant(&mut conn, &make_new_assistant("a1", "To Delete", 0)).unwrap();
         delete_assistant(&mut conn, "a1").unwrap();

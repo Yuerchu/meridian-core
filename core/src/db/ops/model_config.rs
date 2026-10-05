@@ -223,9 +223,9 @@ pub fn seed_flat(conn: &mut SqliteConnection, flat: &FlatModelConfig) -> QueryRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::model_profile::ModelProfileInsert;
     use crate::db::models::provider::ProviderInsert;
-    use crate::db::test_db;
 
     fn seed_provider(conn: &mut SqliteConnection) {
         diesel::insert_into(crate::db::schema::providers::table)
@@ -309,7 +309,7 @@ mod tests {
     /// fail here instead of in somebody's settings panel.
     #[test]
     fn an_edit_writes_every_column_it_was_given() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_provider(&mut conn);
         seed_profile(&mut conn, "prof1");
@@ -362,7 +362,7 @@ mod tests {
     /// off goes on being sent.
     #[test]
     fn an_edit_can_empty_a_column_again() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_provider(&mut conn);
         seed_profile(&mut conn, "prof1");
@@ -398,7 +398,7 @@ mod tests {
     /// stated twice and then to disagree.
     #[test]
     fn moving_a_model_collects_the_profile_it_emptied() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_provider(&mut conn);
         seed_profile(&mut conn, "prof1");
@@ -445,7 +445,7 @@ mod tests {
     /// The join every reader actually wants.
     #[test]
     fn a_model_reads_back_beside_the_profile_that_describes_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_provider(&mut conn);
         seed_profile(&mut conn, "prof1");
@@ -460,7 +460,7 @@ mod tests {
     /// Deleting the only model on a profile takes the profile with it.
     #[test]
     fn deleting_the_last_model_collects_its_profile() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_provider(&mut conn);
         seed_profile(&mut conn, "prof1");

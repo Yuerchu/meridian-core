@@ -486,7 +486,7 @@ mod tests {
     fn reconcile_covers_write_drift_and_explicit_restore() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let appended = pending_plan(&mut conn, "conv-1", "# Durable\n");
 
@@ -515,7 +515,7 @@ mod tests {
     fn external_change_after_staging_becomes_a_conflict_instead_of_being_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let appended = pending_plan(&mut conn, "conv-1", "# Durable\n");
 
@@ -535,7 +535,7 @@ mod tests {
     fn reconcile_all_recovers_later_documents_before_returning_the_first_stable_error() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let mut plans = [
             pending_plan(&mut conn, "conv-1", "# One\n"),
@@ -577,7 +577,7 @@ mod tests {
     fn desired_bytes_before_database_ack_are_only_acknowledged() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let appended = pending_plan(&mut conn, "conv-1", "# Already renamed\n");
         let path = store.path_for(&appended.document).unwrap();

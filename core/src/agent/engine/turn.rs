@@ -1706,7 +1706,7 @@ mod tests {
     use super::super::ports::{Approvals, Steered, Steering, SurfaceTools};
     use super::*;
     use crate::agent::turn_config::TurnConfig;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
     use crate::provider::{ProviderError, SenderRef, StreamEvent, TokenUsage, ToolCall};
     use crate::turn::TurnOrigin;
     use diesel::connection::SimpleConnection;
@@ -2286,7 +2286,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_boundary_caps_user_context_even_below_a_large_windows_trim_threshold() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("done")]);
@@ -2336,7 +2336,7 @@ mod tests {
     /// and puts the answer back where a tool result goes.
     #[tokio::test]
     async fn a_delegated_run_reaches_the_port_and_its_answer_reaches_the_model() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("c1", ERRAND), says("thanks")]);
@@ -2377,7 +2377,7 @@ mod tests {
     /// half an answer as the answer.
     #[tokio::test]
     async fn a_stopped_sub_agent_does_not_come_back_looking_like_a_conclusion() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("c1", ERRAND), says("ok")]);
@@ -2409,7 +2409,7 @@ mod tests {
     /// turn over it would throw away everything the parent had already done.
     #[tokio::test]
     async fn a_port_that_refuses_is_a_tool_result_and_the_turn_carries_on() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("c1", ERRAND), says("I will do it myself")]);
@@ -2444,7 +2444,7 @@ mod tests {
             ),
             ("not json at all", "not valid JSON"),
         ] {
-            let pool = test_db();
+            let pool = diesel_test_db();
             conversation(&pool);
             let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
             let provider = Scripted::of(vec![run_agent_call("c1", args), says("fine")]);
@@ -2473,7 +2473,7 @@ mod tests {
     /// keeps a sub-agent from delegating to a sub-agent.
     #[tokio::test]
     async fn without_a_port_the_name_is_withheld_and_nothing_is_started() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("c1", ERRAND), says("understood")]);
@@ -2499,7 +2499,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_turn_with_nothing_to_run_asks_once_and_answers() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("here you go")]);
@@ -2529,7 +2529,7 @@ mod tests {
     /// without ever seeing what it asked for.
     #[tokio::test]
     async fn a_tool_call_runs_and_its_answer_goes_into_the_next_request() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", r#"{"x":1}"#), says("that worked")]);
@@ -2577,7 +2577,7 @@ mod tests {
     /// as an error.
     #[tokio::test]
     async fn cancelling_ends_the_turn_without_making_it_an_error() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("never asked for")]);
@@ -2609,7 +2609,7 @@ mod tests {
     /// carrying whatever was said — an error would lose that.
     #[tokio::test]
     async fn a_model_repeating_itself_is_stopped_and_the_caller_is_told_why() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let rounds: Vec<_> = (0..crate::agent::loop_guard::LOOP_ABORT_AFTER + 2)
@@ -2647,7 +2647,7 @@ mod tests {
     /// has already touched the world, so the row is worth less than the turn.
     #[tokio::test]
     async fn a_tool_row_the_database_refuses_does_not_stop_the_turn_or_move_the_cursor() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         {
             let mut conn = pool.get().unwrap();
@@ -2705,7 +2705,7 @@ mod tests {
             ("desktop", &Broken("tool_call") as &dyn Emit, true),
             ("onebot", &Deaf as &dyn Emit, false),
         ] {
-            let pool = test_db();
+            let pool = diesel_test_db();
             conversation(&pool);
             let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
             let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("carried on")]);
@@ -2738,7 +2738,7 @@ mod tests {
     /// `streaming` flag its optimistic send set.
     #[tokio::test]
     async fn a_failed_turn_still_reports_what_it_had_got_done() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![]);
@@ -2765,7 +2765,7 @@ mod tests {
     /// while it still cannot.
     #[tokio::test]
     async fn a_mode_switch_reaches_the_very_next_request() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
@@ -2803,7 +2803,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_update_in_the_batch_prevents_exit_from_submitting_a_review() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let patch = serde_json::json!({
@@ -2864,7 +2864,7 @@ mod tests {
     /// cache on every following request of the turn.
     #[tokio::test]
     async fn steering_lands_at_the_end_and_leaves_the_prefix_alone() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("noted")]);
@@ -2947,7 +2947,7 @@ mod tests {
             }
         }
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
@@ -2992,7 +2992,7 @@ mod tests {
     /// turn instead.
     #[tokio::test]
     async fn a_message_that_lands_on_the_last_round_still_gets_an_answer() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("here is the answer"), says("and about that")]);
@@ -3047,7 +3047,7 @@ mod tests {
     /// turn off a row the queue has never heard of.
     #[tokio::test]
     async fn a_steered_message_that_already_has_a_row_is_not_written_again() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("here is the answer"), says("and about that")]);
@@ -3100,7 +3100,7 @@ mod tests {
     /// to them — draining and then stopping would make them disappear.
     #[tokio::test]
     async fn the_continuation_cap_leaves_the_inbox_alone() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         // Enough replies for every continuation plus the one that stops.
@@ -3153,7 +3153,7 @@ mod tests {
     /// opens a branch that pushes the result off the active path.
     #[tokio::test]
     async fn the_final_cursor_is_the_last_row_that_landed_not_the_last_reply() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("never asked")]);
@@ -3197,7 +3197,7 @@ mod tests {
             (2, 2, "None of them could be written down"),
             (3, 1, "1 of them could not be written down"),
         ] {
-            let pool = test_db();
+            let pool = diesel_test_db();
             conversation(&pool);
             let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
             let provider = Scripted::of(vec![run_agent_call("call-1", ERRAND), says("understood")]);
@@ -3221,7 +3221,7 @@ mod tests {
     /// The ordinary case says nothing about it, because there is nothing to say.
     #[tokio::test]
     async fn a_run_that_saw_everything_is_not_reported_as_having_missed_something() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("call-1", ERRAND), says("understood")]);
@@ -3261,7 +3261,7 @@ mod tests {
     /// warning was protecting.
     #[tokio::test]
     async fn a_stopped_reply_does_not_retire_the_interruption_notice() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         {
             let mut conn = pool.get().unwrap();
@@ -3334,7 +3334,7 @@ mod tests {
     /// conversation itself would have fitted.
     #[tokio::test]
     async fn the_output_allowance_is_trimmed_to_what_the_prompt_left() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("brief")]);
@@ -3367,7 +3367,7 @@ mod tests {
     /// not made at all, and what comes back names the numbers.
     #[tokio::test]
     async fn a_prompt_that_fills_the_window_is_never_sent() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("never reached")]);
@@ -3400,7 +3400,7 @@ mod tests {
     /// the turn worse off than the refusal did.
     #[tokio::test]
     async fn recovery_that_frees_nothing_fails_instead_of_asking_again() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![vec![StreamEvent::Error {
@@ -3435,7 +3435,7 @@ mod tests {
     /// A short conversation is not penalised for the long ones' sake.
     #[tokio::test]
     async fn a_short_prompt_still_gets_the_whole_allowance() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("hi")]);
@@ -3456,7 +3456,7 @@ mod tests {
     /// carry the assistant row that holds them, or the search starts over.
     #[tokio::test]
     async fn a_pause_turn_is_resumed_with_the_rounds_blocks_on_the_request() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let paused = vec![
@@ -3506,7 +3506,7 @@ mod tests {
     /// what keeps it from being a loop the loop guard cannot see.
     #[tokio::test]
     async fn pause_turn_resumption_is_bounded() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let pause = || {
@@ -3539,7 +3539,7 @@ mod tests {
             ("length", ChatStopReason::MaxTokens),
             ("end_turn", ChatStopReason::EndTurn),
         ] {
-            let pool = test_db();
+            let pool = diesel_test_db();
             conversation(&pool);
             let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
             let provider = Scripted::of(vec![vec![StreamEvent::Stop {
@@ -3566,7 +3566,7 @@ mod tests {
     /// already recovers from.
     #[tokio::test]
     async fn a_call_whose_arguments_never_arrived_intact_is_stored_empty() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let truncated = vec![
@@ -3621,7 +3621,7 @@ mod tests {
     /// Usage is accumulated across every round, not taken from the last one.
     #[tokio::test]
     async fn the_tokens_of_every_round_are_added_up() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let used = |p: i32, c: i32| StreamEvent::Stop {
@@ -3671,7 +3671,7 @@ mod tests {
     /// priced model the cost carries gaps where the zeros used to be.
     #[tokio::test]
     async fn an_unreported_count_leaves_the_turn_total_unknown_not_short() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
@@ -3752,7 +3752,7 @@ mod tests {
     /// total on every row would pass a single-round test.
     #[tokio::test]
     async fn a_cache_hit_reaches_the_row_that_got_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let used = |p: i32, c: i32, read: i32| StreamEvent::Stop {
@@ -3820,7 +3820,7 @@ mod tests {
     /// about the data.
     #[tokio::test]
     async fn a_provider_that_says_nothing_about_caching_stores_nothing() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![vec![
@@ -3854,7 +3854,7 @@ mod tests {
     /// decorative if naming it anyway worked.
     #[tokio::test]
     async fn a_tool_that_was_not_offered_is_refused_before_anything_runs() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("fine then")]);
@@ -3896,7 +3896,7 @@ mod tests {
     /// the port's own documentation is what holds it.
     #[tokio::test]
     async fn typed_words_answer_a_question_and_authorise_nothing_else() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
@@ -3937,7 +3937,7 @@ mod tests {
     /// path where saying yes runs a command.
     #[tokio::test]
     async fn a_tool_nobody_approved_is_not_run() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("fine")]);
@@ -3974,7 +3974,7 @@ mod tests {
     /// still telling the model a person refused.
     #[tokio::test]
     async fn an_unanswered_registry_tool_is_not_reported_as_a_users_refusal() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
@@ -4039,7 +4039,7 @@ mod tests {
     /// the model was told comes back with the file's path.
     #[cfg(not(target_os = "android"))]
     async fn run_with_unreadable_settings(approvals: &Sequence) -> (String, std::path::PathBuf, tempfile::TempDir) {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");

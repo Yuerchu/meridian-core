@@ -565,7 +565,7 @@ pub fn optouts(conn: &mut SqliteConnection) -> QueryResult<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn key<'a>(sha: &'a str) -> BlobKey<'a> {
         BlobKey {
@@ -593,7 +593,7 @@ mod tests {
     /// 同一段音频的第二个采集任务认出别人已经有了它，而不是写第二份。
     #[test]
     fn a_second_claim_on_the_same_bytes_finds_the_first() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         own(&mut conn, "aa", "b1", "t1");
 
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn an_unknown_persisted_blob_status_is_rejected() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let mut blob = ready_blob(&mut conn, "aa", "b1");
         blob.status = "archived".to_string();
@@ -617,7 +617,7 @@ mod tests {
     /// 另一个群里的同一段音频是另一份语料：删掉这个群的不该动那个群的。
     #[test]
     fn the_same_bytes_in_another_session_is_another_blob() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         own(&mut conn, "aa", "b1", "t1");
 
@@ -637,7 +637,7 @@ mod tests {
     /// 那版就是这么错的，进程 id 对同进程的两个任务是同一个值。
     #[test]
     fn a_fenced_out_owner_cannot_publish() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let (id, old_epoch) = own(&mut conn, "aa", "b1", "old");
 
@@ -657,7 +657,7 @@ mod tests {
     /// lease 还没过期时接管不了。
     #[test]
     fn a_live_lease_cannot_be_taken_over() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let (id, epoch) = own(&mut conn, "aa", "b1", "t1");
         assert!(
@@ -671,7 +671,7 @@ mod tests {
     /// 单表按 sha 唯一的那版会把第二个人整个丢掉。
     #[test]
     fn two_senders_of_one_recording_are_two_clips() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let blob = ready_blob(&mut conn, "aa", "b1");
 
@@ -692,7 +692,7 @@ mod tests {
     /// 只有文本没有来源。
     #[test]
     fn a_replayed_event_fills_the_transcript_it_lacked() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let blob = ready_blob(&mut conn, "aa", "b1");
 
@@ -721,7 +721,7 @@ mod tests {
     /// 一条消息里的两个 record 段是两行。
     #[test]
     fn two_segments_of_one_message_are_two_clips() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let a = ready_blob(&mut conn, "aa", "b1");
         let b = ready_blob(&mut conn, "bb", "b2");
@@ -740,7 +740,7 @@ mod tests {
     /// 一个人不能让另一个人的样本消失。
     #[test]
     fn deleting_one_sender_leaves_a_shared_recording_alone() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let blob = ready_blob(&mut conn, "aa", "b1");
         record_clip(&mut conn, &blob, "c1", "alice", Some(10), 0, None, None, 1).unwrap();
@@ -762,7 +762,7 @@ mod tests {
     /// 墓碑扫描只看 `ready`，而"坏"恰恰意味着这一行不会再变回 `ready`。
     #[test]
     fn a_damaged_recording_nobody_references_is_collected_too() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let blob = ready_blob(&mut conn, "aa", "b1");
         mark_damaged(&mut conn, &blob.id, 2).unwrap();
@@ -777,7 +777,7 @@ mod tests {
     /// 而它不该因为文件坏了就消失。
     #[test]
     fn a_damaged_recording_someone_still_references_stays() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let blob = ready_blob(&mut conn, "aa", "b1");
         record_clip(&mut conn, &blob, "c1", "alice", Some(10), 0, None, None, 1).unwrap();
@@ -791,7 +791,7 @@ mod tests {
     /// 一份文件只占一次地方。
     #[test]
     fn a_shared_recording_counts_twice_but_takes_up_room_once() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let blob = ready_blob(&mut conn, "aa", "b1");
         record_clip(&mut conn, &blob, "c1", "alice", Some(10), 0, None, None, 1).unwrap();
@@ -809,7 +809,7 @@ mod tests {
     /// 按 `ready` 过滤正好把最该被删的那批数据变成删不掉的。
     #[test]
     fn a_session_whose_files_all_went_bad_is_still_listed_for_deletion() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let blob = ready_blob(&mut conn, "aa", "b1");
         record_clip(&mut conn, &blob, "c1", "alice", Some(10), 0, None, None, 1).unwrap();
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn an_optout_is_global_and_idempotent() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         set_optout(&mut conn, "alice", 1).unwrap();
         set_optout(&mut conn, "alice", 2).unwrap();

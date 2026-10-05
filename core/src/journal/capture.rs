@@ -945,14 +945,14 @@ impl JournalCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn ctx(root: Option<&Path>) -> Arc<JournalCtx> {
         // `keep()` so the directory outlives the TempDir guard; the OS temp
         // cleaner owns it from here, which is fine for a test.
         let blob = tempfile::tempdir().unwrap().keep();
         JournalCtx::new(
-            test_db(),
+            diesel_test_db(),
             blob,
             "conv".into(),
             "turn".into(),
@@ -1113,7 +1113,7 @@ mod tests {
     fn ctx_sharing(root: Option<&Path>, shared: Arc<JournalShared>) -> Arc<JournalCtx> {
         let blob = tempfile::tempdir().unwrap().keep();
         JournalCtx::new(
-            test_db(),
+            diesel_test_db(),
             blob,
             "conv".into(),
             "turn".into(),

@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn items_are_ordered_and_die_with_their_message() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_message(&mut conn, "m1");
         let make = |id, position| MessageContextItemInsert {

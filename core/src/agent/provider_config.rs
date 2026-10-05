@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn a_model_that_rejects_temperature_never_sees_one() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let assistant = assistant_with(Some(0.7));
 
         let turn = resolve_for(&pool, "o3", &assistant);
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn dropping_thinking_leaves_the_rest_of_the_turn_alone() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let assistant = assistant_with(Some(0.7));
 
         let turn = resolve_for(&pool, "gpt-4o", &assistant);
@@ -635,7 +635,7 @@ mod tests {
     /// from here and did honour the override.
     #[test]
     fn a_capability_override_reaches_the_turns_capabilities() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             db::ops::provider::create_provider(
@@ -741,7 +741,7 @@ mod tests {
     /// goes on using the built-in `web_search`.
     #[test]
     fn a_configured_server_tool_reaches_the_turn() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             db::ops::provider::create_provider(
@@ -892,7 +892,7 @@ mod tests {
 
     #[test]
     fn an_unknown_stored_credential_kind_is_reported_through_fallback_resolution() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_provider_with(&pool, "chat_completions", "future_login", "standard");
         let dir = tempfile::tempdir().unwrap();
         let secrets = mock_secrets(dir.path());
@@ -915,7 +915,7 @@ mod tests {
     /// pair the user had saved sat unread in the overrides.
     #[test]
     fn a_full_override_pair_needs_no_assistant() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_provider(&pool);
         let dir = tempfile::tempdir().unwrap();
         let secrets = mock_secrets(dir.path());
@@ -945,7 +945,7 @@ mod tests {
     /// named provider's missing key — never about the assistant nobody passed.
     #[test]
     fn a_full_override_pair_fails_about_itself() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_provider(&pool);
         let dir = tempfile::tempdir().unwrap();
         let secrets = mock_secrets(dir.path());
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn an_unknown_model_asks_the_user_to_configure_it() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let assistant = assistant_with(None);
 
         let err = resolve_turn_params(

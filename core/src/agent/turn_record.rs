@@ -154,8 +154,8 @@ fn report(outcome: Result<Result<usize, String>, tokio::task::JoinError>, what: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::turn::TurnPhase;
-    use crate::db::test_db;
 
     fn conv(pool: &DbPool, id: &str) {
         let mut conn = pool.get().unwrap();
@@ -175,7 +175,7 @@ mod tests {
     /// refused to prevent.
     #[tokio::test]
     async fn a_refused_duplicate_leaves_the_turn_it_named_untouched() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conv(&pool, "c1");
 
         begin(&pool, "t1", "c1", TurnOrigin::Desktop, None)
@@ -202,7 +202,7 @@ mod tests {
     /// losing the diagnosis is cheaper than losing the answer.
     #[tokio::test]
     async fn a_turn_whose_record_cannot_be_written_still_runs() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         // No conversation row, so the foreign key refuses the insert. Not a
         // duplicate — the turn should be allowed to carry on regardless.
         assert!(begin(&pool, "t1", "missing", TurnOrigin::Desktop, None).await.is_ok());

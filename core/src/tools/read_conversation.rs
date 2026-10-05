@@ -290,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_only_what_the_user_attached() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_reference(&pool);
         let tool = ReadConversationTool::new();
 
@@ -318,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_grant_set_refuses_everything() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_reference(&pool);
         // `c-there` has no conversation items of its own, so nothing may be
         // read from it — the QQ case in miniature, where no drag surface
@@ -335,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_bridge_pin_outranks_the_context() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_reference(&pool);
         // Pinned to `c-there` (no grants), the context claiming `c-here`
         // must not widen it — the wrapper overwrites, never asserts.
@@ -351,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_deleted_target_reads_as_gone_not_as_a_crash() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_reference(&pool);
         {
             let mut conn = pool.get().unwrap();

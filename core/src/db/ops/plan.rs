@@ -138,7 +138,7 @@ pub fn format_plan_block(plan: &ModeArtifactRow) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn seed_conversation(conn: &mut SqliteConnection, id: &str) {
         use crate::db::schema::conversations;
@@ -156,7 +156,7 @@ mod tests {
     /// so this is the only place a broken ALTER TABLE surfaces before runtime.
     #[test]
     fn migrations_apply_and_the_mode_column_round_trips() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn a_recorded_plan_starts_pending_and_is_not_active_yet() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn approving_makes_it_active() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn approving_a_second_plan_supersedes_the_first() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -225,7 +225,7 @@ mod tests {
     /// approval that slipped past it must still be refused by the database.
     #[test]
     fn the_database_refuses_a_second_approved_artifact() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn finishing_the_work_retires_the_plan() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn completing_with_no_active_plan_is_a_no_op() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         assert_eq!(complete_active(&mut conn, "c1", 10).unwrap(), 0);
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn rejecting_leaves_the_previous_approval_in_place() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn plans_do_not_leak_between_conversations() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         seed_conversation(&mut conn, "c2");
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn deleting_a_conversation_cascades_to_its_artifacts() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         record_plan(&mut conn, "c1", "doomed", 10).unwrap();
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn the_block_carries_the_plan_and_skips_empty_ones() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
 

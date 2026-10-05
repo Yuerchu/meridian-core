@@ -152,7 +152,7 @@ mod tests {
     use super::*;
     use crate::db::models::skill::SkillInsert;
     use crate::db::models::skill_binding::SkillLayer;
-    use crate::db::{DbPool, test_db};
+    use crate::db::{DbPool, diesel_test_db};
     use crate::tools::{FileAccess, ShellType};
     use std::path::Path;
 
@@ -214,7 +214,7 @@ mod tests {
         std::fs::create_dir_all(&refs).unwrap();
         std::fs::write(refs.join("forms.md"), "Form details").unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         index_and_bind(&pool, "pdf-tools", "pdf-tools");
 
         let out = LoadSkillTool::new(dir.path().to_path_buf())
@@ -235,7 +235,7 @@ mod tests {
         std::fs::create_dir_all(&refs).unwrap();
         std::fs::write(refs.join("deep.md"), "Deep content").unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         index_and_bind(&pool, "s", "s");
 
         let out = LoadSkillTool::new(dir.path().to_path_buf())
@@ -253,7 +253,7 @@ mod tests {
         write_skill(dir.path(), "bound", "bound", "Visible");
         write_skill(dir.path(), "unbound", "unbound", "Hidden");
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         index_and_bind(&pool, "bound", "bound");
         // Indexed but never bound.
         let mut conn = pool.get().unwrap();
@@ -291,7 +291,7 @@ mod tests {
         write_skill(dir.path(), "mine-pdf", "pdf", "Mine");
         write_skill(dir.path(), "theirs-pdf", "pdf", "Theirs");
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         index_and_bind(&pool, "mine-pdf", "pdf");
         index_and_bind(&pool, "theirs-pdf", "pdf");
 
@@ -310,7 +310,7 @@ mod tests {
         write_skill(dir.path(), "s", "s", "Body");
         std::fs::write(dir.path().join("secret.txt"), "TOP SECRET").unwrap();
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         index_and_bind(&pool, "s", "s");
 
         let err = LoadSkillTool::new(dir.path().to_path_buf())

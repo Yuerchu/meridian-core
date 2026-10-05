@@ -1448,7 +1448,7 @@ mod tests {
     fn an_import_writes_one_readable_chain_and_bills_nobody() {
         use diesel::prelude::*;
 
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         let imported = plan(vec![
@@ -1547,7 +1547,7 @@ mod tests {
     fn an_import_keeps_the_diff_the_agent_reported_beside_its_call() {
         use crate::events::ToolCallDiff;
 
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let hunk = ToolCallDiff {
             path: "/w/src/lib.rs".into(),
@@ -1620,7 +1620,7 @@ mod tests {
             actions: vec![AcpNoticeAction::Login],
         });
 
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let imported = plan(vec![
             orphan,
@@ -1669,7 +1669,7 @@ mod tests {
     /// it back the session that wrote those rows.
     #[test]
     fn attaching_refuses_the_wrong_conversation_and_a_session_already_taken() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         let hosted = |conn: &mut SqliteConnection, id: &str, kind: Option<&str>| {

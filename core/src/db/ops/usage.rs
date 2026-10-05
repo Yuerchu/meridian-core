@@ -974,9 +974,9 @@ fn label(conn: &mut SqliteConnection, dimension: UsageDimension, buckets: &mut [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::audit::AuditMessageInsert;
     use crate::db::schema::{audit_messages, model_configs};
-    use crate::db::test_db;
 
     fn decimal(raw: &str) -> Decimal {
         raw.parse().unwrap()
@@ -1173,7 +1173,7 @@ mod tests {
     /// The scope the ACP bridge rests on: one conversation, nothing else.
     #[test]
     fn a_conversation_filter_excludes_every_other_conversation() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_model(&mut conn, "m1", "1", "2");
         reply_in(&mut conn, "a1", "mine", (10, 10));
@@ -1204,7 +1204,7 @@ mod tests {
     /// other conversation may appear in it — not even as a key.
     #[test]
     fn no_dimension_widens_a_scoped_report() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_model(&mut conn, "m1", "1", "2");
         reply_in(&mut conn, "a1", "mine", (10, 10));
@@ -1245,7 +1245,7 @@ mod tests {
     /// plan the user already paid for would appear a second time on this bill.
     #[test]
     fn a_subscription_is_not_priced_from_todays_configuration() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_model(&mut conn, "m1", "1", "2");
 
@@ -1257,7 +1257,7 @@ mod tests {
             "a metered row still falls back to today's rates"
         );
 
-        let pool2 = test_db();
+        let pool2 = diesel_test_db();
         let mut conn2 = pool2.get().unwrap();
         seed_model(&mut conn2, "m1", "1", "2");
         reply_billed(&mut conn2, "b1", "m1", "subscription", (1_000_000, 1_000_000));
@@ -1270,7 +1270,7 @@ mod tests {
     /// produces a warning nobody can clear.
     #[test]
     fn only_metered_traffic_can_be_unpriced() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         // No `seed_model`, so nothing is priced anywhere.
         reply_billed(&mut conn, "a1", "unpriced", "metered", (10, 10));
@@ -1296,7 +1296,7 @@ mod tests {
     /// and legacy rows without `turn_id` are not guessed onto a turn.
     #[test]
     fn turn_summaries_carry_persisted_cost_and_pricing_status() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         reply(
@@ -1403,7 +1403,7 @@ mod tests {
             detail: String,
         }
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let plan = diesel::sql_query(
             "EXPLAIN QUERY PLAN
@@ -1430,7 +1430,7 @@ mod tests {
 
     #[test]
     fn missing_usage_is_not_conflated_with_an_explicit_zero() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         for (id, turn_id) in [("missing-row", "missing"), ("zero-row", "zero")] {
             reply(&mut conn, id, "m", 1, (0, 0, 0, 0), Some(("10", "20")), "desktop");
@@ -1571,7 +1571,7 @@ mod tests {
     /// side remains billable, but the absent side is not an exact zero.
     #[test]
     fn partial_token_reports_keep_the_known_component_as_a_lower_bound() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         reply(
@@ -1647,7 +1647,7 @@ mod tests {
     /// group — the subscription half would be priced at the metered half's rates.
     #[test]
     fn the_two_modes_are_grouped_apart() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_model(&mut conn, "m1", "1", "2");
         reply_billed(&mut conn, "a1", "m1", "metered", (1_000_000, 0));
@@ -1712,7 +1712,7 @@ mod tests {
     /// each half at what it was, so the two halves cannot be added at one price.
     #[test]
     fn each_half_of_a_price_change_is_billed_at_its_own_rate() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         // A million input tokens at 10/M, then another million at 20/M.
         reply(
@@ -1750,7 +1750,7 @@ mod tests {
     /// already shown.
     #[test]
     fn a_tiered_model_bills_each_side_of_the_threshold_at_its_own_rate() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         // grok-4.6: 100k under the 200k threshold at 2/M, then 250k over it at
         // 4/M — the whole prompt, not the excess.
@@ -1788,7 +1788,7 @@ mod tests {
     /// reporting unpriced traffic as free.
     #[test]
     fn a_review_counts_towards_the_total() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(
             &mut conn,
@@ -1811,7 +1811,7 @@ mod tests {
     /// see what it costs.
     #[test]
     fn the_two_kinds_of_spend_can_be_told_apart() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(
             &mut conn,
@@ -1840,7 +1840,7 @@ mod tests {
     /// has to survive being reached through a `GROUP BY`.
     #[test]
     fn the_cache_discount_survives_aggregation() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         // 900k of the million prompt tokens came from the cache, and the cache
         // read price is blank — so they bill at the input rate, once.
@@ -1863,7 +1863,7 @@ mod tests {
     /// the total, including cache replacement and per-thousand tool pricing.
     #[test]
     fn cost_components_add_up_to_the_reported_total() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(
             &mut conn,
@@ -1901,7 +1901,7 @@ mod tests {
     /// that actually used the tool is marked as containing unpriced usage.
     #[test]
     fn a_missing_tool_rate_keeps_token_cost_and_marks_only_calling_replies() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         for (id, created_at) in [("with-tool", 1_000), ("tokens-only", 2_000)] {
             reply(
@@ -1941,7 +1941,7 @@ mod tests {
     /// The reply is unpriced once, not once per missing component.
     #[test]
     fn a_known_tool_rate_survives_unknown_token_rates() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(&mut conn, "a", "m", 1_000, (100, 50, 0, 0), None, "desktop");
         diesel::update(audit_messages::table.find("a"))
@@ -1975,7 +1975,7 @@ mod tests {
     /// historical tool rate would still win above it.
     #[test]
     fn a_legacy_null_tool_rate_falls_back_to_the_current_exact_model() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_model(&mut conn, "m", "99", "99");
         diesel::update(model_configs::table.filter(model_configs::model_id.eq("m")))
@@ -2014,7 +2014,7 @@ mod tests {
     /// without saying so.
     #[test]
     fn traffic_with_no_price_is_counted_apart_rather_than_billed_at_nothing() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(
             &mut conn,
@@ -2042,7 +2042,7 @@ mod tests {
         use crate::db::models::provider::ProviderInsert;
         use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         diesel::insert_into(crate::db::schema::providers::table)
             .values(&ProviderInsert {
@@ -2107,7 +2107,7 @@ mod tests {
     /// must stay free even when the model is priced later.
     #[test]
     fn an_explicit_zero_snapshot_never_falls_back_to_a_current_price() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_model(&mut conn, "m", "10", "20");
         reply(
@@ -2130,7 +2130,7 @@ mod tests {
     /// A zero rate is explicitly free. Only NULL means the price is unknown.
     #[test]
     fn an_explicit_zero_price_reads_as_free() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(
             &mut conn,
@@ -2151,7 +2151,7 @@ mod tests {
     /// count every reply exactly once.
     #[test]
     fn the_window_excludes_its_upper_bound() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(&mut conn, "a", "m", 1_000, (10, 0, 0, 0), Some(("1", "1")), "desktop");
         reply(&mut conn, "b", "m", 2_000, (10, 0, 0, 0), Some(("1", "1")), "desktop");
@@ -2170,7 +2170,7 @@ mod tests {
 
     #[test]
     fn origin_separates_bot_traffic_from_the_desktop() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(&mut conn, "a", "m", 1_000, (10, 0, 0, 0), Some(("1", "1")), "desktop");
         reply(&mut conn, "b", "m", 2_000, (20, 0, 0, 0), Some(("1", "1")), "onebot");
@@ -2188,7 +2188,7 @@ mod tests {
     /// same query with a different key for exactly this reason.
     #[test]
     fn a_breakdown_adds_up_to_the_total_above_it() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(
             &mut conn,
@@ -2234,7 +2234,7 @@ mod tests {
     /// and says so by having no title rather than by disappearing.
     #[test]
     fn a_deleted_conversation_keeps_its_row_and_loses_its_name() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("Named"), None, None, 1).unwrap();
         reply(&mut conn, "a", "m", 1_000, (100, 0, 0, 0), Some(("10", "0")), "desktop");
@@ -2252,7 +2252,7 @@ mod tests {
 
     #[test]
     fn an_untitled_conversation_stays_distinct_from_a_deleted_one() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::conversation::create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         reply(&mut conn, "a", "m", 1_000, (100, 0, 0, 0), Some(("10", "0")), "desktop");
@@ -2273,7 +2273,7 @@ mod tests {
     /// alone would add two different places together.
     #[test]
     fn a_source_key_carries_its_kind() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         reply(&mut conn, "a", "m", 1_000, (100, 0, 0, 0), Some(("10", "0")), "onebot");
 
@@ -2283,7 +2283,7 @@ mod tests {
 
     #[test]
     fn a_series_reads_forwards_and_splits_on_the_local_day() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         // Two days apart, so no timezone puts them in the same bucket.
         reply(
@@ -2315,9 +2315,9 @@ mod tests {
 #[cfg(test)]
 mod decimal_tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::audit::AuditMessageInsert;
     use crate::db::schema::audit_messages;
-    use crate::db::test_db;
 
     fn decimal(raw: &str) -> Decimal {
         raw.parse().unwrap()
@@ -2362,7 +2362,7 @@ mod decimal_tests {
 
     #[test]
     fn report_preserves_full_decimal_precision_and_serializes_strings() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         insert_reply(&mut conn, "reply", "metered").unwrap();
 
@@ -2380,7 +2380,7 @@ mod decimal_tests {
 
     #[test]
     fn database_rejects_unknown_billing_modes() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         assert!(insert_reply(&mut conn, "bad", "future_mode").is_err());
     }

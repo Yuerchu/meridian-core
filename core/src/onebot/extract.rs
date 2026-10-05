@@ -468,7 +468,7 @@ pub async fn run_extraction(pool: &DbPool, raw_response: &str, facts: TurnFacts)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn facts(is_group: bool) -> TurnFacts {
         let mut messages = HashMap::new();
@@ -578,7 +578,7 @@ mod tests {
     /// Bot-wide memory is parked, never stored on the model's say-so.
     #[test]
     fn bot_self_becomes_a_proposal_not_a_memory() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
 
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn approval_stores_the_memory_exactly_once() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
         let Accepted::Proposed(id) = commit(conn, &c, &facts(true), 1000).unwrap() else {
@@ -622,7 +622,7 @@ mod tests {
     /// never took effect.
     #[test]
     fn a_rejected_write_leaves_the_proposal_retryable() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
 
         // Fill the bot-wide scope to its ceiling so the next write is refused.
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn expired_proposals_cannot_be_approved() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
         let Accepted::Proposed(id) = commit(conn, &c, &facts(true), 1000).unwrap() else {
@@ -693,7 +693,7 @@ mod tests {
     /// an owner-only note.
     #[test]
     fn approved_bot_memory_is_visible_to_the_model() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
         let Accepted::Proposed(id) = commit(conn, &c, &facts(true), 1000).unwrap() else {
@@ -712,7 +712,7 @@ mod tests {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     /// The decision dispatcher asks each queue in turn. An id nobody holds must
     /// report "not mine" so the message falls through to ordinary chat rather
@@ -720,14 +720,14 @@ mod dispatch_tests {
     /// must not stop a proposal from being found.
     #[test]
     fn unknown_ids_are_not_claimed() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         assert_eq!(is_known_proposal(conn, 42), None);
     }
 
     #[test]
     fn a_parked_proposal_is_claimable_by_id() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let conn = &mut pool.get().unwrap();
         let p = crate::db::ops::memory::create_proposal(
             conn,

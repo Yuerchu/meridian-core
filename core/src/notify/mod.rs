@@ -767,7 +767,7 @@ pub struct AppNotify(pub Arc<Mutex<NotifyServer>>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     fn set(pool: &DbPool, key: &str, value: &str) {
         let mut conn = pool.get().unwrap();
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn absent_preferences_keep_the_documented_defaults() {
-        let config = load_config(&test_db()).unwrap();
+        let config = load_config(&diesel_test_db()).unwrap();
         assert_eq!(config, NotifyConfig::default());
         assert!(!config.enabled);
         assert_eq!(config.balance_threshold, None, "off until somebody sets a floor");
@@ -787,16 +787,16 @@ mod tests {
     /// loaders validate on the way in.
     #[test]
     fn a_stored_value_outside_the_bounds_fails_the_load() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         set(&pool, "notify.usage.window_hours", "0");
         assert!(load_config(&pool).is_err());
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         set(&pool, "notify.usage.multiplier", "0.5");
         let error = load_config(&pool).unwrap_err();
         assert!(error.contains("multiplier"), "{error}");
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         set(&pool, "notify.usage.window_hours", "48");
         set(&pool, "notify.usage.baseline_days", "1");
         let error = load_config(&pool).unwrap_err();
@@ -805,19 +805,19 @@ mod tests {
 
     #[test]
     fn a_non_canonical_number_is_refused_rather_than_rounded() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         set(&pool, "notify.usage.multiplier", "3.0");
         assert!(load_config(&pool).is_err(), "3.0 is not the canonical spelling of 3");
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         set(&pool, "notify.balance.threshold", "-1");
         assert!(load_config(&pool).is_err());
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         set(&pool, "notify.balance.threshold", "");
         assert!(load_config(&pool).is_err(), "empty is not a spelling of absent");
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         set(&pool, "notify.enabled", "yes");
         assert!(load_config(&pool).is_err());
     }
@@ -827,7 +827,7 @@ mod tests {
     /// absent means "do not ask at all".
     #[test]
     fn a_zero_threshold_round_trips_apart_from_an_absent_one() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut config = NotifyConfig {
             balance_threshold: Some(Decimal::zero()),
             ..Default::default()
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn a_full_config_round_trips() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let config = NotifyConfig {
             enabled: true,
             balance_threshold: Some("12.5".parse().unwrap()),
@@ -897,7 +897,7 @@ mod tests {
 
     #[test]
     fn saving_an_invalid_config_is_refused_before_anything_is_written() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let config = NotifyConfig {
             usage_baseline_days: 0,
             ..Default::default()

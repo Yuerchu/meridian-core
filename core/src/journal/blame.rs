@@ -426,8 +426,8 @@ fn plain_span(line: u32, kind: BlameKind) -> BlameSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::ops::journal::{AppendVersion, Attribution as OpsAttribution, append_version};
-    use crate::db::test_db;
     use crate::journal::blobs::StoredBlob;
     use diesel::sqlite::SqliteConnection;
     use std::path::PathBuf;
@@ -441,7 +441,7 @@ mod tests {
     impl Rig {
         fn new() -> Rig {
             Rig {
-                pool: test_db(),
+                pool: diesel_test_db(),
                 blob_root: tempfile::tempdir().unwrap().keep(),
                 cancel: tokio_util::sync::CancellationToken::new(),
             }

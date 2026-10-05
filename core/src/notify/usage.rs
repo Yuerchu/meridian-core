@@ -308,9 +308,9 @@ mod ledger_tests {
     //! where the boundary between them is decided.
 
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::audit::AuditMessageInsert;
     use crate::db::schema::audit_messages;
-    use crate::db::test_db;
     use diesel::RunQueryDsl;
 
     const HOUR: i64 = HOUR_MS;
@@ -383,7 +383,7 @@ mod ledger_tests {
     /// exactly when the spike is largest.
     #[test]
     fn the_baseline_stops_where_the_measured_window_begins() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         quiet_hours(&mut conn, 200);
         reply(&mut conn, "spike", NOW - HOUR / 2, 500_000);
@@ -408,7 +408,7 @@ mod ledger_tests {
     /// The same ledger without the spike is ordinary spending and says nothing.
     #[test]
     fn a_steady_ledger_raises_nothing() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         quiet_hours(&mut conn, 200);
         assert!(collect(&mut conn, &thresholds(), NOW).unwrap().is_none());
@@ -418,7 +418,7 @@ mod ledger_tests {
     /// baseline, only an install date.
     #[test]
     fn a_young_ledger_raises_nothing_however_large_the_hour() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         quiet_hours(&mut conn, 10);
         reply(&mut conn, "spike", NOW - HOUR / 2, 5_000_000);
@@ -429,7 +429,7 @@ mod ledger_tests {
     /// conversation, and a total with no breakdown is a number nobody can act on.
     #[test]
     fn the_alert_carries_a_breakdown_of_the_window() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         quiet_hours(&mut conn, 200);
         reply(&mut conn, "spike", NOW - HOUR / 2, 500_000);

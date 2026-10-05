@@ -454,9 +454,9 @@ pub fn list_recent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::ops::conversation::{create_conversation, delete_conversation};
     use crate::db::ops::message::append_message;
-    use crate::db::test_db;
 
     fn decimal(raw: &str) -> Decimal {
         raw.parse().unwrap()
@@ -501,7 +501,7 @@ mod tests {
     /// a test that recorded by hand would pass even if that wiring were removed.
     #[test]
     fn an_audit_record_survives_deleting_its_conversation() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         append_message(&mut conn, &user_row("m1", "c1"), None).unwrap();
@@ -530,7 +530,7 @@ mod tests {
         use crate::db::models::provider::ProviderInsert;
         use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         diesel::insert_into(crate::db::schema::providers::table)
@@ -625,7 +625,7 @@ mod tests {
         use crate::db::models::provider::ProviderInsert;
         use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         diesel::insert_into(crate::db::schema::providers::table)
@@ -699,7 +699,7 @@ mod tests {
     fn a_live_acp_reply_snapshots_external_billing() {
         use crate::db::models::conversation::ConversationInsert;
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         crate::db::ops::conversation::insert(
             &mut conn,
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn conversation_kind_only_fills_a_missing_turn_origin() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         assert_eq!(
             billing_mode_for(&mut conn, None, None, Some(crate::acp::AGENT_KIND)),
@@ -751,7 +751,7 @@ mod tests {
     fn acp_billing_migration_follows_origin_not_display_or_provider_shape() {
         use diesel::connection::SimpleConnection;
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         conn.batch_execute(
             "INSERT INTO audit_messages
@@ -809,7 +809,7 @@ mod tests {
         use crate::db::models::provider::ProviderInsert;
         use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         diesel::insert_into(crate::db::schema::providers::table)
@@ -911,7 +911,7 @@ mod tests {
     /// indistinguishable from a reply priced at nothing.
     #[test]
     fn a_message_with_no_model_is_recorded_with_no_price() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         append_message(&mut conn, &user_row("m1", "c1"), None).unwrap();
@@ -930,7 +930,7 @@ mod tests {
         use crate::db::models::provider::ProviderInsert;
         use crate::db::ops::model_config::{FlatModelConfig, seed_flat};
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         diesel::insert_into(crate::db::schema::providers::table)
@@ -1019,7 +1019,7 @@ mod tests {
     /// question is what happened, not what the transcript says now.
     #[test]
     fn a_second_record_for_one_message_is_kept_alongside_the_first() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
         // One from the append, one from the explicit call standing in for the

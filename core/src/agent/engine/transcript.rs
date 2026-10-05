@@ -430,8 +430,8 @@ pub async fn in_phase<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::models::turn::TurnStatus;
-    use crate::db::test_db;
     use crate::turn::TurnOrigin;
     use diesel::prelude::*;
 
@@ -461,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_iteration_opens_a_row_and_then_fills_it_in() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
 
         let id = begin_assistant(&pool, "c1", "t1", (None, None), "gpt-4.1-mini", None)
@@ -509,7 +509,7 @@ mod tests {
     /// of that answers nothing.
     #[tokio::test]
     async fn a_completed_reply_is_copied_into_the_audit_log() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
 
         // The pool hands out one connection, so every borrow here is scoped:
@@ -566,7 +566,7 @@ mod tests {
     /// with.
     #[tokio::test]
     async fn a_turn_that_cannot_open_a_row_stops() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         // No conversation, so the foreign key refuses it.
         assert!(
             begin_assistant(&pool, "nope", "t1", (None, None), "m", None)
@@ -592,7 +592,7 @@ mod tests {
     /// both call sites.
     #[tokio::test]
     async fn filling_a_row_in_propagates_a_database_write_error() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let id = begin_assistant(&pool, "c1", "t1", (None, None), "m", None)
             .await
@@ -649,7 +649,7 @@ mod tests {
     /// its own call just did.
     #[tokio::test]
     async fn a_tool_result_that_cannot_be_written_does_not_stop_the_turn() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         let assistant = begin_assistant(&pool, "c1", "t1", (None, None), "m", None)
             .await
@@ -669,7 +669,7 @@ mod tests {
     /// tick with the refusal text displayed as the tool's output.
     #[tokio::test]
     async fn a_tool_row_records_how_the_call_went() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
 
         for (call, outcome) in [("a", "success"), ("b", "denied"), ("c", "error")] {
@@ -693,7 +693,7 @@ mod tests {
     /// dies is where it died.
     #[tokio::test]
     async fn the_phase_is_recorded_while_the_work_runs_and_given_back_after() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
 
         let seen = in_phase(&pool, "t1", TurnPhase::RunningTool, Some("edit_file"), async {
@@ -713,7 +713,7 @@ mod tests {
     /// sit in for as long as the user takes to answer.
     #[tokio::test]
     async fn the_same_bracket_covers_waiting_on_a_person() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
 
         let seen = in_phase(&pool, "t1", TurnPhase::AwaitingApproval, Some("run_command"), async {
@@ -728,7 +728,7 @@ mod tests {
     /// it cannot rewrite how it finished.
     #[tokio::test]
     async fn a_bracket_on_a_finished_turn_changes_nothing() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&pool);
         {
             let mut conn = pool.get().unwrap();

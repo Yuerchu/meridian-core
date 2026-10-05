@@ -695,7 +695,7 @@ mod tests {
     /// 而那个目录名之后没有人解析得出来——恢复器会把它当野文件扫掉。
     #[test]
     fn the_storage_key_is_created_once_and_then_read() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let first = storage_key(&pool).unwrap();
         assert_eq!(first.len(), 32);
         assert_eq!(storage_key(&pool).unwrap(), first);

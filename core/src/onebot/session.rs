@@ -253,7 +253,7 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
 
     /// A QQ project is an ordinary project, and the user can make a
     /// conversation in it from the desktop and run a turn there. `/new` used to
@@ -262,7 +262,7 @@ mod tests {
     /// have, since the lease it takes names one conversation.
     #[test]
     fn a_reset_archives_only_the_conversation_it_was_given() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut sessions = SessionManager::new(pool.clone());
         let key = SessionKey::group(1);
         let (project_id, current) = sessions

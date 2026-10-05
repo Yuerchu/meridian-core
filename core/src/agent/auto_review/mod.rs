@@ -772,7 +772,7 @@ impl AutoReviewed<'_> {
 mod tests {
     use super::*;
     use crate::agent::modes::{ENTER_PLAN_TOOL, EXIT_PLAN_TOOL};
-    use crate::db::test_db;
+    use crate::db::diesel_test_db;
     use diesel::RunQueryDsl;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn absent_auto_review_preferences_keep_the_existing_defaults() {
-        let settings = Settings::load(&test_db()).unwrap();
+        let settings = Settings::load(&diesel_test_db()).unwrap();
 
         assert!(!settings.enabled);
         assert!(settings.escalate);
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn malformed_auto_review_boole_are_not_defaulted() {
         for (key, value) in [("autoreview.enabled", "1"), ("autoreview.escalate", "FALSE")] {
-            let pool = test_db();
+            let pool = diesel_test_db();
             set_preference(&pool, key, value);
             let error = Settings::load(&pool).expect_err("malformed stored boolean must fail settings loading");
             assert!(error.contains(key), "{key}: {error}");
@@ -806,13 +806,13 @@ mod tests {
     #[test]
     fn malformed_admin_roster_is_not_an_empty_roster() {
         for value in ["not json", r#"{"admin": 1}"#, r#"[1,"2"]"#] {
-            let pool = test_db();
+            let pool = diesel_test_db();
             set_preference(&pool, "onebot.admin_users", value);
             let error = admin_roster(&pool).expect_err("malformed admin roster must fail");
             assert!(error.contains("onebot.admin_users"), "{value}: {error}");
         }
 
-        let pool = test_db();
+        let pool = diesel_test_db();
         assert!(admin_roster(&pool).unwrap().is_empty());
         set_preference(&pool, "onebot.admin_users", "[1,2]");
         assert_eq!(admin_roster(&pool).unwrap(), vec![1, 2]);
@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn auto_review_preference_read_errors_are_not_defaulted() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         diesel::sql_query("DROP TABLE preferences").execute(&mut conn).unwrap();
         drop(conn);

@@ -151,7 +151,7 @@ mod pool_tests {
     /// which is what "database is locked" in the log was.
     #[test]
     fn test_pooled_connections_wait_for_locks() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
         let rows: Vec<BusyTimeout> = diesel::sql_query("PRAGMA busy_timeout").load(&mut conn).unwrap();
         assert_eq!(rows[0].timeout, BUSY_TIMEOUT_MS as i32);
@@ -247,7 +247,7 @@ mod migration_tests {
 
     /// Bring a database up to migration 18 only, so migration 19 can be tested
     /// against realistic pre-existing rows rather than against an empty schema.
-    /// Running the whole migration set (as `test_db` does) would never exercise
+    /// Running the whole migration set (as `diesel_test_db` does) would never exercise
     /// the data-mapping half of the migration.
     fn conn_at_18() -> SqliteConnection {
         conn_before("00000000000019")
@@ -1222,7 +1222,7 @@ mod migration_tests {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn test_db() -> DbPool {
+pub fn diesel_test_db() -> DbPool {
     let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
     let pool = Pool::builder()
         .max_size(1)

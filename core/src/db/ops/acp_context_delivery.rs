@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn receipt_is_idempotent_and_cascades_with_the_item() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed(&mut conn);
         let ids = vec!["i1".to_string()];

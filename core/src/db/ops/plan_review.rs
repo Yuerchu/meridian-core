@@ -2204,7 +2204,7 @@ mod tests {
 
     #[test]
     fn append_uses_generation_and_hash_cas() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# First\n");
 
@@ -2232,7 +2232,7 @@ mod tests {
 
     #[test]
     fn submit_and_waiting_review_commit_together_and_survive_reconcile() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -2255,7 +2255,7 @@ mod tests {
 
     #[test]
     fn approve_accepts_only_a_pristine_draft() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -2386,7 +2386,7 @@ mod tests {
 
     #[test]
     fn incompatible_rich_schema_can_fall_back_to_source_once_without_rebasing() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -2511,7 +2511,7 @@ mod tests {
 
     #[test]
     fn continuation_delivery_holds_the_conversation_barrier_until_acknowledged() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -2560,7 +2560,7 @@ mod tests {
 
     #[test]
     fn startup_reconciliation_versions_each_dispatched_delivery_as_in_doubt() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -2598,7 +2598,7 @@ mod tests {
 
     #[test]
     fn startup_acknowledges_a_native_delivery_whose_persisted_continuation_turn_finished() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -2657,7 +2657,7 @@ mod tests {
 
     #[test]
     fn an_explicit_native_retry_persists_its_new_continuation_turn_identity() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -2690,7 +2690,7 @@ mod tests {
 
     #[test]
     fn native_runtime_selection_is_strict_and_survives_a_fresh_database_read() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let review_id = {
             let mut conn = pool.get().unwrap();
             let first = append_first(&mut conn, "c1", "# Plan\n");
@@ -2752,7 +2752,7 @@ mod tests {
 
     #[test]
     fn runtime_mutation_guards_ignore_settled_historical_reviews() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# First plan\n");
         mark_applied(&mut conn, &first);
@@ -2866,7 +2866,7 @@ mod tests {
 
     #[test]
     fn a_change_request_requires_a_new_linked_update_before_resubmission() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -3033,7 +3033,7 @@ mod tests {
 
     #[test]
     fn request_changes_is_idempotent_and_suggestion_does_not_advance_head() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -3109,7 +3109,7 @@ mod tests {
 
     #[test]
     fn rich_suggestion_patch_uses_the_exact_submitted_revision_as_its_base() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan  \n");
         mark_applied(&mut conn, &first);
@@ -3163,7 +3163,7 @@ mod tests {
 
     #[test]
     fn draft_save_rejects_blank_non_deleted_comments() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);
@@ -3204,7 +3204,7 @@ mod tests {
 
     #[test]
     fn legacy_backfill_is_idempotent_hashes_content_and_never_creates_a_hidden_barrier() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         seed_conversation(&mut conn, "c1");
         let artifact = crate::db::ops::plan::record_plan(&mut conn, "c1", "# Legacy\n", 2).unwrap();
@@ -3249,7 +3249,7 @@ mod tests {
 
     #[test]
     fn completing_a_conversation_marks_the_new_document_done() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# Plan\n");
         mark_applied(&mut conn, &first);

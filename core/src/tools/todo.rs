@@ -276,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn writes_the_checklist_and_reports_the_current_step() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_conversation(&pool, "c1");
         let ctx = ctx(pool.clone(), "c1");
 
@@ -301,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_two_steps_in_progress() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_conversation(&pool, "c1");
         let ctx = ctx(pool.clone(), "c1");
 
@@ -328,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_blank_and_unknown_fields() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_conversation(&pool, "c1");
         let ctx = ctx(pool.clone(), "c1");
 
@@ -355,7 +355,7 @@ mod tests {
     /// stays in the system prompt for the rest of the conversation.
     #[tokio::test]
     async fn finishing_the_checklist_retires_the_approved_plan() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_conversation(&pool, "c1");
         let ctx = ctx(pool.clone(), "c1");
         {
@@ -388,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_completion_when_every_step_is_done() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_conversation(&pool, "c1");
         let ctx = ctx(pool.clone(), "c1");
 
@@ -408,7 +408,7 @@ mod tests {
     /// path the chat command takes: call the tool, then read the block back.
     #[tokio::test]
     async fn the_prompt_block_follows_the_tool_across_calls() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         seed_conversation(&pool, "c1");
         let ctx = ctx(pool.clone(), "c1");
 
@@ -466,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_conversation_it_says_so_instead_of_panicking() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         let mut ctx = ctx(pool, "c1");
         ctx.conversation_id = None;
 

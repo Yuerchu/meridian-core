@@ -248,8 +248,8 @@ fn take_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::diesel_test_db;
     use crate::db::ops::queue::{enqueue, list};
-    use crate::db::test_db;
 
     fn conversation(conn: &mut SqliteConnection, id: &str) {
         crate::db::ops::conversation::create_conversation(conn, id, Some("q"), None, None, 0).unwrap();
@@ -282,7 +282,7 @@ mod tests {
     /// screen either, since the transcript is only re-read when the turn ends.
     #[tokio::test]
     async fn taking_an_interjection_tells_the_window_and_an_empty_round_does_not() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             conversation(&mut conn, "c1");
@@ -320,7 +320,7 @@ mod tests {
     /// and a follow-up behind them stays where it is.
     #[tokio::test]
     async fn interjections_arrive_written_and_a_follow_up_waits() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             conversation(&mut conn, "c1");
@@ -362,7 +362,7 @@ mod tests {
     /// spent in the transaction that wrote its row.
     #[tokio::test]
     async fn a_second_drain_in_the_same_turn_finds_nothing() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         {
             let mut conn = pool.get().unwrap();
             conversation(&mut conn, "c1");
@@ -385,7 +385,7 @@ mod tests {
     /// happens between every round of every desktop turn.
     #[tokio::test]
     async fn an_empty_queue_is_silent() {
-        let pool = test_db();
+        let pool = diesel_test_db();
         conversation(&mut pool.get().unwrap(), "c1");
         let port = Interjections::new(pool, "c1".into(), "t1".into());
         assert!(port.drain().await.is_empty());

@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn stored_log_level_is_strict_and_errors_are_not_defaulted() {
-        let pool = crate::db::test_db();
+        let pool = crate::db::diesel_test_db();
         assert_eq!(load_saved_level(&pool).unwrap(), default_level());
 
         for raw in ["WARN", " info ", "trace", "future"] {
