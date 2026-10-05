@@ -1179,11 +1179,12 @@ fn format_history(messages: &[serde_json::Value]) -> String {
         if let Some(seq) = msg.get("message_seq").and_then(|v| v.as_i64()).filter(|s| *s > 0) {
             min_seq = Some(min_seq.map_or(seq, |m: i64| m.min(seq)));
         }
+        // The same format the `<sent_at>` marker uses on live messages, so the
+        // model reads one notation for time wherever it meets it.
         let time = msg
             .get("time")
             .and_then(|v| v.as_i64())
-            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-            .map(|dt| dt.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+            .and_then(|ts| crate::provider::format_sent_at(ts.saturating_mul(1000)).ok())
             .unwrap_or_default();
         let sender = msg
             .get("sender")
@@ -1501,6 +1502,15 @@ mod tests {
         assert!(
             out.contains("message_seq=120"),
             "footer points at the oldest seq: {out}"
+        );
+        // Same clock format as the `<sent_at>` marker on live messages, so the
+        // model does not meet two notations for time in one conversation.
+        assert!(
+            out.starts_with(&format!(
+                "[{}] 甲: hello",
+                crate::provider::format_sent_at(1_700_000_000_000).unwrap()
+            )),
+            "{out}"
         );
     }
 

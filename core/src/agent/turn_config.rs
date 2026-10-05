@@ -6,6 +6,10 @@
 //! assistant configured with a preset silently got the wrong tools, and the
 //! estimator left the checklist block out of its count. Resolving it once, here,
 //! is what stops modes from becoming a fourth thing to keep in sync.
+//!
+//! The checklist has since left the prompt altogether: it is a frozen context
+//! row (`agent::todo_context`), so the loops and the estimator agree on it by
+//! construction rather than by sharing this function.
 
 use std::collections::HashSet;
 
@@ -184,27 +188,24 @@ pub fn resolve(
     for block in &context_blocks {
         prompt.push_str(block);
     }
-    // State blocks last, and re-derived from the database rather than read back
-    // out of the transcript, which is what carries them across compaction.
-    // Anything appended after them would be evicted from the provider's prompt
-    // cache every time they change.
+    // The one state block, last, and re-derived from the database rather than
+    // read back out of the transcript, which is what carries it across
+    // compaction. Anything appended after it would be evicted from the
+    // provider's prompt cache every time it changes — which for an approved plan
+    // is once per implementation, so it can afford to be here. The checklist,
+    // which changes several times a turn, cannot, and is not: see the note at
+    // the end of this function.
     //
-    // The same reasoning orders these two against each other: an approved plan
-    // does not change for the whole of an implementation, while the checklist
-    // changes several times per turn. Plan first keeps it inside the cached
-    // prefix instead of behind every checkbox tick.
-    //
-    // Both are per-conversation and deliberately do not follow branch switches:
-    // paging back to an earlier answer still shows the plan and checklist as
-    // they stand now. They describe the work in progress rather than the
+    // The plan is per-conversation and deliberately does not follow branch
+    // switches: paging back to an earlier answer still shows the plan as it
+    // stands now. It describes the work in progress rather than the
     // transcript, and the rest of that work — files edited, commands run,
     // memories written — cannot be rewound by switching branches either. Making
-    // these two alone branch-aware would imply the whole world rewinds, which
-    // is a harder model to explain than "branches switch the transcript only".
+    // it alone branch-aware would imply the whole world rewinds, which is a
+    // harder model to explain than "branches switch the transcript only".
     // A read failure drops the block from the prompt, and the model then ignores
-    // a plan it agreed to or forgets the checklist — read as "it went off the
-    // rails again" rather than as an error. `Ok(None)` is the ordinary case and
-    // stays quiet.
+    // a plan it agreed to — read as "it went off the rails again" rather than as
+    // an error. `Ok(None)` is the ordinary case and stays quiet.
     let has_versioned_plan =
         match crate::db::ops::plan_review::get_approved_revision_for_conversation(conn, &conversation_id) {
             Ok(Some(revision)) => {
@@ -236,18 +237,10 @@ pub fn resolve(
             ),
         }
     }
-    match crate::db::ops::todo::get_active_view(conn, &conversation_id) {
-        Ok(Some(view)) => {
-            if let Some(block) = crate::db::ops::todo::format_todo_block(&view) {
-                prompt.push_str(&block);
-            }
-        }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(
-            conversation_id = %conversation_id, block = "todo", error = %e,
-            "could not read the todo list; it will be missing from this turn"
-        ),
-    }
+    // The checklist is not here. It changes several times a turn, and anything
+    // in the system prompt is the front of the cached prefix, so it is frozen
+    // into the history as a context row instead — see `agent::todo_context`.
+    // The approved plan is the one state block left; it could go the same way.
 
     let offered = tool_defs.iter().map(|d| d.name.clone()).collect();
     Ok(TurnConfig {
@@ -670,10 +663,15 @@ mod tests {
         let persona = cfg.system_prompt.find("You are a test.").unwrap();
         let instructions = cfg.system_prompt.find("# Project instructions").unwrap();
         let plan_at = cfg.system_prompt.find("<approved_plan>").unwrap();
-        let todo = cfg.system_prompt.find("<todo_list>").unwrap();
-        // Plan before checklist: the checklist churns several times a turn and
-        // would otherwise push the stable plan out of the cached prefix.
-        assert!(persona < instructions && instructions < plan_at && plan_at < todo);
+        assert!(persona < instructions && instructions < plan_at);
+        // The checklist churns several times a turn, and the prompt is the front
+        // of the cached prefix. It is a frozen context row now (`todo_context`),
+        // and a list seeded above must not find its way back in here.
+        assert!(
+            !cfg.system_prompt.contains("<todo_list>\nTitle:"),
+            "{}",
+            cfg.system_prompt
+        );
     }
 
     #[test]
@@ -742,6 +740,9 @@ mod tests {
     fn the_estimator_and_the_chat_loop_see_the_same_prompt() {
         // Previously the estimator built its own prompt and left the checklist
         // out, so its token count ran low exactly when the context was tightest.
+        // The checklist is a frozen row now and both sides plan it through
+        // `todo_context`; what this still pins is that two resolutions of the
+        // same state are the same bytes, and that neither smuggles the list back.
         let (pool, reg) = setup();
         let mut conn = pool.get().unwrap();
         crate::db::ops::todo::replace_active_list(
@@ -760,7 +761,7 @@ mod tests {
         let a = resolve_ok(&mut conn, &reg, input(switchable(None), None));
         let b = resolve_ok(&mut conn, &reg, input(switchable(None), None));
         assert_eq!(a.system_prompt, b.system_prompt);
-        assert!(a.system_prompt.contains("<todo_list>"));
+        assert!(!a.system_prompt.contains("<todo_list>\nTitle:"));
     }
 
     #[test]

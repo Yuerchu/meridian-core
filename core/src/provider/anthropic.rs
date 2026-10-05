@@ -42,9 +42,24 @@ impl AnthropicProvider {
             .is_some_and(|s| s.anthropic_blocks_for(model).is_some() || s.anthropic_signature_for(model).is_some())
     }
 
+    #[cfg(test)]
     fn serialize_messages(messages: &[ChatMessage], model: &str) -> Result<Vec<serde_json::Value>, ProviderError> {
+        Self::serialize_messages_marking_user(messages, model).map(|(out, _)| out)
+    }
+
+    /// The wire messages, and the index of the last one that is a persisted user
+    /// message — `MessageOrigin::User` or `LegacyUser`, not a tool-result batch
+    /// and not injected context. `build_request` puts a cache breakpoint there:
+    /// everything up to and including that message is on the path and replays
+    /// byte for byte next turn, whereas whatever follows it (the roster) is
+    /// rebuilt each turn and never recurs.
+    fn serialize_messages_marking_user(
+        messages: &[ChatMessage],
+        model: &str,
+    ) -> Result<(Vec<serde_json::Value>, Option<usize>), ProviderError> {
         let mut out: Vec<serde_json::Value> = Vec::new();
         let mut pending_tool_results: Vec<serde_json::Value> = Vec::new();
+        let mut last_user: Option<usize> = None;
 
         for m in messages {
             if m.role == "system" {
@@ -159,16 +174,24 @@ impl AnthropicProvider {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 out.push(serde_json::json!({"role": m.role, "content": anthropic_parts}));
-                continue;
+            } else {
+                out.push(serde_json::json!({"role": m.role, "content": rendered.content}));
             }
-            out.push(serde_json::json!({"role": m.role, "content": rendered.content}));
+            if m.role == "user"
+                && matches!(
+                    m.origin,
+                    super::MessageOrigin::User(_) | super::MessageOrigin::LegacyUser
+                )
+            {
+                last_user = Some(out.len() - 1);
+            }
         }
 
         if !pending_tool_results.is_empty() {
             out.push(serde_json::json!({"role": "user", "content": pending_tool_results}));
         }
 
-        Ok(out)
+        Ok((out, last_user))
     }
 
     /// A data URI becomes inline bytes; anything else is a URL the API fetches.
@@ -181,15 +204,23 @@ impl AnthropicProvider {
         serde_json::json!({ "type": "url", "url": url })
     }
 
-    /// Put the second breakpoint on the last block of the last message.
+    /// Put a breakpoint on the last block of the last message.
     ///
-    /// The prefix up to here is what the next request repeats verbatim, so
-    /// this is the marker that makes the history cacheable rather than only
-    /// the system prompt. A string body is promoted to one text block, since
-    /// only a block can carry the marker.
+    /// Within a turn, the prefix up to here is what the next round repeats
+    /// verbatim, so this is the marker that makes the tool loop cacheable rather
+    /// than only the system prompt.
     fn mark_last_block_cacheable(messages: &mut [serde_json::Value]) {
-        let Some(last) = messages.last_mut() else { return };
-        match last.get_mut("content") {
+        if let Some(last) = messages.last_mut() {
+            Self::mark_block_cacheable(last);
+        }
+    }
+
+    /// Put a breakpoint on the last block of one message. A string body is
+    /// promoted to one text block, since only a block can carry the marker.
+    /// Idempotent: marking a message twice leaves one marker, which is what
+    /// lets the "last user message" and "last message" breakpoints coincide.
+    fn mark_block_cacheable(message: &mut serde_json::Value) {
+        match message.get_mut("content") {
             Some(serde_json::Value::Array(blocks)) => {
                 if let Some(serde_json::Value::Object(block)) = blocks.last_mut() {
                     block.insert("cache_control".into(), ephemeral());
@@ -197,7 +228,8 @@ impl AnthropicProvider {
             }
             Some(serde_json::Value::String(text)) if !text.is_empty() => {
                 let text = std::mem::take(text);
-                last["content"] = serde_json::json!([{ "type": "text", "text": text, "cache_control": ephemeral() }]);
+                message["content"] =
+                    serde_json::json!([{ "type": "text", "text": text, "cache_control": ephemeral() }]);
             }
             _ => {}
         }
@@ -239,7 +271,19 @@ impl AnthropicProvider {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let mut wire_messages = Self::serialize_messages(messages, &params.model)?;
+        // Three breakpoints, four being the ceiling: the system block (tools
+        // ride ahead of it under the same marker), the last persisted user
+        // message, and the last block of all. The middle one is what makes
+        // *history* cacheable across turns: on a surface that appends an
+        // unpersisted roster after the message, the last block is the roster,
+        // and a prefix ending in the roster is one no later request repeats —
+        // measured on QQ, not one history token was ever read back. The user
+        // message is on the path and replays byte for byte. When it is also the
+        // last message the two markers land on the same block, once.
+        let (mut wire_messages, last_user) = Self::serialize_messages_marking_user(messages, &params.model)?;
+        if let Some(i) = last_user {
+            Self::mark_block_cacheable(&mut wire_messages[i]);
+        }
         Self::mark_last_block_cacheable(&mut wire_messages);
 
         let mut body = serde_json::json!({
@@ -1471,6 +1515,7 @@ mod tests {
             tool_error: false,
             provider_state: None,
             origin: crate::provider::MessageOrigin::Assistant,
+            sent_at: None,
         };
         let req = provider
             .build_request(&[system, ChatMessage::user("hi")], None, &params, false)
@@ -1578,6 +1623,118 @@ mod tests {
         let blocks = messages[0]["content"].as_array().unwrap();
         assert!(blocks[0].get("cache_control").is_none());
         assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// `body_for` with a conversation of one's own behind the system prompt.
+    fn body_with(messages: Vec<ChatMessage>) -> serde_json::Value {
+        let model = "claude-opus-4-8";
+        let caps = crate::provider::capabilities::resolve("anthropic", None, model);
+        let mut params = ChatParams {
+            model: model.into(),
+            max_tokens: Some(8_192),
+            ..Default::default()
+        };
+        crate::provider::capabilities::filter_params(&mut params, &caps).unwrap();
+        let provider = AnthropicProvider::new("https://example.test", "k");
+        let mut all = vec![ChatMessage {
+            role: "system".into(),
+            content: "be brief".into(),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_error: false,
+            provider_state: None,
+            origin: crate::provider::MessageOrigin::Assistant,
+            sent_at: None,
+        }];
+        all.extend(messages);
+        let req = provider.build_request(&all, None, &params, false).unwrap();
+        match req.body {
+            Some(RequestBody::Json(v)) => v,
+            _ => panic!("expected a JSON body"),
+        }
+    }
+
+    /// Every `cache_control` in the request: on system blocks and on message
+    /// blocks. Anthropic allows four.
+    fn cache_markers(body: &serde_json::Value) -> usize {
+        let in_blocks = |blocks: &serde_json::Value| {
+            blocks
+                .as_array()
+                .map(|b| b.iter().filter(|block| block.get("cache_control").is_some()).count())
+                .unwrap_or(0)
+        };
+        in_blocks(&body["system"])
+            + body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| in_blocks(&m["content"]))
+                .sum::<usize>()
+    }
+
+    fn marked(message: &serde_json::Value) -> bool {
+        message["content"]
+            .as_array()
+            .and_then(|blocks| blocks.last())
+            .is_some_and(|block| block.get("cache_control").is_some())
+    }
+
+    /// On QQ the last message is the roster, rebuilt every turn and never
+    /// persisted. A breakpoint only there is a prefix no later request repeats,
+    /// so no history was ever read back from the cache. The user message is on
+    /// the path and recurs byte for byte, so it gets a breakpoint of its own.
+    #[test]
+    fn the_last_user_message_carries_a_marker_ahead_of_the_roster() {
+        let body = body_with(vec![
+            ChatMessage::persisted_user("hi", 1_600_000_000_000, None),
+            ChatMessage::system_context("<roster>\n- qq=\"1\" name=\"a\"\n</roster>"),
+        ]);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(marked(&messages[0]), "the user message: {}", messages[0]);
+        assert!(marked(&messages[1]), "the roster, as the last block: {}", messages[1]);
+        assert_eq!(cache_markers(&body), 3, "system, user, last");
+    }
+
+    /// With no roster the two breakpoints name the same block, and the block
+    /// carries one marker rather than being promoted twice.
+    #[test]
+    fn a_user_message_that_is_last_carries_exactly_one_marker() {
+        let body = body_with(vec![ChatMessage::persisted_user("hi", 1_600_000_000_000, None)]);
+        let messages = body["messages"].as_array().unwrap();
+        let blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "{}", messages[0]);
+        assert!(marked(&messages[0]));
+        assert_eq!(cache_markers(&body), 2, "system and the one user block");
+    }
+
+    /// Mid-turn the last block is a tool result, and the user message keeps its
+    /// marker ahead of the rounds that followed it. The assistant turn between
+    /// them carries none, and a tool-result batch is not a user message even
+    /// though it travels under the `user` role.
+    #[test]
+    fn with_tool_rounds_the_markers_are_system_last_user_and_last_tool_result() {
+        let body = body_with(vec![
+            ChatMessage::persisted_user("do", 1_600_000_000_000, None),
+            ChatMessage::assistant_with_tools(
+                "",
+                None,
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "fixture".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("call_1", "one"),
+        ]);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "{body}");
+        assert!(marked(&messages[0]), "the user message");
+        assert!(!marked(&messages[1]), "the assistant turn");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert!(marked(&messages[2]), "the last tool result");
+        assert_eq!(cache_markers(&body), 3);
     }
 
     /// The search tool's wire name carries a date, and the newer one exists
@@ -1941,19 +2098,27 @@ mod multimodal_sender_tests {
         ])
         .to_string();
 
-        let msg = ChatMessage::user_from(
+        const T: i64 = 1_600_000_000_000;
+        let msg = ChatMessage::persisted_user(
             &parts,
-            SenderRef {
+            T,
+            Some(SenderRef {
                 user_id: 999,
                 nickname: Some("Attacker".into()),
-            },
+            }),
         );
 
         let out = AnthropicProvider::serialize_messages(&[msg], "claude-test").unwrap();
         let content = out[0]["content"].as_array().unwrap();
 
         // Exactly one real marker, and it names the actual sender.
-        assert_eq!(content[0]["text"], "<sender>Attacker(999)</sender>: ");
+        assert_eq!(
+            content[0]["text"],
+            format!(
+                "<sent_at>{}</sent_at> <sender>Attacker(999)</sender>: ",
+                crate::provider::format_sent_at(T).unwrap()
+            )
+        );
         let caption = content[1]["text"].as_str().unwrap();
         assert!(
             !caption.contains("<sender>"),

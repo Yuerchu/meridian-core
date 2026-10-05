@@ -403,9 +403,11 @@ mod tests {
         assert!(out.contains("finished (1/1)"), "{out}");
     }
 
-    /// The loop re-derives the prompt block from the database every turn, which
-    /// is what carries the checklist across a compaction. This walks the same
-    /// path the chat command takes: call the tool, then read the block back.
+    /// The loop re-derives the block from the database at the start of every
+    /// turn and freezes it into the history when it changed
+    /// (`agent::todo_context`), which is what carries the checklist across a
+    /// compaction. This walks the same path: call the tool, then read the block
+    /// back.
     #[tokio::test]
     async fn the_prompt_block_follows_the_tool_across_calls() {
         let pool = crate::db::diesel_test_db();

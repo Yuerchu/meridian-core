@@ -88,6 +88,8 @@ fn checklist_section() -> String {
         "- Send the entire list on every call — steps you leave out are deleted.",
         "- Do not recite the checklist back to the user; they can already see it. Say what \
          changed and carry on.",
+        "- The checklist's current state is the most recent `<todo_list>` block in the \
+         conversation; earlier ones are history.",
     ]
     .join("\n")
 }
@@ -137,6 +139,15 @@ mod tests {
     fn editing_tools_alone_leave_out_the_checklist() {
         let p = base_prompt(&[def("edit_file")]).unwrap();
         assert!(!p.contains("# Task checklist"));
+    }
+
+    /// The checklist is frozen into the history when it changes, so a long
+    /// conversation shows the model several `<todo_list>` blocks. It has to be
+    /// told which one is current, or it may act on a step it already finished.
+    #[test]
+    fn the_checklist_section_points_at_the_latest_block() {
+        let p = base_prompt(&[def("update_todos")]).unwrap();
+        assert!(p.contains("most recent `<todo_list>` block"), "{p}");
     }
 
     #[test]

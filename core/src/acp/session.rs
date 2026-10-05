@@ -937,6 +937,7 @@ impl Shared {
                 &item.text,
                 None,
                 Some(&last),
+                crate::util::now_ms(),
             )
             .await
             {

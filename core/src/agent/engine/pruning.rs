@@ -115,6 +115,7 @@ mod tests {
             tool_error: false,
             provider_state: None,
             origin: Default::default(),
+            sent_at: None,
         }
     }
 

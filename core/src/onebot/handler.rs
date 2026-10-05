@@ -561,6 +561,37 @@ pub(super) async fn run_agent_turn(
         }
     };
 
+    // Refresh this person's interaction clock. Its own short transaction: the
+    // extraction pass that may write memories about them happens later, well
+    // after this one has to be durable.
+    //
+    // Before the turn is claimed, not after: a message that gets *queued* into
+    // a running turn returns from `try_begin_turn` without reaching anything
+    // below it, and the round that later drains it attributes speakers from the
+    // subject table. Touched afterwards, that speaker would not be in the table
+    // yet, and their first message would render with a bare number.
+    {
+        let pool = state.services.db.clone();
+        let scope_id = sender.scope_id();
+        let display = sender.nickname.clone();
+        let protected = sender.is_admin;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(mut conn) = pool.get() {
+                let _ = crate::db::ops::memory::touch_subject(
+                    &mut conn,
+                    &scope_id,
+                    display.as_deref(),
+                    protected,
+                    crate::util::now_ms(),
+                );
+            }
+        })
+        .await;
+    }
+
+    // The one instant this message is known by: the inbox item's `created_at`,
+    // the row's `created_at`, and the `<sent_at>` the model reads.
+    let received_at = crate::util::now_ms();
     let turn = match super::try_begin_turn(
         &state.session_states,
         &state.services.turns,
@@ -569,7 +600,7 @@ pub(super) async fn run_agent_turn(
         super::InboxItem {
             text: user_content.clone(),
             kind: super::InboxKind::UserMessage,
-            created_at: crate::util::now_ms(),
+            created_at: received_at,
             sender: Some(sender.clone()),
         },
     ) {
@@ -589,28 +620,6 @@ pub(super) async fn run_agent_turn(
             return build_session_reply(session_key, "这个对话正在电脑端处理,请等它结束后再发。", reply_to);
         }
     };
-
-    // Refresh this person's interaction clock. Its own short transaction: the
-    // extraction pass that may write memories about them happens later, well
-    // after this one has to be durable.
-    {
-        let pool = state.services.db.clone();
-        let scope_id = sender.scope_id();
-        let display = sender.nickname.clone();
-        let protected = sender.is_admin;
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(mut conn) = pool.get() {
-                let _ = crate::db::ops::memory::touch_subject(
-                    &mut conn,
-                    &scope_id,
-                    display.as_deref(),
-                    protected,
-                    crate::util::now_ms(),
-                );
-            }
-        })
-        .await;
-    }
 
     // Everything the turn owes back, in one value that is dropped on every
     // exit — including the ones with no code after them. This task is detached:
@@ -657,7 +666,11 @@ pub(super) async fn run_agent_turn(
     let interim_text_fn = make_interim_text_fn(state, session_key);
     let inbox = super::InboxHandle::new(state.session_states.clone(), session_key.clone());
 
-    let mut incoming = vec![super::IncomingMessage::new(user_content, Some(sender.clone()))];
+    let mut incoming = vec![super::IncomingMessage::new(
+        user_content,
+        Some(sender.clone()),
+        received_at,
+    )];
     let mut reply_anchor = reply_to;
 
     loop {
@@ -2240,8 +2253,8 @@ mod tests {
         };
         let member = sender(2, "群友");
 
-        let msg = |s: SenderContext| IncomingMessage::new("...", Some(s));
-        let notice = IncomingMessage::new("有人退群了", None);
+        let msg = |s: SenderContext| IncomingMessage::new("...", Some(s), 0);
+        let notice = IncomingMessage::new("有人退群了", None, 0);
 
         assert!(super::round_authority(true, &[msg(admin.clone())]));
         assert!(
@@ -2265,7 +2278,10 @@ mod tests {
     fn queued_messages_keep_their_own_speakers() {
         let items = [
             item("你好", Some(sender(1, "张三"))),
-            item("我也要", Some(sender(2, "李四"))),
+            InboxItem {
+                created_at: 7,
+                ..item("我也要", Some(sender(2, "李四")))
+            },
             item("[系统提示] 2 加入了群聊", None),
         ];
 
@@ -2275,6 +2291,9 @@ mod tests {
         assert_eq!(carried[0].sender.as_ref().map(|s| s.user_id), Some(1));
         assert_eq!(carried[1].sender.as_ref().map(|s| s.user_id), Some(2));
         assert_eq!(carried[2].sender, None, "a notice is nobody's utterance");
+        // And its own arrival time: a message that waited through the previous
+        // round is stamped with when it came in, not when the round began.
+        assert_eq!(carried[1].received_at, 7);
         assert_eq!(carried[1].text, "我也要");
     }
 }

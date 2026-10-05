@@ -573,6 +573,7 @@ pub(crate) fn system(content: &str) -> ChatMessage {
         tool_error: false,
         provider_state: None,
         origin: crate::provider::MessageOrigin::Assistant,
+        sent_at: None,
     }
 }
 

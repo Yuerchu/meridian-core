@@ -75,8 +75,10 @@ conversation and as a bar above the composer naming the step running right now.
 
 A conversation accumulates several checklists, one per piece of work: changing
 the title retires the running one and opens another, and a checklist whose steps
-are all done is put away. Only the running checklist is injected into the
-request, which is how progress survives compaction.
+are all done is put away. The running checklist is frozen into the conversation
+as a context block whenever it has changed since the last one, and in full again
+after a compaction, which is how progress survives compaction; the most recent
+block is the current state.
 
 Checklists are written by the assistant, not the user — there is no way to tick
 a box by hand.

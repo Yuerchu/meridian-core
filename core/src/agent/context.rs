@@ -11,7 +11,7 @@ use super::tool_calls::parse_stored_tool_calls;
 /// Last known nickname per platform user id. Nicknames are not stored on the
 /// message row (they change), so multi-speaker surfaces pass a lookup built
 /// from the subject table.
-pub(crate) type SenderNames = HashMap<i64, String>;
+pub type SenderNames = HashMap<i64, String>;
 
 /// Single-speaker shorthand. Production callers all attribute senders now, so
 /// only tests still take this path.
@@ -68,6 +68,7 @@ pub fn build_messages_with_context_items(
             tool_error: false,
             provider_state: None,
             origin: provider::MessageOrigin::Assistant,
+            sent_at: None,
         });
     }
     if let Some(summary) = context.summary.as_ref() {
@@ -88,44 +89,86 @@ pub fn build_messages_with_context_items(
     // three token-estimation callers did not, so the estimate counted rows that
     // never went out.
     remove_orphan_tool_messages(&mut msgs);
-    attach_sender_note(&mut msgs);
+    attach_marker_note(&mut msgs);
     Ok(msgs)
 }
 
-/// Explain the `<sender>` marker once, in the system prompt, whenever anyone in
-/// this payload is attributed.
+/// Explain the `<sent_at>` and `<sender>` markers once, in the system prompt,
+/// whenever any message in this payload carries one.
 ///
-/// Lives here rather than in each adapter because the marker is no longer a
-/// fallback for formats lacking a `name` field — it is how every format carries
-/// a speaker — so the explanation is not a per-adapter concern either.
-fn attach_sender_note(msgs: &mut Vec<ChatMessage>) {
-    if !provider::needs_sender_note(msgs) {
+/// Lives here rather than in each adapter because the markers are not a
+/// fallback for formats lacking a `name` field — they are how every format
+/// carries a speaker and a send time — so the explanation is not a per-adapter
+/// concern either.
+fn attach_marker_note(msgs: &mut Vec<ChatMessage>) {
+    if !provider::needs_marker_note(msgs) {
         return;
     }
     if let Some(system) = msgs.first_mut().filter(|m| m.role == "system") {
         system.content.push_str("\n\n");
-        system.content.push_str(provider::SENDER_PREFIX_NOTE);
+        system.content.push_str(provider::MESSAGE_MARKER_NOTE);
         return;
     }
     msgs.insert(
         0,
         ChatMessage {
             role: "system".into(),
-            content: provider::SENDER_PREFIX_NOTE.into(),
+            content: provider::MESSAGE_MARKER_NOTE.into(),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             tool_error: false,
             provider_state: None,
             origin: provider::MessageOrigin::Assistant,
+            sent_at: None,
         },
     );
 }
 
-fn sender_ref(user_id: i64, names: &SenderNames) -> SenderRef {
+pub(crate) fn sender_ref(user_id: i64, names: &SenderNames) -> SenderRef {
     SenderRef {
         user_id,
         nickname: names.get(&user_id).cloned(),
+    }
+}
+
+/// Last known nickname per platform user, read off the subject table. Both the
+/// history replay and the live turn resolve a speaker through this one map, so
+/// the same person renders the same way on both sides of a turn boundary.
+pub fn load_sender_names(conn: &mut diesel::SqliteConnection) -> Result<SenderNames, String> {
+    let subjects = crate::db::ops::memory::list_subjects(conn).map_err(|e| e.to_string())?;
+    Ok(subjects
+        .into_iter()
+        .filter_map(|s| {
+            let uid = s.user_id()?;
+            Some((uid, s.display_name?))
+        })
+        .collect())
+}
+
+/// The payload message for something a person said, built the same way whether
+/// it is being sent for the first time or replayed from its row.
+///
+/// This is the one place a persisted user message becomes a `ChatMessage`. The
+/// live turn calls it with the instant it is about to write as `created_at`;
+/// `push_history_message` calls it with the instant the row carries. Both must
+/// produce identical bytes, because the first is what the provider cached and
+/// the second is what it is asked to match — so the two are not allowed to be
+/// two code paths.
+///
+/// Dictated messages carry a marker the voice_input prompt block explains.
+/// Applied to the payload only — the stored row and the UI keep the clean
+/// transcript.
+pub fn persisted_user_message(
+    content: &str,
+    source: Option<&str>,
+    sender: Option<SenderRef>,
+    created_at: i64,
+) -> ChatMessage {
+    if source == Some("voice") {
+        ChatMessage::persisted_user(&format!("[voice] {content}"), created_at, sender)
+    } else {
+        ChatMessage::persisted_user(content, created_at, sender)
     }
 }
 
@@ -139,20 +182,12 @@ fn push_history_message(
 
     let role = MessageRole::parse(&m.role).map_err(|error| format!("message {}: {error}", m.id))?;
     match role {
-        MessageRole::User => {
-            // Dictated messages carry a marker the voice_input prompt block
-            // explains. Applied to the payload only — the stored row and the
-            // UI keep the clean transcript.
-            let content = if m.source.as_deref() == Some("voice") {
-                std::borrow::Cow::Owned(format!("[voice] {}", m.content))
-            } else {
-                std::borrow::Cow::Borrowed(m.content.as_str())
-            };
-            match m.sender_id {
-                Some(uid) => msgs.push(ChatMessage::user_from(&content, sender_ref(uid, names))),
-                None => msgs.push(ChatMessage::user(&content)),
-            }
-        }
+        MessageRole::User => msgs.push(persisted_user_message(
+            &m.content,
+            m.source.as_deref(),
+            m.sender_id.map(|uid| sender_ref(uid, names)),
+            m.created_at,
+        )),
         MessageRole::Assistant => {
             let provider_state = m
                 .provider_state
@@ -198,6 +233,7 @@ fn push_history_message(
                     tool_error: false,
                     provider_state,
                     origin: provider::MessageOrigin::Assistant,
+                    sent_at: None,
                 });
             }
         }
@@ -682,6 +718,7 @@ mod tests {
             tool_error: false,
             provider_state: None,
             origin: provider::MessageOrigin::LegacyUser,
+            sent_at: None,
         }
     }
 
@@ -700,7 +737,14 @@ mod tests {
         let history = vec![msg("1", "user", "hi")];
         let msgs = build_messages("You are a helper", &ctx(&history), "new question").unwrap();
         assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[0].content, "You are a helper");
+        // A history row carries a send time, so the note explaining the marker
+        // rides along on the system prompt.
+        assert!(
+            msgs[0].content.starts_with("You are a helper\n\n"),
+            "{}",
+            msgs[0].content
+        );
+        assert!(msgs[0].content.ends_with(provider::MESSAGE_MARKER_NOTE));
         assert_eq!(msgs[1].role, "user");
         assert_eq!(msgs[1].content, "hi");
         assert_eq!(msgs[2].role, "user");
@@ -712,6 +756,43 @@ mod tests {
         let msgs = build_messages("", &ctx(&[]), "hello").unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
+    }
+
+    /// A user row carries its send time back out exactly as the live message
+    /// carried it in, and renders to the same bytes. This is the property the
+    /// `<sent_at>` marker rests on: the live message is what the provider
+    /// cached, and the replay is what it is asked to match.
+    #[test]
+    fn a_user_row_is_replayed_byte_for_byte() {
+        use provider::{SenderRendering, render_message};
+        const T: i64 = 1_600_000_000_000;
+        let names: SenderNames = [(7, "Seven".to_string())].into_iter().collect();
+
+        for (sender_id, source, text) in [
+            (None, None, "hello"),
+            (Some(7), None, "hello"),
+            (None, Some("voice"), "dictated"),
+        ] {
+            // What the turn that first sent it built.
+            let fresh = persisted_user_message(text, source, sender_id.map(|uid| sender_ref(uid, &names)), T);
+            // What the next turn reads back off the row.
+            let mut row = msg("r", "user", text);
+            row.created_at = T;
+            row.sender_id = sender_id;
+            row.source = source.map(str::to_owned);
+            let mut replayed = Vec::new();
+            push_history_message(&mut replayed, &row, &names, None).unwrap();
+
+            assert_eq!(replayed.len(), 1);
+            assert_eq!(replayed[0].sent_at, Some(T));
+            for rendering in [SenderRendering::NameField, SenderRendering::Prefix] {
+                assert_eq!(
+                    render_message(&replayed[0], rendering).unwrap().content,
+                    render_message(&fresh, rendering).unwrap().content,
+                    "{sender_id:?} {source:?}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -1150,6 +1231,7 @@ mod injected_context_tests {
             tool_error: false,
             provider_state: None,
             origin: MessageOrigin::Assistant,
+            sent_at: None,
         }];
         msgs.push(ChatMessage::system_context("<bot_memories>\n- x\n</bot_memories>"));
         msgs.extend(long_history(40));
@@ -1190,6 +1272,32 @@ mod injected_context_tests {
         assert!(matches!(replayed[0].origin, MessageOrigin::SystemContext));
 
         // And on the wire, which is where it actually matters.
+        for rendering in [provider::SenderRendering::NameField, provider::SenderRendering::Prefix] {
+            assert_eq!(
+                provider::render_message(&replayed[0], rendering).unwrap().content,
+                provider::render_message(&fresh, rendering).unwrap().content,
+            );
+        }
+    }
+
+    /// The checklist is frozen the same way, under its own `source`, and the
+    /// replay does not care which: every `context` row comes back as the bytes
+    /// it went in as.
+    #[test]
+    fn a_frozen_todo_row_is_replayed_byte_for_byte() {
+        let block = "<todo_list>\nTitle: Ship it\n1. [in_progress] step\n</todo_list>";
+        let fresh = ChatMessage::system_context(block);
+        let mut replayed = Vec::new();
+        push_history_message(
+            &mut replayed,
+            &frozen_row(block, "todo|list"),
+            &SenderNames::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(replayed.len(), 1);
+        assert!(matches!(replayed[0].origin, MessageOrigin::SystemContext));
         for rendering in [provider::SenderRendering::NameField, provider::SenderRendering::Prefix] {
             assert_eq!(
                 provider::render_message(&replayed[0], rendering).unwrap().content,
