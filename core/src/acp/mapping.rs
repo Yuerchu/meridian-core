@@ -189,7 +189,28 @@ pub fn notice_of(record: &SessionFailureRecord) -> Option<SessionNoticeRecord> {
 /// diff"). Read as a bare call, the approval card for an edit showed nothing
 /// of what it would change. The diff is said after the call, so it lands on the
 /// call it belongs to.
+///
+/// **And an update can carry the diff beside the finished arguments.** Without
+/// the AIR envelope, the frame that completes an Edit's `rawInput` — the first
+/// with `new_string` in it — is the one that brings the diff. Read as a diff
+/// alone, the arguments stored for the call stopped at the frame before, with
+/// `old_string` and no `new_string`. So that frame is a revision and then a
+/// diff, in that order.
 pub fn effects_of(update: SessionUpdate) -> Vec<Effect> {
+    let revised = match &update {
+        SessionUpdate::ToolCallUpdate(call)
+            if call.raw_input.is_some()
+                && !matches!(call.status.as_deref(), Some("completed" | "failed"))
+                && call.content.iter().any(|b| b.kind == "diff") =>
+        {
+            Some(Effect::ToolCallRevised {
+                call_id: call.tool_call_id.clone(),
+                tool_name: explicit_tool_name(call).unwrap_or_default().to_string(),
+                arguments: arguments_of(call),
+            })
+        }
+        _ => None,
+    };
     let (diffs, finished) = match &update {
         SessionUpdate::ToolCall(call) => {
             let diffs = diffs_of(call);
@@ -201,16 +222,25 @@ pub fn effects_of(update: SessionUpdate) -> Vec<Effect> {
         }
         _ => (None, None),
     };
-    let mut effects = vec![effect_of(update)];
+    let mut effects: Vec<Effect> = revised.into_iter().collect();
+    effects.push(effect_of(update));
     effects.extend(diffs);
     effects.extend(finished);
     effects
 }
 
 /// The result a call's status reports, if it reports one.
+///
+/// **A refusal is `failed` on the wire and `Denied` here.** The adapter sends
+/// a call the user or a permission rule refused exactly as it sends one that
+/// ran and broke, and says which in `_meta.claudeCode.nonExecutionKind`. Read
+/// as an error, a "no" the user clicked a moment ago was drawn as the tool
+/// failing. The other kinds (`interrupted`, `cancelled`, whatever ships next)
+/// stay errors: the tool did not run, and nobody declined it.
 fn result_of(call: &ToolCall) -> Option<Effect> {
     let outcome = match call.status.as_deref() {
         Some("completed") => ToolOutcome::Success,
+        Some("failed") if refused(call) => ToolOutcome::Denied,
         Some("failed") => ToolOutcome::Error,
         _ => return None,
     };
@@ -402,7 +432,27 @@ pub fn diffs_of(call: &ToolCall) -> Vec<ToolCallDiff> {
         .collect()
 }
 
+fn refused(call: &ToolCall) -> bool {
+    let kind = call
+        .meta
+        .as_ref()
+        .and_then(|m| m.claude_code.as_ref())
+        .and_then(|c| c.non_execution_kind.as_deref());
+    matches!(kind, Some("user-rejected" | "permission-rule"))
+}
+
+/// What the call returned. `rawOutput` when it is a string, because that is
+/// what the model saw — the same thing a native tool's result row holds —
+/// where `content` is the adapter's display copy: a command's output fenced as
+/// `console`, a Read fenced bare, a web search re-set as a list.
+/// Stored fenced, every reader downstream (the card, the audit copy, search)
+/// would have had to know to strip it. A structured `rawOutput` has no single
+/// text to keep, so it falls back to `content`, as does an AIR client, which
+/// gets `rawOutput` only when `content` is empty.
 fn output_of(call: &ToolCall) -> String {
+    if let Some(serde_json::Value::String(raw)) = &call.raw_output {
+        return raw.clone();
+    }
     let mut out = String::new();
     for block in &call.content {
         if let Some(text) = block.content.as_ref().and_then(|c| c.as_text()) {
@@ -1008,5 +1058,195 @@ mod tests {
             )),
             Effect::Ignored
         );
+    }
+
+    /// The recordings `tests/acp_tool_probe.rs` made against the real adapter
+    /// (0.84.0), replayed through the mapping. Each holds one session's frames
+    /// in both directions; only what came in is fed here.
+    const PROBE: &str = include_str!("../../tests/fixtures/acp/tool-probe-no-air.jsonl");
+    const PROBE_AIR: &str = include_str!("../../tests/fixtures/acp/tool-probe.jsonl");
+
+    struct Replayed {
+        /// `(tool name, result, outcome)`, in the order the calls finished.
+        results: Vec<(String, String, ToolOutcome)>,
+        /// The last arguments seen for each call, by tool name.
+        arguments: Vec<(String, String)>,
+    }
+
+    fn replay(recording: &str) -> Replayed {
+        let mut names = std::collections::HashMap::new();
+        let mut replayed = Replayed {
+            results: Vec::new(),
+            arguments: Vec::new(),
+        };
+        for line in recording.lines().filter(|l| !l.trim().is_empty()) {
+            let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+            if frame["dir"] != "in" || frame["msg"]["method"] != "session/update" {
+                continue;
+            }
+            let notification: SessionNotification = serde_json::from_value(frame["msg"]["params"].clone()).unwrap();
+            for effect in effects_of(notification.update) {
+                match effect {
+                    Effect::ToolCall {
+                        call_id,
+                        tool_name,
+                        arguments,
+                    } => {
+                        replayed.arguments.push((tool_name.clone(), arguments));
+                        names.insert(call_id, tool_name);
+                    }
+                    Effect::ToolCallRevised {
+                        call_id,
+                        tool_name,
+                        arguments,
+                    } => {
+                        let name = if tool_name.is_empty() {
+                            names.get(&call_id).cloned().unwrap_or_default()
+                        } else {
+                            tool_name
+                        };
+                        replayed.arguments.push((name.clone(), arguments));
+                        names.insert(call_id, name);
+                    }
+                    Effect::ToolResult {
+                        call_id,
+                        result,
+                        outcome,
+                    } => {
+                        let name = names.get(&call_id).cloned().unwrap_or_default();
+                        replayed.results.push((name, result, outcome));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        replayed
+    }
+
+    fn results_of<'a>(replayed: &'a Replayed, tool: &str) -> Vec<(&'a str, ToolOutcome)> {
+        replayed
+            .results
+            .iter()
+            .filter(|(name, ..)| name == tool)
+            .map(|(_, result, outcome)| (result.as_str(), *outcome))
+            .collect()
+    }
+
+    /// What a hosted call stores is what the model saw, not the adapter's
+    /// display copy: a Read keeps its line numbers and loses its fence, a
+    /// command's output is bare, and a structured `rawOutput` (`ToolSearch`)
+    /// falls back to the text.
+    #[test]
+    fn a_recorded_result_is_what_the_model_saw() {
+        let replayed = replay(PROBE);
+        assert!(
+            replayed.results.iter().all(|(_, result, _)| !result.contains("```")),
+            "{:?}",
+            replayed.results
+        );
+        assert_eq!(
+            results_of(&replayed, "Read"),
+            [
+                (
+                    "1\tone alpha\n2\ttwo\n3\tthree\n4\tfour needle\n5\tfive\n6\t",
+                    ToolOutcome::Success
+                ),
+                ("2\ttwo\n3\tthree", ToolOutcome::Success),
+            ]
+        );
+        assert_eq!(
+            results_of(&replayed, "Bash"),
+            [
+                ("hello", ToolOutcome::Success),
+                ("Exit code 3", ToolOutcome::Error),
+                ("(Bash completed with no output)", ToolOutcome::Success),
+            ]
+        );
+        assert_eq!(
+            results_of(&replayed, "ToolSearch"),
+            [("Tool: WebSearch", ToolOutcome::Success)]
+        );
+    }
+
+    /// The refused Write in the recording is `failed` on the wire with
+    /// `nonExecutionKind: permission-rule`, and the Bash that exited 3 is
+    /// `failed` with none. Only the first is a refusal.
+    #[test]
+    fn a_recorded_refusal_is_denied_and_a_failure_is_an_error() {
+        let replayed = replay(PROBE);
+        assert_eq!(
+            results_of(&replayed, "Write"),
+            [
+                (
+                    "File created successfully at: <WORKSPACE>\\new.txt (file state is current in your context — no need to Read it back)",
+                    ToolOutcome::Success
+                ),
+                ("User refused permission to run tool", ToolOutcome::Denied),
+            ]
+        );
+        let interrupted = effect_of(update(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"failed","rawOutput":"Interrupted",
+                "_meta":{"claudeCode":{"toolName":"Bash","nonExecutionKind":"interrupted"}}}"#,
+        ));
+        assert!(
+            matches!(
+                interrupted,
+                Effect::ToolResult {
+                    outcome: ToolOutcome::Error,
+                    ..
+                }
+            ),
+            "nobody declined an interrupted call: {interrupted:?}"
+        );
+        let rejected = effect_of(update(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"t2","status":"failed",
+                "_meta":{"claudeCode":{"toolName":"Bash","nonExecutionKind":"user-rejected"}}}"#,
+        ));
+        assert!(
+            matches!(
+                rejected,
+                Effect::ToolResult {
+                    outcome: ToolOutcome::Denied,
+                    ..
+                }
+            ),
+            "{rejected:?}"
+        );
+    }
+
+    /// Without the AIR envelope an Edit and a Write carry their file text in
+    /// `rawInput`, so the card and the approval can show it from the call.
+    #[test]
+    fn a_recorded_edit_carries_its_text() {
+        let replayed = replay(PROBE);
+        let edit = replayed
+            .arguments
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "Edit")
+            .unwrap();
+        let edit: serde_json::Value = serde_json::from_str(&edit.1).unwrap();
+        assert_eq!(
+            (edit["old_string"].as_str(), edit["new_string"].as_str()),
+            (Some("alpha"), Some("beta"))
+        );
+        let write = replayed
+            .arguments
+            .iter()
+            .rev()
+            .find(|(name, arguments)| name == "Write" && arguments.contains("new.txt"))
+            .unwrap();
+        let write: serde_json::Value = serde_json::from_str(&write.1).unwrap();
+        assert_eq!(write["content"].as_str(), Some("x\n"));
+    }
+
+    /// Why the envelope is gone (`protocol::ClientCapabilities`): declared,
+    /// the same Read comes back with no text anywhere, `rawOutput` included.
+    #[test]
+    fn under_the_air_envelope_a_read_has_no_text() {
+        let replayed = replay(PROBE_AIR);
+        let reads = results_of(&replayed, "Read");
+        assert_eq!(reads.len(), 2, "{:?}", replayed.results);
+        assert!(reads.iter().all(|(result, _)| result.is_empty()), "{reads:?}");
     }
 }

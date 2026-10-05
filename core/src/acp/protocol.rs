@@ -1142,6 +1142,13 @@ pub struct ToolCall {
     pub raw_input: Option<serde_json::Value>,
     #[serde(default)]
     pub content: Vec<ToolCallContent>,
+    /// What the tool returned, as the model saw it. A string for most tools
+    /// (Read with its line numbers, a command's bare output), structured for a
+    /// few (`ToolSearch` sends its references as an array). `content` is the
+    /// same result dressed for display — fenced, prettified — and an AIR
+    /// client gets this only when `content` carries nothing.
+    #[serde(default)]
+    pub raw_output: Option<serde_json::Value>,
     #[serde(default)]
     pub locations: Vec<ToolCallLocation>,
     /// The tool's real name, as `claude-agent-acp` sends it beside the ACP
@@ -1170,6 +1177,11 @@ pub struct ToolCallMeta {
 pub struct ClaudeCodeMeta {
     #[serde(default)]
     pub tool_name: Option<String>,
+    /// Why a `failed` call never ran: `user-rejected`, `permission-rule`,
+    /// `interrupted`, `cancelled`, … An open set by the adapter's own
+    /// account — new kinds ship ahead of any schema — so it stays a string.
+    #[serde(default)]
+    pub non_execution_kind: Option<String>,
 }
 
 /// One block of a call's `content`. `content` blocks carry text; `diff`

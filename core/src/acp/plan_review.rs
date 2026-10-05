@@ -500,11 +500,13 @@ mod tests {
                 status: None,
                 raw_input: Some(raw_input),
                 content: Vec::new(),
+                raw_output: None,
                 locations: Vec::new(),
                 name: None,
                 meta: Some(ToolCallMeta {
                     claude_code: Some(ClaudeCodeMeta {
                         tool_name: Some(tool_name.into()),
+                        non_execution_kind: None,
                     }),
                 }),
             },
