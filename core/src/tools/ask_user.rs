@@ -1,6 +1,10 @@
 use super::{Permission, Tool, ToolContext};
 use async_trait::async_trait;
 
+/// The question tool's name. One spelling: the loop, the parallel batcher, the
+/// reviewers and ACP's elicitation all recognise it by this.
+pub const ASK_USER_TOOL: &str = "ask_user";
+
 pub struct AskUserTool;
 
 #[async_trait]
@@ -17,7 +21,7 @@ impl Tool for AskUserTool {
     }
 
     fn name(&self) -> &str {
-        "ask_user"
+        ASK_USER_TOOL
     }
 
     fn description(&self) -> &str {

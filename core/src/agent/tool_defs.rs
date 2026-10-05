@@ -44,7 +44,7 @@ pub(crate) fn apply_mode(defs: &mut Vec<ToolDefinition>, modes: Modes, registry:
     // model calls one and gets back the registry tool's refusal to be called
     // outside the loop -- as a tool result, in its own transcript.
     let offered = if modes.switchable() {
-        mode.offered_tools(&working)
+        mode.offered_tools(&working, registry)
     } else {
         Vec::new()
     };
@@ -55,8 +55,10 @@ pub(crate) fn apply_mode(defs: &mut Vec<ToolDefinition>, modes: Modes, registry:
         !mode_tool || offered.contains(&name)
     });
 
-    if let Some(allowed) = mode.tools {
-        defs.retain(|d| allowed.contains(&d.name.as_str()) || offered.contains(&d.name.as_str()));
+    if let Some(keeps) = mode.tools {
+        defs.retain(|d| {
+            registry.builtin_spec(&d.name).is_some_and(|s| keeps(&s)) || offered.contains(&d.name.as_str())
+        });
     }
 
     for name in offered {

@@ -110,7 +110,7 @@ use super::protocol::{self, CreateElicitationParams, ElicitationSchema, EnumOpti
 /// two buttons — and all three are right for a form and wrong for a permission.
 /// The transcript card keeps the agent's name for the call, which is what it
 /// actually ran.
-const ASK_TOOL: &str = "ask_user";
+const ASK_TOOL: &str = crate::tools::ask_user::ASK_USER_TOOL;
 
 /// Sentinels [`formatAnswer`](../../../../src/components/chat/tool-call-block.tsx)
 /// writes for a question that was passed over. They are answers to nothing and

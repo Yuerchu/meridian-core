@@ -254,8 +254,11 @@ impl<'a> AutoReviewed<'a> {
     /// transitions because entering or leaving plan mode is the user being
     /// shown a plan, not a permission being checked; a reviewer that approved
     /// `exit_plan` would be agreeing to a plan on their behalf.
-    fn passthrough(name: &str) -> bool {
-        name == "ask_user" || crate::agent::modes::transition_tools().any(|t| t == name)
+    ///
+    /// `agent::denied` passes the same calls through, for the same reasons, by
+    /// calling this rather than keeping a copy.
+    pub(crate) fn passthrough(name: &str) -> bool {
+        name == crate::tools::ask_user::ASK_USER_TOOL || crate::agent::modes::transition_tools().any(|t| t == name)
     }
 }
 

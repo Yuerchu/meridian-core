@@ -78,7 +78,7 @@ impl Tool for EditFileTool {
         // `old_string` is the text being replaced. `open_edit` also refuses
         // to create the file: a failed match must not leave an empty one.
         let target = context.open_edit(file_path)?;
-        let journal = context.journal_record("edit_file", crate::journal::capture::Op::Edit);
+        let journal = context.journal_record(self.name(), crate::journal::capture::Op::Edit);
         let mut replaced = 0usize;
         super::backend::edit_opened(
             target,

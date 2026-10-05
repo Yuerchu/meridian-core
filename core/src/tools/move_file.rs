@@ -74,7 +74,7 @@ impl Tool for MoveFileTool {
             ));
         }
 
-        let journal = context.journal_record("move_file", crate::journal::capture::Op::RenameFrom);
+        let journal = context.journal_record(self.name(), crate::journal::capture::Op::RenameFrom);
         let observed = match (&journal, &from, &to) {
             // Files only: a directory move re-homes whole chains, which is a
             // per-file history rewrite the journal does not attempt — the

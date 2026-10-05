@@ -76,22 +76,34 @@ pub(super) struct Findings {
 /// model's earlier guess, and showing it here would anchor this pass to a
 /// conclusion it is supposed to re-reach independently — the same reason the
 /// two hook gates do not share a conversation.
-const ESCALATION: &str = "\
-这个动作不能只凭对话记录判断。你现在有四个只读工具：read_file、search_files、glob、
-list_directory。
+fn escalation(tools: &[&str]) -> String {
+    format!(
+        "\
+这个动作不能只凭对话记录判断。你现在有 {} 个只读工具：{}。
 
 先去核实再裁决：命令里的路径展开之后指向什么？目标存在吗，是文件还是目录，大不大？
 通配符会匹配到哪些东西？要写入的位置是不是符号链接？要执行的脚本内容是什么？
 
 查证之后按同样的格式给出裁决。查不到的东西就当作查不到 —— 缺失的信息应当让你更谨慎，
-但不要凭想象补上它。";
+但不要凭想象补上它。",
+        tools.len(),
+        tools.join("、")
+    )
+}
 
-fn definitions(services: &Services) -> Vec<ToolDefinition> {
-    services
-        .tools
+/// Whether the reviewer may run this tool. Not a filter over what the
+/// registry has — the reviewer classification *is* the set — so a model
+/// naming `run_command`, an MCP tool or a custom tool is told no rather than
+/// getting it.
+fn reviewer_may_call(registry: &crate::tools::ToolRegistry, name: &str) -> bool {
+    registry.builtin_spec(name).is_some_and(|s| s.reviewer)
+}
+
+fn definitions(registry: &crate::tools::ToolRegistry) -> Vec<ToolDefinition> {
+    registry
         .definitions()
         .into_iter()
-        .filter(|d| crate::tools::READ_ONLY_TOOLS.contains(&d.name.as_str()))
+        .filter(|d| reviewer_may_call(registry, &d.name))
         .collect()
 }
 
@@ -172,12 +184,12 @@ pub(super) async fn run(job: Job<'_>) -> Findings {
 }
 
 async fn drive(job: &Job<'_>, cancel: &CancellationToken, deadline: tokio::time::Instant) -> Findings {
-    let tools = definitions(job.services);
+    let tools = definitions(&job.services.tools);
     let tool_context = context(job, cancel);
     let mut messages = vec![
         super::system(&job.system_prompt),
         ChatMessage::user(job.scene),
-        ChatMessage::user(ESCALATION),
+        ChatMessage::user(&escalation(&crate::tools::reviewer_tools(&job.services.tools))),
     ];
     let mut usage = MessageUsage::default();
     let mut peak_prompt: Option<i32> = None;
@@ -237,7 +249,7 @@ async fn drive(job: &Job<'_>, cancel: &CancellationToken, deadline: tokio::time:
             // Not a filter over what the registry has — the whitelist *is* the
             // set. A model naming `run_command` gets told no rather than
             // getting a shell.
-            let allowed = crate::tools::READ_ONLY_TOOLS.contains(&call.name.as_str());
+            let allowed = reviewer_may_call(&job.services.tools, &call.name);
             let output = match (allowed, job.services.tools.get(&call.name)) {
                 (true, Some(tool)) => {
                     match serde_json::from_str::<serde_json::Value>(&call.arguments) {
@@ -265,7 +277,10 @@ async fn drive(job: &Job<'_>, cancel: &CancellationToken, deadline: tokio::time:
                         }
                     }
                 }
-                _ => "Error: 审查员只能使用 read_file、search_files、glob、list_directory。".to_string(),
+                _ => format!(
+                    "Error: 审查员只能使用 {}。",
+                    crate::tools::reviewer_tools(&job.services.tools).join("、")
+                ),
             };
             evidence.push(AutoReviewEvidence {
                 tool: call.name.clone(),
@@ -287,6 +302,42 @@ async fn drive(job: &Job<'_>, cancel: &CancellationToken, deadline: tokio::time:
 
 #[cfg(test)]
 mod tests {
+    fn registry() -> crate::tools::ToolRegistry {
+        crate::tools::ToolRegistry::new(
+            std::path::PathBuf::from("/nonexistent"),
+            std::path::PathBuf::from("/nonexistent"),
+            std::sync::Arc::new(crate::redaction::RedactionEngine::disabled()),
+        )
+    }
+
+    /// The reviewer is offered the reviewer tools and nothing else, and a call
+    /// naming anything outside them — a shell, an MCP tool, a name nobody
+    /// registered — is refused rather than run. Nothing covered either half
+    /// before: widening the gate to every built-in left the suite green.
+    #[test]
+    fn the_reviewer_holds_and_may_call_only_the_reviewer_tools() {
+        let r = registry();
+        let offered: Vec<String> = super::definitions(&r).into_iter().map(|d| d.name).collect();
+        let mut expected = crate::tools::reviewer_tools(&r);
+        expected.sort_unstable();
+        let mut got: Vec<&str> = offered.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+        for name in &expected {
+            assert!(super::reviewer_may_call(&r, name), "{name}");
+        }
+        for name in [
+            "run_command",
+            "write_file",
+            "web_search",
+            "recall_memory",
+            "mcp__notes__append",
+            "nope",
+        ] {
+            assert!(!super::reviewer_may_call(&r, name), "{name}");
+        }
+    }
+
     use super::*;
     use crate::db::test_db;
 

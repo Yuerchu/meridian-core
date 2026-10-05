@@ -60,7 +60,7 @@ impl Tool for WriteFileTool {
         // The write may run without a prompt, so it goes through the handle it
         // verified rather than resolving the name again.
         let target = context.open_write(path_str)?;
-        let journal = context.journal_record("write_file", crate::journal::capture::Op::Write);
+        let journal = context.journal_record(self.name(), crate::journal::capture::Op::Write);
         super::backend::write_opened(target, content, journal).await?;
         Ok(format!("Successfully wrote {} bytes to {}", content.len(), path_str))
     }

@@ -25,7 +25,7 @@ impl Tool for EnterPlanTool {
     }
 
     fn name(&self) -> &str {
-        "enter_plan"
+        crate::agent::modes::ENTER_PLAN_TOOL
     }
 
     fn description(&self) -> &str {
@@ -84,7 +84,7 @@ impl Tool for ExitPlanTool {
     }
 
     fn name(&self) -> &str {
-        "exit_plan"
+        crate::agent::modes::EXIT_PLAN_TOOL
     }
 
     fn description(&self) -> &str {
@@ -130,7 +130,7 @@ impl Tool for ReadPlanTool {
     }
 
     fn name(&self) -> &str {
-        "read_plan"
+        crate::agent::modes::READ_PLAN_TOOL
     }
 
     fn description(&self) -> &str {
@@ -174,7 +174,7 @@ impl Tool for UpdatePlanTool {
     }
 
     fn name(&self) -> &str {
-        "update_plan"
+        crate::agent::modes::UPDATE_PLAN_TOOL
     }
 
     fn description(&self) -> &str {

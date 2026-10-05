@@ -56,9 +56,12 @@ impl ChatMode {
 /// leavable.
 pub struct ModeSpec {
     pub id: &'static str,
-    /// Whitelist intersected with the assistant's own tool set. `None` means
-    /// the mode does not narrow anything.
-    pub tools: Option<&'static [&'static str]>,
+    /// Which built-in tools the mode keeps, asked of each tool's spec and
+    /// intersected with the assistant's own tool set. `None` means the mode
+    /// does not narrow anything. A tool with no built-in spec — custom, MCP —
+    /// is never kept, which is what a whitelist always did with a name it did
+    /// not list.
+    pub tools: Option<fn(&crate::tools::spec::ToolSpec) -> bool>,
     /// Tools owned by this mode rather than by an assistant configuration.
     /// They are injected while the mode is active and stripped everywhere
     /// else. Plan document I/O lives here so every planning assistant reaches
@@ -82,33 +85,22 @@ pub const EXIT_PLAN_TOOL: &str = "exit_plan";
 pub const READ_PLAN_TOOL: &str = "read_plan";
 pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 
-/// Tools that cannot change anything outside the conversation.
+/// Tools that cannot change anything outside the conversation: the ones
+/// whose spec says `plan_mode`.
 ///
-/// A whitelist rather than a blacklist of writers, because the set of writers
-/// is not knowable: `save_memory` and `delete_memory` write to the database
-/// rather than the filesystem, and custom tools and MCP tools have no declared
-/// read/write property at all. Anything unrecognised is therefore excluded by
-/// construction.
+/// Still a whitelist rather than a blacklist of writers, because the set of
+/// writers is not knowable: `save_memory` and `delete_memory` write to the
+/// database rather than the filesystem, and custom tools and MCP tools have no
+/// declared property at all. `plan_mode` is `false` until a tool says
+/// otherwise, and anything without a built-in spec is excluded by construction.
 ///
 /// `run_command` is the deliberate soft spot. Without it the model cannot run
 /// a test or read `git log` to check that a plan is even feasible, which is
 /// most of what makes a plan worth reading. It can also write files, so the
 /// mode prompt has to carry that constraint instead.
-const PLAN_TOOLS: &[&str] = &[
-    "ask_user",
-    "glob",
-    "list_directory",
-    "list_memories",
-    "load_skill",
-    "read_file",
-    READ_PLAN_TOOL,
-    "recall_memory",
-    "run_command",
-    "search_files",
-    "update_todos",
-    UPDATE_PLAN_TOOL,
-    "web_search",
-];
+fn plan_keeps(spec: &crate::tools::spec::ToolSpec) -> bool {
+    spec.plan_mode
+}
 
 const WORK: ModeSpec = ModeSpec {
     id: WORK_MODE,
@@ -122,7 +114,7 @@ const WORK: ModeSpec = ModeSpec {
 
 const PLAN: ModeSpec = ModeSpec {
     id: PLAN_MODE,
-    tools: Some(PLAN_TOOLS),
+    tools: Some(plan_keeps),
     owned_tools: &[READ_PLAN_TOOL, UPDATE_PLAN_TOOL],
     instructions: Some(PLAN_INSTRUCTIONS),
     enter_tool: Some(ENTER_PLAN_TOOL),
@@ -201,22 +193,24 @@ impl ModeSpec {
     /// by planning first, so offering it the way in is pure prompt overhead on
     /// every single turn. The check is derived rather than configured, so it
     /// keeps working for a mode added later.
-    fn would_narrow(&self, current: &[String]) -> bool {
+    fn would_narrow(&self, current: &[String], registry: &crate::tools::ToolRegistry) -> bool {
         match self.tools {
             None => false,
-            Some(allowed) => current.iter().any(|name| !allowed.contains(&name.as_str())),
+            Some(keeps) => current
+                .iter()
+                .any(|name| !registry.builtin_spec(name).is_some_and(|s| keeps(&s))),
         }
     }
 
     /// Transitions offered while in this mode: the way out of it, plus the way
     /// into any other mode that would meaningfully change what is possible.
-    pub fn offered_tools(&self, current_tools: &[String]) -> Vec<&'static str> {
+    pub fn offered_tools(&self, current_tools: &[String], registry: &crate::tools::ToolRegistry) -> Vec<&'static str> {
         let mut out: Vec<&'static str> = self.owned_tools.to_vec();
         out.extend(self.exit_tool);
         out.extend(
             MODES
                 .iter()
-                .filter(|m| m.id != self.id && m.would_narrow(current_tools))
+                .filter(|m| m.id != self.id && m.would_narrow(current_tools, registry))
                 .filter_map(|m| m.enter_tool),
         );
         out
@@ -269,14 +263,26 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    fn registry() -> crate::tools::ToolRegistry {
+        crate::tools::ToolRegistry::new(
+            std::path::PathBuf::from("/nonexistent"),
+            std::path::PathBuf::from("/nonexistent"),
+            std::sync::Arc::new(crate::redaction::RedactionEngine::disabled()),
+        )
+    }
+
+    fn plan_keeps_named(name: &str) -> bool {
+        registry().builtin_spec(name).is_some_and(|s| plan_keeps(&s))
+    }
+
     #[test]
     fn work_offers_the_way_into_plan_and_plan_offers_the_way_out() {
         let editing = tools(&["read_file", "write_file"]);
 
-        let work = resolve(None).unwrap().offered_tools(&editing);
+        let work = resolve(None).unwrap().offered_tools(&editing, &registry());
         assert_eq!(work, [ENTER_PLAN_TOOL], "no exit from the default mode");
 
-        let plan = resolve(Some("plan")).unwrap().offered_tools(&editing);
+        let plan = resolve(Some("plan")).unwrap().offered_tools(&editing, &registry());
         assert_eq!(
             plan,
             [READ_PLAN_TOOL, UPDATE_PLAN_TOOL, EXIT_PLAN_TOOL],
@@ -289,15 +295,18 @@ mod tests {
     #[test]
     fn a_read_only_assistant_is_not_offered_planning() {
         let read_only = tools(&["read_file", "web_search", "ask_user"]);
-        assert!(resolve(None).unwrap().offered_tools(&read_only).is_empty());
+        assert!(resolve(None).unwrap().offered_tools(&read_only, &registry()).is_empty());
 
         let with_shell = tools(&["read_file", "run_command", "delete_file"]);
-        assert_eq!(resolve(None).unwrap().offered_tools(&with_shell), [ENTER_PLAN_TOOL]);
+        assert_eq!(
+            resolve(None).unwrap().offered_tools(&with_shell, &registry()),
+            [ENTER_PLAN_TOOL]
+        );
     }
 
     #[test]
     fn an_assistant_with_no_tools_at_all_is_not_offered_planning() {
-        assert!(resolve(None).unwrap().offered_tools(&[]).is_empty());
+        assert!(resolve(None).unwrap().offered_tools(&[], &registry()).is_empty());
     }
 
     /// The pairing a bool would have allowed: a narrowed mode with no way out
@@ -344,7 +353,7 @@ mod tests {
             "delete_memory",
         ] {
             assert!(
-                !PLAN_TOOLS.contains(&writer),
+                !plan_keeps_named(writer),
                 "{writer} can change things and must not be in plan mode"
             );
         }
@@ -355,11 +364,14 @@ mod tests {
         let plan = resolve(Some("plan")).unwrap();
         assert_eq!(plan.exit_tool, Some(EXIT_PLAN_TOOL));
         assert_eq!(plan.exit_to, Some(WORK_MODE));
-        assert!(plan.offered_tools(&tools(&["read_file"])).contains(&EXIT_PLAN_TOOL));
+        assert!(
+            plan.offered_tools(&tools(&["read_file"]), &registry())
+                .contains(&EXIT_PLAN_TOOL)
+        );
         // Neither transition tool is in the whitelist: they are added by the
         // mode itself, since no assistant would have enabled them up front.
-        assert!(!PLAN_TOOLS.contains(&EXIT_PLAN_TOOL));
-        assert!(!PLAN_TOOLS.contains(&ENTER_PLAN_TOOL));
+        assert!(!plan_keeps_named(EXIT_PLAN_TOOL));
+        assert!(!plan_keeps_named(ENTER_PLAN_TOOL));
         assert!(
             MODES.iter().any(|m| Some(m.id) == plan.exit_to),
             "exit_to must name a real mode"

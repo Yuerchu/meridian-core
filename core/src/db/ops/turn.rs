@@ -102,7 +102,7 @@ pub fn wait_for_review(conn: &mut SqliteConnection, id: &str, now: i64) -> Query
         .set((
             turns::status.eq(TurnStatus::WaitingReview.as_str()),
             turns::phase.eq(Some(TurnPhase::AwaitingApproval.as_str())),
-            turns::phase_tool.eq(Some("exit_plan")),
+            turns::phase_tool.eq(Some(crate::agent::modes::EXIT_PLAN_TOOL)),
             turns::updated_at.eq(now),
         ))
         .execute(conn)

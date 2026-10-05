@@ -35,7 +35,7 @@ impl Tool for LoadSkillTool {
     }
 
     fn name(&self) -> &str {
-        "load_skill"
+        crate::agent::tool_defs::LOAD_SKILL_TOOL
     }
 
     fn description(&self) -> &str {

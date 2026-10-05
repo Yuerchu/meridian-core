@@ -93,7 +93,7 @@ impl Tool for DeleteFileTool {
         // tombstones only the files the journal already tracks — an untracked
         // file's disappearance is the external-labelling path's to notice,
         // never something to guess at.
-        let journal = context.journal_record("delete_file", crate::journal::capture::Op::Delete);
+        let journal = context.journal_record(self.name(), crate::journal::capture::Op::Delete);
         let mut observations = Vec::new();
         if let (Some(j), ResolvedTarget::Real(p)) = (&journal, &target) {
             let is_dir = tokio::fs::symlink_metadata(p)
