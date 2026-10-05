@@ -251,7 +251,7 @@ pub struct AcpConfig {
 /// and stopped at 0.16.2 — a version that announces a tool call twice from its
 /// two sources instead of revising the first. The successor deduplicates
 /// (`emittedToolCalls`), and is where updates now go.
-const ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.84.0";
+pub const ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.84.0";
 
 /// **Pinned, and upgrading is a change to this repository.** This used to be
 /// unpinned, on the reasoning that a pinned adapter falls behind the `claude`
