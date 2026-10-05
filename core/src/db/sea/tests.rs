@@ -39,7 +39,7 @@ struct SchemaObject {
 }
 
 const SCHEMA: &str = "SELECT type AS kind, name, sql FROM sqlite_master \
-     WHERE name NOT LIKE 'sqlite_%' AND name <> '__diesel_schema_migrations' ORDER BY type, name";
+     WHERE name NOT LIKE 'sqlite_%' AND name NOT IN ('__diesel_schema_migrations', 'seaql_migrations') \n     ORDER BY type, name";
 
 /// The replay goes through sqlx, the migrations through Diesel: the two must
 /// leave the same schema, every trigger and partial index included. This is

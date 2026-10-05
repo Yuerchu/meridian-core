@@ -154,3 +154,11 @@ pretty_assertions = "1"
 # cases the dev-dependencies, not the ordinary ones.
 sea-orm = { version = "2.0.4", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
 trybuild = "1"
+
+[[example]]
+name = "gen_baseline"
+required-features = ["test-support"]
+
+[[example]]
+name = "bridge_check"
+required-features = ["test-support"]

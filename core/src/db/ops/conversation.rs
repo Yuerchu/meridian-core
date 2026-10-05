@@ -1034,10 +1034,11 @@ mod tests {
     /// database — the race needs two connections to one file, which is what
     /// the desktop's pool is. This is the test that goes red without the
     /// `immediate_transaction`.
-    #[test]
-    fn concurrent_toggles_are_each_applied() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_toggles_are_each_applied() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("race.sqlite");
+        crate::db::sea::bridge::migrate_file(&path).await.unwrap();
         let pool = crate::db::init_db(path.to_str().unwrap());
         create_conversation(&mut pool.get().unwrap(), "c1", None, None, None, 1).unwrap();
 
