@@ -30,14 +30,3 @@ pub struct ToolPresetInsert<'a> {
     pub created_at: i64,
     pub updated_at: i64,
 }
-
-#[derive(Debug, AsChangeset, Default)]
-#[diesel(table_name = tool_presets)]
-pub struct ToolPresetChangeset {
-    pub name: Option<String>,
-    pub description: Option<Option<String>>,
-    pub icon: Option<Option<String>>,
-    pub tool_names: Option<String>,
-    pub sort_order: Option<i32>,
-    pub updated_at: Option<i64>,
-}

@@ -4,7 +4,11 @@
 //! such pair with its remaining Diesel callers, and the checker keeps the two
 //! in step.
 
+pub mod custom_tool;
 pub mod journal;
+pub mod mcp_server;
 pub mod notification;
 pub mod preference;
+pub mod tool_category;
+pub mod tool_preset;
 pub mod voice_corpus;

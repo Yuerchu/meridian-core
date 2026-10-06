@@ -153,16 +153,16 @@ impl McpTransport for MockTransport {
     }
 }
 
-fn server(id: &str) -> McpServerRow {
-    McpServerRow {
+fn server(id: &str) -> mcp_server::Model {
+    mcp_server::Model {
         id: id.to_string(),
         name: id.to_string(),
-        transport_type: "stdio".into(),
+        transport_type: McpTransportKind::Stdio,
         command: Some("mock".into()),
         args: None,
         env: None,
         url: None,
-        is_enabled: 0,
+        is_enabled: crate::db::types::SqlBool::FALSE,
         sort_order: 0,
         created_at: 0,
         updated_at: 0,
