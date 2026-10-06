@@ -162,3 +162,7 @@ required-features = ["test-support"]
 [[example]]
 name = "bridge_check"
 required-features = ["test-support"]
+
+[[example]]
+name = "gen_schema_snapshot"
+required-features = ["test-support"]
