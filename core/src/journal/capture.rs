@@ -31,7 +31,9 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::db::ops::journal::{AppendVersion, Attribution};
+use crate::db::entity::journal_version::{VersionOp, VersionSource};
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops::journal::{self as journal_ops, AppendVersion, Attribution};
 use crate::journal::blobs;
 
 /// Files past this size are not journalled — the snapshot store is for source
@@ -127,15 +129,15 @@ pub enum Op {
     RenameTo,
 }
 
-impl Op {
-    fn as_str(self) -> &'static str {
-        match self {
-            Op::Write => crate::db::models::journal::version_op::WRITE,
-            Op::Edit => crate::db::models::journal::version_op::EDIT,
-            Op::Patch => crate::db::models::journal::version_op::PATCH,
-            Op::Delete => crate::db::models::journal::version_op::DELETE,
-            Op::RenameFrom => crate::db::models::journal::version_op::RENAME_FROM,
-            Op::RenameTo => crate::db::models::journal::version_op::RENAME_TO,
+impl From<Op> for VersionOp {
+    fn from(op: Op) -> Self {
+        match op {
+            Op::Write => VersionOp::Write,
+            Op::Edit => VersionOp::Edit,
+            Op::Patch => VersionOp::Patch,
+            Op::Delete => VersionOp::Delete,
+            Op::RenameFrom => VersionOp::RenameFrom,
+            Op::RenameTo => VersionOp::RenameTo,
         }
     }
 }
@@ -152,7 +154,7 @@ pub struct JournalRecord<'a> {
 /// The turn-scoped half of the journal: identity, storage, gitignore cache,
 /// and a borrow of the process-wide path locks.
 pub struct JournalCtx {
-    pub pool: crate::db::DbPool,
+    pub sea: Db,
     pub blob_root: PathBuf,
     pub conversation_id: String,
     pub turn_id: String,
@@ -178,7 +180,7 @@ pub struct JournalCtx {
 impl JournalCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pool: crate::db::DbPool,
+        sea: Db,
         blob_root: PathBuf,
         conversation_id: String,
         turn_id: String,
@@ -189,7 +191,7 @@ impl JournalCtx {
         shared: Arc<JournalShared>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            pool,
+            sea,
             blob_root,
             conversation_id,
             turn_id,
@@ -218,7 +220,7 @@ impl JournalCtx {
         model_id: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            pool: self.pool.clone(),
+            sea: self.sea.clone(),
             blob_root: self.blob_root.clone(),
             conversation_id,
             turn_id,
@@ -281,22 +283,13 @@ impl JournalCtx {
             return None;
         }
 
-        // Everything below blocks — the blob store fsyncs, the append takes a
-        // pooled connection — so the whole tail runs on a blocking thread.
-        let pool = self.pool.clone();
+        // The blob store fsyncs, so it runs on a blocking thread. Bytes before
+        // rows: both snapshots are durably in the store before the
+        // transaction that references them opens.
         let blob_root = self.blob_root.clone();
-        let display = path.to_string_lossy().into_owned();
-        let conversation_id = self.conversation_id.clone();
-        let turn_id = self.turn_id.clone();
-        let origin = self.origin.clone();
-        let model_id = self.model_id.clone();
-        let project_id = self.project_id.clone();
-        let tool = tool_name.to_string();
         let old_content = observed_old.map(str::to_string);
         let new_content = new.map(str::to_string);
-        let appended = tokio::task::spawn_blocking(move || {
-            // Bytes before rows: both snapshots are durably in the store
-            // before the transaction that references them opens.
+        let stored = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let stored_old = old_content
                 .map(|c| blobs::store(&blob_root, &c))
                 .transpose()
@@ -305,41 +298,54 @@ impl JournalCtx {
                 .map(|c| blobs::store(&blob_root, &c))
                 .transpose()
                 .map_err(|e| e.to_string())?;
-
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            crate::db::ops::journal::append_version(
-                &mut conn,
-                &norm,
-                &AppendVersion {
-                    display_path: &display,
-                    op: op.as_str(),
-                    observed_old: stored_old.as_ref(),
-                    new: stored_new.as_ref(),
-                    attribution: Attribution {
-                        source: crate::db::models::journal::version_source::NATIVE,
-                        conversation_id: Some(&conversation_id),
-                        turn_id: Some(&turn_id),
-                        project_id: project_id.as_deref(),
-                        origin: Some(&origin),
-                        model_id: model_id.as_deref(),
-                        tool_name: Some(&tool),
-                    },
-                    moved_from_version_id: moved_from_version_id.as_deref(),
-                    now: crate::util::now_ms(),
-                },
-            )
-            .map_err(|e| e.to_string())
+            Ok((stored_old, stored_new))
         })
         .await;
-
-        match appended {
-            Ok(Ok(outcome)) => Some(outcome.version_id),
+        let (stored_old, stored_new) = match stored {
+            Ok(Ok(stored)) => stored,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "journal: append failed; entry skipped");
-                None
+                return None;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "journal: append task failed; entry skipped");
+                return None;
+            }
+        };
+
+        let display = path.to_string_lossy().into_owned();
+        let appended = self
+            .sea
+            .write(async |tx| {
+                journal_ops::append_version(
+                    tx,
+                    &norm,
+                    &AppendVersion {
+                        display_path: &display,
+                        op: op.into(),
+                        observed_old: stored_old.as_ref(),
+                        new: stored_new.as_ref(),
+                        attribution: Attribution {
+                            source: VersionSource::Native,
+                            conversation_id: Some(&self.conversation_id),
+                            turn_id: Some(&self.turn_id),
+                            project_id: self.project_id.as_deref(),
+                            origin: Some(&self.origin),
+                            model_id: self.model_id.as_deref(),
+                            tool_name: Some(tool_name),
+                        },
+                        moved_from_version_id: moved_from_version_id.as_deref(),
+                        now: crate::util::now_ms(),
+                    },
+                )
+                .await
+            })
+            .await;
+
+        match appended {
+            Ok(outcome) => Some(outcome.version_id),
+            Err(e) => {
+                tracing::warn!(error = %e, "journal: append failed; entry skipped");
                 None
             }
         }
@@ -678,16 +684,7 @@ impl JournalCtx {
             key: prefix.clone(),
         };
 
-        let pool = self.pool.clone();
-        let query_prefix = prefix.clone();
-        let tracked = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            crate::db::ops::journal::chains_under_prefix(&mut conn, &query_prefix, BRACKET_MAX_FILES + 1)
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|inner| inner);
+        let tracked = journal_ops::chains_under_prefix(&self.sea, &prefix, BRACKET_MAX_FILES + 1).await;
         let tracked = match tracked {
             Ok(t) => t,
             Err(e) => {
@@ -731,31 +728,34 @@ impl JournalCtx {
                 PreState::Missing => None,
             };
             if pre_sha != head_sha {
-                let pool = self.pool.clone();
                 let blob_root = self.blob_root.clone();
                 let norm = file.norm_path.clone();
                 let content = match &pre {
                     PreState::Content(c) => Some(c.clone()),
                     PreState::Missing => None,
                 };
-                let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let stored = content
+                // Bytes before rows, as in `record`: the snapshot is in the
+                // store before the transaction that references it opens.
+                let stored = tokio::task::spawn_blocking(move || {
+                    content
                         .map(|c| blobs::store(&blob_root, &c))
                         .transpose()
-                        .map_err(|e| e.to_string())?;
-                    let mut conn = pool.get().map_err(|e| e.to_string())?;
-                    crate::db::ops::journal::reconcile_external(
-                        &mut conn,
-                        &norm,
-                        stored.as_ref(),
-                        crate::util::now_ms(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok(())
+                        .map_err(|e| e.to_string())
                 })
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|inner| inner);
+                let outcome = match stored {
+                    Ok(stored) => self
+                        .sea
+                        .write(async |tx| {
+                            journal_ops::reconcile_external(tx, &norm, stored.as_ref(), crate::util::now_ms()).await
+                        })
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                };
                 if let Err(e) = outcome {
                     tracing::warn!(error = %e, "journal: pre-command reconcile failed; entry skipped");
                 }
@@ -845,14 +845,7 @@ impl JournalCtx {
                 continue;
             }
 
-            let pool = self.pool.clone();
             let blob_root = self.blob_root.clone();
-            let conversation_id = self.conversation_id.clone();
-            let turn_id = self.turn_id.clone();
-            let origin = self.origin.clone();
-            let model_id = self.model_id.clone();
-            let project_id = self.project_id.clone();
-            let tool = tool_name.to_string();
             let norm = f.norm;
             let pre_content = match f.pre {
                 PreState::Content(c) => Some(c),
@@ -862,7 +855,8 @@ impl JournalCtx {
                 PreState::Content(c) => Some(c),
                 PreState::Missing => None,
             };
-            let outcome = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            // Bytes before rows, as in `record`.
+            let stored = tokio::task::spawn_blocking(move || -> Result<_, String> {
                 let stored_pre = pre_content
                     .map(|c| blobs::store(&blob_root, &c))
                     .transpose()
@@ -871,28 +865,44 @@ impl JournalCtx {
                     .map(|c| blobs::store(&blob_root, &c))
                     .transpose()
                     .map_err(|e| e.to_string())?;
-                let mut conn = pool.get().map_err(|e| e.to_string())?;
-                crate::db::ops::journal::append_command_observed(
-                    &mut conn,
-                    &norm,
-                    stored_pre.as_ref(),
-                    stored_post.as_ref(),
-                    &Attribution {
-                        source: crate::db::models::journal::version_source::INFERRED,
-                        conversation_id: Some(&conversation_id),
-                        turn_id: Some(&turn_id),
-                        project_id: project_id.as_deref(),
-                        origin: Some(&origin),
-                        model_id: model_id.as_deref(),
-                        tool_name: Some(&tool),
-                    },
-                    crate::util::now_ms(),
-                )
-                .map_err(|e| e.to_string())
+                Ok((stored_pre, stored_post))
             })
             .await;
+            let (stored_pre, stored_post) = match stored {
+                Ok(Ok(stored)) => stored,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "journal: bracket settle failed; entry skipped");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "journal: bracket settle task failed; entry skipped");
+                    continue;
+                }
+            };
+            let outcome = self
+                .sea
+                .write(async |tx| {
+                    journal_ops::append_command_observed(
+                        tx,
+                        &norm,
+                        stored_pre.as_ref(),
+                        stored_post.as_ref(),
+                        &Attribution {
+                            source: VersionSource::Inferred,
+                            conversation_id: Some(&self.conversation_id),
+                            turn_id: Some(&self.turn_id),
+                            project_id: self.project_id.as_deref(),
+                            origin: Some(&self.origin),
+                            model_id: self.model_id.as_deref(),
+                            tool_name: Some(tool_name),
+                        },
+                        crate::util::now_ms(),
+                    )
+                    .await
+                })
+                .await;
             match outcome {
-                Ok(Ok(crate::db::ops::journal::CommandObservedOutcome::Recorded)) => {
+                Ok(journal_ops::CommandObservedOutcome::Recorded) => {
                     // The command rewrote a `.gitignore`: the matchers built
                     // under the old rules are stale for the rest of this turn,
                     // exactly as `record` invalidates for a tool edit.
@@ -901,11 +911,10 @@ impl JournalCtx {
                         self.invalidate_ignore_under(dir);
                     }
                 }
-                Ok(Ok(other)) => {
+                Ok(other) => {
                     tracing::debug!(?other, "journal: bracket observation not recorded")
                 }
-                Ok(Err(e)) => tracing::warn!(error = %e, "journal: bracket settle failed; entry skipped"),
-                Err(e) => tracing::warn!(error = %e, "journal: bracket settle task failed; entry skipped"),
+                Err(e) => tracing::warn!(error = %e, "journal: bracket settle failed; entry skipped"),
             }
         }
     }
@@ -922,20 +931,10 @@ impl JournalCtx {
         if !prefix.ends_with('/') {
             prefix.push('/');
         }
-        let pool = self.pool.clone();
-        let listed = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            crate::db::ops::journal::tracked_files(&mut conn, &prefix, usize::MAX).map_err(|e| e.to_string())
-        })
-        .await;
-        match listed {
-            Ok(Ok(files)) => files.into_iter().map(|(f, _)| PathBuf::from(f.display_path)).collect(),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "journal: listing tracked files failed; no tombstones");
-                Vec::new()
-            }
+        match journal_ops::tracked_files(&self.sea, &prefix, usize::MAX).await {
+            Ok(files) => files.into_iter().map(|(f, _)| PathBuf::from(f.display_path)).collect(),
             Err(e) => {
-                tracing::warn!(error = %e, "journal: tracked-files task failed; no tombstones");
+                tracing::warn!(error = %e, "journal: listing tracked files failed; no tombstones");
                 Vec::new()
             }
         }
@@ -945,14 +944,14 @@ impl JournalCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
+    use crate::db::sea::sea_test_db;
 
-    fn ctx(root: Option<&Path>) -> Arc<JournalCtx> {
+    async fn ctx(root: Option<&Path>) -> Arc<JournalCtx> {
         // `keep()` so the directory outlives the TempDir guard; the OS temp
         // cleaner owns it from here, which is fine for a test.
         let blob = tempfile::tempdir().unwrap().keep();
         JournalCtx::new(
-            diesel_test_db(),
+            sea_test_db().await,
             blob,
             "conv".into(),
             "turn".into(),
@@ -966,7 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_recorded_edit_lands_with_full_attribution() {
-        let ctx = ctx(None);
+        let ctx = ctx(None).await;
         let id = ctx
             .record(
                 Path::new("C:/p/a.rs"),
@@ -979,19 +978,16 @@ mod tests {
             .await
             .expect("recorded");
 
-        let mut conn = ctx.pool.get().unwrap();
-        let file = crate::db::ops::journal::file_by_path(
-            &mut conn,
-            &crate::journal::norm_path(Path::new("C:/p/a.rs")).unwrap(),
-        )
-        .unwrap()
-        .expect("file row");
-        let chain = crate::db::ops::journal::chain(&mut conn, &file.id).unwrap();
+        let file = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(Path::new("C:/p/a.rs")).unwrap())
+            .await
+            .unwrap()
+            .expect("file row");
+        let chain = journal_ops::chain(&ctx.sea, &file.id).await.unwrap();
         assert_eq!(chain.len(), 1);
         let v = &chain[0];
         assert_eq!(v.id, id);
-        assert_eq!(v.op, "edit");
-        assert_eq!(v.source, "native");
+        assert_eq!(v.op, VersionOp::Edit);
+        assert_eq!(v.source, VersionSource::Native);
         assert_eq!(v.conversation_id.as_deref(), Some("conv"));
         assert_eq!(v.turn_id.as_deref(), Some("turn"));
         assert_eq!(v.project_id.as_deref(), Some("proj"));
@@ -1008,7 +1004,7 @@ mod tests {
     async fn gitignored_files_and_git_internals_are_not_recorded() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "*.log\n!kept.log\n").unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
 
         let ignored = dir.path().join("noise.log");
         assert!(
@@ -1045,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_snapshot_is_skipped_not_split() {
-        let ctx = ctx(None);
+        let ctx = ctx(None).await;
         let big = "x".repeat(MAX_SNAPSHOT_BYTES + 1);
         assert!(
             ctx.record(
@@ -1066,7 +1062,7 @@ mod tests {
     /// another writer's observation and publication.
     #[tokio::test]
     async fn the_path_lock_serialises_observe_to_append() {
-        let ctx = ctx(None);
+        let ctx = ctx(None).await;
         let path = Path::new("C:/p/contended.rs");
         ctx.record(path, None, Some("A"), Op::Write, "write_file", None)
             .await
@@ -1098,22 +1094,22 @@ mod tests {
         racer.await.unwrap().unwrap();
 
         // Publication order matches lock order: A→B then B→C, no external rows.
-        let mut conn = ctx.pool.get().unwrap();
-        let file = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(path).unwrap())
+        let file = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(path).unwrap())
+            .await
             .unwrap()
             .unwrap();
-        let chain = crate::db::ops::journal::chain(&mut conn, &file.id).unwrap();
+        let chain = journal_ops::chain(&ctx.sea, &file.id).await.unwrap();
         assert_eq!(chain.len(), 3);
         assert!(
-            chain.iter().all(|v| v.source != "external"),
+            chain.iter().all(|v| v.source != VersionSource::External),
             "no fictional external rows"
         );
     }
 
-    fn ctx_sharing(root: Option<&Path>, shared: Arc<JournalShared>) -> Arc<JournalCtx> {
+    async fn ctx_sharing(root: Option<&Path>, shared: Arc<JournalShared>) -> Arc<JournalCtx> {
         let blob = tempfile::tempdir().unwrap().keep();
         JournalCtx::new(
-            diesel_test_db(),
+            sea_test_db().await,
             blob,
             "conv".into(),
             "turn".into(),
@@ -1130,8 +1126,8 @@ mod tests {
     #[tokio::test]
     async fn independent_turns_share_the_path_lock() {
         let shared = JournalShared::new();
-        let a = ctx_sharing(None, shared.clone());
-        let b = ctx_sharing(None, shared);
+        let a = ctx_sharing(None, shared.clone()).await;
+        let b = ctx_sharing(None, shared).await;
         let path = Path::new("C:/p/contended.rs");
         a.record(path, None, Some("A"), Op::Write, "write_file", None)
             .await
@@ -1165,7 +1161,7 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "secrets/\ntarget/\n").unwrap();
         std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
 
         assert!(
             ctx.record(
@@ -1209,7 +1205,7 @@ mod tests {
     async fn rewriting_gitignore_invalidates_the_cache() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let secret = dir.path().join("secret.env");
 
         assert!(
@@ -1242,7 +1238,7 @@ mod tests {
     async fn a_malformed_gitignore_line_keeps_the_valid_rules() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "*.log\n[\n.env\n").unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
 
         assert!(
             ctx.record(
@@ -1291,7 +1287,7 @@ mod tests {
         std::fs::create_dir(proj.join("nested")).unwrap();
         std::fs::write(proj.join(".gitignore"), ".env\n").unwrap();
         let aliased = proj.join("nested").join("..");
-        let ctx = ctx(Some(&aliased));
+        let ctx = ctx(Some(&aliased)).await;
 
         assert!(
             ctx.record(
@@ -1310,7 +1306,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_under_returns_every_live_file_not_a_page() {
-        let ctx = ctx(None);
+        let ctx = ctx(None).await;
         for i in 0..257 {
             let p = PathBuf::from(format!("C:/p/f{i}.rs"));
             ctx.record(&p, None, Some("x"), Op::Write, "write_file", None)
@@ -1325,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn a_windows_dot_git_directory_is_skipped_regardless_of_case() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let git_internal = dir.path().join(".GIT").join("config");
         assert!(
             ctx.record(&git_internal, None, Some("x"), Op::Write, "write_file", None)
@@ -1383,7 +1379,7 @@ mod tests {
         let env = dir.path().join(".env");
         let shared = JournalShared::new();
 
-        let first = ctx_sharing(Some(dir.path()), shared.clone());
+        let first = ctx_sharing(Some(dir.path()), shared.clone()).await;
         assert!(
             first
                 .record(&env, None, Some("SECRET=1"), Op::Write, "write_file", None)
@@ -1394,7 +1390,7 @@ mod tests {
 
         std::fs::write(dir.path().join(".gitignore"), ".env\n").unwrap();
 
-        let second = ctx_sharing(Some(dir.path()), shared);
+        let second = ctx_sharing(Some(dir.path()), shared).await;
         assert!(
             second
                 .record(&env, None, Some("SECRET=2"), Op::Write, "write_file", None)
@@ -1418,8 +1414,8 @@ mod tests {
         let secret = nested.join("src/secret.txt");
 
         let shared = JournalShared::new();
-        let outer = ctx_sharing(Some(&repo), shared.clone());
-        let inner = ctx_sharing(Some(&nested), shared);
+        let outer = ctx_sharing(Some(&repo), shared.clone()).await;
+        let inner = ctx_sharing(Some(&nested), shared).await;
 
         assert!(
             outer
@@ -1447,8 +1443,8 @@ mod tests {
         let secret = nested.join("src/secret.txt");
 
         let shared = JournalShared::new();
-        let outer = ctx_sharing(Some(&repo), shared.clone());
-        let inner = ctx_sharing(Some(&nested), shared);
+        let outer = ctx_sharing(Some(&repo), shared.clone()).await;
+        let inner = ctx_sharing(Some(&nested), shared).await;
 
         assert!(
             inner
@@ -1472,7 +1468,7 @@ mod tests {
     #[tokio::test]
     async fn a_bracketed_command_change_is_recorded_as_inferred() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let file = dir.path().join("tracked.txt");
         std::fs::write(&file, "v1\n").unwrap();
         let real = crate::tools::verified::resolve_root(&file).unwrap();
@@ -1484,14 +1480,14 @@ mod tests {
         std::fs::write(&file, "v1\nv2 from a script\n").unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let mut conn = ctx.pool.get().unwrap();
-        let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
             .unwrap()
             .unwrap();
-        let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
+        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
         assert_eq!(chain.len(), 2);
         let v = &chain[1];
-        assert_eq!((v.op.as_str(), v.source.as_str()), ("command_observed", "inferred"));
+        assert_eq!((v.op, v.source), (VersionOp::CommandObserved, VersionSource::Inferred));
         assert_eq!(v.conversation_id.as_deref(), Some("conv"));
         assert_eq!(v.turn_id.as_deref(), Some("turn"));
         assert_eq!(v.tool_name.as_deref(), Some("run_command"));
@@ -1507,7 +1503,7 @@ mod tests {
     #[tokio::test]
     async fn a_pre_command_hand_edit_is_pinned_external_not_inferred() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let file = dir.path().join("tracked.txt");
         std::fs::write(&file, "v1\n").unwrap();
         let real = crate::tools::verified::resolve_root(&file).unwrap();
@@ -1521,13 +1517,13 @@ mod tests {
         // The command changes nothing.
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let mut conn = ctx.pool.get().unwrap();
-        let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
             .unwrap()
             .unwrap();
-        let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
+        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[1].op, "external");
+        assert_eq!(chain[1].op, VersionOp::External);
         assert_eq!(chain[1].conversation_id, None, "a hand edit is nobody's");
     }
 
@@ -1536,17 +1532,17 @@ mod tests {
     #[tokio::test]
     async fn an_untracked_file_is_not_bracketed() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         std::fs::write(dir.path().join("stranger.txt"), "v1\n").unwrap();
 
         let bracket = ctx.command_bracket().await.unwrap();
         std::fs::write(dir.path().join("stranger.txt"), "v2\n").unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let mut conn = ctx.pool.get().unwrap();
         let real = crate::tools::verified::resolve_root(&dir.path().join("stranger.txt")).unwrap();
         assert!(
-            crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
+            journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -1556,7 +1552,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_deletion_is_a_command_observed_tombstone() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let file = dir.path().join("doomed.txt");
         std::fs::write(&file, "v1\n").unwrap();
         let real = crate::tools::verified::resolve_root(&file).unwrap();
@@ -1568,15 +1564,15 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let mut conn = ctx.pool.get().unwrap();
-        let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
             .unwrap()
             .unwrap();
-        let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
+        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(
-            (chain[1].op.as_str(), chain[1].new_sha.as_deref()),
-            ("command_observed", None)
+            (chain[1].op, chain[1].new_sha.as_deref()),
+            (VersionOp::CommandObserved, None)
         );
     }
 
@@ -1586,7 +1582,7 @@ mod tests {
     #[tokio::test]
     async fn a_newly_gitignored_tracked_file_is_not_scanned() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let file = dir.path().join("config.txt");
         std::fs::write(&file, "harmless\n").unwrap();
         let real = crate::tools::verified::resolve_root(&file).unwrap();
@@ -1595,13 +1591,13 @@ mod tests {
             .unwrap();
 
         // The rule arrives after the file was journalled; a fresh turn sees
-        // it. Same pool and blob store as the first turn — `ctx_sharing`
+        // it. Same database and blob store as the first turn — `ctx_sharing`
         // would mint a new database, and a bracket over an empty journal
         // proves nothing (this test sat green under mutation for exactly
         // that reason).
         std::fs::write(dir.path().join(".gitignore"), "config.txt\n").unwrap();
         let ctx2 = JournalCtx::new(
-            ctx.pool.clone(),
+            ctx.sea.clone(),
             ctx.blob_root.clone(),
             "conv2".into(),
             "turn2".into(),
@@ -1635,7 +1631,7 @@ mod tests {
     async fn a_command_edit_of_gitignore_invalidates_the_cache() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let gi = dir.path().join(".gitignore");
         let real_gi = crate::tools::verified::resolve_root(&gi).unwrap();
         ctx.record(&real_gi, None, Some(""), Op::Write, "write_file", None)
@@ -1666,7 +1662,7 @@ mod tests {
     #[tokio::test]
     async fn a_recreation_after_a_command_deletion_is_attributed() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let file = dir.path().join("phoenix.txt");
         std::fs::write(&file, "v1\n").unwrap();
         let real = crate::tools::verified::resolve_root(&file).unwrap();
@@ -1684,16 +1680,16 @@ mod tests {
         std::fs::write(&file, "reborn\n").unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let mut conn = ctx.pool.get().unwrap();
-        let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
             .unwrap()
             .unwrap();
-        let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
+        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
         assert_eq!(chain.len(), 3);
         let rebirth = &chain[2];
         assert_eq!(
-            (rebirth.op.as_str(), rebirth.observed_old_sha.as_deref()),
-            ("command_observed", None)
+            (rebirth.op, rebirth.observed_old_sha.as_deref()),
+            (VersionOp::CommandObserved, None)
         );
         assert_eq!(rebirth.conversation_id.as_deref(), Some("conv"));
     }
@@ -1706,8 +1702,8 @@ mod tests {
     async fn overlapping_brackets_void_both_windows() {
         let dir = tempfile::tempdir().unwrap();
         let shared = JournalShared::new();
-        let a = ctx_sharing(Some(dir.path()), shared.clone());
-        let b = ctx_sharing(Some(dir.path()), shared);
+        let a = ctx_sharing(Some(dir.path()), shared.clone()).await;
+        let b = ctx_sharing(Some(dir.path()), shared).await;
         let file = dir.path().join("contended.txt");
         std::fs::write(&file, "v1\n").unwrap();
         let real = crate::tools::verified::resolve_root(&file).unwrap();
@@ -1722,29 +1718,22 @@ mod tests {
         a.settle_command_bracket(bracket_a, "run_command").await;
         b.settle_command_bracket(bracket_b, "run_command").await;
 
-        let row = {
-            // Scoped: the test pool is tiny, and holding a connection across
-            // the next bracket starves its spawn_blocking query into a
-            // timeout — a defect of this test, not of the bracket.
-            let mut conn = a.pool.get().unwrap();
-            let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
-                .unwrap()
-                .unwrap();
-            let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
-            assert_eq!(chain.len(), 1, "voided windows record nothing: {chain:?}");
-            row
-        };
+        let row = journal_ops::file_by_path(&a.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let chain = journal_ops::chain(&a.sea, &row.id).await.unwrap();
+        assert_eq!(chain.len(), 1, "voided windows record nothing: {chain:?}");
 
         // And the window closes with its brackets: a later lone bracket works.
         std::fs::write(&file, "later solo change\n").unwrap();
         let bracket = a.command_bracket().await.unwrap();
         std::fs::write(&file, "solo command work\n").unwrap();
         a.settle_command_bracket(bracket, "run_command").await;
-        let mut conn = a.pool.get().unwrap();
-        let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
+        let chain = journal_ops::chain(&a.sea, &row.id).await.unwrap();
         assert_eq!(
-            chain.last().map(|v| v.op.as_str()),
-            Some("command_observed"),
+            chain.last().map(|v| v.op),
+            Some(VersionOp::CommandObserved),
             "the slot must not stay tainted after both windows closed"
         );
     }
@@ -1760,7 +1749,7 @@ mod tests {
         let secret_target = outside.path().join("host-secret.txt");
         std::fs::write(&secret_target, "HOST SECRET\n").unwrap();
 
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let file = dir.path().join("tracked.txt");
         std::fs::write(&file, "v1\n").unwrap();
         let real = crate::tools::verified::resolve_root(&file).unwrap();
@@ -1785,11 +1774,11 @@ mod tests {
             blobs::load(&ctx.blob_root, &sha).is_err(),
             "the symlink target's bytes reached the store"
         );
-        let mut conn = ctx.pool.get().unwrap();
-        let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
             .unwrap()
             .unwrap();
-        let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
+        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
         assert_eq!(chain.len(), 1, "an unobservable path appends nothing: {chain:?}");
     }
 
@@ -1799,7 +1788,7 @@ mod tests {
     #[tokio::test]
     async fn a_head_moved_during_the_window_drops_the_observation() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx(Some(dir.path()));
+        let ctx = ctx(Some(dir.path())).await;
         let file = dir.path().join("tracked.txt");
         std::fs::write(&file, "v1\n").unwrap();
         let real = crate::tools::verified::resolve_root(&file).unwrap();
@@ -1822,14 +1811,14 @@ mod tests {
         .unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let mut conn = ctx.pool.get().unwrap();
-        let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
             .unwrap()
             .unwrap();
-        let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
+        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
         assert_eq!(chain.len(), 2, "the stale observation must not append");
         assert!(
-            chain.iter().all(|v| v.source != "external"),
+            chain.iter().all(|v| v.source != VersionSource::External),
             "and must not mint external rows"
         );
     }
@@ -1837,7 +1826,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_trailing_space_is_a_different_file() {
-        let ctx = ctx(None);
+        let ctx = ctx(None).await;
         ctx.record(Path::new("/tmp/file"), None, Some("a"), Op::Write, "write_file", None)
             .await
             .unwrap();
@@ -1845,19 +1834,14 @@ mod tests {
             .await
             .unwrap();
 
-        let mut conn = ctx.pool.get().unwrap();
-        let a = crate::db::ops::journal::file_by_path(
-            &mut conn,
-            &crate::journal::norm_path(Path::new("/tmp/file")).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-        let b = crate::db::ops::journal::file_by_path(
-            &mut conn,
-            &crate::journal::norm_path(Path::new("/tmp/file ")).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
+        let a = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(Path::new("/tmp/file")).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let b = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(Path::new("/tmp/file ")).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_ne!(a.id, b.id, "two Unix names must not share a chain");
     }
 }

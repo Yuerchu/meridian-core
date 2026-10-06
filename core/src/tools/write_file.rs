@@ -158,9 +158,11 @@ mod tests {
         assert!(err.contains("Access denied"), "got {err}");
     }
 
-    fn ctx_with_journal(wd: &std::path::Path) -> (ToolContext, std::sync::Arc<crate::journal::capture::JournalCtx>) {
+    async fn ctx_with_journal(
+        wd: &std::path::Path,
+    ) -> (ToolContext, std::sync::Arc<crate::journal::capture::JournalCtx>) {
         let journal = crate::journal::capture::JournalCtx::new(
-            crate::db::diesel_test_db(),
+            crate::db::sea::sea_test_db().await,
             tempfile::tempdir().unwrap().keep(),
             "conv".into(),
             "turn".into(),
@@ -182,7 +184,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.bin");
         std::fs::write(&file, [0xff, 0xfe, 0xfd]).unwrap();
-        let (context, journal) = ctx_with_journal(dir.path());
+        let (context, journal) = ctx_with_journal(dir.path()).await;
 
         WriteFileTool
             .execute(serde_json::json!({"path": "a.bin", "content": "ok"}), &context)
@@ -191,8 +193,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "ok");
 
         let real = crate::tools::verified::resolve_root(&file).unwrap();
-        let mut conn = journal.pool.get().unwrap();
-        let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap()).unwrap();
+        let row = crate::db::sea::ops::journal::file_by_path(&journal.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
+            .unwrap();
         assert!(row.is_none(), "unreadable old bytes are not journalled");
     }
 
@@ -201,7 +204,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("big.txt");
         std::fs::write(&file, vec![b'x'; crate::journal::capture::MAX_SNAPSHOT_BYTES + 1]).unwrap();
-        let (context, _) = ctx_with_journal(dir.path());
+        let (context, _) = ctx_with_journal(dir.path()).await;
 
         WriteFileTool
             .execute(serde_json::json!({"path": "big.txt", "content": "tiny"}), &context)
