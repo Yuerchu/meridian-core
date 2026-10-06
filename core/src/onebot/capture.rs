@@ -152,7 +152,7 @@ async fn capture_one(
         return Ok(());
     }
 
-    let key_bytes = voice_corpus::storage_key(&state.services.db)?;
+    let key_bytes = voice_corpus::storage_key(&state.services.sea).await?;
     let pseudonym = voice_corpus::session_pseudonym(
         &key_bytes,
         source.scope.bot_self_id,

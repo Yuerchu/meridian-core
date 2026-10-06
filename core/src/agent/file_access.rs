@@ -1,4 +1,4 @@
-use crate::db::DbPool;
+use crate::db::sea::cap::Db;
 use crate::tools;
 
 /// Persisted SAF root entry, stored as a JSON array under the
@@ -22,20 +22,15 @@ fn parse_saf_roots(value: Option<&str>) -> Result<Vec<SafRootEntry>, String> {
 /// Build the file access policy for tool execution.
 /// Desktop: unrestricted (legacy working_directory validation only).
 /// Android: whitelist of authorized roots from preferences + system grants.
-pub async fn build_file_access(pool: &DbPool) -> Result<tools::FileAccess, String> {
+pub async fn build_file_access(db: &Db) -> Result<tools::FileAccess, String> {
     #[cfg(target_os = "android")]
     {
-        let pool = pool.clone();
-        let (manage_pref, saf_pref) = tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let mut conn = pool.get().map_err(|error| error.to_string())?;
-            let manage = crate::db::ops::preference::get_preference(&mut conn, "android.manage_storage_enabled")
-                .map_err(|error| error.to_string())?;
-            let saf = crate::db::ops::preference::get_preference(&mut conn, "android.saf_roots")
-                .map_err(|error| error.to_string())?;
-            Ok((manage, saf))
-        })
-        .await
-        .map_err(|error| error.to_string())??;
+        let manage_pref = crate::db::sea::ops::preference::get_preference(db, "android.manage_storage_enabled")
+            .await
+            .map_err(|error| error.to_string())?;
+        let saf_pref = crate::db::sea::ops::preference::get_preference(db, "android.saf_roots")
+            .await
+            .map_err(|error| error.to_string())?;
         let manage_enabled = crate::db::ops::preference::parse_bool_preference(
             "android.manage_storage_enabled",
             manage_pref.as_deref(),
@@ -90,7 +85,7 @@ pub async fn build_file_access(pool: &DbPool) -> Result<tools::FileAccess, Strin
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = pool;
+        let _ = db;
         Ok(tools::FileAccess::default())
     }
 }

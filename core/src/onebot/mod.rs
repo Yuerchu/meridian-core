@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::DbPool;
+use crate::db::sea::cap::Db;
 use crate::listen_guard::{constant_time_eq, validate_listen_config};
 use crate::services::Services;
 use crate::turn::{Busy, TurnCoordinator, TurnLease, TurnOrigin};
@@ -1128,33 +1128,39 @@ fn validate_scope_list(key: &str, values: &[String], groups_only: bool) -> Resul
     Ok(())
 }
 
-pub fn load_config(pool: &DbPool) -> Result<OneBotConfig, String> {
-    let mut conn = get_conn(pool)?;
-    let mut get = |key: &str| -> Result<Option<String>, String> {
-        crate::db::ops::preference::get_preference(&mut conn, key)
+pub async fn load_config(db: &Db) -> Result<OneBotConfig, String> {
+    let get = async |key: &str| -> Result<Option<String>, String> {
+        crate::db::sea::ops::preference::get_preference(db, key)
+            .await
             .map_err(|error| format!("failed to read preference {key}: {error}"))
     };
 
-    let voice_capture_sessions: Vec<String> =
-        parse_stored_json("onebot.voice_capture_sessions", get("onebot.voice_capture_sessions")?)?;
+    let voice_capture_sessions: Vec<String> = parse_stored_json(
+        "onebot.voice_capture_sessions",
+        get("onebot.voice_capture_sessions").await?,
+    )?;
     validate_scope_list("onebot.voice_capture_sessions", &voice_capture_sessions, false)?;
     let voice_send_groups: Vec<String> =
-        parse_stored_json("onebot.voice_send_groups", get("onebot.voice_send_groups")?)?;
+        parse_stored_json("onebot.voice_send_groups", get("onebot.voice_send_groups").await?)?;
     validate_scope_list("onebot.voice_send_groups", &voice_send_groups, true)?;
 
     Ok(OneBotConfig {
-        enabled: parse_stored_bool("onebot.enabled", get("onebot.enabled")?, false)?,
-        host: get("onebot.host")?.unwrap_or_else(|| "127.0.0.1".into()),
-        port: parse_stored_port("onebot.port", get("onebot.port")?, 6700)?,
-        access_token: get("onebot.access_token")?.filter(|s| !s.is_empty()),
-        assistant_id: get("onebot.assistant_id")?.filter(|s| !s.is_empty()),
-        admin_users: parse_stored_json("onebot.admin_users", get("onebot.admin_users")?)?,
-        ack_emoji_id: get("onebot.ack_emoji_id")?.unwrap_or_else(default_ack_emoji),
+        enabled: parse_stored_bool("onebot.enabled", get("onebot.enabled").await?, false)?,
+        host: get("onebot.host").await?.unwrap_or_else(|| "127.0.0.1".into()),
+        port: parse_stored_port("onebot.port", get("onebot.port").await?, 6700)?,
+        access_token: get("onebot.access_token").await?.filter(|s| !s.is_empty()),
+        assistant_id: get("onebot.assistant_id").await?.filter(|s| !s.is_empty()),
+        admin_users: parse_stored_json("onebot.admin_users", get("onebot.admin_users").await?)?,
+        ack_emoji_id: get("onebot.ack_emoji_id").await?.unwrap_or_else(default_ack_emoji),
         voice_capture_sessions,
-        voice_send_enabled: parse_stored_bool("onebot.voice_send_enabled", get("onebot.voice_send_enabled")?, false)?,
+        voice_send_enabled: parse_stored_bool(
+            "onebot.voice_send_enabled",
+            get("onebot.voice_send_enabled").await?,
+            false,
+        )?,
         voice_send_groups,
-        voice_tts_model: get("onebot.voice_tts_model")?.unwrap_or_default(),
-        voice_tts_reference_id: get("onebot.voice_tts_reference_id")?.unwrap_or_default(),
+        voice_tts_model: get("onebot.voice_tts_model").await?.unwrap_or_default(),
+        voice_tts_reference_id: get("onebot.voice_tts_reference_id").await?.unwrap_or_default(),
     })
 }
 
@@ -1163,12 +1169,11 @@ pub fn load_config(pool: &DbPool) -> Result<OneBotConfig, String> {
 /// **一个事务**，不是逐条写。中途失败会留下一个没人能解释的状态：UI 报了失败，
 /// 内存里还是旧策略，而重启之后生效的却是写进去的那一半。对普通设置那是难看，
 /// 对 `voice_capture_sessions` 那是"用户以为关掉了而它还在录"。
-pub fn save_config(pool: &DbPool, config: &OneBotConfig) -> Result<(), String> {
-    use diesel::connection::Connection;
+pub async fn save_config(db: &Db, config: &OneBotConfig) -> Result<(), String> {
+    use crate::db::sea::ops::preference::set_preference;
 
     validate_scope_list("onebot.voice_capture_sessions", &config.voice_capture_sessions, false)?;
     validate_scope_list("onebot.voice_send_groups", &config.voice_send_groups, true)?;
-    let mut conn = get_conn(pool)?;
     let now = now_ms();
     let admin_users = serde_json::to_string(&config.admin_users)
         .map_err(|error| format!("could not serialize onebot.admin_users: {error}"))?;
@@ -1177,27 +1182,40 @@ pub fn save_config(pool: &DbPool, config: &OneBotConfig) -> Result<(), String> {
     let voice_send_groups = serde_json::to_string(&config.voice_send_groups)
         .map_err(|error| format!("could not serialize onebot.voice_send_groups: {error}"))?;
 
-    conn.transaction::<_, diesel::result::Error, _>(|conn| {
-        let mut set =
-            |key: &str, val: &str| crate::db::ops::preference::set_preference(conn, key, val, now).map(|_| ());
-
-        set("onebot.enabled", if config.enabled { "true" } else { "false" })?;
-        set("onebot.host", &config.host)?;
-        set("onebot.port", &config.port.to_string())?;
-        set("onebot.access_token", config.access_token.as_deref().unwrap_or(""))?;
-        set("onebot.assistant_id", config.assistant_id.as_deref().unwrap_or(""))?;
-        set("onebot.admin_users", &admin_users)?;
-        set("onebot.ack_emoji_id", &config.ack_emoji_id)?;
-        set("onebot.voice_capture_sessions", &voice_capture_sessions)?;
-        set(
+    db.write(async |tx| {
+        set_preference(tx, "onebot.enabled", if config.enabled { "true" } else { "false" }, now).await?;
+        set_preference(tx, "onebot.host", &config.host, now).await?;
+        set_preference(tx, "onebot.port", &config.port.to_string(), now).await?;
+        set_preference(
+            tx,
+            "onebot.access_token",
+            config.access_token.as_deref().unwrap_or(""),
+            now,
+        )
+        .await?;
+        set_preference(
+            tx,
+            "onebot.assistant_id",
+            config.assistant_id.as_deref().unwrap_or(""),
+            now,
+        )
+        .await?;
+        set_preference(tx, "onebot.admin_users", &admin_users, now).await?;
+        set_preference(tx, "onebot.ack_emoji_id", &config.ack_emoji_id, now).await?;
+        set_preference(tx, "onebot.voice_capture_sessions", &voice_capture_sessions, now).await?;
+        set_preference(
+            tx,
             "onebot.voice_send_enabled",
             if config.voice_send_enabled { "true" } else { "false" },
-        )?;
-        set("onebot.voice_send_groups", &voice_send_groups)?;
-        set("onebot.voice_tts_model", &config.voice_tts_model)?;
-        set("onebot.voice_tts_reference_id", &config.voice_tts_reference_id)?;
-        Ok(())
+            now,
+        )
+        .await?;
+        set_preference(tx, "onebot.voice_send_groups", &voice_send_groups, now).await?;
+        set_preference(tx, "onebot.voice_tts_model", &config.voice_tts_model, now).await?;
+        set_preference(tx, "onebot.voice_tts_reference_id", &config.voice_tts_reference_id, now).await?;
+        Ok::<(), sea_orm::DbErr>(())
     })
+    .await
     .map_err(|e| e.to_string())
 }
 
@@ -1413,9 +1431,22 @@ impl OneBotServer {
                 let pool = services.db.clone();
                 let data_dir = services.paths.data_dir.clone();
                 let writable = services.corpus.writable();
-                let recovered =
-                    tokio::task::spawn_blocking(move || crate::voice_corpus::recover::run(&pool, &data_dir, writable))
-                        .await;
+                // 假名化密钥是一个异步的 SeaORM 写事务，在这里等；恢复器本身还是
+                // Diesel 加文件系统，留在 spawn_blocking 里。拿不到锁就不取：那时
+                // 恢复器什么都不做，也不该为它铸一把 key。
+                let recovered = if !writable {
+                    Ok(Ok(crate::voice_corpus::recover::Recovered::default()))
+                } else {
+                    match crate::voice_corpus::storage_key(&services.sea).await {
+                        Ok(key) => {
+                            tokio::task::spawn_blocking(move || {
+                                crate::voice_corpus::recover::run(&pool, &key, &data_dir, writable)
+                            })
+                            .await
+                        }
+                        Err(error) => Ok(Err(error)),
+                    }
+                };
                 if let Ok(Err(error)) = recovered {
                     tracing::warn!(%error, "voice corpus recovery failed");
                 }
@@ -1808,17 +1839,20 @@ pub struct AppOneBot(pub Arc<Mutex<OneBotServer>>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
     use crate::turn::{Busy, TurnOrigin};
 
-    #[test]
-    fn stored_onebot_config_rejects_malformed_values() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::preference::set_preference(&mut conn, "onebot.admin_users", "not json", 1).unwrap();
-        drop(conn);
+    #[tokio::test]
+    async fn stored_onebot_config_rejects_malformed_values() {
+        let db = crate::db::sea::sea_test_db().await;
+        db.write(async |tx| {
+            crate::db::sea::ops::preference::set_preference(tx, "onebot.admin_users", "not json", 1).await
+        })
+        .await
+        .unwrap();
 
-        let error = load_config(&pool).expect_err("malformed stored JSON must fail config loading");
+        let error = load_config(&db)
+            .await
+            .expect_err("malformed stored JSON must fail config loading");
         assert!(error.contains("onebot.admin_users"), "{error}");
     }
 

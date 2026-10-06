@@ -234,9 +234,9 @@ pub fn validate_level(level: &str) -> Result<LogLevel, String> {
 
 /// Read the exact saved spelling. Absence means the documented default; a row
 /// that exists but is invalid is a broken contract and is returned as an error.
-pub fn load_saved_level(pool: &crate::db::DbPool) -> Result<LogLevel, String> {
-    let mut conn = pool.get().map_err(|error| error.to_string())?;
-    let saved = crate::db::ops::preference::get_preference(&mut conn, LEVEL_PREFERENCE_KEY)
+pub async fn load_saved_level(db: &crate::db::sea::cap::Db) -> Result<LogLevel, String> {
+    let saved = crate::db::sea::ops::preference::get_preference(db, LEVEL_PREFERENCE_KEY)
+        .await
         .map_err(|error| format!("failed to read preference {LEVEL_PREFERENCE_KEY}: {error}"))?;
     match saved {
         None => Ok(config::DEFAULT_LEVEL),
@@ -246,8 +246,8 @@ pub fn load_saved_level(pool: &crate::db::DbPool) -> Result<LogLevel, String> {
 
 /// Apply the saved level. Runs after the database is up, so the handful of lines
 /// written before this point use the default level.
-pub(crate) fn apply_saved_level(pool: &crate::db::DbPool) -> Result<(), String> {
-    set_level(load_saved_level(pool)?)
+pub(crate) async fn apply_saved_level(db: &crate::db::sea::cap::Db) -> Result<(), String> {
+    set_level(load_saved_level(db).await?)
 }
 
 /// Change the file log level for the running process.
@@ -324,17 +324,20 @@ mod tests {
     use super::*;
     use tracing_subscriber::layer::SubscriberExt;
 
-    #[test]
-    fn stored_log_level_is_strict_and_errors_are_not_defaulted() {
-        let pool = crate::db::diesel_test_db();
-        assert_eq!(load_saved_level(&pool).unwrap(), default_level());
+    #[tokio::test]
+    async fn stored_log_level_is_strict_and_errors_are_not_defaulted() {
+        let db = crate::db::sea::sea_test_db().await;
+        assert_eq!(load_saved_level(&db).await.unwrap(), default_level());
 
         for raw in ["WARN", " info ", "trace", "future"] {
-            {
-                let mut conn = pool.get().unwrap();
-                crate::db::ops::preference::set_preference(&mut conn, LEVEL_PREFERENCE_KEY, raw, 1).unwrap();
-            }
-            let error = load_saved_level(&pool).expect_err("invalid stored log level must fail");
+            db.write(async |tx| {
+                crate::db::sea::ops::preference::set_preference(tx, LEVEL_PREFERENCE_KEY, raw, 1).await
+            })
+            .await
+            .unwrap();
+            let error = load_saved_level(&db)
+                .await
+                .expect_err("invalid stored log level must fail");
             assert!(error.contains("unsupported log level"), "{raw:?}: {error}");
         }
     }

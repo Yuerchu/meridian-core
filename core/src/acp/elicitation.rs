@@ -595,7 +595,7 @@ pub async fn ask(
 
     // Worked out once, here, rather than by the waiter — see the note in
     // `acp::approvals::ask`.
-    let ttl = crate::approval::ttl(services)?;
+    let ttl = crate::approval::ttl(services).await?;
 
     // Stamped once and sent both ways: on the event, and in the register every
     // listing reads, so a card rebuilt after a reload keeps its time.

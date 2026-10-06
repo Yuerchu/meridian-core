@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
 
-use crate::db::DbPool;
 use crate::db::models::notification::NotificationEventKind;
+use crate::db::sea::cap::Db;
 use crate::decimal::Decimal;
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
 use crate::services::Services;
@@ -160,55 +160,55 @@ fn parse_optional_decimal(key: &str, raw: Option<String>) -> Result<Option<Decim
         .map_err(|error| error.to_string())
 }
 
-pub fn load_config(pool: &DbPool) -> Result<NotifyConfig, String> {
-    let mut conn = pool.get().map_err(|error| format!("db connection: {error}"))?;
-    let mut get = |key: &str| -> Result<Option<String>, String> {
-        crate::db::ops::preference::get_preference(&mut conn, key)
+pub async fn load_config(db: &Db) -> Result<NotifyConfig, String> {
+    let get = async |key: &str| -> Result<Option<String>, String> {
+        crate::db::sea::ops::preference::get_preference(db, key)
+            .await
             .map_err(|error| format!("failed to read preference {key}: {error}"))
     };
     let defaults = NotifyConfig::default();
 
     let config = NotifyConfig {
-        enabled: parse_stored_bool("notify.enabled", get("notify.enabled")?, defaults.enabled)?,
-        balance_threshold: parse_optional_decimal("notify.balance.threshold", get("notify.balance.threshold")?)?,
+        enabled: parse_stored_bool("notify.enabled", get("notify.enabled").await?, defaults.enabled)?,
+        balance_threshold: parse_optional_decimal("notify.balance.threshold", get("notify.balance.threshold").await?)?,
         balance_interval_minutes: parse_stored_u32(
             "notify.balance.interval_minutes",
-            get("notify.balance.interval_minutes")?,
+            get("notify.balance.interval_minutes").await?,
             defaults.balance_interval_minutes,
         )?,
         usage_enabled: parse_stored_bool(
             "notify.usage.enabled",
-            get("notify.usage.enabled")?,
+            get("notify.usage.enabled").await?,
             defaults.usage_enabled,
         )?,
         usage_check_interval_minutes: parse_stored_u32(
             "notify.usage.check_interval_minutes",
-            get("notify.usage.check_interval_minutes")?,
+            get("notify.usage.check_interval_minutes").await?,
             defaults.usage_check_interval_minutes,
         )?,
         usage_window_hours: parse_stored_u32(
             "notify.usage.window_hours",
-            get("notify.usage.window_hours")?,
+            get("notify.usage.window_hours").await?,
             defaults.usage_window_hours,
         )?,
         usage_baseline_days: parse_stored_u32(
             "notify.usage.baseline_days",
-            get("notify.usage.baseline_days")?,
+            get("notify.usage.baseline_days").await?,
             defaults.usage_baseline_days,
         )?,
         usage_multiplier: parse_stored_decimal(
             "notify.usage.multiplier",
-            get("notify.usage.multiplier")?,
+            get("notify.usage.multiplier").await?,
             defaults.usage_multiplier,
         )?,
         usage_min_cost: parse_stored_decimal(
             "notify.usage.min_cost",
-            get("notify.usage.min_cost")?,
+            get("notify.usage.min_cost").await?,
             defaults.usage_min_cost,
         )?,
         usage_cooldown_minutes: parse_stored_u32(
             "notify.usage.cooldown_minutes",
-            get("notify.usage.cooldown_minutes")?,
+            get("notify.usage.cooldown_minutes").await?,
             defaults.usage_cooldown_minutes,
         )?,
     };
@@ -243,76 +243,69 @@ pub fn validate(config: &NotifyConfig) -> Result<(), String> {
     Ok(())
 }
 
-pub fn save_config(pool: &DbPool, config: &NotifyConfig) -> Result<(), String> {
-    validate(config)?;
-    let mut conn = pool.get().map_err(|error| format!("db connection: {error}"))?;
-    let now = now_ms();
-    fn set(conn: &mut diesel::SqliteConnection, key: &str, value: &str, now: i64) -> Result<(), String> {
-        crate::db::ops::preference::set_preference(conn, key, value, now).map_err(|error| error.to_string())
-    }
+/// One transaction for the whole block, so a failure part-way leaves the
+/// previous configuration rather than half of each.
+pub async fn save_config(db: &Db, config: &NotifyConfig) -> Result<(), String> {
+    use crate::db::sea::ops::preference::{delete_preference, set_preference};
 
-    set(
-        &mut conn,
-        "notify.enabled",
-        if config.enabled { "true" } else { "false" },
-        now,
-    )?;
-    match config.balance_threshold.as_ref() {
-        Some(value) => set(&mut conn, "notify.balance.threshold", &value.to_string(), now)?,
-        // Deleted rather than stored empty: absent is the "off" state, and an
-        // empty string is refused by the parser on the way back in.
-        None => crate::db::ops::preference::delete_preference(&mut conn, "notify.balance.threshold")
-            .map_err(|error| error.to_string())?,
-    }
-    set(
-        &mut conn,
-        "notify.balance.interval_minutes",
-        &config.balance_interval_minutes.to_string(),
-        now,
-    )?;
-    set(
-        &mut conn,
-        "notify.usage.enabled",
-        if config.usage_enabled { "true" } else { "false" },
-        now,
-    )?;
-    set(
-        &mut conn,
-        "notify.usage.check_interval_minutes",
-        &config.usage_check_interval_minutes.to_string(),
-        now,
-    )?;
-    set(
-        &mut conn,
-        "notify.usage.window_hours",
-        &config.usage_window_hours.to_string(),
-        now,
-    )?;
-    set(
-        &mut conn,
-        "notify.usage.baseline_days",
-        &config.usage_baseline_days.to_string(),
-        now,
-    )?;
-    set(
-        &mut conn,
-        "notify.usage.multiplier",
-        &config.usage_multiplier.to_string(),
-        now,
-    )?;
-    set(
-        &mut conn,
-        "notify.usage.min_cost",
-        &config.usage_min_cost.to_string(),
-        now,
-    )?;
-    set(
-        &mut conn,
-        "notify.usage.cooldown_minutes",
-        &config.usage_cooldown_minutes.to_string(),
-        now,
-    )?;
-    Ok(())
+    validate(config)?;
+    let now = now_ms();
+    db.write(async |tx| {
+        set_preference(tx, "notify.enabled", if config.enabled { "true" } else { "false" }, now).await?;
+        match config.balance_threshold.as_ref() {
+            Some(value) => set_preference(tx, "notify.balance.threshold", &value.to_string(), now).await?,
+            // Deleted rather than stored empty: absent is the "off" state, and an
+            // empty string is refused by the parser on the way back in.
+            None => delete_preference(tx, "notify.balance.threshold").await?,
+        }
+        set_preference(
+            tx,
+            "notify.balance.interval_minutes",
+            &config.balance_interval_minutes.to_string(),
+            now,
+        )
+        .await?;
+        set_preference(
+            tx,
+            "notify.usage.enabled",
+            if config.usage_enabled { "true" } else { "false" },
+            now,
+        )
+        .await?;
+        set_preference(
+            tx,
+            "notify.usage.check_interval_minutes",
+            &config.usage_check_interval_minutes.to_string(),
+            now,
+        )
+        .await?;
+        set_preference(
+            tx,
+            "notify.usage.window_hours",
+            &config.usage_window_hours.to_string(),
+            now,
+        )
+        .await?;
+        set_preference(
+            tx,
+            "notify.usage.baseline_days",
+            &config.usage_baseline_days.to_string(),
+            now,
+        )
+        .await?;
+        set_preference(tx, "notify.usage.multiplier", &config.usage_multiplier.to_string(), now).await?;
+        set_preference(tx, "notify.usage.min_cost", &config.usage_min_cost.to_string(), now).await?;
+        set_preference(
+            tx,
+            "notify.usage.cooldown_minutes",
+            &config.usage_cooldown_minutes.to_string(),
+            now,
+        )
+        .await?;
+        Ok::<(), sea_orm::DbErr>(())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// A URL this app is willing to POST to.
@@ -767,16 +760,17 @@ pub struct AppNotify(pub Arc<Mutex<NotifyServer>>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
+    use crate::db::sea::sea_test_db;
 
-    fn set(pool: &DbPool, key: &str, value: &str) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::preference::set_preference(&mut conn, key, value, 1).unwrap();
+    async fn set(db: &Db, key: &str, value: &str) {
+        db.write(async |tx| crate::db::sea::ops::preference::set_preference(tx, key, value, 1).await)
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn absent_preferences_keep_the_documented_defaults() {
-        let config = load_config(&diesel_test_db()).unwrap();
+    #[tokio::test]
+    async fn absent_preferences_keep_the_documented_defaults() {
+        let config = load_config(&sea_test_db().await).await.unwrap();
         assert_eq!(config, NotifyConfig::default());
         assert!(!config.enabled);
         assert_eq!(config.balance_threshold, None, "off until somebody sets a floor");
@@ -785,70 +779,74 @@ mod tests {
     /// A stored value that no longer satisfies the bounds is reported at load
     /// rather than quietly driving a watcher — the same reason the other
     /// loaders validate on the way in.
-    #[test]
-    fn a_stored_value_outside_the_bounds_fails_the_load() {
-        let pool = diesel_test_db();
-        set(&pool, "notify.usage.window_hours", "0");
-        assert!(load_config(&pool).is_err());
+    #[tokio::test]
+    async fn a_stored_value_outside_the_bounds_fails_the_load() {
+        let db = sea_test_db().await;
+        set(&db, "notify.usage.window_hours", "0").await;
+        assert!(load_config(&db).await.is_err());
 
-        let pool = diesel_test_db();
-        set(&pool, "notify.usage.multiplier", "0.5");
-        let error = load_config(&pool).unwrap_err();
+        let db = sea_test_db().await;
+        set(&db, "notify.usage.multiplier", "0.5").await;
+        let error = load_config(&db).await.unwrap_err();
         assert!(error.contains("multiplier"), "{error}");
 
-        let pool = diesel_test_db();
-        set(&pool, "notify.usage.window_hours", "48");
-        set(&pool, "notify.usage.baseline_days", "1");
-        let error = load_config(&pool).unwrap_err();
+        let db = sea_test_db().await;
+        set(&db, "notify.usage.window_hours", "48").await;
+        set(&db, "notify.usage.baseline_days", "1").await;
+        let error = load_config(&db).await.unwrap_err();
         assert!(error.contains("whole window"), "{error}");
     }
 
-    #[test]
-    fn a_non_canonical_number_is_refused_rather_than_rounded() {
-        let pool = diesel_test_db();
-        set(&pool, "notify.usage.multiplier", "3.0");
-        assert!(load_config(&pool).is_err(), "3.0 is not the canonical spelling of 3");
+    #[tokio::test]
+    async fn a_non_canonical_number_is_refused_rather_than_rounded() {
+        let db = sea_test_db().await;
+        set(&db, "notify.usage.multiplier", "3.0").await;
+        assert!(
+            load_config(&db).await.is_err(),
+            "3.0 is not the canonical spelling of 3"
+        );
 
-        let pool = diesel_test_db();
-        set(&pool, "notify.balance.threshold", "-1");
-        assert!(load_config(&pool).is_err());
+        let db = sea_test_db().await;
+        set(&db, "notify.balance.threshold", "-1").await;
+        assert!(load_config(&db).await.is_err());
 
-        let pool = diesel_test_db();
-        set(&pool, "notify.balance.threshold", "");
-        assert!(load_config(&pool).is_err(), "empty is not a spelling of absent");
+        let db = sea_test_db().await;
+        set(&db, "notify.balance.threshold", "").await;
+        assert!(load_config(&db).await.is_err(), "empty is not a spelling of absent");
 
-        let pool = diesel_test_db();
-        set(&pool, "notify.enabled", "yes");
-        assert!(load_config(&pool).is_err());
+        let db = sea_test_db().await;
+        set(&db, "notify.enabled", "yes").await;
+        assert!(load_config(&db).await.is_err());
     }
 
     /// `Some(0)` and `None` are different settings and have to survive a round
     /// trip as such: zero means "tell me when the upstream refuses the account",
     /// absent means "do not ask at all".
-    #[test]
-    fn a_zero_threshold_round_trips_apart_from_an_absent_one() {
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn a_zero_threshold_round_trips_apart_from_an_absent_one() {
+        let db = sea_test_db().await;
         let mut config = NotifyConfig {
             balance_threshold: Some(Decimal::zero()),
             ..Default::default()
         };
-        save_config(&pool, &config).unwrap();
-        assert_eq!(load_config(&pool).unwrap().balance_threshold, Some(Decimal::zero()));
+        save_config(&db, &config).await.unwrap();
+        assert_eq!(load_config(&db).await.unwrap().balance_threshold, Some(Decimal::zero()));
 
         config.balance_threshold = None;
-        save_config(&pool, &config).unwrap();
-        assert_eq!(load_config(&pool).unwrap().balance_threshold, None);
-        let mut conn = pool.get().unwrap();
+        save_config(&db, &config).await.unwrap();
+        assert_eq!(load_config(&db).await.unwrap().balance_threshold, None);
         assert_eq!(
-            crate::db::ops::preference::get_preference(&mut conn, "notify.balance.threshold").unwrap(),
+            crate::db::sea::ops::preference::get_preference(&db, "notify.balance.threshold")
+                .await
+                .unwrap(),
             None,
             "turning it off deletes the key rather than storing an empty one"
         );
     }
 
-    #[test]
-    fn a_full_config_round_trips() {
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn a_full_config_round_trips() {
+        let db = sea_test_db().await;
         let config = NotifyConfig {
             enabled: true,
             balance_threshold: Some("12.5".parse().unwrap()),
@@ -861,8 +859,8 @@ mod tests {
             usage_min_cost: "0.25".parse().unwrap(),
             usage_cooldown_minutes: 30,
         };
-        save_config(&pool, &config).unwrap();
-        assert_eq!(load_config(&pool).unwrap(), config);
+        save_config(&db, &config).await.unwrap();
+        assert_eq!(load_config(&db).await.unwrap(), config);
     }
 
     /// This value is typed into a settings box and then handed to an HTTP
@@ -895,17 +893,18 @@ mod tests {
         assert!(validate_endpoint("x", url, &[NotificationEventKind::Test]).is_ok());
     }
 
-    #[test]
-    fn saving_an_invalid_config_is_refused_before_anything_is_written() {
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn saving_an_invalid_config_is_refused_before_anything_is_written() {
+        let db = sea_test_db().await;
         let config = NotifyConfig {
             usage_baseline_days: 0,
             ..Default::default()
         };
-        assert!(save_config(&pool, &config).is_err());
-        let mut conn = pool.get().unwrap();
+        assert!(save_config(&db, &config).await.is_err());
         assert_eq!(
-            crate::db::ops::preference::get_preference(&mut conn, "notify.usage.baseline_days").unwrap(),
+            crate::db::sea::ops::preference::get_preference(&db, "notify.usage.baseline_days")
+                .await
+                .unwrap(),
             None,
             "a refused save leaves no half-written configuration"
         );

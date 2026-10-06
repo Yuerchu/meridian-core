@@ -595,19 +595,19 @@ async fn headless_chat_inner(
     let emit = emitter.as_ref().map(|e| e as &dyn crate::agent::engine::Emit);
 
     // Keep the machine awake for the rest of the turn (RAII; missing pref = enabled).
-    let _sleep_guard = {
-        let sleep_enabled = {
-            let pool = pool.clone();
-            tokio::task::spawn_blocking(move || -> Result<bool, String> {
-                let mut conn = get_conn(&pool)?;
-                let stored = crate::db::ops::preference::get_preference(&mut conn, "sleep_inhibitor.enabled")
-                    .map_err(|error| error.to_string())?;
-                crate::db::ops::preference::parse_bool_preference("sleep_inhibitor.enabled", stored.as_deref(), true)
-            })
-            .await
-            .map_err(|error| error.to_string())??
-        };
-        services.filter(|_| sleep_enabled).map(|s| s.sleep.begin_turn())
+    // Read only when there is an inhibitor to arm: with no services the value
+    // went unused before, and now it is not read at all — so a malformed row
+    // is no longer an error on that path, only on the one that acts on it.
+    let _sleep_guard = match services {
+        Some(s) => {
+            let stored = crate::db::sea::ops::preference::get_preference(&s.sea, "sleep_inhibitor.enabled")
+                .await
+                .map_err(|error| error.to_string())?;
+            let enabled =
+                crate::db::ops::preference::parse_bool_preference("sleep_inhibitor.enabled", stored.as_deref(), true)?;
+            enabled.then(|| s.sleep.begin_turn())
+        }
+        None => None,
     };
 
     // Load assistant + the conversation's active path

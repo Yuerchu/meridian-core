@@ -32,13 +32,12 @@ impl Recovered {
 /// 五类对象，各有各的处理方式。
 ///
 /// 拿不到锁就什么都不做：那时磁盘上的东西属于另一个进程。
-pub fn run(pool: &DbPool, app_data_dir: &Path, writable: bool) -> Result<Recovered, String> {
+/// `key` 是调用方先 `storage_key(&services.sea).await` 拿到的假名化密钥：取它要走
+/// 异步的 SeaORM 写事务，而这个函数在 `spawn_blocking` 里跑，没有运行时可等。
+pub fn run(pool: &DbPool, key: &[u8], app_data_dir: &Path, writable: bool) -> Result<Recovered, String> {
     if !writable {
         return Ok(Recovered::default());
     }
-    // key 要在拿连接**之前**取。`storage_key` 自己要一个连接，而这个函数会一直
-    // 持着它的那个直到结束——两者叠在一起，一个只有一条连接的池就死等到超时。
-    let key = super::storage_key(pool)?;
     let mut conn = crate::util::get_conn(pool)?;
     let now = crate::util::now_ms();
     let mut out = Recovered::default();
@@ -65,7 +64,7 @@ pub fn run(pool: &DbPool, app_data_dir: &Path, writable: bool) -> Result<Recover
     //    核的是 sha 而不只是大小，理由在 `file_matches` 上：这份语料要拿去训练，
     //    一条内容错了的样本会被当成真的用。
     for blob in ops::all_ready(&mut conn).map_err(|e| e.to_string())? {
-        let path = blob_path(app_data_dir, &key, &blob);
+        let path = blob_path(app_data_dir, key, &blob);
         if !super::file_matches(&path, blob.file_size, &blob.sha256) {
             ops::mark_damaged(&mut conn, &blob.id, now).map_err(|e| e.to_string())?;
             out.marked_damaged += 1;
@@ -76,13 +75,13 @@ pub fn run(pool: &DbPool, app_data_dir: &Path, writable: bool) -> Result<Recover
     //    之后**：一个刚被标坏又没人引用的行，排在前面就要再等一次启动才走得掉，
     //    而它的文件在那之前一直占着地方。
     for blob in ops::orphaned(&mut conn).map_err(|e| e.to_string())? {
-        let _ = std::fs::remove_file(blob_path(app_data_dir, &key, &blob));
+        let _ = std::fs::remove_file(blob_path(app_data_dir, key, &blob));
         out.orphans_removed += ops::delete_blob_rows(&mut conn, &[blob.id]).map_err(|e| e.to_string())?;
     }
 
     // 5. 墓碑：接着删。删成功了行才走。
     for blob in ops::tombstones(&mut conn).map_err(|e| e.to_string())? {
-        let path = blob_path(app_data_dir, &key, &blob);
+        let path = blob_path(app_data_dir, key, &blob);
         if !path.exists() || std::fs::remove_file(&path).is_ok() {
             out.tombstones_cleared += ops::delete_blob_rows(&mut conn, &[blob.id]).map_err(|e| e.to_string())?;
         }
@@ -90,7 +89,7 @@ pub fn run(pool: &DbPool, app_data_dir: &Path, writable: bool) -> Result<Recover
 
     // 6. 磁盘上有、库里没有的文件。上一步之后才做，否则会把刚标成 damaged 的
     //    那些误当成野文件——它们的行还在。
-    out.stray_files_removed = sweep_stray_files(&mut conn, app_data_dir, &key)?;
+    out.stray_files_removed = sweep_stray_files(&mut conn, app_data_dir, key)?;
 
     if !out.is_quiet() {
         tracing::info!(?out, "voice corpus: recovered after an unclean stop");
@@ -144,8 +143,17 @@ fn sweep_stray_files(conn: &mut diesel::SqliteConnection, app_data_dir: &Path, k
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
     use crate::db::models::voice_corpus::blob_status;
+    use crate::db::sea::cap::Db;
+    use crate::db::sea::shared_test_db;
+
+    /// 一个数据目录、一个库文件、两个池：`run` 走 Diesel，key 走 SeaORM。
+    async fn fixture() -> (tempfile::TempDir, DbPool, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, sea): (DbPool, Db) = shared_test_db(dir.path()).await;
+        let key = super::super::storage_key(&sea).await.unwrap();
+        (dir, pool, key)
+    }
 
     /// 行**照着字节来**：sha 和大小都从 `bytes` 算，所以 fixture 本身是自洽的,
     /// 一条测试要制造"对不上"就得明确地去改磁盘。
@@ -189,30 +197,27 @@ mod tests {
         })
     }
 
-    fn write_blob_file(dir: &Path, pool: &DbPool, b: &VoiceBlobRow, bytes: &[u8]) {
-        let key = super::super::storage_key(pool).unwrap();
-        let path = blob_path(dir, &key, b);
+    fn write_blob_file(dir: &Path, key: &[u8], b: &VoiceBlobRow, bytes: &[u8]) {
+        let path = blob_path(dir, key, b);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
     }
 
     /// 拿不到锁时一个字节都不动——磁盘上的东西属于另一个进程。
-    #[test]
-    fn a_reader_without_the_lock_touches_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn a_reader_without_the_lock_touches_nothing() {
+        let (dir, pool, key) = fixture().await;
         {
             let mut conn = pool.get().unwrap();
             blob(&mut conn, "a", blob_status::PENDING, b"abc");
         }
-        assert_eq!(run(&pool, dir.path(), false).unwrap(), Recovered::default());
+        assert_eq!(run(&pool, &key, dir.path(), false).unwrap(), Recovered::default());
     }
 
     /// pending 行是上次崩溃的残骸，staging 里的临时文件也是。
-    #[test]
-    fn what_a_crash_left_behind_is_cleared() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn what_a_crash_left_behind_is_cleared() {
+        let (dir, pool, key) = fixture().await;
         {
             let mut conn = pool.get().unwrap();
             blob(&mut conn, "a", blob_status::PENDING, b"abc");
@@ -221,26 +226,25 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("half.part"), b"xx").unwrap();
 
-        let out = run(&pool, dir.path(), true).unwrap();
+        let out = run(&pool, &key, dir.path(), true).unwrap();
         assert_eq!(out.pending_dropped, 1);
         assert_eq!(out.staged_removed, 1);
     }
 
     /// 文件对不上的行被**标坏，不是删掉**：它背后的 clip 记着谁在什么时候
     /// 说过话，那份记录不该因为文件坏了就消失。
-    #[test]
-    fn a_ready_row_whose_file_is_wrong_is_marked_not_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn a_ready_row_whose_file_is_wrong_is_marked_not_dropped() {
+        let (dir, pool, key) = fixture().await;
         let b = {
             let mut conn = pool.get().unwrap();
             let b = blob(&mut conn, "a", blob_status::READY, b"the real bytes");
             crate::db::ops::voice_corpus::record_clip(&mut conn, &b, "c1", "alice", Some(7), 0, None, None, 1).unwrap();
             b
         };
-        write_blob_file(dir.path(), &pool, &b, b"short");
+        write_blob_file(dir.path(), &key, &b, b"short");
 
-        let out = run(&pool, dir.path(), true).unwrap();
+        let out = run(&pool, &key, dir.path(), true).unwrap();
         assert_eq!(out.marked_damaged, 1);
 
         use crate::db::schema::voice_blobs;
@@ -259,52 +263,48 @@ mod tests {
     /// 只比大小的那一版对这条一无所知：一次写到一半的崩溃、一块坏扇区、一次
     /// 同名覆盖，长度可以分毫不差。而这份语料是要拿去训练的——一条内容错了的
     /// 样本会被当成真的用，比一条缺失的贵得多。
-    #[test]
-    fn a_file_of_the_right_length_but_the_wrong_bytes_is_still_wrong() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn a_file_of_the_right_length_but_the_wrong_bytes_is_still_wrong() {
+        let (dir, pool, key) = fixture().await;
         let b = {
             let mut conn = pool.get().unwrap();
             let b = blob(&mut conn, "a", blob_status::READY, b"aaaaa");
             crate::db::ops::voice_corpus::record_clip(&mut conn, &b, "c1", "alice", Some(7), 0, None, None, 1).unwrap();
             b
         };
-        write_blob_file(dir.path(), &pool, &b, b"bbbbb");
+        write_blob_file(dir.path(), &key, &b, b"bbbbb");
 
-        assert_eq!(run(&pool, dir.path(), true).unwrap().marked_damaged, 1);
+        assert_eq!(run(&pool, &key, dir.path(), true).unwrap().marked_damaged, 1);
     }
 
     /// 没有任何 clip 指着的已发布行，连同它的文件一起走。
-    #[test]
-    fn an_orphan_takes_its_file_with_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn an_orphan_takes_its_file_with_it() {
+        let (dir, pool, key) = fixture().await;
         let b = {
             let mut conn = pool.get().unwrap();
             blob(&mut conn, "a", blob_status::READY, b"hello")
         };
-        write_blob_file(dir.path(), &pool, &b, b"hello");
-        let key = super::super::storage_key(&pool).unwrap();
+        write_blob_file(dir.path(), &key, &b, b"hello");
         let path = blob_path(dir.path(), &key, &b);
         assert!(path.exists());
 
-        let out = run(&pool, dir.path(), true).unwrap();
+        let out = run(&pool, &key, dir.path(), true).unwrap();
         assert_eq!(out.marked_damaged, 0, "文件是对的");
         assert_eq!(out.orphans_removed, 1);
         assert!(!path.exists(), "孤儿的文件不该留着占地方");
     }
 
     /// 库里没人认领的文件也要清掉——那是删除删了一半留下的。
-    #[test]
-    fn a_file_nobody_claims_is_swept() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn a_file_nobody_claims_is_swept() {
+        let (dir, pool, key) = fixture().await;
         let stray = super::super::session_dir(dir.path(), "deadbeefdeadbeef");
         std::fs::create_dir_all(&stray).unwrap();
         let path = stray.join("nobody.amr");
         std::fs::write(&path, b"x").unwrap();
 
-        let out = run(&pool, dir.path(), true).unwrap();
+        let out = run(&pool, &key, dir.path(), true).unwrap();
         assert_eq!(out.stray_files_removed, 1);
         assert!(!path.exists());
     }

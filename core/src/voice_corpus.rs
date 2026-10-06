@@ -18,7 +18,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::sync::watch;
 
-use crate::db::DbPool;
+use crate::db::sea::cap::Db;
 
 /// 语料根目录。**不放 `files/<conversation_id>/`**：删会话会把那个目录整个
 /// `remove_dir_all` 掉（`commands/conversation.rs`），`/new` 会把一个群的语料
@@ -150,21 +150,23 @@ pub const STORAGE_KEY_PREF: &str = "onebot.voice_storage_key";
 /// 各自生成一把、后写的覆盖先写的——而先写的那个任务已经拿着它自己的 key 算出
 /// 目录名开始落盘了。那个目录之后没有人解析得出来，还会被恢复器当野文件扫掉。
 /// `BEGIN IMMEDIATE` 让第二个调用者堵在事务开头，醒来时读到的是已经提交的那把。
-pub fn storage_key(pool: &DbPool) -> Result<Vec<u8>, String> {
-    let mut conn = crate::util::get_conn(pool)?;
-    let existing = conn
-        .immediate_transaction(|conn| {
-            if let Some(existing) =
-                crate::db::ops::preference::get_preference(conn, STORAGE_KEY_PREF)?.filter(|v| !v.trim().is_empty())
+pub async fn storage_key(db: &Db) -> Result<Vec<u8>, String> {
+    let existing = db
+        .write(async |tx| {
+            if let Some(existing) = crate::db::sea::ops::preference::get_preference(tx, STORAGE_KEY_PREF)
+                .await?
+                .filter(|v| !v.trim().is_empty())
             {
                 return Ok(existing);
             }
             // uuid 的随机性来自 getrandom,这里要的就是"没人能猜到"。两个 v4
             // 拼起来是 256 位。
             let fresh = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-            crate::db::ops::preference::set_preference(conn, STORAGE_KEY_PREF, &fresh, crate::util::now_ms())?;
-            Ok::<_, diesel::result::Error>(fresh)
+            crate::db::sea::ops::preference::set_preference(tx, STORAGE_KEY_PREF, &fresh, crate::util::now_ms())
+                .await?;
+            Ok::<_, sea_orm::DbErr>(fresh)
         })
+        .await
         .map_err(|e| e.to_string())?;
     hex_decode(&existing)
 }
@@ -688,17 +690,38 @@ mod tests {
     }
 
     /// 建一次，之后每次都是同一把。
-    ///
-    /// 测试池只有一条连接，所以这里跑的是顺序那一路——真正的并发靠的是
-    /// `BEGIN IMMEDIATE`，第二个调用者堵在事务开头，醒来时读到的是已提交的值。
-    /// 不是同一把的话，先动手的那个任务已经用它自己的 key 算出目录名开始落盘了，
-    /// 而那个目录名之后没有人解析得出来——恢复器会把它当野文件扫掉。
-    #[test]
-    fn the_storage_key_is_created_once_and_then_read() {
-        let pool = crate::db::diesel_test_db();
-        let first = storage_key(&pool).unwrap();
+    #[tokio::test]
+    async fn the_storage_key_is_created_once_and_then_read() {
+        let db = crate::db::sea::sea_test_db().await;
+        let first = storage_key(&db).await.unwrap();
         assert_eq!(first.len(), 32);
-        assert_eq!(storage_key(&pool).unwrap(), first);
+        assert_eq!(storage_key(&db).await.unwrap(), first);
+    }
+
+    /// 并发的第一批调用者拿到的也是同一把——靠的是 `BEGIN IMMEDIATE`：第二个
+    /// 调用者堵在事务开头，醒来时读到的是已提交的值。读在事务外、写在事务内的
+    /// 版本在这里会各自读到空、各自造一把，而先动手的那个任务已经用它自己的 key
+    /// 算出目录名开始落盘了——那个目录名之后没有人解析得出来，恢复器会把它当
+    /// 野文件扫掉。文件库、多条连接，否则并发根本到不了数据库。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_callers_agree_on_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_diesel, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let db = db.clone();
+                tokio::spawn(async move { storage_key(&db).await.unwrap() })
+            })
+            .collect();
+        let mut keys = Vec::new();
+        for task in tasks {
+            keys.push(task.await.unwrap());
+        }
+        assert!(
+            keys.iter().all(|k| *k == keys[0]),
+            "every caller must see the one minted key"
+        );
+        assert_eq!(keys[0].len(), 32);
     }
 
     /// 假名化要把账号算进去，否则两个 bot 同群会共用一个目录；
