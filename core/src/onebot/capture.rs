@@ -9,6 +9,7 @@
 //! vision 判断，采集一个都不需要）。代价是 @ 过 bot 的语音会被转写两次，多一次
 //! API 调用换一条干净的边界。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -18,8 +19,10 @@ use tokio::io::AsyncWriteExt;
 use super::format::MediaRef;
 use super::protocol::OneBotAction;
 use super::{DirectedCallOutcome, SharedState};
-use crate::db::models::voice_corpus::VoiceBlobRow;
-use crate::db::ops::voice_corpus as ops;
+use crate::db::entity::voice_blob;
+use crate::db::entity::voice_blob::VoiceCorpusSourceType;
+use crate::db::sea::cap::{Db, WriteTx};
+use crate::db::sea::ops::voice_corpus as ops;
 use crate::voice_corpus::{self, CapturePermit, CaptureScope};
 
 /// 单条语音的上限。一分钟的 SILK 是几十 KB，10 MiB 给的是"这显然不是语音"
@@ -44,7 +47,7 @@ const TRANSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 #[derive(Debug, Clone)]
 pub struct RecordSource {
     pub scope: CaptureScope,
-    pub source_type: &'static str,
+    pub source_type: VoiceCorpusSourceType,
     pub source_id: String,
     /// 消息的发送者。**已经排除过所有本地 bot 账号**——只查当前连接的 self_id
     /// 不够：bot A 发的 TTS 会被同群的 bot B 当成真人语音采集。
@@ -67,6 +70,9 @@ pub fn capture_in_background(state: Arc<SharedState>, source: RecordSource, reco
     else {
         return;
     };
+    // 一条消息一个 permit，几段语音共享；提交任务各自再 clone 一份，所以
+    // 撤权要等的是"最后一个提交任务结束"，不是"这个 future 还活着"。
+    let permit = Arc::new(permit);
     static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = SLOTS
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(CAPTURE_SLOTS)))
@@ -78,7 +84,12 @@ pub fn capture_in_background(state: Arc<SharedState>, source: RecordSource, reco
     });
 }
 
-async fn capture_all(state: &Arc<SharedState>, source: &RecordSource, records: &[MediaRef], permit: &CapturePermit) {
+async fn capture_all(
+    state: &Arc<SharedState>,
+    source: &RecordSource,
+    records: &[MediaRef],
+    permit: &Arc<CapturePermit>,
+) {
     // 转写按**消息**作答，所以只有单段时它能被归给某一段。多段时一律留空:
     // 把一次结果复制到每一段，产出的是自信的错误标签。
     let transcript = match records.len() {
@@ -118,8 +129,9 @@ async fn transcribe(state: &Arc<SharedState>, source: &RecordSource) -> Option<S
 /// 已经存在的音频是最常见的结果（同一段语音被转发、被重发），而那条路只是把
 /// 既有的 blob 拿来挂一条 clip，谁也不会想起本次下载还留着一个 `.part`。留下
 /// 的是一段真人录音，在数据库之外，删除找不到它，导出也看不见它。
+#[derive(Debug)]
 struct Staged {
-    path: std::path::PathBuf,
+    path: PathBuf,
     sha256: String,
     size: i64,
     format: &'static str,
@@ -139,10 +151,10 @@ async fn capture_one(
     record: &MediaRef,
     segment_index: i32,
     transcript: Option<&str>,
-    permit: &CapturePermit,
+    permit: &Arc<CapturePermit>,
 ) -> Result<(), String> {
     let data_dir = state.services.paths.data_dir.clone();
-    let staged = fetch_to_staging(record, &data_dir).await?;
+    let mut staged = fetch_to_staging(record, &data_dir).await?;
 
     // 一次采集可能跑几十秒，而这中间用户可能把这个会话从白名单里拿掉。permit
     // 保证撤权会等我们结束，但不保证写下去的东西还是用户想要的。这里问一次是
@@ -156,7 +168,7 @@ async fn capture_one(
     let pseudonym = voice_corpus::session_pseudonym(
         &key_bytes,
         source.scope.bot_self_id,
-        source.source_type,
+        source.source_type.as_str(),
         &source.source_id,
     );
     let dir = voice_corpus::session_dir(&data_dir, &pseudonym);
@@ -171,37 +183,24 @@ async fn capture_one(
         if attempt > 0 {
             tokio::time::sleep(CLAIM_BACKOFF).await;
         }
-        let pool = state.services.db.clone();
-        let auth = permit.authorisation();
-        let source = source.clone();
-        let transcript = transcript.map(str::to_string);
-        let staged_path = staged.path.clone();
-        let final_path = final_path.clone();
-        let file_name = file_name.clone();
-        let sha = staged.sha256.clone();
-        let format = staged.format;
-        let size = staged.size;
-
-        let settled = tokio::task::spawn_blocking(move || {
-            commit(CommitInput {
-                pool,
-                auth,
-                source,
-                transcript,
-                staged_path,
-                final_path,
-                file_name,
-                sha,
-                format,
-                size,
-                segment_index,
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-
-        if settled == Settled::Done {
-            return Ok(());
+        let input = CommitInput {
+            sea: state.services.sea.clone(),
+            auth: permit.authorisation(),
+            permit: Arc::clone(permit),
+            source: source.clone(),
+            transcript: transcript.map(str::to_string),
+            staged,
+            final_path: final_path.clone(),
+            file_name: file_name.clone(),
+            segment_index,
+            #[cfg(test)]
+            pauses: None,
+        };
+        // 提交在自己的任务里跑，这个 future 只等它的结果：这里被丢掉（连接
+        // 断了、服务停了）不会把一次提交掐在半路。
+        match spawn_commit(input).await.map_err(|e| e.to_string())?? {
+            Settled::Done => return Ok(()),
+            Settled::Retry(back) => staged = back,
         }
     }
     tracing::warn!(
@@ -211,42 +210,55 @@ async fn capture_one(
     Ok(())
 }
 
-/// [`commit`] 的参数。一个结构体而不是十一个位置参数——顺序相同类型相同的
+/// [`commit`] 的参数。一个结构体而不是十个位置参数——顺序相同类型相同的
 /// `String` 太多，写反了编译器不会说话。
+///
+/// **提交任务按值拥有它需要的一切。** `staged` 的 `Drop` 删 `.part`，所以它
+/// 必须活到改名之后；`permit` 让撤权的 drain 等到这个任务返回，而不是等到
+/// `capture_one` 的 future 被丢掉；`sea` 是池的一个 clone。这三样一起进任务，
+/// 任务就是提交的所有者，丢掉等它的那个 future 改变不了任何事。
 struct CommitInput {
-    pool: crate::db::DbPool,
+    sea: Db,
     auth: voice_corpus::Authorisation,
+    permit: Arc<CapturePermit>,
     source: RecordSource,
     transcript: Option<String>,
-    staged_path: std::path::PathBuf,
-    final_path: std::path::PathBuf,
+    staged: Staged,
+    final_path: PathBuf,
     file_name: String,
-    sha: String,
-    format: &'static str,
-    size: i64,
     segment_index: i32,
+    /// 测试用：让任务停在某个点上，好在它停着的时候丢掉等它的 future、或者
+    /// 发起一次撤权。生产一律 `None`。
+    #[cfg(test)]
+    pauses: CommitPauses,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug)]
 enum Settled {
     Done,
-    /// 有人正握着这段音频。退一步再来。
+    /// 有人正握着这段音频。退一步再来——临时文件还给调用方，下一轮还要用。
+    Retry(Staged),
+}
+
+/// 事务闭包里的答案；`staged` 留在闭包外面，它要在 `Retry` 时原样交回去。
+enum Committed {
+    Done,
     Retry,
 }
 
 /// 事务里的失败。
 ///
-/// 要一个自己的类型，是因为 diesel 的 `immediate_transaction` 要求错误能从
-/// `diesel::result::Error` 转过来，而这段代码有一半的失败来自文件系统。全都
-/// 压成 `String` 就得让文件错误冒充数据库错误，回滚的原因在日志里会对不上号。
+/// 要一个自己的类型，是因为 `Db::write` 要求错误能从 `DbErr` 转过来，而这段
+/// 代码有一半的失败来自文件系统。全都压成 `String` 就得让文件错误冒充数据库
+/// 错误，回滚的原因在日志里会对不上号。
 #[derive(Debug)]
 enum CommitError {
-    Db(diesel::result::Error),
+    Db(sea_orm::DbErr),
     File(String),
 }
 
-impl From<diesel::result::Error> for CommitError {
-    fn from(error: diesel::result::Error) -> Self {
+impl From<sea_orm::DbErr> for CommitError {
+    fn from(error: sea_orm::DbErr) -> Self {
         Self::Db(error)
     }
 }
@@ -260,6 +272,16 @@ impl std::fmt::Display for CommitError {
     }
 }
 
+/// 把一次提交放到它自己的任务上。
+///
+/// 返回的 `JoinHandle` 被丢掉只是不再等——任务照跑到底。`capture_one` 等它，
+/// 而 `capture_one` 的 future 被丢掉时（连接断开、服务停止），`Staged` 和
+/// permit 都在任务手里：`.part` 不会在 rename 中途被 `Drop` 抢走，撤权的 drain
+/// 也要等到这个事务提交或回滚之后才放行。
+fn spawn_commit(input: CommitInput) -> tokio::task::JoinHandle<Result<Settled, String>> {
+    tokio::spawn(commit(input))
+}
+
 /// 一个写事务：查授权、抢所有权、发布文件、记一次采集。
 ///
 /// **整个在 `BEGIN IMMEDIATE` 里面**，而这两头各有一个理由。
@@ -270,63 +292,91 @@ impl std::fmt::Display for CommitError {
 ///
 /// 后头是 clip 的幂等：`record_clip` 先查后插，两步之间同一个事件的重投会撞上
 /// 唯一索引，把一次本该无声的重复变成一个失败。
-fn commit(input: CommitInput) -> Result<Settled, String> {
+///
+/// rename 也在事务里，和 Diesel 那版一样：它很小，而发布状态和磁盘上的文件要
+/// 一起成立——行说 `ready` 的时候文件已经在位。
+async fn commit(input: CommitInput) -> Result<Settled, String> {
     let CommitInput {
-        pool,
+        sea,
         auth,
+        permit,
         source,
         transcript,
-        staged_path,
+        staged,
         final_path,
         file_name,
-        sha,
-        format,
-        size,
         segment_index,
+        #[cfg(test)]
+        pauses,
     } = input;
-    let mut conn = crate::util::get_conn(&pool)?;
     let now = crate::util::now_ms();
     let key = ops::BlobKey {
         bot_self_id: source.scope.bot_self_id,
         source_type: source.source_type,
         source_id: &source.source_id,
-        sha256: &sha,
-        file_format: format,
+        sha256: &staged.sha256,
+        file_format: staged.format,
     };
 
-    conn.immediate_transaction(|conn| {
-        if !auth.still_authorised() {
-            tracing::info!(session = %source.scope, "voice capture dropped: the grant moved while it was running");
-            return Ok(Settled::Done);
-        }
+    let outcome = sea
+        .write(async |tx| {
+            #[cfg(test)]
+            wait_at(&pauses, PausePoint::InsideTransaction).await;
+            if !auth.still_authorised() {
+                tracing::info!(session = %source.scope, "voice capture dropped: the grant moved while it was running");
+                return Ok(Committed::Done);
+            }
 
-        let blob = match settle_blob(conn, &key, &file_name, size, &staged_path, &final_path, now)? {
-            Claimed::Blob(blob) => blob,
-            Claimed::Retry => return Ok(Settled::Retry),
-            // 它正在被删除，或者别人已经把它标坏了。两种情况下这次都不写。
-            Claimed::Skip => return Ok(Settled::Done),
-        };
+            let blob = match settle_blob(
+                tx,
+                &key,
+                &file_name,
+                staged.size,
+                &staged.path,
+                &final_path,
+                now,
+                #[cfg(test)]
+                &pauses,
+            )
+            .await?
+            {
+                Claimed::Blob(blob) => blob,
+                Claimed::Retry => return Ok(Committed::Retry),
+                // 它正在被删除，或者别人已经把它标坏了。两种情况下这次都不写。
+                Claimed::Skip => return Ok(Committed::Done),
+            };
 
-        ops::record_clip(
-            conn,
-            &blob,
-            &uuid::Uuid::new_v4().to_string(),
-            &source.sender_id.to_string(),
-            source.message_id,
-            segment_index,
-            transcript.as_deref(),
-            transcript.as_deref().map(|_| "llonebot.voice_msg_to_text"),
-            now,
-        )?;
-        Ok(Settled::Done)
+            #[cfg(test)]
+            wait_at(&pauses, PausePoint::BeforeClip).await;
+            ops::record_clip(
+                tx,
+                &blob,
+                &uuid::Uuid::new_v4().to_string(),
+                &source.sender_id.to_string(),
+                source.message_id,
+                segment_index,
+                transcript.as_deref(),
+                transcript.as_deref().map(|_| "llonebot.voice_msg_to_text"),
+                now,
+            )
+            .await?;
+            Ok::<_, CommitError>(Committed::Done)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // 事务已经提交或回滚，permit 这时才归还：撤权的 drain 等的就是这一刻。
+    drop(permit);
+    Ok(match outcome {
+        Committed::Done => Settled::Done,
+        Committed::Retry => Settled::Retry(staged),
     })
-    .map_err(|error: CommitError| error.to_string())
 }
 
 /// [`settle_blob`] 的三种答案。
 enum Claimed {
     /// 可以挂 clip 的那一行。
-    Blob(VoiceBlobRow),
+    Blob(voice_blob::Model),
     /// 有人正握着它，退一步再来。
     Retry,
     /// 这次不写：墓碑，或者已经被标坏了。
@@ -335,53 +385,65 @@ enum Claimed {
 
 /// 抢所有权、发布文件，返回可以挂 clip 的那一行。
 #[allow(clippy::too_many_arguments)]
-fn settle_blob(
-    conn: &mut diesel::SqliteConnection,
+async fn settle_blob(
+    tx: &WriteTx,
     key: &ops::BlobKey<'_>,
     file_name: &str,
     size: i64,
-    staged_path: &std::path::Path,
-    final_path: &std::path::Path,
+    staged_path: &Path,
+    final_path: &Path,
     now: i64,
+    #[cfg(test)] pauses: &CommitPauses,
 ) -> Result<Claimed, CommitError> {
     let id = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
-    match ops::claim_blob(conn, key, &id, &token, file_name, size, now, LEASE_MS)? {
+    match ops::claim_blob(tx, key, &id, &token, file_name, size, now, LEASE_MS).await? {
         ops::ClaimOutcome::Owned { id, token, epoch } => {
-            publish_file(staged_path, final_path).map_err(CommitError::File)?;
+            #[cfg(test)]
+            wait_at(pauses, PausePoint::BeforeRename).await;
+            publish_file(staged_path, final_path).await.map_err(CommitError::File)?;
             // fencing:返回 false 就是所有权在下载期间被接管了。这个任务既不
             // 发布也不写 clip——文件已经在位,让接管者去 publish。
-            if !ops::publish_blob(conn, &id, &token, epoch, now)? {
+            if !ops::publish_blob(tx, &id, &token, epoch, now).await? {
                 return Ok(Claimed::Retry);
             }
-            read_blob(conn, key)
+            read_blob(tx, key).await
         }
         ops::ClaimOutcome::Ready(blob) => {
             // 已经有一份。校验磁盘上那个确实对得上——对不上就是它坏了,
-            // 标出来而不是把新 clip 挂到一个坏文件上。
-            if voice_corpus::file_matches(final_path, blob.file_size, &blob.sha256) {
+            // 标出来而不是把新 clip 挂到一个坏文件上。整个文件要读一遍算 sha，
+            // 那是一条阻塞线程的活，不是运行时的。
+            let (path, expected_size, expected_sha) = (final_path.to_path_buf(), blob.file_size, blob.sha256.clone());
+            let matches =
+                tokio::task::spawn_blocking(move || voice_corpus::file_matches(&path, expected_size, &expected_sha))
+                    .await
+                    .map_err(|e| CommitError::File(e.to_string()))?;
+            if matches {
                 return Ok(Claimed::Blob(blob));
             }
-            ops::mark_damaged(conn, &blob.id, now)?;
+            ops::mark_damaged(tx, &blob.id, now).await?;
             Ok(Claimed::Skip)
         }
         ops::ClaimOutcome::Takeable(blob) => {
             let token = uuid::Uuid::new_v4().to_string();
             let taken = ops::takeover_blob(
-                conn,
+                tx,
                 &blob.id,
                 blob.owner_token.as_deref(),
                 blob.fence_epoch,
                 &token,
                 now,
                 LEASE_MS,
-            )?;
+            )
+            .await?;
             let Some(epoch) = taken else { return Ok(Claimed::Retry) };
-            publish_file(staged_path, final_path).map_err(CommitError::File)?;
-            if !ops::publish_blob(conn, &blob.id, &token, epoch, now)? {
+            #[cfg(test)]
+            wait_at(pauses, PausePoint::BeforeRename).await;
+            publish_file(staged_path, final_path).await.map_err(CommitError::File)?;
+            if !ops::publish_blob(tx, &blob.id, &token, epoch, now).await? {
                 return Ok(Claimed::Retry);
             }
-            read_blob(conn, key)
+            read_blob(tx, key).await
         }
         ops::ClaimOutcome::PendingElsewhere(_) => Ok(Claimed::Retry),
         ops::ClaimOutcome::Damaged(_) => Ok(Claimed::Skip),
@@ -392,20 +454,9 @@ fn settle_blob(
     }
 }
 
-fn read_blob(conn: &mut diesel::SqliteConnection, key: &ops::BlobKey<'_>) -> Result<Claimed, CommitError> {
-    use crate::db::schema::voice_blobs;
-    use diesel::prelude::*;
-    let blob = voice_blobs::table
-        .filter(voice_blobs::bot_self_id.eq(key.bot_self_id))
-        .filter(voice_blobs::source_type.eq(key.source_type))
-        .filter(voice_blobs::source_id.eq(key.source_id))
-        .filter(voice_blobs::file_format.eq(key.file_format))
-        .filter(voice_blobs::sha256.eq(key.sha256))
-        .select(VoiceBlobRow::as_select())
-        .first(conn)
-        .optional()?;
+async fn read_blob(tx: &WriteTx, key: &ops::BlobKey<'_>) -> Result<Claimed, CommitError> {
     // 刚刚 publish 过，所以它必然在。真读不到就当作没抢到，让上面再转一圈。
-    Ok(blob.map_or(Claimed::Retry, Claimed::Blob))
+    Ok(ops::find_blob(tx, key).await?.map_or(Claimed::Retry, Claimed::Blob))
 }
 
 /// 把临时文件挪到最终位置。
@@ -413,18 +464,53 @@ fn read_blob(conn: &mut diesel::SqliteConnection, key: &ops::BlobKey<'_>) -> Res
 /// **Windows 上 `rename` 在目标已存在时会失败**（Unix 是覆盖），所以先看目标
 /// 在不在：在就直接用它（内容寻址保证字节相同，这里的 TOCTOU 无害）。
 /// 剩下的失败——权限、磁盘满、父目录缺失——要报出来，不能伪装成"别人赢了"。
-fn publish_file(staged: &std::path::Path, final_path: &std::path::Path) -> Result<(), String> {
-    if final_path.exists() {
-        let _ = std::fs::remove_file(staged);
+async fn publish_file(staged: &Path, final_path: &Path) -> Result<(), String> {
+    if tokio::fs::try_exists(final_path).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_file(staged).await;
         return Ok(());
     }
-    match std::fs::rename(staged, final_path) {
+    match tokio::fs::rename(staged, final_path).await {
         Ok(()) => Ok(()),
-        Err(_) if final_path.exists() => {
-            let _ = std::fs::remove_file(staged);
+        Err(_) if tokio::fs::try_exists(final_path).await.unwrap_or(false) => {
+            let _ = tokio::fs::remove_file(staged).await;
             Ok(())
         }
         Err(e) => Err(format!("could not publish the audio: {e}")),
+    }
+}
+
+/// 测试用的停靠点。每个都在写事务里面：第一个在授权复查之前，后两个夹着
+/// rename 和 clip 的写入，正好是"丢掉 future"和"发起撤权"最想撞上的三个时刻。
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PausePoint {
+    /// 事务已开，授权还没复查。
+    InsideTransaction,
+    /// 已经抢到所有权，`.part` 还没改名。
+    BeforeRename,
+    /// 文件已经发布、行已经 `ready`，clip 还没写。
+    BeforeClip,
+}
+
+/// 一个停靠点：任务到了就说一声，然后等放行。`Notify` 存得住一次通知，所以
+/// 两边谁先到都不丢。
+#[cfg(test)]
+struct Pause {
+    at: PausePoint,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type CommitPauses = Option<Arc<Pause>>;
+
+#[cfg(test)]
+async fn wait_at(pauses: &CommitPauses, point: PausePoint) {
+    if let Some(pause) = pauses
+        && pause.at == point
+    {
+        pause.reached.notify_one();
+        pause.release.notified().await;
     }
 }
 
@@ -435,7 +521,7 @@ fn publish_file(staged: &std::path::Path, final_path: &std::path::Path) -> Resul
 /// 时读不到），而"是否同机"没有可靠依据——`onebot.host` 是监听地址不是 peer。
 /// 做对它要引入"授权根目录"让 WS 对端指定 Meridian 去读本机文件，那是一个新的
 /// 攻击面，换一档必然转码的数据。
-async fn fetch_to_staging(record: &MediaRef, data_dir: &std::path::Path) -> Result<Staged, String> {
+async fn fetch_to_staging(record: &MediaRef, data_dir: &Path) -> Result<Staged, String> {
     let staging = voice_corpus::staging_dir(data_dir);
     tokio::fs::create_dir_all(&staging).await.map_err(|e| e.to_string())?;
     let path = staging.join(format!("{}.part", uuid::Uuid::new_v4()));
@@ -480,13 +566,7 @@ async fn fetch_to_staging(record: &MediaRef, data_dir: &std::path::Path) -> Resu
         let path = path.clone();
         move || -> Result<(String, &'static str), String> {
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-            let digest = Sha256::digest(&bytes);
-            let sha = digest.iter().fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-            Ok((sha, magic_format(&bytes)))
+            Ok((sha_hex(&bytes), magic_format(&bytes)))
         }
     })
     .await
@@ -500,7 +580,15 @@ async fn fetch_to_staging(record: &MediaRef, data_dir: &std::path::Path) -> Resu
     })
 }
 
-async fn stream_to_file(url: &str, path: &std::path::Path) -> Result<u64, String> {
+fn sha_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+async fn stream_to_file(url: &str, path: &Path) -> Result<u64, String> {
     let response = super::media::http_client()?
         .get(url)
         .timeout(FETCH_TIMEOUT)
@@ -525,7 +613,7 @@ async fn stream_to_file(url: &str, path: &std::path::Path) -> Result<u64, String
     Ok(written)
 }
 
-async fn write_base64(payload: &str, path: &std::path::Path) -> Result<u64, String> {
+async fn write_base64(payload: &str, path: &Path) -> Result<u64, String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)
@@ -562,7 +650,13 @@ fn magic_format(bytes: &[u8]) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+    use crate::db::entity::voice_blob::VoiceBlobStatus;
+    use crate::db::entity::voice_clip;
+    use crate::db::sea::shared_test_db;
+    use crate::voice_corpus::CorpusCoordinator;
 
     /// 格式认的是字节。QQ 的 SILK 常带一个前导字节，所以第二个位置也要看。
     #[test]
@@ -587,5 +681,241 @@ mod tests {
     #[test]
     fn a_lying_file_name_does_not_decide_the_format() {
         assert_eq!(magic_format(b"#!AMR\n\x00\x00"), "amr", "叫 .mp3 也还是 amr");
+    }
+
+    const BYTES: &[u8] = b"#!AMR\n\x00\x00some audio";
+
+    /// 一个数据目录、一个库文件、一个持锁的协调器，和一条已经下载好的语音。
+    struct Fixture {
+        dir: tempfile::TempDir,
+        db: Db,
+        coordinator: Arc<CorpusCoordinator>,
+        key: Vec<u8>,
+    }
+
+    fn scope() -> CaptureScope {
+        CaptureScope::new(1, "group:123")
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let (_diesel, db) = shared_test_db(dir.path()).await;
+            let coordinator = Arc::new(CorpusCoordinator::new(dir.path()));
+            coordinator.apply(HashSet::from([scope()]), HashSet::new()).await;
+            let key = voice_corpus::storage_key(&db).await.unwrap();
+            Self {
+                dir,
+                db,
+                coordinator,
+                key,
+            }
+        }
+
+        fn permit(&self) -> Arc<CapturePermit> {
+            Arc::new(self.coordinator.acquire(&scope(), "alice").expect("granted"))
+        }
+
+        /// 下载完的 `.part`，和它要去的地方。
+        fn stage(&self) -> (Staged, PathBuf) {
+            let staging = voice_corpus::staging_dir(self.dir.path());
+            std::fs::create_dir_all(&staging).unwrap();
+            let part = staging.join("x.part");
+            std::fs::write(&part, BYTES).unwrap();
+            let staged = Staged {
+                path: part,
+                sha256: sha_hex(BYTES),
+                size: BYTES.len() as i64,
+                format: magic_format(BYTES),
+            };
+            let pseudonym = voice_corpus::session_pseudonym(&self.key, 1, "onebot_group", "123");
+            let dir = voice_corpus::session_dir(self.dir.path(), &pseudonym);
+            std::fs::create_dir_all(&dir).unwrap();
+            let final_path = dir.join(format!("{}.{}", staged.sha256, staged.format));
+            (staged, final_path)
+        }
+
+        fn input(&self, permit: &Arc<CapturePermit>, pauses: CommitPauses) -> (CommitInput, PathBuf, PathBuf) {
+            let (staged, final_path) = self.stage();
+            let part = staged.path.clone();
+            let file_name = final_path.file_name().unwrap().to_string_lossy().into_owned();
+            let input = CommitInput {
+                sea: self.db.clone(),
+                auth: permit.authorisation(),
+                permit: Arc::clone(permit),
+                source: RecordSource {
+                    scope: scope(),
+                    source_type: VoiceCorpusSourceType::OnebotGroup,
+                    source_id: "123".into(),
+                    sender_id: 42,
+                    message_id: Some(7),
+                    conn_id: 1,
+                },
+                transcript: Some("你好".into()),
+                staged,
+                final_path: final_path.clone(),
+                file_name,
+                segment_index: 0,
+                pauses,
+            };
+            (input, final_path, part)
+        }
+
+        /// 等这个 scope 上的 permit 全部归还——也就是等提交任务结束。
+        async fn wait_idle(&self) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.coordinator.in_flight(&scope()) > 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the commit task never returned its permit"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        /// 每一行，不论状态——连接只经 ops 可达，这里没有别的读法。
+        async fn blobs(&self) -> Vec<voice_blob::Model> {
+            ops::all_blobs(&self.db).await.unwrap()
+        }
+
+        /// 挂在 `ready` blob 上的 clip；这些测试里要么 blob 是 `ready`，要么
+        /// 根本没有 blob，所以这就是全部的 clip。
+        async fn clips(&self) -> Vec<voice_clip::Model> {
+            self.db
+                .read(async |tx| ops::export_rows(tx).await)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(clip, _)| clip)
+                .collect()
+        }
+    }
+
+    fn pause_at(at: PausePoint) -> Arc<Pause> {
+        Arc::new(Pause {
+            at,
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// 等任务的那个 future 在停靠点上被丢掉；返回时它确实已经丢了。
+    async fn drop_the_waiter_at(pause: &Arc<Pause>, input: CommitInput) {
+        let waiter = tokio::spawn(async move { spawn_commit(input).await.unwrap() });
+        pause.reached.notified().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+    }
+
+    /// 等提交的 future 在 rename 之前被丢掉，提交照样走完：行 `ready`，文件在
+    /// 最终位置，`.part` 没了，permit 归还。
+    #[tokio::test]
+    async fn a_commit_dropped_before_the_rename_still_publishes_whole() {
+        let f = Fixture::new().await;
+        let pause = pause_at(PausePoint::BeforeRename);
+        let permit = f.permit();
+        let (input, final_path, part) = f.input(&permit, Some(pause.clone()));
+
+        drop_the_waiter_at(&pause, input).await;
+        drop(permit);
+        assert_eq!(
+            f.coordinator.in_flight(&scope()),
+            1,
+            "the task's own clone keeps the permit alive"
+        );
+        assert!(part.exists(), "nothing has been renamed yet");
+        pause.release.notify_one();
+        f.wait_idle().await;
+
+        let blobs = f.blobs().await;
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].status, VoiceBlobStatus::Ready);
+        assert!(final_path.exists(), "the file reached its final path");
+        assert!(!part.exists(), "no .part left behind");
+        assert_eq!(f.clips().await.len(), 1);
+        assert_eq!(f.coordinator.in_flight(&scope()), 0);
+    }
+
+    /// 在 rename 之后、写 clip 之前被丢掉也一样：事务整个提交——blob `ready`
+    /// **而且** clip 在。
+    #[tokio::test]
+    async fn a_commit_dropped_after_the_rename_still_records_the_clip() {
+        let f = Fixture::new().await;
+        let pause = pause_at(PausePoint::BeforeClip);
+        let permit = f.permit();
+        let (input, final_path, part) = f.input(&permit, Some(pause.clone()));
+
+        drop_the_waiter_at(&pause, input).await;
+        drop(permit);
+        assert!(final_path.exists(), "renamed already");
+        assert!(f.clips().await.is_empty(), "the clip is not written yet");
+        pause.release.notify_one();
+        f.wait_idle().await;
+
+        let blobs = f.blobs().await;
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].status, VoiceBlobStatus::Ready);
+        let clips = f.clips().await;
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].blob_id, blobs[0].id);
+        assert_eq!(clips[0].transcript.as_deref(), Some("你好"));
+        assert!(final_path.exists());
+        assert!(!part.exists());
+        assert_eq!(f.coordinator.in_flight(&scope()), 0);
+    }
+
+    /// 撤权在任务停在事务里的时候开始：drain 不会在任务之前返回；放行之后，
+    /// 事务里的那次复查说"不"，于是什么都不写——没有 clip、没有 blob 行、
+    /// `.part` 也删了。
+    #[tokio::test]
+    async fn a_revocation_during_the_commit_waits_for_it_and_the_commit_writes_nothing() {
+        let f = Fixture::new().await;
+        let pause = pause_at(PausePoint::InsideTransaction);
+        let permit = f.permit();
+        let (input, _final_path, part) = f.input(&permit, Some(pause.clone()));
+
+        let handle = spawn_commit(input);
+        pause.reached.notified().await;
+        drop(permit);
+
+        let revoker = {
+            let c = Arc::clone(&f.coordinator);
+            tokio::spawn(async move { c.revoke_and_drain(&[scope()]).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!revoker.is_finished(), "the drain must wait for the commit task");
+
+        pause.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(3), revoker)
+            .await
+            .expect("the drain returns once the task does")
+            .unwrap();
+        assert!(matches!(handle.await.unwrap().unwrap(), Settled::Done));
+
+        assert!(f.blobs().await.is_empty(), "the claim never happened");
+        assert!(f.clips().await.is_empty());
+        assert!(!part.exists(), "the staged file is cleaned up");
+        assert_eq!(f.coordinator.in_flight(&scope()), 0);
+        assert!(f.coordinator.acquire(&scope(), "alice").is_none(), "revoked");
+    }
+
+    /// 没有停靠点的一次提交：从 `.part` 到 `ready` 行加 clip，再来一次同一条
+    /// 消息什么都不重复。
+    #[tokio::test]
+    async fn a_plain_commit_publishes_once_and_a_replay_adds_nothing() {
+        let f = Fixture::new().await;
+        let permit = f.permit();
+        let (input, final_path, _part) = f.input(&permit, None);
+        assert!(matches!(spawn_commit(input).await.unwrap().unwrap(), Settled::Done));
+        let (input, _, part) = f.input(&permit, None);
+        assert!(matches!(spawn_commit(input).await.unwrap().unwrap(), Settled::Done));
+
+        assert_eq!(f.blobs().await.len(), 1);
+        assert_eq!(f.clips().await.len(), 1);
+        assert!(final_path.exists());
+        assert!(
+            !part.exists(),
+            "the second download is dropped, not kept beside the first"
+        );
     }
 }

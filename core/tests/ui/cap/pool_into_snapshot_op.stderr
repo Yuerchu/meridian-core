@@ -1,0 +1,58 @@
+error[E0277]: the trait bound `Db: Snapshot` is not satisfied
+ --> tests/ui/cap/pool_into_snapshot_op.rs:8:17
+  |
+8 |     joined_read(db).await;
+  |     ----------- ^^ the trait `Snapshot` is not implemented for `Db`
+  |     |
+  |     required by a bound introduced by this call
+  |
+help: the following other types implement trait `Snapshot`
+ --> src/db/sea/cap.rs
+  |
+  | impl Snapshot for ReadTx {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^ `ReadTx`
+  | impl Snapshot for WriteTx {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^ `WriteTx`
+note: required by a bound in `joined_read`
+ --> tests/ui/cap/pool_into_snapshot_op.rs:5:31
+  |
+5 | async fn joined_read(_: &impl Snapshot) {}
+  |                               ^^^^^^^^ required by this bound in `joined_read`
+
+error[E0277]: the trait bound `Db: Snapshot` is not satisfied
+ --> tests/ui/cap/pool_into_snapshot_op.rs:8:5
+  |
+8 |     joined_read(db).await;
+  |     ^^^^^^^^^^^^^^^ the trait `Snapshot` is not implemented for `Db`
+  |
+help: the following other types implement trait `Snapshot`
+ --> src/db/sea/cap.rs
+  |
+  | impl Snapshot for ReadTx {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^ `ReadTx`
+  | impl Snapshot for WriteTx {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^ `WriteTx`
+note: required by a bound in `joined_read`
+ --> tests/ui/cap/pool_into_snapshot_op.rs:5:31
+  |
+5 | async fn joined_read(_: &impl Snapshot) {}
+  |                               ^^^^^^^^ required by this bound in `joined_read`
+
+error[E0277]: the trait bound `Db: Snapshot` is not satisfied
+ --> tests/ui/cap/pool_into_snapshot_op.rs:8:21
+  |
+8 |     joined_read(db).await;
+  |                     ^^^^^ the trait `Snapshot` is not implemented for `Db`
+  |
+help: the following other types implement trait `Snapshot`
+ --> src/db/sea/cap.rs
+  |
+  | impl Snapshot for ReadTx {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^ `ReadTx`
+  | impl Snapshot for WriteTx {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^ `WriteTx`
+note: required by a bound in `joined_read`
+ --> tests/ui/cap/pool_into_snapshot_op.rs:5:31
+  |
+5 | async fn joined_read(_: &impl Snapshot) {}
+  |                               ^^^^^^^^ required by this bound in `joined_read`

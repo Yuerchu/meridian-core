@@ -7,3 +7,4 @@
 pub mod journal;
 pub mod notification;
 pub mod preference;
+pub mod voice_corpus;

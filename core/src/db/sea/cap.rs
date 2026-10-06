@@ -74,6 +74,17 @@ pub(in crate::db) mod sealed {
 /// Anything a read op accepts.
 pub trait Read: sealed::Access + Sync {}
 
+/// A read that sees one moment of the database: a [`ReadTx`] or a [`WriteTx`],
+/// never the pool.
+///
+/// An op that issues more than one statement and joins their answers needs
+/// this. On the pool each statement autocommits on its own snapshot, so a
+/// write that lands between the first and the second is half-visible — a clip
+/// in the second read whose blob was not in the first. Inside a transaction
+/// SQLite (WAL) fixes the snapshot at the first read and keeps it until the
+/// end, so the two answers agree. A one-statement read stays on [`Read`].
+pub trait Snapshot: Read {}
+
 /// The pool.
 #[derive(Clone, Debug)]
 pub struct Db(DatabaseConnection);
@@ -176,3 +187,5 @@ impl sealed::Access for WriteTx {
 impl Read for Db {}
 impl Read for ReadTx {}
 impl Read for WriteTx {}
+impl Snapshot for ReadTx {}
+impl Snapshot for WriteTx {}

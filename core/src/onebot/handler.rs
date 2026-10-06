@@ -2118,9 +2118,17 @@ fn capture_voice(
         if group_id == 0 {
             return;
         }
-        (SessionKey::group(group_id), "onebot_group", group_id.to_string())
+        (
+            SessionKey::group(group_id),
+            crate::db::entity::voice_blob::VoiceCorpusSourceType::OnebotGroup,
+            group_id.to_string(),
+        )
     } else {
-        (SessionKey::private(user_id), "onebot_private", user_id.to_string())
+        (
+            SessionKey::private(user_id),
+            crate::db::entity::voice_blob::VoiceCorpusSourceType::OnebotPrivate,
+            user_id.to_string(),
+        )
     };
     super::capture::capture_in_background(
         state.clone(),
