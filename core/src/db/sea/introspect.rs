@@ -312,6 +312,33 @@ async fn index_columns(conn: &impl ConnectionTrait, index: &str) -> Result<Vec<I
     Ok(columns)
 }
 
+/// The schema as executable DDL: every application table, index and trigger
+/// in creation order, each as the text `sqlite_master` holds for it, which is
+/// the text that was executed to create it. Running the result on an empty
+/// database rebuilds the same schema, so the checkers outside this crate can
+/// read the schema without a Rust toolchain or the migration set.
+pub async fn ddl(conn: &impl ConnectionTrait) -> Result<String, DbErr> {
+    let rows = conn
+        .query_all_raw(raw(format!(
+            "SELECT sql FROM sqlite_master \
+             WHERE name NOT LIKE 'sqlite_%' AND name NOT IN ({}) AND sql IS NOT NULL \
+             ORDER BY rowid",
+            LEDGER_TABLES.map(|t| format!("'{t}'")).join(", ")
+        )))
+        .await?;
+    let mut out = String::from(concat!(
+        "-- The schema the SeaORM migrations build, as SQLite stores it. Generated:\n",
+        "--   cargo run -p meridian-core --example gen_schema_snapshot --features test-support\n",
+        "-- A test pins it to the migrations; do not edit by hand.\n\n",
+    ));
+    for row in &rows {
+        let sql: String = row.try_get("", "sql")?;
+        out.push_str(sql.trim_end_matches(';').trim_end());
+        out.push_str(";\n\n");
+    }
+    Ok(out)
+}
+
 /// SQLite's affinity rules (datatype3.html §3.1), in their order of precedence.
 pub fn affinity(declared: &str) -> &'static str {
     let upper = declared.to_ascii_uppercase();

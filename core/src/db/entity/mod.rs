@@ -1,0 +1,240 @@
+//! The SeaORM entities, one module per table.
+//!
+//! Empty at the start of Phase 3: every table is still read and written
+//! through Diesel, and each transaction root that moves over brings the
+//! entities it needs and takes their tables out of [`PENDING_TABLES`]. The
+//! drift test (`sea::schema_drift`) holds each registered entity against the
+//! live schema — columns, affinities, nullability, keys, foreign keys — so a
+//! migration that changes a table without its entity following is a red test
+//! rather than a runtime surprise. Diesel gave that check for free at compile
+//! time through `schema.rs`; this is where it lives now.
+
+/// The tables that have no entity yet.
+///
+/// Written once, at the end of Phase 2, with every table the baseline builds;
+/// from then on names only leave. The transaction-graph checker keeps the
+/// list as part of `docs/migration-counters.json` and refuses a name that was
+/// not in it — a table created during the coexistence period comes with its
+/// entity, it does not join the backlog — and refuses a list that grew. Phase
+/// 5 needs it empty. Sorted and one per line, because the checker parses it.
+pub const PENDING_TABLES: &[&str] = &[
+    "acp_context_deliveries",
+    "acp_session_notices",
+    "acp_sessions",
+    "assistant_emoji_packs",
+    "assistants",
+    "audit_messages",
+    "cached_models",
+    "composer_drafts",
+    "conversations",
+    "custom_tools",
+    "emoji_packs",
+    "emojis",
+    "journal_blobs",
+    "journal_files",
+    "journal_versions",
+    "mcp_servers",
+    "memories",
+    "memory_proposals",
+    "memory_subjects",
+    "message_context_items",
+    "message_stickers",
+    "messages",
+    "mode_artifacts",
+    "model_configs",
+    "model_profiles",
+    "notification_alert_state",
+    "notification_webhooks",
+    "plan_comments",
+    "plan_documents",
+    "plan_materializations",
+    "plan_review_deliveries",
+    "plan_review_drafts",
+    "plan_review_sessions",
+    "plan_revisions",
+    "preferences",
+    "projects",
+    "providers",
+    "queued_prompt_context_items",
+    "queued_prompts",
+    "redaction_rules",
+    "skill_bindings_assistant",
+    "skill_bindings_global",
+    "skill_bindings_project",
+    "skills",
+    "todo_items",
+    "todo_lists",
+    "tool_categories",
+    "tool_presets",
+    "turns",
+    "voice_blobs",
+    "voice_clips",
+    "voice_sender_optouts",
+];
+
+/// What an entity claims about its table, in the vocabulary the schema reader
+/// (`sea::introspect`) speaks: affinities rather than Rust or sea-query types,
+/// foreign keys as `pragma foreign_key_list` reports them. The drift test
+/// compares one of these with the live table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityShape {
+    pub table: String,
+    pub columns: Vec<ColumnShape>,
+    pub primary_key: Vec<String>,
+    pub foreign_keys: Vec<ForeignKeyShape>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnShape {
+    pub name: String,
+    /// `TEXT`, `INTEGER`, `REAL`, `BLOB` or `NUMERIC`, as `introspect::affinity`
+    /// reduces a declared type.
+    pub affinity: &'static str,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ForeignKeyShape {
+    pub columns: Vec<String>,
+    pub references_table: String,
+    pub references_columns: Vec<String>,
+    /// As the pragma spells it: `CASCADE`, `SET NULL`, `NO ACTION`,
+    /// `RESTRICT`, `SET DEFAULT`.
+    pub on_delete: String,
+}
+
+/// The entities that have moved over, each as its shape. Empty today.
+///
+/// Phase 3 appends `shape_of::<x::Entity>()` here for every entity it adds and
+/// removes the table from [`PENDING_TABLES`] in the same commit; the drift
+/// test holds each shape against the live table, and the registry test holds
+/// the union of both lists against the schema.
+pub fn registered() -> Vec<EntityShape> {
+    vec![]
+}
+
+/// Derives an entity's shape from SeaORM's own reflection: the table name, the
+/// columns with their types and nullability, the primary key, and every
+/// `belongs_to` relation as the foreign key it declares. A `has_one` or
+/// `has_many` is the other side of someone else's key and declares nothing.
+///
+/// Panics on a column type this crate has not decided an affinity for, naming
+/// the table, column and type: a new type gets a decision in [`affinity_of`],
+/// not a guess. Every registered entity goes through here on every test run,
+/// so the panic is caught before the entity is used.
+pub fn shape_of<E: sea_orm::EntityTrait>() -> EntityShape {
+    use sea_orm::sea_query::{TableName, TableRef};
+    use sea_orm::{ColumnTrait, IdenStatic, Identity, Iterable, PrimaryKeyToColumn, RelationTrait, RelationType};
+
+    let table = E::default().table_name().to_owned();
+
+    let columns = E::Column::iter()
+        .map(|column| {
+            let def = column.def();
+            let name = column.as_str().to_owned();
+            let affinity = affinity_of(def.get_column_type()).unwrap_or_else(|type_name| {
+                panic!("column {table}.{name} has type {type_name}, which has no SQLite affinity decision yet")
+            });
+            ColumnShape {
+                name,
+                affinity,
+                nullable: def.is_null(),
+            }
+        })
+        .collect();
+
+    let primary_key = E::PrimaryKey::iter()
+        .map(|key| key.into_column().as_str().to_owned())
+        .collect();
+
+    fn table_of(reference: &TableRef) -> String {
+        match reference {
+            TableRef::Table(TableName(_, name), _) => name.to_string(),
+            other => panic!("a relation names {other:?} rather than a table"),
+        }
+    }
+    fn names_of(identity: &Identity) -> Vec<String> {
+        identity.iter().map(|iden| iden.to_string()).collect()
+    }
+
+    let foreign_keys = E::Relation::iter()
+        .map(|relation| relation.def())
+        // `belongs_to` builds a `HasOne` whose owner flag is off; `has_one`
+        // and `has_many` are built from the reverse of a `belongs_to` with the
+        // flag on. The flag, not the cardinality, says which side holds the key.
+        .filter(|def| def.rel_type == RelationType::HasOne && !def.is_owner)
+        .map(|def| {
+            let from = table_of(&def.from_tbl);
+            assert_eq!(
+                from, table,
+                "a belongs_to on {table} has its foreign key on {from}; the relation is defined on the wrong entity"
+            );
+            ForeignKeyShape {
+                columns: names_of(&def.from_col),
+                references_table: table_of(&def.to_tbl),
+                references_columns: names_of(&def.to_col),
+                on_delete: pragma_action(def.on_delete),
+            }
+        })
+        .collect();
+
+    EntityShape {
+        table,
+        columns,
+        primary_key,
+        foreign_keys,
+    }
+}
+
+/// The SQLite affinity a sea-query column type lands on when the baseline
+/// declares it, by the names sea-query's SQLite builder emits. The error
+/// carries the type's name for the panic in [`shape_of`].
+///
+/// Money is `TEXT` here on purpose: `crate::decimal::Decimal` declares itself
+/// as `ColumnType::Text`, and a `Decimal`/`Money` column type would come from
+/// a floating or scaled type this crate does not use — it still maps to `TEXT`
+/// so that a monetary column is held to the text affinity the contract
+/// requires. `SqlBool` declares `Integer`, which is how it arrives here.
+fn affinity_of(column_type: &sea_orm::sea_query::ColumnType) -> Result<&'static str, String> {
+    use sea_orm::sea_query::ColumnType;
+
+    Ok(match column_type {
+        ColumnType::Char(_)
+        | ColumnType::String(_)
+        | ColumnType::Text
+        | ColumnType::Json
+        | ColumnType::JsonBinary
+        | ColumnType::Decimal(_)
+        | ColumnType::Money(_) => "TEXT",
+        ColumnType::TinyInteger
+        | ColumnType::SmallInteger
+        | ColumnType::Integer
+        | ColumnType::BigInteger
+        | ColumnType::TinyUnsigned
+        | ColumnType::SmallUnsigned
+        | ColumnType::Unsigned
+        | ColumnType::BigUnsigned
+        | ColumnType::Boolean => "INTEGER",
+        ColumnType::Float | ColumnType::Double => "REAL",
+        ColumnType::Blob | ColumnType::Binary(_) | ColumnType::VarBinary(_) => "BLOB",
+        other => return Err(format!("{other:?}")),
+    })
+}
+
+/// `pragma foreign_key_list` spells the action in upper case with a space;
+/// a relation without one is `NO ACTION`, which is also SQLite's default.
+fn pragma_action(action: Option<sea_orm::sea_query::ForeignKeyAction>) -> String {
+    use sea_orm::sea_query::ForeignKeyAction;
+
+    match action {
+        None | Some(ForeignKeyAction::NoAction) => "NO ACTION",
+        Some(ForeignKeyAction::Cascade) => "CASCADE",
+        Some(ForeignKeyAction::SetNull) => "SET NULL",
+        Some(ForeignKeyAction::Restrict) => "RESTRICT",
+        Some(ForeignKeyAction::SetDefault) => "SET DEFAULT",
+        // The enum is `#[non_exhaustive]`; a variant sea-query adds later gets
+        // a spelling here rather than a guess.
+        Some(other) => panic!("foreign key action {other:?} has no pragma spelling yet"),
+    }
+    .to_owned()
+}

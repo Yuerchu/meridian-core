@@ -1,3 +1,4 @@
+pub mod entity;
 pub mod models;
 pub mod ops;
 pub mod schema;

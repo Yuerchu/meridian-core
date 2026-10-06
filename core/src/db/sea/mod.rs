@@ -1,5 +1,8 @@
 //! The SeaORM side of the persistence layer, alongside Diesel while modules
 //! move over one transaction root at a time.
+//!
+//! `schema_drift` holds every registered entity (`db::entity`) against the
+//! live schema and pins the DDL the migrations build to `schema.snapshot.sql`.
 
 pub mod bridge;
 pub mod cap;
@@ -21,6 +24,8 @@ mod equivalence_tests;
 mod legacy_tests;
 #[cfg(test)]
 mod poc;
+#[cfg(test)]
+mod schema_drift;
 
 use std::path::Path;
 use std::time::Duration;
