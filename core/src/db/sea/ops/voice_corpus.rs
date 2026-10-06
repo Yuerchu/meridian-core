@@ -18,7 +18,7 @@ use sea_orm::{ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrde
 use crate::db::entity::voice_blob::{VoiceBlobStatus, VoiceCorpusSourceType};
 use crate::db::entity::{voice_blob, voice_clip, voice_sender_optout};
 use crate::db::sea::cap::sealed::Access;
-use crate::db::sea::cap::{Read, WriteTx};
+use crate::db::sea::cap::{Read, Snapshot, WriteTx};
 use crate::db::types::EpochMs;
 
 /// 一个 blob 的去重身份。账号是其中一维，不是附注——两个 bot 各自被拉进同一个
@@ -512,8 +512,13 @@ pub async fn all_blobs(db: &impl Read) -> Result<Vec<voice_blob::Model>, DbErr> 
 /// blob"，正是这个 crate 到处拒绝的那种静默默认。分开读，blob 那一边的解码
 /// 失败就是整个查询的失败。`blob_id` 非空且级联，所以一条没有 blob 的 clip
 /// 是坏库，不是空答案。
+///
+/// **两个查询必须落在同一个快照上，所以参数是 [`Snapshot`] 而不是池。** 在池上
+/// 各自自动提交时，后台采集在两次读之间提交一个新 blob 和它的 clip，第二次读
+/// 看得见 clip、第一次读的 blob 表里却没有它——上面那个"坏库"报错就会在一个
+/// 好好的库上冒出来，设置页的列表和导出随采集节奏间歇失败。
 async fn clips_with_blobs(
-    db: &impl Read,
+    db: &impl Snapshot,
     statuses: &[VoiceBlobStatus],
 ) -> Result<Vec<(voice_clip::Model, voice_blob::Model)>, DbErr> {
     let blobs: std::collections::HashMap<String, voice_blob::Model> = all_blobs(db)
@@ -541,7 +546,7 @@ async fn clips_with_blobs(
 ///
 /// manifest 的每一行两边都要——转写和发送者在 clip 上，文件名和格式在 blob 上。
 /// 只读 `ready` 的：`damaged` 的文件对不上，`deleting` 的正在消失。
-pub async fn export_rows(db: &impl Read) -> Result<Vec<(voice_clip::Model, voice_blob::Model)>, DbErr> {
+pub async fn export_rows(db: &impl Snapshot) -> Result<Vec<(voice_clip::Model, voice_blob::Model)>, DbErr> {
     clips_with_blobs(db, &[VoiceBlobStatus::Ready]).await
 }
 
@@ -592,7 +597,7 @@ pub struct SessionTotal {
 /// 里。恢复器把一个会话的文件全标成 `damaged` 之后，按 `ready` 过滤正好把
 /// 最该被删的那批数据变成删不掉的。`deleting` 不用排——墓碑只立在没有任何
 /// clip 引用的 blob 上，join 过 clips 之后它本来就贡献不了行。
-pub async fn session_totals(db: &impl Read) -> Result<Vec<SessionTotal>, DbErr> {
+pub async fn session_totals(db: &impl Snapshot) -> Result<Vec<SessionTotal>, DbErr> {
     use std::collections::{HashMap, HashSet};
 
     let rows = clips_with_blobs(db, &[VoiceBlobStatus::Ready, VoiceBlobStatus::Damaged]).await?;
@@ -745,6 +750,79 @@ mod tests {
             .unwrap()
     }
 
+    /// The two-query reads take a [`Snapshot`]; on the pool they would not compile.
+    async fn totals(db: &Db) -> Result<Vec<SessionTotal>, DbErr> {
+        db.read(async |tx| session_totals(tx).await).await
+    }
+
+    async fn exported(db: &Db) -> Result<Vec<(voice_clip::Model, voice_blob::Model)>, DbErr> {
+        db.read(async |tx| export_rows(tx).await).await
+    }
+
+    /// A blob and its clip, committed together, from a task of its own — the
+    /// shape a background capture has. Spawned because a write started from a
+    /// task that has a read open is refused (`cap::refuse_inside_transaction`):
+    /// another task is exactly what a concurrent capture is.
+    async fn capture_elsewhere(db: &Db, sha: &'static str, blob_id: &'static str, clip_id: &'static str) {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let blob = ready_blob(&db, sha, blob_id).await;
+            clip(&db, &blob, clip_id, "alice", None, 0, None, 2_000).await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The race Codex review found on PR 36, reproduced deterministically: on
+    /// the pool every statement is its own snapshot, so a capture committed
+    /// between "read the blobs" and "read the clips" leaves a clip whose blob
+    /// the first read never saw. This is what made the join report a broken
+    /// database on a sound one. It is why the join takes a `Snapshot`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_the_pool_a_capture_between_two_reads_is_half_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_diesel, db) = crate::db::sea::shared_test_db(dir.path()).await;
+
+        let blobs_before = all_blobs(&db).await.unwrap();
+        capture_elsewhere(&db, "aa", "b1", "c1").await;
+        let clips_after = clips(&db).await;
+
+        assert!(blobs_before.is_empty());
+        assert_eq!(clips_after.len(), 1, "the second read sees the new clip");
+        assert!(
+            !blobs_before.iter().any(|blob| blob.id == clips_after[0].blob_id),
+            "and its blob is missing from the first read"
+        );
+    }
+
+    /// The other half of the experiment: inside a read transaction the snapshot
+    /// is fixed at the first statement, so the same interleaving is invisible
+    /// to both reads, the join answers for one moment, and a fresh read
+    /// afterwards sees the capture whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inside_a_read_transaction_both_reads_see_one_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_diesel, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        ready_blob(&db, "00", "b0").await;
+        // The capture's own handle on the pool, standing for another task's.
+        let capturer = db.clone();
+
+        let (blobs, rows) = db
+            .read(async |tx| {
+                let blobs = all_blobs(tx).await?;
+                capture_elsewhere(&capturer, "aa", "b1", "c1").await;
+                Ok::<_, DbErr>((blobs, export_rows(tx).await?))
+            })
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 1, "the snapshot was taken before the capture");
+        assert!(rows.is_empty(), "the capture is invisible to the second read too");
+
+        let rows = exported(&db).await.unwrap();
+        assert_eq!(rows.len(), 1, "a fresh snapshot sees it, blob and clip together");
+        assert_eq!(rows[0].1.id, "b1");
+    }
+
     /// 同一段音频的第二个采集任务认出别人已经有了它，而不是写第二份。
     #[tokio::test]
     async fn a_second_claim_on_the_same_bytes_finds_the_first() {
@@ -777,9 +855,9 @@ mod tests {
 
         // 经 clip 读 blob 的两条路也要失败，而且要说出那个值。`find_also_related`
         // 在这里会把坏行读成"没有 blob"——这两条断言钉住的就是不用它的理由。
-        let error = session_totals(&db).await.unwrap_err().to_string();
+        let error = totals(&db).await.unwrap_err().to_string();
         assert!(error.contains("onebot_channel"), "{error}");
-        let error = export_rows(&db).await.unwrap_err().to_string();
+        let error = exported(&db).await.unwrap_err().to_string();
         assert!(error.contains("onebot_channel"), "{error}");
     }
 
@@ -1003,7 +1081,7 @@ mod tests {
         clip(&db, &blob, "c1", "alice", Some(10), 0, None, 1).await;
         clip(&db, &blob, "c2", "bob", Some(11), 0, None, 5).await;
 
-        let totals = session_totals(&db).await.unwrap();
+        let totals = totals(&db).await.unwrap();
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].clips, 2, "两次出现是两条");
         assert_eq!(totals[0].bytes, 10, "一份文件只占一次地方");
@@ -1024,13 +1102,13 @@ mod tests {
         clip(&db, &blob, "c1", "alice", Some(10), 0, None, 1).await;
         damage(&db, &blob.id, 2).await;
 
-        let totals = session_totals(&db).await.unwrap();
+        let totals = totals(&db).await.unwrap();
         assert_eq!(totals.len(), 1, "damaged 只挡导出，不挡删除");
         assert_eq!(totals[0].clips, 1);
 
         // 导出这边照旧跳过它——两个调用者对 damaged 的答案相反，
         // 这正是统计不借用 export_rows 的原因。
-        assert!(export_rows(&db).await.unwrap().is_empty());
+        assert!(exported(&db).await.unwrap().is_empty());
     }
 
     /// 导出按 clip 的时间排，每一行都带着它的 blob。
@@ -1042,7 +1120,7 @@ mod tests {
         clip(&db, &b, "c2", "bob", Some(11), 0, None, 5).await;
         clip(&db, &a, "c1", "alice", Some(10), 0, Some("你好"), 1).await;
 
-        let rows = export_rows(&db).await.unwrap();
+        let rows = exported(&db).await.unwrap();
         let pairs: Vec<(&str, &str)> = rows.iter().map(|(c, b)| (c.id.as_str(), b.id.as_str())).collect();
         assert_eq!(pairs, vec![("c1", "b1"), ("c2", "b2")]);
     }

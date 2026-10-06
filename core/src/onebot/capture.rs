@@ -781,7 +781,8 @@ mod tests {
         /// 挂在 `ready` blob 上的 clip；这些测试里要么 blob 是 `ready`，要么
         /// 根本没有 blob，所以这就是全部的 clip。
         async fn clips(&self) -> Vec<voice_clip::Model> {
-            ops::export_rows(&self.db)
+            self.db
+                .read(async |tx| ops::export_rows(tx).await)
                 .await
                 .unwrap()
                 .into_iter()

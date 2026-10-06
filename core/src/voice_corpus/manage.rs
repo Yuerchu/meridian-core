@@ -39,7 +39,11 @@ pub const DELETE_ALL_CONFIRMATION: &str = "DELETE ALL VOICE";
 /// 认不出来是错误而不是"什么都不删"——一个说了删却什么都没删的按钮，比一个
 /// 报错的按钮糟。
 async fn resolve_handle(db: &Db, key: &[u8], handle: &str) -> Result<(i64, VoiceCorpusSourceType, String), String> {
-    for total in ops::session_totals(db).await.map_err(|e| e.to_string())? {
+    let totals = db
+        .read(async |tx| ops::session_totals(tx).await)
+        .await
+        .map_err(|e| e.to_string())?;
+    for total in totals {
         let pseudonym = crate::voice_corpus::session_pseudonym(
             key,
             total.bot_self_id,
@@ -71,7 +75,9 @@ pub type SessionTotal = ops::SessionTotal;
 /// 一个认不出来的 `source_type` 在读的时候就失败了（它是 entity 上的闭合枚举），
 /// 所以这里不用再逐行校验。
 pub async fn list_sessions(db: &Db) -> Result<Vec<SessionTotal>, String> {
-    ops::session_totals(db).await.map_err(|e| e.to_string())
+    db.read(async |tx| ops::session_totals(tx).await)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Default)]
@@ -296,7 +302,10 @@ pub async fn export(
     include_sender: bool,
     include_untranscribed: bool,
 ) -> Result<ExportReport, String> {
-    let clips = ops::export_rows(db).await.map_err(|e| e.to_string())?;
+    let clips = db
+        .read(async |tx| ops::export_rows(tx).await)
+        .await
+        .map_err(|e| e.to_string())?;
     let key: std::sync::Arc<[u8]> = key.into();
     let app_data_dir = app_data_dir.to_path_buf();
     let output_dir = output_dir.to_path_buf();
