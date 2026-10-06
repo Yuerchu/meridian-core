@@ -146,7 +146,7 @@ fn run() -> Result<(), String> {
         secrets.clone(),
     ))?;
 
-    let report = apply::apply(&services.db, &services.secrets, &config)?;
+    let report = runtime.block_on(apply::apply(&services.db, &services.sea, &services.secrets, &config))?;
     tracing::info!(
         providers = report.providers_written,
         providers_disabled = report.providers_disabled,

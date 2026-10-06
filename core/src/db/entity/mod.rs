@@ -9,6 +9,8 @@
 //! rather than a runtime surprise. Diesel gave that check for free at compile
 //! time through `schema.rs`; this is where it lives now.
 
+pub mod preference;
+
 /// The tables that have no entity yet.
 ///
 /// Written once, at the end of Phase 2, with every table the baseline builds;
@@ -52,7 +54,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "plan_review_drafts",
     "plan_review_sessions",
     "plan_revisions",
-    "preferences",
     "projects",
     "providers",
     "queued_prompt_context_items",
@@ -103,14 +104,14 @@ pub struct ForeignKeyShape {
     pub on_delete: String,
 }
 
-/// The entities that have moved over, each as its shape. Empty today.
+/// The entities that have moved over, each as its shape.
 ///
 /// Phase 3 appends `shape_of::<x::Entity>()` here for every entity it adds and
 /// removes the table from [`PENDING_TABLES`] in the same commit; the drift
 /// test holds each shape against the live table, and the registry test holds
 /// the union of both lists against the schema.
 pub fn registered() -> Vec<EntityShape> {
-    vec![]
+    vec![shape_of::<preference::Entity>()]
 }
 
 /// Derives an entity's shape from SeaORM's own reflection: the table name, the

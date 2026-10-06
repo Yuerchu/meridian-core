@@ -143,7 +143,7 @@ pub async fn ask(
     // Worked out once, here, rather than by the waiter. The two would be the
     // same number, but only one of them can be the answer to "when does this
     // stop standing" — and the listing paths read the stored one.
-    let ttl = crate::approval::ttl(services)?;
+    let ttl = crate::approval::ttl(services).await?;
 
     // Stamped once and sent both ways: on the event, and in the register every
     // listing reads, so a card rebuilt after a reload keeps its time.

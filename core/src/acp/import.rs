@@ -91,7 +91,7 @@ pub struct DiscoveredSession {
 /// opened, because listing is a question about the disk rather than about a
 /// conversation.
 pub async fn discover(services: &Services, cwd: Option<&str>) -> Result<Vec<DiscoveredSession>, String> {
-    let config = AcpConfig::load(&services.db)?;
+    let config = AcpConfig::load(&services.sea).await?;
     let listed = list_sessions(&config, cwd).await?;
 
     let pool = services.db.clone();
@@ -273,7 +273,7 @@ pub async fn import(services: &Services, listed: &ImportRequest) -> Result<Impor
         return Err(format!("this session is already open as conversation {owner}"));
     }
 
-    let config = AcpConfig::load(&services.db)?;
+    let config = AcpConfig::load(&services.sea).await?;
     let conversation_id = uuid::Uuid::new_v4().to_string();
     let session = AcpSession::open_for_import(
         services.clone(),

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::db::DbPool;
 use crate::db::models::voice_corpus::{VoiceBlobRow, VoiceCorpusSourceType};
 use crate::db::ops::voice_corpus as ops;
+use crate::db::sea::cap::Db;
 
 /// 要动哪些语料。
 ///
@@ -37,13 +38,12 @@ pub const DELETE_ALL_CONFIRMATION: &str = "DELETE ALL VOICE";
 /// 没有反查表：假名是 HMAC，所以把还在库里的每个会话算一遍再比对就够了。
 /// 认不出来是错误而不是"什么都不删"——一个说了删却什么都没删的按钮，比一个
 /// 报错的按钮糟。
-fn resolve_handle(pool: &DbPool, handle: &str) -> Result<(i64, VoiceCorpusSourceType, String), String> {
-    let key = crate::voice_corpus::storage_key(pool)?;
+fn resolve_handle(pool: &DbPool, key: &[u8], handle: &str) -> Result<(i64, VoiceCorpusSourceType, String), String> {
     let mut conn = crate::util::get_conn(pool)?;
     for total in ops::session_totals(&mut conn).map_err(|e| e.to_string())? {
         let source_type = VoiceCorpusSourceType::parse(&total.source_type)?;
         let pseudonym =
-            crate::voice_corpus::session_pseudonym(&key, total.bot_self_id, source_type.as_str(), &total.source_id);
+            crate::voice_corpus::session_pseudonym(key, total.bot_self_id, source_type.as_str(), &total.source_id);
         if pseudonym == handle {
             return Ok((total.bot_self_id, source_type, total.source_id));
         }
@@ -96,6 +96,7 @@ pub struct DeleteReport {
 /// 因为合并意味着一次手滑要么删掉几个月的数据，要么把一次删除变成永久停录。
 pub async fn delete(
     pool: &DbPool,
+    sea: &Db,
     app_data_dir: &Path,
     coordinator: &crate::voice_corpus::CorpusCoordinator,
     selector: CorpusSelector,
@@ -107,14 +108,19 @@ pub async fn delete(
         return Err(format!("confirmation must be exactly `{DELETE_ALL_CONFIRMATION}`"));
     }
 
+    // 假名化密钥取一次，换真身和删文件都用它。在这里 `.await`，因为下面两段
+    // 都在 `spawn_blocking` 里，没有运行时可等。
+    let key = crate::voice_corpus::storage_key(sea).await?;
+
     // 假名在立屏障之前就要换回真身：屏障要挂在真实的会话上，而且认不出来的
     // 句柄该在什么都没动之前就报错。
     let resolved = match &selector {
         CorpusSelector::Session { handle } => {
             let pool = pool.clone();
+            let key = key.clone();
             let handle = handle.clone();
             Some(
-                tokio::task::spawn_blocking(move || resolve_handle(&pool, &handle))
+                tokio::task::spawn_blocking(move || resolve_handle(&pool, &key, &handle))
                     .await
                     .map_err(|e| e.to_string())??,
             )
@@ -137,7 +143,7 @@ pub async fn delete(
 
     let pool2 = pool.clone();
     let data_dir = app_data_dir.to_path_buf();
-    let out = tokio::task::spawn_blocking(move || delete_blocking(&pool2, &data_dir, selector, resolved))
+    let out = tokio::task::spawn_blocking(move || delete_blocking(&pool2, &key, &data_dir, selector, resolved))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -147,11 +153,11 @@ pub async fn delete(
 
 fn delete_blocking(
     pool: &DbPool,
+    key: &[u8],
     app_data_dir: &Path,
     selector: CorpusSelector,
     resolved: Option<(i64, VoiceCorpusSourceType, String)>,
 ) -> Result<DeleteReport, String> {
-    let key = crate::voice_corpus::storage_key(pool)?;
     let mut conn = crate::util::get_conn(pool)?;
     let now = crate::util::now_ms();
 
@@ -170,7 +176,7 @@ fn delete_blocking(
     };
 
     for blob in ops::tombstone_unreferenced(&mut conn, now).map_err(|e| e.to_string())? {
-        let path = blob_path(app_data_dir, &key, &blob);
+        let path = blob_path(app_data_dir, key, &blob);
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 report.files += 1;
@@ -220,6 +226,7 @@ pub fn set_optout(
 /// 而那是上一层的事。
 pub async fn forget_sender<F, Fut>(
     pool: &DbPool,
+    sea: &Db,
     app_data_dir: &Path,
     coordinator: &crate::voice_corpus::CorpusCoordinator,
     sender_id: &str,
@@ -243,6 +250,7 @@ where
     refresh().await?;
     delete(
         pool,
+        sea,
         app_data_dir,
         coordinator,
         CorpusSelector::Sender {
@@ -266,8 +274,11 @@ pub struct ExportReport {
 ///
 /// 固定这个形状，不给"音频拷到哪"之类的参数：那些参数没有 UI，语义也没定义过，
 /// 而 recipe 那边要的就是一个自洽的目录。
+/// `key` 是调用方先 `storage_key(&services.sea).await` 拿到的假名化密钥——这个函数
+/// 在 `spawn_blocking` 里跑，自己等不了那个异步事务。
 pub fn export(
     pool: &DbPool,
+    key: &[u8],
     app_data_dir: &Path,
     output_dir: &Path,
     include_sender: bool,
@@ -289,7 +300,6 @@ pub fn export(
         Err(e) => return Err(e.to_string()),
     }
 
-    let key = crate::voice_corpus::storage_key(pool)?;
     let mut conn = crate::util::get_conn(pool)?;
     let clips = ops::export_rows(&mut conn).map_err(|e| e.to_string())?;
 
@@ -310,14 +320,13 @@ pub fn export(
             report.skipped += 1;
             continue;
         }
-        let session =
-            crate::voice_corpus::session_pseudonym(&key, blob.bot_self_id, &blob.source_type, &blob.source_id);
+        let session = crate::voice_corpus::session_pseudonym(key, blob.bot_self_id, &blob.source_type, &blob.source_id);
         let relative = format!("audio/{session}/{}", blob.file_name);
         let dest = output_dir.join(&relative);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        if std::fs::copy(blob_path(app_data_dir, &key, &blob), &dest).is_err() {
+        if std::fs::copy(blob_path(app_data_dir, key, &blob), &dest).is_err() {
             report.skipped += 1;
             continue;
         }
@@ -332,7 +341,7 @@ pub fn export(
             "speaker": if include_sender {
                 serde_json::Value::String(clip.sender_id.clone())
             } else {
-                serde_json::Value::String(crate::voice_corpus::sender_pseudonym(&key, &clip.sender_id))
+                serde_json::Value::String(crate::voice_corpus::sender_pseudonym(key, &clip.sender_id))
             },
             "format": blob.file_format,
             "bytes": blob.file_size,
@@ -366,11 +375,11 @@ fn session_key(source_type: VoiceCorpusSourceType, source_id: &str) -> String {
 }
 
 /// 一次安装内稳定的假名，跨安装不可关联。给设置页显示用。
-pub fn session_label(pool: &DbPool, total: &SessionTotal) -> Result<String, String> {
-    let key = crate::voice_corpus::storage_key(pool)?;
+/// `key` 来自 `storage_key`，由调用方取一次再逐行传进来。
+pub fn session_label(key: &[u8], total: &SessionTotal) -> Result<String, String> {
     let source_type = VoiceCorpusSourceType::parse(&total.source_type)?;
     Ok(crate::voice_corpus::session_pseudonym(
-        &key,
+        key,
         total.bot_self_id,
         source_type.as_str(),
         &total.source_id,
@@ -386,9 +395,16 @@ pub fn untranscribed_counts(pool: &DbPool) -> Result<HashMap<String, i64>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
     use crate::db::models::voice_corpus::{VoiceBlobInsert, blob_status};
+    use crate::db::sea::shared_test_db;
     use diesel::prelude::*;
+
+    /// 一个库文件、两个池：行走 Diesel，key 走 SeaORM。
+    async fn dbs(dir: &Path) -> (DbPool, Vec<u8>) {
+        let (pool, sea) = shared_test_db(dir).await;
+        let key = crate::voice_corpus::storage_key(&sea).await.unwrap();
+        (pool, key)
+    }
 
     fn ready(conn: &mut diesel::SqliteConnection, id: &str, session: &str) -> VoiceBlobRow {
         use crate::db::schema::voice_blobs;
@@ -427,9 +443,10 @@ mod tests {
         assert!(error.contains("unknown voice corpus source_type"), "{error}");
     }
 
-    #[test]
-    fn management_rejects_an_unknown_persisted_source_type() {
-        let pool = diesel_test_db();
+    #[tokio::test]
+    async fn management_rejects_an_unknown_persisted_source_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, key) = dbs(dir.path()).await;
         {
             let mut conn = pool.get().unwrap();
             let blob = ready(&mut conn, "a", "123");
@@ -445,18 +462,17 @@ mod tests {
         let error = list_sessions(&pool).unwrap_err();
         assert!(error.contains("unknown voice corpus source_type"), "{error}");
 
-        let key = crate::voice_corpus::storage_key(&pool).unwrap();
         let handle = crate::voice_corpus::session_pseudonym(&key, 1, "onebot_channel", "123");
-        let error = resolve_handle(&pool, &handle).unwrap_err();
+        let error = resolve_handle(&pool, &key, &handle).unwrap_err();
         assert!(error.contains("unknown voice corpus source_type"), "{error}");
     }
 
     /// 导出默认跳过没有转写的，而且**把跳过的条数说出来**。
-    #[test]
-    fn an_export_says_how_much_it_left_out() {
+    #[tokio::test]
+    async fn an_export_says_how_much_it_left_out() {
         let dir = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+        let (pool, key) = dbs(dir.path()).await;
         {
             let mut conn = pool.get().unwrap();
             let a = ready(&mut conn, "a", "123");
@@ -464,7 +480,6 @@ mod tests {
             ops::record_clip(&mut conn, &a, "c1", "alice", Some(1), 0, Some("你好"), Some("s"), 1).unwrap();
             ops::record_clip(&mut conn, &b, "c2", "bob", Some(2), 0, None, None, 1).unwrap();
         }
-        let key = crate::voice_corpus::storage_key(&pool).unwrap();
         for id in ["a", "b"] {
             let mut conn = pool.get().unwrap();
             use crate::db::schema::voice_blobs;
@@ -478,7 +493,7 @@ mod tests {
             std::fs::write(path, b"abcd").unwrap();
         }
 
-        let report = export(&pool, dir.path(), out.path(), false, false).unwrap();
+        let report = export(&pool, &key, dir.path(), out.path(), false, false).unwrap();
         assert_eq!(report.clips, 1);
         assert_eq!(report.skipped, 1, "没有转写的那条被跳过，并且说了出来");
 
@@ -491,31 +506,30 @@ mod tests {
     /// 非空目录拒绝导出。上一次 bundle 的 `audio/` 里可能躺着这次已经删掉的
     /// 录音，只重写 manifest 会让它们以旧文件的身份继续存在；也不替用户清场，
     /// 这是一个用户随手指定的目录。
-    #[test]
-    fn an_export_refuses_a_directory_that_already_has_content() {
+    #[tokio::test]
+    async fn an_export_refuses_a_directory_that_already_has_content() {
         let dir = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         std::fs::write(out.path().join("leftover.txt"), b"old").unwrap();
-        let pool = diesel_test_db();
+        let (pool, key) = dbs(dir.path()).await;
 
-        let err = export(&pool, dir.path(), out.path(), false, false).unwrap_err();
+        let err = export(&pool, &key, dir.path(), out.path(), false, false).unwrap_err();
         assert!(err.contains("not empty"), "{err}");
         // 而一个还不存在的目录是可以的——由导出自己创建。
-        assert!(export(&pool, dir.path(), &out.path().join("fresh"), false, false).is_ok());
+        assert!(export(&pool, &key, dir.path(), &out.path().join("fresh"), false, false).is_ok());
     }
 
     /// 带上真实发送者是另一条路，要显式要求。
-    #[test]
-    fn asking_for_real_sender_ids_is_a_separate_decision() {
+    #[tokio::test]
+    async fn asking_for_real_sender_ids_is_a_separate_decision() {
         let dir = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+        let (pool, key) = dbs(dir.path()).await;
         {
             let mut conn = pool.get().unwrap();
             let a = ready(&mut conn, "a", "123");
             ops::record_clip(&mut conn, &a, "c1", "alice", Some(1), 0, Some("你好"), Some("s"), 1).unwrap();
         }
-        let key = crate::voice_corpus::storage_key(&pool).unwrap();
         let mut conn = pool.get().unwrap();
         use crate::db::schema::voice_blobs;
         let blob: VoiceBlobRow = voice_blobs::table
@@ -528,7 +542,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"abcd").unwrap();
 
-        export(&pool, dir.path(), out.path(), true, false).unwrap();
+        export(&pool, &key, dir.path(), out.path(), true, false).unwrap();
         let manifest = std::fs::read_to_string(out.path().join("manifest.jsonl")).unwrap();
         assert!(manifest.contains("alice"));
     }

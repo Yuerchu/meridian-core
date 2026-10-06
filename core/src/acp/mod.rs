@@ -28,7 +28,7 @@ pub mod session;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::db::DbPool;
+use crate::db::sea::cap::Db;
 
 pub use plan_review::{AcpPlanReviewDelivery, AcpPlanReviewDeliveryOutcome};
 pub use session::AcpSession;
@@ -282,20 +282,20 @@ impl Default for AcpConfig {
 }
 
 impl AcpConfig {
-    pub fn load(pool: &DbPool) -> Result<Self, String> {
-        let mut conn = crate::util::get_conn(pool)?;
-        let mut get = |key: &str| -> Result<Option<String>, String> {
-            crate::db::ops::preference::get_preference(&mut conn, key)
+    pub async fn load(db: &Db) -> Result<Self, String> {
+        let get = async |key: &str| -> Result<Option<String>, String> {
+            crate::db::sea::ops::preference::get_preference(db, key)
+                .await
                 .map_err(|error| format!("failed to read preference {key}: {error}"))
         };
 
         let default = Self::default();
         Ok(Self {
-            command: get("acp.command")?.unwrap_or(default.command),
+            command: get("acp.command").await?.unwrap_or(default.command),
             // Stored as JSON rather than a space-separated string: an argument
             // containing a space is ordinary on Windows, and splitting one back
             // apart would break a path under `Program Files`.
-            args: match get("acp.args")? {
+            args: match get("acp.args").await? {
                 Some(raw) => serde_json::from_str::<Vec<String>>(&raw)
                     .map_err(|error| format!("preference acp.args has invalid JSON: {error}"))?,
                 None => default.args,
@@ -303,16 +303,20 @@ impl AcpConfig {
         })
     }
 
-    pub fn save(&self, pool: &DbPool) -> Result<(), String> {
-        let mut conn = crate::util::get_conn(pool)?;
+    /// Both keys in one transaction, so a failure part-way leaves the previous
+    /// command and arguments together rather than a new command with old ones.
+    pub async fn save(&self, db: &Db) -> Result<(), String> {
+        use crate::db::sea::ops::preference::set_preference;
+
         let now = crate::util::now_ms();
-        let mut set = |key: &str, value: &str| -> Result<(), String> {
-            crate::db::ops::preference::set_preference(&mut conn, key, value, now).map_err(|e| e.to_string())
-        };
-        set("acp.command", &self.command)?;
         let args = serde_json::to_string(&self.args).map_err(|e| e.to_string())?;
-        set("acp.args", &args)?;
-        Ok(())
+        db.write(async |tx| {
+            set_preference(tx, "acp.command", &self.command, now).await?;
+            set_preference(tx, "acp.args", &args, now).await?;
+            Ok::<(), sea_orm::DbErr>(())
+        })
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -356,7 +360,7 @@ async fn remember_session(services: &crate::services::Services, session: &AcpSes
 /// row in the sidebar that can never be opened, and the usual reason for
 /// failure — the command is not installed — is one every attempt would repeat.
 pub async fn open_session(services: &crate::services::Services, cwd: &str) -> Result<String, String> {
-    let config = AcpConfig::load(&services.db)?;
+    let config = AcpConfig::load(&services.sea).await?;
     let conversation_id = uuid::Uuid::new_v4().to_string();
 
     // Decided once, before the adapter: the bridge needs it in the first thing
@@ -446,7 +450,7 @@ pub async fn reopen_session(
     .await
     .map_err(|e| e.to_string())??;
 
-    let config = AcpConfig::load(&services.db)?;
+    let config = AcpConfig::load(&services.sea).await?;
     let session = AcpSession::reopen(
         services.clone(),
         &config,
@@ -622,7 +626,6 @@ fn title_for(cwd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
 
     /// A stop pressed while a send is still reopening its session reaches the
     /// send, with no session in the registry at all — the case that used to
@@ -683,22 +686,22 @@ mod tests {
         assert!(default.args.contains(&"-y".to_string()));
     }
 
-    #[test]
-    fn absent_acp_preferences_use_fresh_install_defaults() {
-        let loaded = AcpConfig::load(&diesel_test_db()).unwrap();
+    #[tokio::test]
+    async fn absent_acp_preferences_use_fresh_install_defaults() {
+        let loaded = AcpConfig::load(&crate::db::sea::sea_test_db().await).await.unwrap();
         let expected = AcpConfig::default();
         assert_eq!(loaded.command, expected.command);
         assert_eq!(loaded.args, expected.args);
     }
 
-    #[test]
-    fn malformed_stored_acp_arguments_are_not_defaulted() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::preference::set_preference(&mut conn, "acp.args", "npx -y adapter", 1).unwrap();
-        drop(conn);
+    #[tokio::test]
+    async fn malformed_stored_acp_arguments_are_not_defaulted() {
+        let db = crate::db::sea::sea_test_db().await;
+        db.write(async |tx| crate::db::sea::ops::preference::set_preference(tx, "acp.args", "npx -y adapter", 1).await)
+            .await
+            .unwrap();
 
-        let error = AcpConfig::load(&pool).unwrap_err();
+        let error = AcpConfig::load(&db).await.unwrap_err();
         assert!(error.contains("acp.args has invalid JSON"), "{error}");
     }
 }

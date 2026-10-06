@@ -93,7 +93,7 @@ pub async fn bootstrap_with_secrets(
         .map_err(|error| format!("could not open the database through SeaORM: {error}"))?;
     // The preference lives in the database, so the first few lines above
     // are recorded at the default level.
-    crate::logging::apply_saved_level(&pool)?;
+    crate::logging::apply_saved_level(&sea).await?;
 
     // Create default assistant on first run
     {

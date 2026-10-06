@@ -97,9 +97,9 @@ impl RetireCause {
 /// Read per question rather than held: it is one indexed row and a card is a
 /// human-scale event, while a cached copy would mean the setting takes effect
 /// at some point nobody can name.
-pub fn ttl(services: &Services) -> Result<Option<Duration>, String> {
-    let mut conn = services.db.get().map_err(|error| error.to_string())?;
-    let stored = crate::db::ops::preference::get_preference(&mut conn, TTL_PREFERENCE)
+pub async fn ttl(services: &Services) -> Result<Option<Duration>, String> {
+    let stored = crate::db::sea::ops::preference::get_preference(&services.sea, TTL_PREFERENCE)
+        .await
         .map_err(|error| format!("failed to read preference {TTL_PREFERENCE}: {error}"))?;
     let minutes = match stored {
         None => DEFAULT_TTL_MINUTES,
@@ -275,22 +275,25 @@ mod tests {
         (dir, services)
     }
 
-    fn set_ttl(services: &Services, raw: &str) {
-        let mut conn = services.db.get().unwrap();
-        crate::db::ops::preference::set_preference(&mut conn, TTL_PREFERENCE, raw, 1).unwrap();
+    async fn set_ttl(services: &Services, raw: &str) {
+        services
+            .sea
+            .write(async |tx| crate::db::sea::ops::preference::set_preference(tx, TTL_PREFERENCE, raw, 1).await)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn stored_ttl_is_strict_and_errors_are_not_defaulted() {
         let (_dir, services) = services().await;
-        assert_eq!(ttl(&services).unwrap(), Some(Duration::from_secs(30 * 60)));
+        assert_eq!(ttl(&services).await.unwrap(), Some(Duration::from_secs(30 * 60)));
 
-        set_ttl(&services, "0");
-        assert_eq!(ttl(&services).unwrap(), None);
+        set_ttl(&services, "0").await;
+        assert_eq!(ttl(&services).await.unwrap(), None);
 
         for raw in [" 5", "05", "five", "18446744073709551615"] {
-            set_ttl(&services, raw);
-            let error = ttl(&services).expect_err("invalid stored TTL must fail");
+            set_ttl(&services, raw).await;
+            let error = ttl(&services).await.expect_err("invalid stored TTL must fail");
             assert!(error.contains(TTL_PREFERENCE), "{raw:?}: {error}");
         }
     }

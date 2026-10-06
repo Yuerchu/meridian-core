@@ -28,10 +28,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, watch};
 
-use crate::db::DbPool;
+use crate::db::sea::cap::Db;
 use crate::listen_guard::validate_listen_config;
 use crate::services::Services;
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 /// Which incarnation of the server wrote the handshake file.
 ///
@@ -185,61 +185,79 @@ fn parse_stored_u32(key: &str, raw: Option<String>, default: u32) -> Result<u32,
     Ok(value)
 }
 
-pub fn load_config(pool: &DbPool) -> Result<HookConfig, String> {
-    let mut conn = get_conn(pool)?;
-    let mut get = |key: &str| -> Result<Option<String>, String> {
-        crate::db::ops::preference::get_preference(&mut conn, key)
+pub async fn load_config(db: &Db) -> Result<HookConfig, String> {
+    let get = async |key: &str| -> Result<Option<String>, String> {
+        crate::db::sea::ops::preference::get_preference(db, key)
+            .await
             .map_err(|error| format!("failed to read preference {key}: {error}"))
     };
 
     Ok(HookConfig {
-        enabled: parse_stored_bool("hooks.enabled", get("hooks.enabled")?, false)?,
-        host: get("hooks.host")?.unwrap_or_else(|| "127.0.0.1".into()),
-        port: parse_stored_u16("hooks.port", get("hooks.port")?, DEFAULT_PORT)?,
-        token: get("hooks.token")?.filter(|s| !s.is_empty()),
-        review_model: get("hooks.plan_review.model")?.filter(|s| !s.is_empty()),
-        assistant_id: get("hooks.plan_review.assistant_id")?.filter(|s| !s.is_empty()),
+        enabled: parse_stored_bool("hooks.enabled", get("hooks.enabled").await?, false)?,
+        host: get("hooks.host").await?.unwrap_or_else(|| "127.0.0.1".into()),
+        port: parse_stored_u16("hooks.port", get("hooks.port").await?, DEFAULT_PORT)?,
+        token: get("hooks.token").await?.filter(|s| !s.is_empty()),
+        review_model: get("hooks.plan_review.model").await?.filter(|s| !s.is_empty()),
+        assistant_id: get("hooks.plan_review.assistant_id").await?.filter(|s| !s.is_empty()),
         // Clamped on the way in as well as on the way out, so a value stored
         // before the ceiling existed corrects itself on the next load instead
         // of waiting for someone to open the settings page and press save.
         timeout_secs: clamp_timeout(parse_stored_u32(
             "hooks.plan_review.timeout_secs",
-            get("hooks.plan_review.timeout_secs")?,
+            get("hooks.plan_review.timeout_secs").await?,
             DEFAULT_TIMEOUT_SECS,
         )?),
         max_rounds: clamp_rounds(parse_stored_u32(
             "hooks.plan_review.max_rounds",
-            get("hooks.plan_review.max_rounds")?,
+            get("hooks.plan_review.max_rounds").await?,
             DEFAULT_MAX_ROUNDS,
         )?),
     })
 }
 
-pub fn save_config(pool: &DbPool, config: &HookConfig) -> Result<(), String> {
-    let mut conn = get_conn(pool)?;
-    let now = now_ms();
-    let mut set = |key: &str, val: &str| -> Result<(), String> {
-        crate::db::ops::preference::set_preference(&mut conn, key, val, now).map_err(|e| e.to_string())
-    };
+/// One transaction for the whole block, so a failure part-way leaves the
+/// previous configuration rather than half of each.
+pub async fn save_config(db: &Db, config: &HookConfig) -> Result<(), String> {
+    use crate::db::sea::ops::preference::set_preference;
 
-    set("hooks.enabled", if config.enabled { "true" } else { "false" })?;
-    set("hooks.host", &config.host)?;
-    set("hooks.port", &config.port.to_string())?;
-    set("hooks.token", config.token.as_deref().unwrap_or(""))?;
-    set("hooks.plan_review.model", config.review_model.as_deref().unwrap_or(""))?;
-    set(
-        "hooks.plan_review.assistant_id",
-        config.assistant_id.as_deref().unwrap_or(""),
-    )?;
-    set(
-        "hooks.plan_review.timeout_secs",
-        &clamp_timeout(config.timeout_secs).to_string(),
-    )?;
-    set(
-        "hooks.plan_review.max_rounds",
-        &clamp_rounds(config.max_rounds).to_string(),
-    )?;
-    Ok(())
+    let now = now_ms();
+    db.write(async |tx| {
+        set_preference(tx, "hooks.enabled", if config.enabled { "true" } else { "false" }, now).await?;
+        set_preference(tx, "hooks.host", &config.host, now).await?;
+        set_preference(tx, "hooks.port", &config.port.to_string(), now).await?;
+        set_preference(tx, "hooks.token", config.token.as_deref().unwrap_or(""), now).await?;
+        set_preference(
+            tx,
+            "hooks.plan_review.model",
+            config.review_model.as_deref().unwrap_or(""),
+            now,
+        )
+        .await?;
+        set_preference(
+            tx,
+            "hooks.plan_review.assistant_id",
+            config.assistant_id.as_deref().unwrap_or(""),
+            now,
+        )
+        .await?;
+        set_preference(
+            tx,
+            "hooks.plan_review.timeout_secs",
+            &clamp_timeout(config.timeout_secs).to_string(),
+            now,
+        )
+        .await?;
+        set_preference(
+            tx,
+            "hooks.plan_review.max_rounds",
+            &clamp_rounds(config.max_rounds).to_string(),
+            now,
+        )
+        .await?;
+        Ok::<(), sea_orm::DbErr>(())
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 pub(crate) struct SharedState {
@@ -447,17 +465,17 @@ pub struct AppHooks(pub Arc<Mutex<HookServer>>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
-    use diesel::RunQueryDsl;
+    use crate::db::sea::sea_test_db;
 
-    fn set_preference(pool: &DbPool, key: &str, value: &str) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::preference::set_preference(&mut conn, key, value, 1).unwrap();
+    async fn set_preference(db: &Db, key: &str, value: &str) {
+        db.write(async |tx| crate::db::sea::ops::preference::set_preference(tx, key, value, 1).await)
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn absent_hook_preferences_keep_the_documented_defaults() {
-        let config = load_config(&diesel_test_db()).unwrap();
+    #[tokio::test]
+    async fn absent_hook_preferences_keep_the_documented_defaults() {
+        let config = load_config(&sea_test_db().await).await.unwrap();
         let expected = HookConfig::default();
 
         assert_eq!(config.enabled, expected.enabled);
@@ -467,29 +485,33 @@ mod tests {
         assert_eq!(config.max_rounds, expected.max_rounds);
     }
 
-    #[test]
-    fn malformed_hook_preferences_are_not_defaulted() {
+    #[tokio::test]
+    async fn malformed_hook_preferences_are_not_defaulted() {
         for (key, value) in [
             ("hooks.enabled", "yes"),
             ("hooks.port", "08765"),
             ("hooks.plan_review.timeout_secs", "ten"),
             ("hooks.plan_review.max_rounds", "-1"),
         ] {
-            let pool = diesel_test_db();
-            set_preference(&pool, key, value);
-            let error = load_config(&pool).expect_err("malformed stored preference must fail");
+            let db = sea_test_db().await;
+            set_preference(&db, key, value).await;
+            let error = load_config(&db)
+                .await
+                .expect_err("malformed stored preference must fail");
             assert!(error.contains(key), "{key}: {error}");
         }
     }
 
-    #[test]
-    fn hook_preference_read_errors_are_not_defaulted() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        diesel::sql_query("DROP TABLE preferences").execute(&mut conn).unwrap();
-        drop(conn);
+    #[tokio::test]
+    async fn hook_preference_read_errors_are_not_defaulted() {
+        let db = sea_test_db().await;
+        crate::db::sea::execute_for_tests(&db, "DROP TABLE preferences")
+            .await
+            .unwrap();
 
-        let error = load_config(&pool).expect_err("database errors must fail config loading");
+        let error = load_config(&db)
+            .await
+            .expect_err("database errors must fail config loading");
         assert!(error.contains("hooks.enabled"), "{error}");
     }
 

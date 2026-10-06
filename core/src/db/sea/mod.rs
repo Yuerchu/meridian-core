@@ -10,6 +10,7 @@ pub mod cap;
 /// crate should otherwise need the legacy SQL.
 pub mod legacy;
 pub mod migration;
+pub mod ops;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod baseline_gen;
@@ -144,6 +145,20 @@ pub async fn shared_test_db(dir: &Path) -> (super::DbPool, Db) {
     let diesel = super::init_db(path.to_str().expect("a UTF-8 temp path"));
     let sea = open(&path).await.expect("failed to open the shared test database");
     (diesel, sea)
+}
+
+/// Runs one raw statement on the pool, for tests that need to break the
+/// schema under a loader (`DROP TABLE preferences`) and nothing else. The
+/// sealed connection is reachable only from inside `crate::db`, which is why
+/// this lives here rather than beside the test that wants it.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn execute_for_tests(db: &Db, sql: &str) -> Result<(), DbErr> {
+    use sea_orm::ConnectionTrait;
+
+    use self::cap::sealed::Access;
+
+    db.conn()?.execute_unprepared(sql).await?;
+    Ok(())
 }
 
 #[cfg(test)]

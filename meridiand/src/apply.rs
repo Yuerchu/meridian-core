@@ -15,6 +15,7 @@ use meridian_core::db::DbPool;
 use meridian_core::db::models::notification::{NotificationWebhookChangeset, NotificationWebhookInsert, encode_events};
 use meridian_core::db::models::provider::{ProviderChangeset, ProviderInsert};
 use meridian_core::db::ops;
+use meridian_core::db::sea::cap::Db;
 use meridian_core::secrets::{SecretName, SecretScope, SecretsManager};
 use meridian_core::util::now_ms;
 
@@ -79,7 +80,14 @@ fn claim_data_dir(pool: &DbPool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> Result<ApplyReport, String> {
+/// `async` for the one SeaORM write at the end (`notify::save_config`); the
+/// provider and webhook rows are still written through Diesel, inline.
+pub async fn apply(
+    pool: &DbPool,
+    sea: &Db,
+    secrets: &SecretsManager,
+    config: &DaemonConfig,
+) -> Result<ApplyReport, String> {
     claim_data_dir(pool)?;
 
     // Every secret is read before anything is written. A file naming a variable
@@ -291,7 +299,7 @@ pub fn apply(pool: &DbPool, secrets: &SecretsManager, config: &DaemonConfig) -> 
     }
 
     drop(conn);
-    meridian_core::notify::save_config(pool, &config.notify_config()?)?;
+    meridian_core::notify::save_config(sea, &config.notify_config()?).await?;
     Ok(report)
 }
 
@@ -331,18 +339,18 @@ mod tests {
 
     /// Applying twice must leave exactly what applying once left. A container
     /// that is recreated runs this on every start.
-    #[test]
-    fn applying_twice_converges_rather_than_accumulating() {
+    #[tokio::test]
+    async fn applying_twice_converges_rather_than_accumulating() {
         // SAFETY: single-threaded test; the variable is read by `apply` below.
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+        let (pool, sea) = meridian_core::db::sea::shared_test_db(dir.path()).await;
         let secrets = secrets(dir.path());
         let config = DaemonConfig::parse(ONE_OF_EACH).unwrap();
 
-        let first = apply(&pool, &secrets, &config).unwrap();
+        let first = apply(&pool, &sea, &secrets, &config).await.unwrap();
         assert_eq!((first.providers_written, first.webhooks_written), (1, 1));
-        let second = apply(&pool, &secrets, &config).unwrap();
+        let second = apply(&pool, &sea, &secrets, &config).await.unwrap();
         assert_eq!((second.providers_written, second.webhooks_written), (1, 1));
 
         let mut conn = pool.get().unwrap();
@@ -356,14 +364,16 @@ mod tests {
 
     /// Removing an endpoint from the file has to stop it firing. Left enabled,
     /// the file would be lying about what is configured.
-    #[test]
-    fn what_the_file_stops_naming_is_switched_off_but_kept() {
+    #[tokio::test]
+    async fn what_the_file_stops_naming_is_switched_off_but_kept() {
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+        let (pool, sea) = meridian_core::db::sea::shared_test_db(dir.path()).await;
         let secrets = secrets(dir.path());
 
-        apply(&pool, &secrets, &DaemonConfig::parse(ONE_OF_EACH).unwrap()).unwrap();
+        apply(&pool, &sea, &secrets, &DaemonConfig::parse(ONE_OF_EACH).unwrap())
+            .await
+            .unwrap();
         let narrowed = DaemonConfig::parse(
             r#"
             [notify]
@@ -378,7 +388,7 @@ mod tests {
         "#,
         )
         .unwrap();
-        let report = apply(&pool, &secrets, &narrowed).unwrap();
+        let report = apply(&pool, &sea, &secrets, &narrowed).await.unwrap();
         assert_eq!(report.webhooks_disabled, 1);
 
         // Scoped, because the test pool hands out one connection and `apply`
@@ -390,7 +400,10 @@ mod tests {
             assert_eq!(rows[0].is_enabled, 0);
         }
         // And a second pass does not count it again.
-        assert_eq!(apply(&pool, &secrets, &narrowed).unwrap().webhooks_disabled, 0);
+        assert_eq!(
+            apply(&pool, &sea, &secrets, &narrowed).await.unwrap().webhooks_disabled,
+            0
+        );
     }
 
     /// Moving an entry's address re-derives its vendor, and a vendor carried
@@ -405,13 +418,13 @@ mod tests {
     ///
     /// Mutation check: putting `.or_else(|| existing…catalog_id.clone())` back
     /// between the two sources turns both halves of this red.
-    #[test]
-    fn a_moved_address_re_derives_the_vendor_instead_of_keeping_the_old_one() {
+    #[tokio::test]
+    async fn a_moved_address_re_derives_the_vendor_instead_of_keeping_the_old_one() {
         use meridian_core::provider::balance::{ProviderIdentity, balance_vendor};
 
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+        let (pool, sea) = meridian_core::db::sea::shared_test_db(dir.path()).await;
         let secrets = secrets(dir.path());
 
         let entry = |vendor: &str, url: &str| {
@@ -434,15 +447,19 @@ mod tests {
 
         apply(
             &pool,
+            &sea,
             &secrets,
             &entry("vendor = \"moonshot\"\n", "https://api.moonshot.cn/v1"),
         )
+        .await
         .unwrap();
         assert_eq!(vendor_of(&pool).as_deref(), Some("moonshot"));
 
         // Pointed at a relay with no `vendor`: the address names nobody, so the
         // row must name nobody either.
-        apply(&pool, &secrets, &entry("", "https://codex-api.example/v1")).unwrap();
+        apply(&pool, &sea, &secrets, &entry("", "https://codex-api.example/v1"))
+            .await
+            .unwrap();
         assert_eq!(
             vendor_of(&pool),
             None,
@@ -451,17 +468,19 @@ mod tests {
 
         // And moved to a different vendor's own address, it becomes that one
         // rather than staying unresolved or reverting to the first.
-        apply(&pool, &secrets, &entry("", "https://api.siliconflow.cn/v1")).unwrap();
+        apply(&pool, &sea, &secrets, &entry("", "https://api.siliconflow.cn/v1"))
+            .await
+            .unwrap();
         assert_eq!(vendor_of(&pool).as_deref(), Some("siliconflow"));
     }
 
     /// A half-applied configuration leaves a provider with no key, which
     /// reports as an upstream failure and reads as an outage.
-    #[test]
-    fn a_missing_environment_variable_writes_nothing_at_all() {
+    #[tokio::test]
+    async fn a_missing_environment_variable_writes_nothing_at_all() {
         unsafe { std::env::remove_var("TEST_ABSENT_KEY") };
         let dir = tempfile::tempdir().unwrap();
-        let pool = diesel_test_db();
+        let (pool, sea) = meridian_core::db::sea::shared_test_db(dir.path()).await;
         let secrets = secrets(dir.path());
         let config = DaemonConfig::parse(
             r#"
@@ -475,7 +494,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = apply(&pool, &secrets, &config).unwrap_err();
+        let error = apply(&pool, &sea, &secrets, &config).await.unwrap_err();
         assert!(error.contains("TEST_ABSENT_KEY"), "{error}");
         let mut conn = pool.get().unwrap();
         assert_eq!(
