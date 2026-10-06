@@ -162,7 +162,7 @@ fn run() -> Result<(), String> {
         return runtime.block_on(send_test(&services, &id));
     }
     if args.status {
-        return print_status(&services);
+        return runtime.block_on(print_status(&services));
     }
 
     runtime.block_on(serve(services, notify_config))
@@ -205,24 +205,31 @@ async fn send_test(services: &meridian_core::services::Services, id: &str) -> Re
 /// The database has recorded all of it since the feature existed; until now
 /// nothing could read it without opening the file by hand, which is a diagnosis
 /// nobody makes at three in the morning.
-fn print_status(services: &meridian_core::services::Services) -> Result<(), String> {
-    let mut conn = services.db.get().map_err(|error| format!("db connection: {error}"))?;
-    print_provider_status(&mut conn)?;
-    let rows = meridian_core::db::ops::notification::list_webhooks(&mut conn).map_err(|error| error.to_string())?;
+async fn print_status(services: &meridian_core::services::Services) -> Result<(), String> {
+    {
+        let mut conn = services.db.get().map_err(|error| format!("db connection: {error}"))?;
+        print_provider_status(&mut conn)?;
+    }
+    // A subscription that will not decode fails this read, and the error
+    // names the row: it is why an endpoint is silent, and it is invisible
+    // everywhere else.
+    let rows = meridian_core::db::sea::ops::notification::list_webhooks(&services.sea)
+        .await
+        .map_err(|error| format!("could not read the endpoints: {error}"))?;
     if rows.is_empty() {
         println!("meridiand: no endpoints are configured");
         return Ok(());
     }
     for row in rows {
         let events = row
-            .events()
-            .map(|events| events.iter().map(|event| event.as_str()).collect::<Vec<_>>().join(","))
-            // Shown rather than swallowed: a subscription that will not decode
-            // is why an endpoint is silent, and it is invisible everywhere else.
-            .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+            .events
+            .iter()
+            .map(|event| event.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
             "{}  {}  [{}]  {}",
-            if row.is_enabled() { "on " } else { "off" },
+            if row.is_enabled.get() { "on " } else { "off" },
             row.id,
             events,
             row.url,

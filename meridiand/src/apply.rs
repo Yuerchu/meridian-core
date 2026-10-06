@@ -12,10 +12,14 @@
 //! endpoint's delivery history, while a disabled row can be turned back on.
 
 use meridian_core::db::DbPool;
-use meridian_core::db::models::notification::{NotificationWebhookChangeset, NotificationWebhookInsert, encode_events};
+use meridian_core::db::entity::notification_webhook::{
+    self, BodyTemplate, NotificationEvents, NotificationWebhookChangeset,
+};
 use meridian_core::db::models::provider::{ProviderChangeset, ProviderInsert};
 use meridian_core::db::ops;
 use meridian_core::db::sea::cap::Db;
+use meridian_core::db::sea::ops::notification as notification_ops;
+use meridian_core::db::types::SqlBool;
 use meridian_core::secrets::{SecretName, SecretScope, SecretsManager};
 use meridian_core::util::now_ms;
 
@@ -80,8 +84,8 @@ fn claim_data_dir(pool: &DbPool) -> Result<(), String> {
     Ok(())
 }
 
-/// `async` for the one SeaORM write at the end (`notify::save_config`); the
-/// provider and webhook rows are still written through Diesel, inline.
+/// `async` for the SeaORM half: the webhook rows and `notify::save_config`.
+/// The provider rows are still written through Diesel, inline.
 pub async fn apply(
     pool: &DbPool,
     sea: &Db,
@@ -231,74 +235,87 @@ pub async fn apply(
         report.providers_disabled += 1;
     }
 
+    // The Diesel connection goes back before the SeaORM half: the two pools
+    // share one file, and the test pool hands out a single connection.
+    drop(conn);
+
     for (webhook, secret) in config.webhook.iter().zip(&webhook_secrets) {
-        let events = encode_events(&webhook.events)?;
-        let enabled = i32::from(webhook.enabled);
-        // Stored as the canonical JSON text, which is what the row holds and
-        // what the renderer parses back. Already validated at config parse.
-        let template = webhook
-            .body_template()?
-            .map(|value| serde_json::to_string(&value))
-            .transpose()
-            .map_err(|error| format!("webhook `{}`: could not encode the body: {error}", webhook.id))?;
-        let exists = ops::notification::get_webhook(&mut conn, &webhook.id).is_ok();
-        if exists {
-            ops::notification::update_webhook(
-                &mut conn,
+        // Already validated at config parse; typed here, encoded by the row.
+        let template = webhook.body_template()?.map(BodyTemplate::from);
+        let events = NotificationEvents::from(webhook.events.clone());
+        let enabled = SqlBool::from(webhook.enabled);
+        // The existence check and the write are one transaction, so a second
+        // apply racing this one cannot both see "absent" and both insert.
+        sea.write(async |tx| match notification_ops::get_webhook(tx, &webhook.id).await? {
+            Some(_) => notification_ops::update_webhook(
+                tx,
                 &webhook.id,
-                &NotificationWebhookChangeset {
+                NotificationWebhookChangeset {
                     name: Some(webhook.name.clone()),
                     url: Some(webhook.url.clone()),
-                    format: Some(webhook.format.as_str().to_string()),
+                    format: Some(webhook.format),
                     events: Some(events),
                     is_enabled: Some(enabled),
-                    body_template: Some(template.clone()),
+                    body_template: Some(template),
                     updated_at: Some(now),
                 },
             )
-            .map_err(|error| format!("could not update webhook `{}`: {error}", webhook.id))?;
-        } else {
-            ops::notification::create_webhook(
-                &mut conn,
-                &NotificationWebhookInsert {
-                    id: &webhook.id,
-                    name: &webhook.name,
-                    url: &webhook.url,
-                    format: webhook.format.as_str(),
-                    events: &events,
+            .await
+            .map(|_| ()),
+            None => notification_ops::create_webhook(
+                tx,
+                notification_webhook::Model {
+                    id: webhook.id.clone(),
+                    name: webhook.name.clone(),
+                    url: webhook.url.clone(),
+                    format: webhook.format,
+                    events,
                     is_enabled: enabled,
-                    body_template: template.as_deref(),
+                    body_template: template,
+                    last_attempt_at: None,
+                    last_success_at: None,
+                    last_error: None,
+                    consecutive_failures: 0,
                     created_at: now,
                     updated_at: now,
                 },
             )
-            .map_err(|error| format!("could not create webhook `{}`: {error}", webhook.id))?;
-        }
+            .await
+            .map(|_| ()),
+        })
+        .await
+        .map_err(|error| format!("could not write webhook `{}`: {error}", webhook.id))?;
         meridian_core::notify::write_webhook_secret(secrets, &webhook.id, secret.as_deref())?;
         report.webhooks_written += 1;
     }
 
     let named: Vec<&str> = config.webhook.iter().map(|webhook| webhook.id.as_str()).collect();
-    for row in ops::notification::list_webhooks(&mut conn).map_err(|error| error.to_string())? {
-        if named.contains(&row.id.as_str()) || row.is_enabled == 0 {
+    for row in notification_ops::list_webhooks(sea)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if named.contains(&row.id.as_str()) || !row.is_enabled.get() {
             continue;
         }
-        ops::notification::update_webhook(
-            &mut conn,
-            &row.id,
-            &NotificationWebhookChangeset {
-                is_enabled: Some(0),
-                body_template: None,
-                updated_at: Some(now),
-                ..Default::default()
-            },
-        )
+        sea.write(async |tx| {
+            notification_ops::update_webhook(
+                tx,
+                &row.id,
+                NotificationWebhookChangeset {
+                    is_enabled: Some(SqlBool::FALSE),
+                    body_template: None,
+                    updated_at: Some(now),
+                    ..Default::default()
+                },
+            )
+            .await
+        })
+        .await
         .map_err(|error| format!("could not disable webhook `{}`: {error}", row.id))?;
         tracing::info!(webhook = %row.id, "disabled: the configuration no longer names it");
         report.webhooks_disabled += 1;
     }
 
-    drop(conn);
     meridian_core::notify::save_config(sea, &config.notify_config()?).await?;
     Ok(report)
 }
@@ -355,7 +372,7 @@ mod tests {
 
         let mut conn = pool.get().unwrap();
         assert_eq!(ops::provider::count_providers(&mut conn).unwrap(), 1);
-        assert_eq!(ops::notification::list_webhooks(&mut conn).unwrap().len(), 1);
+        assert_eq!(notification_ops::list_webhooks(&sea).await.unwrap().len(), 1);
         assert_eq!(
             meridian_core::agent::get_provider_api_key(&secrets, "ds").as_deref(),
             Some("sk-test")
@@ -391,14 +408,9 @@ mod tests {
         let report = apply(&pool, &sea, &secrets, &narrowed).await.unwrap();
         assert_eq!(report.webhooks_disabled, 1);
 
-        // Scoped, because the test pool hands out one connection and `apply`
-        // below needs it.
-        {
-            let mut conn = pool.get().unwrap();
-            let rows = ops::notification::list_webhooks(&mut conn).unwrap();
-            assert_eq!(rows.len(), 1, "disabled, not deleted — the history is worth keeping");
-            assert_eq!(rows[0].is_enabled, 0);
-        }
+        let rows = notification_ops::list_webhooks(&sea).await.unwrap();
+        assert_eq!(rows.len(), 1, "disabled, not deleted — the history is worth keeping");
+        assert_eq!(rows[0].is_enabled, SqlBool::FALSE);
         // And a second pass does not count it again.
         assert_eq!(
             apply(&pool, &sea, &secrets, &narrowed).await.unwrap().webhooks_disabled,

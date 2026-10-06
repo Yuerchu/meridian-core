@@ -9,7 +9,7 @@
 //! there was no balance monitoring at all. It is here now, and QQ is one sink
 //! among several.
 
-use crate::db::models::notification::NotificationEventKind;
+use crate::db::entity::notification_webhook::NotificationEventKind;
 use crate::decimal::Decimal;
 use crate::provider::balance::{ProviderBalance, ProviderIdentity, fetch_balance, supports_balance};
 use crate::services::Services;

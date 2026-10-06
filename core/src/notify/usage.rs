@@ -14,7 +14,7 @@ use crate::db::ops::usage::{UsageBucket, UsageDimension, UsageFilter, report};
 use crate::decimal::Decimal;
 
 use super::alert::{Alert, AlertDetail, UsageAlert, UsageSlice};
-use crate::db::models::notification::NotificationEventKind;
+use crate::db::entity::notification_webhook::NotificationEventKind;
 
 pub const USAGE_ALERT_KEY: &str = "usage_surge";
 

@@ -6,8 +6,8 @@
 
 use serde::Serialize;
 
-use crate::db::models::notification::NotificationEventKind;
-use crate::db::models::notification::{NotificationAlertStateRow, NotificationFormat};
+use crate::db::entity::notification_alert_state;
+use crate::db::entity::notification_webhook::{NotificationEventKind, NotificationFormat};
 use crate::decimal::Decimal;
 use crate::provider::balance::BalanceAccount;
 
@@ -153,7 +153,7 @@ pub enum SendReason {
 /// it resolved. Both mean the same thing to a reader, which is why
 /// `clear_alert` deletes rather than flags.
 pub fn decide(
-    state: Option<&NotificationAlertStateRow>,
+    state: Option<&notification_alert_state::Model>,
     fingerprint: &str,
     now: i64,
     cooldown_ms: i64,
@@ -182,8 +182,8 @@ pub fn decide(
 mod tests {
     use super::*;
 
-    fn state(fingerprint: &str, notified_at: Option<i64>) -> NotificationAlertStateRow {
-        NotificationAlertStateRow {
+    fn state(fingerprint: &str, notified_at: Option<i64>) -> notification_alert_state::Model {
+        notification_alert_state::Model {
             alert_key: "balance:p1".into(),
             first_raised_at: 0,
             last_raised_at: 0,

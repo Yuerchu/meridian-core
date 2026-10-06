@@ -16,8 +16,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use meridian_core::db::models::notification::{MAX_WEBHOOKS, NotificationEventKind, NotificationFormat};
+use meridian_core::db::entity::notification_webhook::{NotificationEventKind, NotificationFormat};
 use meridian_core::decimal::Decimal;
+use meridian_core::notify::MAX_WEBHOOKS;
 use serde::Deserialize;
 
 /// The whole document.

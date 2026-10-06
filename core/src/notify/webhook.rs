@@ -21,7 +21,7 @@ use serde::Serialize;
 use sha2::Sha256;
 
 use crate::client::{HttpTransport, Request, RequestBody, ReqwestTransport, TransportError, backoff};
-use crate::db::models::notification::{NotificationEventKind, NotificationFormat, NotificationWebhookRow};
+use crate::db::entity::notification_webhook::{self, NotificationEventKind, NotificationFormat};
 
 use super::alert::{Alert, AlertDetail, BalanceAlert, TestAlert, UsageAlert};
 
@@ -302,24 +302,21 @@ pub fn vendor_error(body: &str) -> Option<String> {
 }
 
 /// Send one alert to one endpoint.
-pub async fn deliver(endpoint: &NotificationWebhookRow, secret: Option<&str>, alert: &Alert) -> DeliveryReport {
+pub async fn deliver(endpoint: &notification_webhook::Model, secret: Option<&str>, alert: &Alert) -> DeliveryReport {
     let started = Instant::now();
     let delivery_id = uuid::Uuid::new_v4().to_string();
-    let format = match endpoint.format() {
-        Ok(format) => format,
-        Err(error) => return failed(started, 1, None, error, None),
-    };
-    // Decoded here rather than at render time so a malformed template fails the
-    // delivery with its own message, instead of posting a document nobody meant.
+    // The format and the template were decoded at the read; what is left to
+    // check is that `custom` has a template at all, which fails the delivery
+    // with its own message instead of posting a document nobody meant.
     let template = match endpoint.body_template() {
         Ok(template) => template,
         Err(error) => return failed(started, 1, None, error, None),
     };
     let prepared = match prepare(
-        format,
+        endpoint.format,
         &endpoint.url,
         secret,
-        template.as_ref(),
+        template,
         alert,
         &delivery_id,
         crate::util::now_ms(),
@@ -463,6 +460,8 @@ mod wire_tests {
 
     use super::tests::test_alert;
     use super::*;
+    use crate::db::entity::notification_webhook::{BodyTemplate, NotificationEvents};
+    use crate::db::types::SqlBool;
 
     struct Seen {
         uri: String,
@@ -542,14 +541,14 @@ mod wire_tests {
         }
     }
 
-    fn endpoint(url: &str, format: NotificationFormat) -> NotificationWebhookRow {
-        NotificationWebhookRow {
+    fn endpoint(url: &str, format: NotificationFormat) -> notification_webhook::Model {
+        notification_webhook::Model {
             id: "w1".into(),
             name: "test".into(),
             url: url.into(),
-            format: format.as_str().into(),
-            events: r#"["test"]"#.into(),
-            is_enabled: 1,
+            format,
+            events: NotificationEvents::from(vec![NotificationEventKind::Test]),
+            is_enabled: SqlBool::TRUE,
             body_template: None,
             last_attempt_at: None,
             last_success_at: None,
@@ -657,16 +656,13 @@ mod wire_tests {
     async fn a_custom_endpoint_sends_its_own_schema_with_a_bearer_token() {
         let server = recorder(vec![(200, "{}")]).await;
         let mut row = endpoint(&server.url, NotificationFormat::Custom);
-        row.body_template = Some(
-            r#"{
-                "title": "{{title}}",
-                "message": "{{summary}}",
-                "service": "billing",
-                "requestId": "{{delivery_id}}",
-                "timestamp": "{{raised_at_iso}}"
-            }"#
-            .into(),
-        );
+        row.body_template = Some(BodyTemplate::from(serde_json::json!({
+            "title": "{{title}}",
+            "message": "{{summary}}",
+            "service": "billing",
+            "requestId": "{{delivery_id}}",
+            "timestamp": "{{raised_at_iso}}"
+        })));
 
         let report = deliver(&row, Some("pipe-token"), &test_alert()).await;
         assert!(report.is_success(), "{report:?}");
@@ -700,7 +696,7 @@ mod wire_tests {
     async fn a_custom_endpoint_with_no_token_sends_no_authorization_header() {
         let server = recorder(vec![(200, "{}")]).await;
         let mut row = endpoint(&server.url, NotificationFormat::Custom);
-        row.body_template = Some(r#"{"title": "{{title}}"}"#.into());
+        row.body_template = Some(BodyTemplate::from(serde_json::json!({"title": "{{title}}"})));
 
         assert!(deliver(&row, None, &test_alert()).await.is_success());
         let seen = server.seen.lock().unwrap();
@@ -709,6 +705,10 @@ mod wire_tests {
 
     /// A `custom` row with no template would post nothing and be recorded as
     /// delivered — the worst outcome available, because it looks like it worked.
+    ///
+    /// A template that will not parse, or a format that is not one of the six,
+    /// no longer reaches this function at all: both fail the row's read (see
+    /// the entity's tests), so there is no `Model` to deliver for.
     #[tokio::test]
     async fn a_custom_endpoint_without_a_template_never_reaches_the_wire() {
         let server = recorder(vec![(200, "{}")]).await;
@@ -717,26 +717,6 @@ mod wire_tests {
 
         assert!(!report.is_success());
         assert!(report.error.as_deref().unwrap().contains("body template"), "{report:?}");
-        assert!(server.seen.lock().unwrap().is_empty());
-
-        // The same for a template that will not parse: it fails rather than
-        // becoming `{}`.
-        let mut broken = endpoint(&server.url, NotificationFormat::Custom);
-        broken.body_template = Some("{not json".into());
-        let report = deliver(&broken, Some("t"), &test_alert()).await;
-        assert!(!report.is_success());
-        assert!(server.seen.lock().unwrap().is_empty());
-    }
-
-    /// A row whose stored format is not one of the five never reaches the wire.
-    #[tokio::test]
-    async fn an_unreadable_format_fails_before_any_request() {
-        let server = recorder(vec![(200, "ok")]).await;
-        let mut row = endpoint(&server.url, NotificationFormat::Generic);
-        row.format = "teams".into();
-        let report = deliver(&row, None, &test_alert()).await;
-        assert!(!report.is_success());
-        assert!(report.error.as_deref().unwrap().contains("teams"), "{report:?}");
         assert!(server.seen.lock().unwrap().is_empty());
     }
 }

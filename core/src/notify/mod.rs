@@ -31,8 +31,9 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
 
-use crate::db::models::notification::NotificationEventKind;
+use crate::db::entity::notification_webhook::NotificationEventKind;
 use crate::db::sea::cap::Db;
+use crate::db::sea::ops::notification as notification_ops;
 use crate::decimal::Decimal;
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
 use crate::services::Services;
@@ -46,6 +47,13 @@ pub use webhook::{DeliveryReport, webhook_secret_name};
 /// that "I just set this up" gets an answer while the user is still looking at
 /// the settings page.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
+
+/// How many endpoints one install may hold.
+///
+/// Not a storage limit — it is what stops a single alert from becoming a
+/// hundred outbound requests while a watcher tick is holding no lock but a lot
+/// of patience. Policy, so it lives beside the dispatcher rather than the row.
+pub const MAX_WEBHOOKS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyConfig {
@@ -389,37 +397,19 @@ pub fn write_webhook_secret(secrets: &SecretsManager, id: &str, secret: Option<&
 pub async fn dispatch(services: &Services, alert: &Alert) -> usize {
     let mut accepted = 0usize;
 
-    let pool = services.db.clone();
-    let endpoints = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::notification::list_enabled_webhooks(&mut conn).map_err(|error| error.to_string())
-    })
-    .await;
-    let endpoints = match endpoints {
-        Ok(Ok(endpoints)) => endpoints,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "could not read the notification endpoints");
-            Vec::new()
-        }
+    // A row whose JSON will not decode fails this read as a whole, and the
+    // error names it; the subscription is decoded at the read now, so there is
+    // no per-row "unreadable" case left to skip.
+    let endpoints = match notification_ops::list_enabled_webhooks(&services.sea).await {
+        Ok(endpoints) => endpoints,
         Err(error) => {
-            tracing::warn!(%error, "reading the notification endpoints panicked");
+            tracing::warn!(%error, "could not read the notification endpoints");
             Vec::new()
         }
     };
 
     for endpoint in endpoints {
-        // A row whose subscription will not decode is skipped rather than
-        // failing the whole dispatch: one corrupt endpoint must not silence the
-        // healthy ones. It is recorded on its own row so it is visible.
-        let wants = match endpoint.wants(alert.event) {
-            Ok(wants) => wants,
-            Err(error) => {
-                tracing::error!(webhook_id = %endpoint.id, %error, "endpoint subscription is unreadable");
-                record_attempt(services, &endpoint.id, Some(&error)).await;
-                continue;
-            }
-        };
-        if !wants {
+        if !endpoint.wants(alert.event) {
             continue;
         }
         let secret = read_webhook_secret(&services.secrets, &endpoint.id);
@@ -449,20 +439,13 @@ pub async fn dispatch(services: &Services, alert: &Alert) -> usize {
 }
 
 async fn record_attempt(services: &Services, id: &str, error: Option<&str>) {
-    let pool = services.db.clone();
-    let id = id.to_string();
-    let error = error.map(str::to_string);
     let now = now_ms();
-    let written = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::notification::record_delivery_attempt(&mut conn, &id, now, error.as_deref())
-            .map_err(|error| error.to_string())
-    })
-    .await;
-    match written {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "could not record a webhook delivery attempt"),
-        Err(error) => tracing::warn!(%error, "recording a webhook delivery attempt panicked"),
+    let written = services
+        .sea
+        .write(async |tx| notification_ops::record_delivery_attempt(tx, id, now, error).await)
+        .await;
+    if let Err(error) = written {
+        tracing::warn!(%error, "could not record a webhook delivery attempt");
     }
 }
 
@@ -473,23 +456,15 @@ async fn record_attempt(services: &Services, id: &str, error: Option<&str>) {
 /// received is one that will not be sent again.
 pub async fn raise_and_dispatch(services: &Services, alert: &Alert, cooldown_ms: i64) {
     let fingerprint = alert.fingerprint();
-    let pool = services.db.clone();
-    let key = alert.alert_key.clone();
-    let fp = fingerprint.clone();
     let now = alert.raised_at;
-    let state = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::notification::record_raised(&mut conn, &key, &fp, now).map_err(|error| error.to_string())
-    })
-    .await;
+    let state = services
+        .sea
+        .write(async |tx| notification_ops::record_raised(tx, &alert.alert_key, &fingerprint, now).await)
+        .await;
     let state = match state {
-        Ok(Ok(state)) => state,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, alert_key = %alert.alert_key, "could not record a raised alert");
-            return;
-        }
+        Ok(state) => state,
         Err(error) => {
-            tracing::warn!(%error, "recording a raised alert panicked");
+            tracing::warn!(%error, alert_key = %alert.alert_key, "could not record a raised alert");
             return;
         }
     };
@@ -511,17 +486,13 @@ pub async fn raise_and_dispatch(services: &Services, alert: &Alert, cooldown_ms:
                 );
                 return;
             }
-            let pool = services.db.clone();
-            let key = alert.alert_key.clone();
-            let written = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().map_err(|error| error.to_string())?;
-                crate::db::ops::notification::record_notified(&mut conn, &key, now).map_err(|error| error.to_string())
-            })
-            .await;
+            let written = services
+                .sea
+                .write(async |tx| notification_ops::record_notified(tx, &alert.alert_key, now).await)
+                .await;
             match written {
-                Ok(Ok(_)) => tracing::info!(alert_key = %alert.alert_key, accepted, ?reason, "alert sent"),
-                Ok(Err(error)) => tracing::warn!(%error, "could not record that an alert was sent"),
-                Err(error) => tracing::warn!(%error, "recording a sent alert panicked"),
+                Ok(_) => tracing::info!(alert_key = %alert.alert_key, accepted, ?reason, "alert sent"),
+                Err(error) => tracing::warn!(%error, "could not record that an alert was sent"),
             }
         }
     }
@@ -530,14 +501,11 @@ pub async fn raise_and_dispatch(services: &Services, alert: &Alert, cooldown_ms:
 /// The condition cleared. The next occurrence is a new alert rather than a
 /// repeat of this one.
 pub async fn clear(services: &Services, alert_key: &str) {
-    let pool = services.db.clone();
-    let key = alert_key.to_string();
-    let cleared = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::notification::clear_alert(&mut conn, &key).map_err(|error| error.to_string())
-    })
-    .await;
-    if let Ok(Err(error)) = cleared {
+    let cleared = services
+        .sea
+        .write(async |tx| notification_ops::clear_alert(tx, alert_key).await)
+        .await;
+    if let Err(error) = cleared {
         tracing::warn!(%error, alert_key, "could not clear a resolved alert");
     }
 }
@@ -548,16 +516,12 @@ pub async fn clear(services: &Services, alert_key: &str) {
 /// and nothing to suppress. Routed through `raise_and_dispatch` it would leave
 /// a row behind and the second press would do nothing.
 pub async fn send_test(services: &Services, endpoint_id: &str) -> Result<DeliveryReport, String> {
-    let pool = services.db.clone();
-    let id = endpoint_id.to_string();
-    let endpoint = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::notification::get_webhook(&mut conn, &id).map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())??;
+    let endpoint = notification_ops::get_webhook(&services.sea, endpoint_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("notification endpoint `{endpoint_id}` does not exist"))?;
 
-    let format = endpoint.format()?;
+    let format = endpoint.format;
     let alert = Alert {
         event: NotificationEventKind::Test,
         raised_at: now_ms(),
