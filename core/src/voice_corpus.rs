@@ -441,6 +441,15 @@ impl CorpusCoordinator {
         }
     }
 
+    /// 这个范围上还有几个 permit 没归还。测试用它看"提交任务结束了没有"。
+    #[cfg(test)]
+    pub fn in_flight(&self, scope: &CaptureScope) -> usize {
+        self.grants
+            .lock()
+            .map(|grants| grants.in_flight.get(scope).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     /// 等这些范围上的在途采集全部归还 permit。
     async fn drain(&self, scopes: &[CaptureScope]) {
         // receiver 在循环外 clone：它记着自己见过的版本，所以两次检查之间的
@@ -498,9 +507,9 @@ impl CorpusCoordinator {
 
 /// permit 那一刻的授权，脱离 permit 单独带走。
 ///
-/// 存在的理由是**最终提交发生在另一条线程上**：写库是 `spawn_blocking`，而
-/// permit 要留在异步这一侧继续挡住撤权。这个句柄是 `'static` 的，所以可以进到
-/// 那个事务里再问一次——**在提交之前**，而不是在下载之前。
+/// 存在的理由是**最终提交发生在另一个任务上**：提交任务按值拿着 permit 的一个
+/// `Arc`（撤权要等它），而事务闭包里问的是这个 `'static` 的句柄——**在提交之
+/// 前**，而不是在下载之前。
 #[derive(Clone)]
 pub struct Authorisation {
     coordinator: Arc<CorpusCoordinator>,
@@ -541,7 +550,7 @@ impl CapturePermit {
         &self.authorisation.scope
     }
 
-    /// 带进 `spawn_blocking` 的那一份。permit 本身留在异步侧继续挡住撤权。
+    /// 带进事务闭包的那一份；permit 本身跟着提交任务走，继续挡住撤权。
     pub fn authorisation(&self) -> Authorisation {
         self.authorisation.clone()
     }

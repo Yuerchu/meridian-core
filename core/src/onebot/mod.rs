@@ -25,7 +25,7 @@ use crate::db::sea::cap::Db;
 use crate::listen_guard::{constant_time_eq, validate_listen_config};
 use crate::services::Services;
 use crate::turn::{Busy, TurnCoordinator, TurnLease, TurnOrigin};
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 use protocol::{OneBotAction, OneBotFrame, OneBotResponse};
 pub use qq_tools::catalog as qq_tool_catalog;
@@ -1243,20 +1243,17 @@ fn capture_scopes(
 /// 要么要一整套取消传播。
 pub async fn refresh_voice_policy(services: &Services, config: &OneBotConfig) -> Result<(), String> {
     let scopes = capture_scopes(config)?;
-    let pool = services.db.clone();
     let secrets = services.secrets.clone();
-    // keyring 是阻塞 IO，和 opt-out 的查询一起挪到 blocking 线程上。
-    //
     // **读不到就报错，不能当作空名单。** 这张表通常是空的，所以"查询失败"和
     // "没人拒绝过"在结果上长得一模一样——而把失败读成后者，等于让一次瞬时的
     // 数据库错误重新开始录一个已经明确说过不要的人。
-    let (optouts, key_fingerprint) = tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        let optouts = crate::db::ops::voice_corpus::optouts(&mut conn).map_err(|e| e.to_string())?;
-        Ok::<_, String>((optouts, fish_key_fingerprint(&secrets)))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let optouts = crate::db::sea::ops::voice_corpus::optouts(&services.sea)
+        .await
+        .map_err(|e| e.to_string())?;
+    // keyring 是阻塞 IO，留在 blocking 线程上。
+    let key_fingerprint = tokio::task::spawn_blocking(move || fish_key_fingerprint(&secrets))
+        .await
+        .map_err(|e| e.to_string())?;
 
     services.corpus.apply(scopes, optouts.into_iter().collect()).await;
 
@@ -1428,26 +1425,19 @@ impl OneBotServer {
             {
                 let services = state.services.clone();
                 let config = state.config.clone();
-                let pool = services.db.clone();
                 let data_dir = services.paths.data_dir.clone();
                 let writable = services.corpus.writable();
-                // 假名化密钥是一个异步的 SeaORM 写事务，在这里等；恢复器本身还是
-                // Diesel 加文件系统，留在 spawn_blocking 里。拿不到锁就不取：那时
-                // 恢复器什么都不做，也不该为它铸一把 key。
+                // 恢复器的数据库那一半走 SeaORM，文件那一半它自己放到阻塞线程上。
+                // 拿不到锁就不取 key：那时恢复器什么都不做，也不该为它铸一把 key。
                 let recovered = if !writable {
-                    Ok(Ok(crate::voice_corpus::recover::Recovered::default()))
+                    Ok(crate::voice_corpus::recover::Recovered::default())
                 } else {
                     match crate::voice_corpus::storage_key(&services.sea).await {
-                        Ok(key) => {
-                            tokio::task::spawn_blocking(move || {
-                                crate::voice_corpus::recover::run(&pool, &key, &data_dir, writable)
-                            })
-                            .await
-                        }
-                        Err(error) => Ok(Err(error)),
+                        Ok(key) => crate::voice_corpus::recover::run(&services.sea, &key, &data_dir, writable).await,
+                        Err(error) => Err(error),
                     }
                 };
-                if let Ok(Err(error)) = recovered {
+                if let Err(error) = recovered {
                     tracing::warn!(%error, "voice corpus recovery failed");
                 }
                 if let Err(error) = refresh_voice_policy(&services, &config).await {

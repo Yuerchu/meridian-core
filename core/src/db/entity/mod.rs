@@ -15,6 +15,9 @@ pub mod journal_version;
 pub mod notification_alert_state;
 pub mod notification_webhook;
 pub mod preference;
+pub mod voice_blob;
+pub mod voice_clip;
+pub mod voice_sender_optout;
 
 /// The tables that have no entity yet.
 ///
@@ -68,9 +71,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "tool_categories",
     "tool_presets",
     "turns",
-    "voice_blobs",
-    "voice_clips",
-    "voice_sender_optouts",
 ];
 
 /// What an entity claims about its table, in the vocabulary the schema reader
@@ -118,6 +118,9 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<notification_alert_state::Entity>(),
         shape_of::<notification_webhook::Entity>(),
         shape_of::<preference::Entity>(),
+        shape_of::<voice_blob::Entity>(),
+        shape_of::<voice_clip::Entity>(),
+        shape_of::<voice_sender_optout::Entity>(),
     ]
 }
 
