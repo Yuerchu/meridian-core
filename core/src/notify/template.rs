@@ -331,7 +331,7 @@ fn iso8601(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::notification::NotificationEventKind;
+    use crate::db::entity::notification_webhook::NotificationEventKind;
     use crate::notify::alert::{BalanceAlert, TestAlert, UsageAlert, UsageSlice};
     use crate::provider::balance::BalanceAccount;
 
@@ -541,7 +541,7 @@ mod tests {
             title: "测试".into(),
             summary: "这是一条测试".into(),
             detail: AlertDetail::Test(TestAlert {
-                format: crate::db::models::notification::NotificationFormat::Custom,
+                format: crate::db::entity::notification_webhook::NotificationFormat::Custom,
             }),
         };
         let rendered = render_str(

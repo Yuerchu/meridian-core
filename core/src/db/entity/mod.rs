@@ -9,6 +9,8 @@
 //! rather than a runtime surprise. Diesel gave that check for free at compile
 //! time through `schema.rs`; this is where it lives now.
 
+pub mod notification_alert_state;
+pub mod notification_webhook;
 pub mod preference;
 
 /// The tables that have no entity yet.
@@ -45,8 +47,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "mode_artifacts",
     "model_configs",
     "model_profiles",
-    "notification_alert_state",
-    "notification_webhooks",
     "plan_comments",
     "plan_documents",
     "plan_materializations",
@@ -111,7 +111,11 @@ pub struct ForeignKeyShape {
 /// test holds each shape against the live table, and the registry test holds
 /// the union of both lists against the schema.
 pub fn registered() -> Vec<EntityShape> {
-    vec![shape_of::<preference::Entity>()]
+    vec![
+        shape_of::<notification_alert_state::Entity>(),
+        shape_of::<notification_webhook::Entity>(),
+        shape_of::<preference::Entity>(),
+    ]
 }
 
 /// Derives an entity's shape from SeaORM's own reflection: the table name, the
