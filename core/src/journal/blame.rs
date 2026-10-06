@@ -21,14 +21,23 @@
 //!   it become `external` (source unknown) and the walk resumes from the next
 //!   loadable content. Blame built on a wrong snapshot would attribute lines
 //!   nobody wrote, which is the one output this system may never produce.
+//!
+//! The database is read first and whole: [`prefetch`] loads the file's chain
+//! and, following `moved_from_version_id` links transitively, every chain a
+//! rename could lead the walk into, bounded exactly as the walk's own depth
+//! guard is. The walk then runs against that in-memory [`ChainStore`] on a
+//! blocking thread — it diffs and re-hashes snapshots, which is CPU and file
+//! work the async runtime should not carry — and never touches a connection.
 
-use std::path::Path;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 
-use diesel::sqlite::SqliteConnection;
+use sea_orm::DbErr;
 use similar::{ChangeTag, TextDiff};
 
-use crate::db::models::journal::JournalVersionRow;
-use crate::db::ops::journal as ops;
+use crate::db::entity::journal_version::{self, VersionOp, VersionSource};
+use crate::db::sea::cap::Read;
+use crate::db::sea::ops::journal as ops;
 use crate::journal::blobs;
 use crate::turn::TurnOrigin;
 
@@ -107,15 +116,14 @@ struct Attribution {
 }
 
 impl Origin {
-    fn of(v: &JournalVersionRow) -> Result<Origin, String> {
-        use crate::db::models::journal::version_source;
-        match v.source.as_str() {
-            version_source::EXTERNAL => Ok(Origin::External),
-            source @ (version_source::NATIVE
-            | version_source::HOSTED
-            | version_source::INFERRED
-            | version_source::REWIND) => Ok(Origin::Version(std::rc::Rc::new(Attribution {
-                kind: if source == version_source::INFERRED {
+    fn of(v: &journal_version::Model) -> Result<Origin, String> {
+        match v.source {
+            VersionSource::External => Ok(Origin::External),
+            source @ (VersionSource::Native
+            | VersionSource::Hosted
+            | VersionSource::Inferred
+            | VersionSource::Rewind) => Ok(Origin::Version(std::rc::Rc::new(Attribution {
+                kind: if source == VersionSource::Inferred {
                     BlameKind::Inferred
                 } else {
                     BlameKind::Conversation
@@ -127,7 +135,6 @@ impl Origin {
                 tool_name: v.tool_name.clone(),
                 timestamp: v.created_at,
             }))),
-            source => Err(format!("unknown journal version source '{source}'")),
         }
     }
 }
@@ -166,39 +173,122 @@ fn line_count(content: &str) -> usize {
     content.split_inclusive('\n').count()
 }
 
+/// Every chain and version the walk can reach from one file, loaded before
+/// it starts. A lookup that misses here means what a missing row meant when
+/// the walk read the database directly: a dangling pointer, answered `None`.
+#[derive(Debug, Default)]
+pub struct ChainStore {
+    /// `file_id` → its chain, oldest first.
+    chains: HashMap<String, Vec<journal_version::Model>>,
+    /// The `rename_from` versions that `moved_from_version_id`s named.
+    versions: HashMap<String, journal_version::Model>,
+}
+
+impl ChainStore {
+    fn chain(&self, file_id: &str) -> Option<&[journal_version::Model]> {
+        self.chains.get(file_id).map(Vec::as_slice)
+    }
+
+    fn version(&self, id: &str) -> Option<&journal_version::Model> {
+        self.versions.get(id)
+    }
+}
+
+/// Load the file's chain and everything a rename link in it leads to.
+///
+/// The walk follows a `rename_to` by looking up the version it names and then
+/// that version's chain, at `depth + 1`, and refuses to look at all once
+/// `depth` reaches `MAX_RENAME_DEPTH`. The prefetch mirrors that exactly: a
+/// chain is expanded at the shallowest depth it is reached at, and its links
+/// are followed only while the walk would follow them. A pointer to a version
+/// that no longer exists is left out, so the walk's lookup misses as it would
+/// have against the database.
+pub async fn prefetch(db: &impl Read, root_file_id: &str) -> Result<ChainStore, DbErr> {
+    let mut store = ChainStore::default();
+    let mut expanded_at: HashMap<String, u32> = HashMap::new();
+    let mut queue = VecDeque::from([(root_file_id.to_owned(), 0u32)]);
+
+    while let Some((file_id, depth)) = queue.pop_front() {
+        if expanded_at.get(&file_id).is_some_and(|seen| *seen <= depth) {
+            continue;
+        }
+        expanded_at.insert(file_id.clone(), depth);
+        if !store.chains.contains_key(&file_id) {
+            let versions = ops::chain(db, &file_id).await?;
+            store.chains.insert(file_id.clone(), versions);
+        }
+        if depth >= MAX_RENAME_DEPTH {
+            continue;
+        }
+        let links: Vec<String> = store.chains[&file_id]
+            .iter()
+            .filter(|v| v.op == VersionOp::RenameTo)
+            .filter_map(|v| v.moved_from_version_id.clone())
+            .collect();
+        for from_id in links {
+            if let Some(from) = store.versions.get(&from_id) {
+                queue.push_back((from.file_id.clone(), depth + 1));
+                continue;
+            }
+            if let Some(from) = ops::version_by_id(db, &from_id).await? {
+                queue.push_back((from.file_id.clone(), depth + 1));
+                store.versions.insert(from_id, from);
+            }
+        }
+    }
+    Ok(store)
+}
+
 /// Blame one file against what is on disk now.
 ///
 /// `disk` is the current content, read by the caller through its own verified
 /// handle — this function touches the database and the blob store, never the
-/// working tree. `cancel` is checked between hops; a viewer flipping through
-/// files abandons the walks it no longer wants.
-pub fn blame(
-    conn: &mut SqliteConnection,
+/// working tree. The database part is the prefetch, awaited here; the walk
+/// runs on a blocking thread. `cancel` is checked between hops; a viewer
+/// flipping through files abandons the walks it no longer wants.
+pub async fn blame(
+    db: &impl Read,
     blob_root: &Path,
     norm_path: &str,
-    disk: &str,
-    cancel: &tokio_util::sync::CancellationToken,
+    disk: String,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<BlameResult, String> {
-    let current_sha = blobs::sha256_of(disk);
+    let current_sha = blobs::sha256_of(&disk);
 
-    let Some(file) = ops::file_by_path(conn, norm_path).map_err(|e| e.to_string())? else {
+    let Some(file) = ops::file_by_path(db, norm_path).await.map_err(|e| e.to_string())? else {
         // Never journalled: everything predates the journal, by definition.
         return Ok(BlameResult {
             current_sha,
             head_sha: None,
             truncated: false,
-            spans: spans_of(&State::all(disk.to_string(), Origin::Preexisting, false)),
+            spans: spans_of(&State::all(disk, Origin::Preexisting, false)),
         });
     };
 
-    let versions = ops::chain(conn, &file.id).map_err(|e| e.to_string())?;
+    let store = prefetch(db, &file.id).await.map_err(|e| e.to_string())?;
+    let blob_root: PathBuf = blob_root.to_path_buf();
+    tokio::task::spawn_blocking(move || blame_loaded(&store, &blob_root, &file.id, disk, current_sha, &cancel))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The synchronous half: walk the prefetched chain and overlay the disk.
+fn blame_loaded(
+    store: &ChainStore,
+    blob_root: &Path,
+    file_id: &str,
+    disk: String,
+    current_sha: String,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<BlameResult, String> {
+    let versions = store.chain(file_id).unwrap_or_default();
     let head_sha = versions.last().and_then(|v| v.new_sha.clone());
-    let mut state = walk(conn, blob_root, &versions, cancel, 0)?;
+    let mut state = walk(store, blob_root, versions, cancel, 0)?;
 
     // The disk overlay: what the chain head does not explain is `external`,
     // in the answer only. Reading must not write.
     if blobs::sha256_of(&state.content) != current_sha {
-        state = advance(state, disk.to_string(), Origin::External);
+        state = advance(state, disk, Origin::External);
     }
 
     Ok(BlameResult {
@@ -211,9 +301,9 @@ pub fn blame(
 
 /// Walk a chain, oldest to newest, carrying line origins.
 fn walk(
-    conn: &mut SqliteConnection,
+    store: &ChainStore,
     blob_root: &Path,
-    versions: &[JournalVersionRow],
+    versions: &[journal_version::Model],
     cancel: &tokio_util::sync::CancellationToken,
     depth: u32,
 ) -> Result<State, String> {
@@ -290,11 +380,11 @@ fn walk(
         // destination's (usually empty) chain would credit the mover with
         // every inherited line, which the journal has no evidence for. Lost
         // base, same discipline.
-        if v.op == "rename_to" {
+        if v.op == VersionOp::RenameTo {
             match v
                 .moved_from_version_id
                 .as_ref()
-                .and_then(|from_id| rename_base(conn, blob_root, from_id, cancel, depth))
+                .and_then(|from_id| rename_base(store, blob_root, from_id, cancel, depth))
             {
                 Some(base) => {
                     state = base;
@@ -318,7 +408,7 @@ fn walk(
 /// the named version. `None` when the pointer dangles (the old chain was
 /// cleaned away) or the depth guard trips.
 fn rename_base(
-    conn: &mut SqliteConnection,
+    store: &ChainStore,
     blob_root: &Path,
     from_version_id: &str,
     cancel: &tokio_util::sync::CancellationToken,
@@ -327,11 +417,11 @@ fn rename_base(
     if depth >= MAX_RENAME_DEPTH {
         return None;
     }
-    let from = ops::version_by_id(conn, from_version_id).ok()??;
-    let full = ops::chain(conn, &from.file_id).ok()?;
+    let from = store.version(from_version_id)?;
+    let full = store.chain(&from.file_id)?;
     // Up to the rename_from itself. Its own row records the file *leaving*
     // (new = None), so the content the move carried is the version before it.
-    let upto: Vec<JournalVersionRow> = full.into_iter().take_while(|x| x.seq < from.seq).collect();
+    let upto: Vec<journal_version::Model> = full.iter().take_while(|x| x.seq < from.seq).cloned().collect();
 
     // A file whose *first* journal event is being moved has no rows below the
     // rename_from — the moved content lives only in that row's observed_old.
@@ -343,7 +433,7 @@ fn rename_base(
         let content = blobs::load(blob_root, sha).ok()?;
         return Some(State::all(content, Origin::Preexisting, true));
     }
-    walk(conn, blob_root, &upto, cancel, depth + 1).ok()
+    walk(store, blob_root, &upto, cancel, depth + 1).ok()
 }
 
 /// Diff `state` onto `new_content`, attributing insertions to `origin`.
@@ -426,22 +516,22 @@ fn plain_span(line: u32, kind: BlameKind) -> BlameSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
-    use crate::db::ops::journal::{AppendVersion, Attribution as OpsAttribution, append_version};
+    use crate::db::sea::cap::Db;
+    use crate::db::sea::ops::journal::{AppendVersion, Attribution as OpsAttribution, append_version};
+    use crate::db::sea::sea_test_db;
     use crate::journal::blobs::StoredBlob;
-    use diesel::sqlite::SqliteConnection;
     use std::path::PathBuf;
 
     struct Rig {
-        pool: crate::db::DbPool,
+        db: Db,
         blob_root: PathBuf,
         cancel: tokio_util::sync::CancellationToken,
     }
 
     impl Rig {
-        fn new() -> Rig {
+        async fn new() -> Rig {
             Rig {
-                pool: diesel_test_db(),
+                db: sea_test_db().await,
                 blob_root: tempfile::tempdir().unwrap().keep(),
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
@@ -452,11 +542,10 @@ mod tests {
         }
 
         #[allow(clippy::too_many_arguments)]
-        fn append(
+        async fn append(
             &self,
-            conn: &mut SqliteConnection,
             path: &str,
-            op: &str,
+            op: VersionOp,
             old: Option<&str>,
             new: Option<&str>,
             conv: Option<&str>,
@@ -466,36 +555,43 @@ mod tests {
             let old = old.map(|c| self.store(c));
             let new = new.map(|c| self.store(c));
             let (source, conversation_id, turn_id) = match conv {
-                Some(c) => ("native", Some(c), Some("t1")),
-                None => ("external", None, None),
+                Some(c) => (VersionSource::Native, Some(c), Some("t1")),
+                None => (VersionSource::External, None, None),
             };
-            append_version(
-                conn,
-                path,
-                &AppendVersion {
-                    display_path: path,
-                    op,
-                    observed_old: old.as_ref(),
-                    new: new.as_ref(),
-                    attribution: OpsAttribution {
-                        source,
-                        conversation_id,
-                        turn_id,
-                        project_id: None,
-                        origin: conversation_id.map(|_| "desktop"),
-                        model_id: None,
-                        tool_name: None,
-                    },
-                    moved_from_version_id: moved_from,
-                    now,
-                },
-            )
-            .unwrap()
-            .version_id
+            self.db
+                .write(async |tx| {
+                    append_version(
+                        tx,
+                        path,
+                        &AppendVersion {
+                            display_path: path,
+                            op,
+                            observed_old: old.as_ref(),
+                            new: new.as_ref(),
+                            attribution: OpsAttribution {
+                                source,
+                                conversation_id,
+                                turn_id,
+                                project_id: None,
+                                origin: conversation_id.map(|_| "desktop"),
+                                model_id: None,
+                                tool_name: None,
+                            },
+                            moved_from_version_id: moved_from,
+                            now,
+                        },
+                    )
+                    .await
+                })
+                .await
+                .unwrap()
+                .version_id
         }
 
-        fn blame(&self, conn: &mut SqliteConnection, path: &str, disk: &str) -> BlameResult {
-            blame(conn, &self.blob_root, path, disk, &self.cancel).unwrap()
+        async fn blame(&self, path: &str, disk: &str) -> BlameResult {
+            blame(&self.db, &self.blob_root, path, disk.to_owned(), self.cancel.clone())
+                .await
+                .unwrap()
         }
     }
 
@@ -507,11 +603,10 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_file_the_journal_never_saw_is_all_preexisting() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
-        let got = rig.blame(&mut conn, "/p/a.rs", "one\ntwo\n");
+    #[tokio::test]
+    async fn a_file_the_journal_never_saw_is_all_preexisting() {
+        let rig = Rig::new().await;
+        let got = rig.blame("/p/a.rs", "one\ntwo\n").await;
         assert_eq!(got.head_sha, None);
         assert_eq!(kinds(&got), vec![(1, 2, "preexisting", None)]);
     }
@@ -519,24 +614,23 @@ mod tests {
     /// The golden vector: pre-journal lines stay `preexisting`, the inserted
     /// line carries its conversation, and the answer is exact — an upstream
     /// diff-algorithm change that reassigns lines turns this red.
-    #[test]
-    fn an_edit_on_a_preexisting_base_attributes_only_its_insertion() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn an_edit_on_a_preexisting_base_attributes_only_its_insertion() {
+        let rig = Rig::new().await;
         let before = "alpha\nbeta\ngamma\n";
         let after = "alpha\nbeta\nNEW LINE\ngamma\n";
         rig.append(
-            &mut conn,
             "/p/a.rs",
-            "edit",
+            VersionOp::Edit,
             Some(before),
             Some(after),
             Some("conv1"),
             None,
             1,
-        );
+        )
+        .await;
 
-        let got = rig.blame(&mut conn, "/p/a.rs", after);
+        let got = rig.blame("/p/a.rs", after).await;
         assert_eq!(
             kinds(&got),
             vec![
@@ -548,27 +642,19 @@ mod tests {
         assert!(got.truncated, "a pre-journal base means unseen history");
     }
 
-    #[test]
-    fn an_external_version_labels_its_lines_external() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn an_external_version_labels_its_lines_external() {
+        let rig = Rig::new().await;
         let v1 = "a\nb\n";
         let hand = "a\nHAND EDIT\nb\n";
         let v3 = "a\nHAND EDIT\nb\nc\n";
-        rig.append(&mut conn, "/p/a.rs", "write", None, Some(v1), Some("conv1"), None, 1);
+        rig.append("/p/a.rs", VersionOp::Write, None, Some(v1), Some("conv1"), None, 1)
+            .await;
         // conv2 observed the hand edit: append interposes the external row.
-        rig.append(
-            &mut conn,
-            "/p/a.rs",
-            "edit",
-            Some(hand),
-            Some(v3),
-            Some("conv2"),
-            None,
-            2,
-        );
+        rig.append("/p/a.rs", VersionOp::Edit, Some(hand), Some(v3), Some("conv2"), None, 2)
+            .await;
 
-        let got = rig.blame(&mut conn, "/p/a.rs", v3);
+        let got = rig.blame("/p/a.rs", v3).await;
         assert_eq!(
             kinds(&got),
             vec![
@@ -580,42 +666,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deletion_and_recreation_start_attribution_over() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn deletion_and_recreation_start_attribution_over() {
+        let rig = Rig::new().await;
         rig.append(
-            &mut conn,
             "/p/a.rs",
-            "write",
+            VersionOp::Write,
             None,
             Some("old life\n"),
             Some("conv1"),
             None,
             1,
-        );
+        )
+        .await;
         rig.append(
-            &mut conn,
             "/p/a.rs",
-            "delete",
+            VersionOp::Delete,
             Some("old life\n"),
             None,
             Some("conv1"),
             None,
             2,
-        );
+        )
+        .await;
         rig.append(
-            &mut conn,
             "/p/a.rs",
-            "write",
+            VersionOp::Write,
             None,
             Some("new life\n"),
             Some("conv2"),
             None,
             3,
-        );
+        )
+        .await;
 
-        let got = rig.blame(&mut conn, "/p/a.rs", "new life\n");
+        let got = rig.blame("/p/a.rs", "new life\n").await;
         assert_eq!(kinds(&got), vec![(1, 1, "conversation", Some("conv2"))]);
         assert!(
             !got.truncated,
@@ -626,27 +711,28 @@ mod tests {
     /// A deletion resets lost history: an unreadable snapshot before it must
     /// not bleed `external` into a recreated file whose base — empty — is
     /// perfectly known.
-    #[test]
-    fn a_deletion_resets_lost_history() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn a_deletion_resets_lost_history() {
+        let rig = Rig::new().await;
         let v1 = "doomed\n";
-        rig.append(&mut conn, "/p/a.rs", "write", None, Some(v1), Some("conv1"), None, 1);
-        rig.append(&mut conn, "/p/a.rs", "delete", Some(v1), None, Some("conv1"), None, 2);
+        rig.append("/p/a.rs", VersionOp::Write, None, Some(v1), Some("conv1"), None, 1)
+            .await;
+        rig.append("/p/a.rs", VersionOp::Delete, Some(v1), None, Some("conv1"), None, 2)
+            .await;
         rig.append(
-            &mut conn,
             "/p/a.rs",
-            "write",
+            VersionOp::Write,
             None,
             Some("reborn\n"),
             Some("conv2"),
             None,
             3,
-        );
+        )
+        .await;
         // Corrupt the *first incarnation's* snapshot.
         std::fs::write(blobs::blob_path(&rig.blob_root, &blobs::sha256_of(v1)), "rotten").unwrap();
 
-        let got = rig.blame(&mut conn, "/p/a.rs", "reborn\n");
+        let got = rig.blame("/p/a.rs", "reborn\n").await;
         assert_eq!(kinds(&got), vec![(1, 1, "conversation", Some("conv2"))]);
         assert!(
             !got.truncated,
@@ -657,45 +743,43 @@ mod tests {
     /// A `rename_to` with no source link is a hop whose base cannot be known:
     /// crediting the mover with every "inserted" line would hand it content
     /// the journal has no evidence it wrote. Whole hop external instead.
-    #[test]
-    fn a_rename_without_a_source_link_goes_external() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn a_rename_without_a_source_link_goes_external() {
+        let rig = Rig::new().await;
         let moved = "line one\nline two\n";
         rig.append(
-            &mut conn,
             "/p/new.rs",
-            "rename_to",
+            VersionOp::RenameTo,
             None,
             Some(moved),
             Some("mover"),
             None,
             1,
-        );
+        )
+        .await;
 
-        let got = rig.blame(&mut conn, "/p/new.rs", moved);
+        let got = rig.blame("/p/new.rs", moved).await;
         assert_eq!(kinds(&got), vec![(1, 2, "external", None)]);
         assert!(got.truncated);
     }
 
     /// And the same when the link dangles — the old chain was cleaned away.
-    #[test]
-    fn a_dangling_rename_link_goes_external() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn a_dangling_rename_link_goes_external() {
+        let rig = Rig::new().await;
         let moved = "line one\n";
         rig.append(
-            &mut conn,
             "/p/new.rs",
-            "rename_to",
+            VersionOp::RenameTo,
             None,
             Some(moved),
             Some("mover"),
             Some("no-such-version"),
             1,
-        );
+        )
+        .await;
 
-        let got = rig.blame(&mut conn, "/p/new.rs", moved);
+        let got = rig.blame("/p/new.rs", moved).await;
         assert_eq!(kinds(&got), vec![(1, 1, "external", None)]);
         assert!(got.truncated);
     }
@@ -703,34 +787,34 @@ mod tests {
     /// A preexisting file whose first journal event is the move itself: the
     /// moved content lives only in the rename_from's observed_old, and it is
     /// `preexisting` — not the mover's.
-    #[test]
-    fn a_first_observation_rename_seeds_a_preexisting_base() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn a_first_observation_rename_seeds_a_preexisting_base() {
+        let rig = Rig::new().await;
         let content = "ancient one\nancient two\n";
-        let from_id = rig.append(
-            &mut conn,
-            "/p/old.rs",
-            "rename_from",
-            Some(content),
-            None,
-            Some("mover"),
-            None,
-            1,
-        );
+        let from_id = rig
+            .append(
+                "/p/old.rs",
+                VersionOp::RenameFrom,
+                Some(content),
+                None,
+                Some("mover"),
+                None,
+                1,
+            )
+            .await;
         let moved = "ancient one\nancient two\nmover's line\n";
         rig.append(
-            &mut conn,
             "/p/new.rs",
-            "rename_to",
+            VersionOp::RenameTo,
             None,
             Some(moved),
             Some("mover"),
             Some(&from_id),
             1,
-        );
+        )
+        .await;
 
-        let got = rig.blame(&mut conn, "/p/new.rs", moved);
+        let got = rig.blame("/p/new.rs", moved).await;
         assert_eq!(
             kinds(&got),
             vec![(1, 2, "preexisting", None), (3, 3, "conversation", Some("mover"))]
@@ -740,17 +824,18 @@ mod tests {
 
     /// Two versions in one turn must stay two spans: a field-subset merge
     /// would report the first version's tool and time for the second's lines.
-    #[test]
-    fn spans_do_not_merge_across_versions_of_one_turn() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn spans_do_not_merge_across_versions_of_one_turn() {
+        let rig = Rig::new().await;
         let v1 = "first\n";
         let v2 = "first\nsecond\n";
         // Same conversation, same turn (the rig pins turn_id to "t1").
-        rig.append(&mut conn, "/p/a.rs", "write", None, Some(v1), Some("conv1"), None, 1);
-        rig.append(&mut conn, "/p/a.rs", "edit", Some(v1), Some(v2), Some("conv1"), None, 2);
+        rig.append("/p/a.rs", VersionOp::Write, None, Some(v1), Some("conv1"), None, 1)
+            .await;
+        rig.append("/p/a.rs", VersionOp::Edit, Some(v1), Some(v2), Some("conv1"), None, 2)
+            .await;
 
-        let got = rig.blame(&mut conn, "/p/a.rs", v2);
+        let got = rig.blame("/p/a.rs", v2).await;
         assert_eq!(got.spans.len(), 2, "adjacent lines from two versions must not merge");
         assert_eq!(got.spans[0].timestamp, Some(1));
         assert_eq!(got.spans[1].timestamp, Some(2));
@@ -759,55 +844,55 @@ mod tests {
     /// A move: inherited lines keep the source chain's attribution, the
     /// mover's tweak is the mover's — and the link is by exact version, so a
     /// later reincarnation of the old path cannot leak in.
-    #[test]
-    fn a_rename_inherits_by_exact_version() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn a_rename_inherits_by_exact_version() {
+        let rig = Rig::new().await;
         let content = "kept one\nkept two\n";
         rig.append(
-            &mut conn,
             "/p/old.rs",
-            "write",
+            VersionOp::Write,
             None,
             Some(content),
             Some("author"),
             None,
             1,
-        );
-        let from_id = rig.append(
-            &mut conn,
-            "/p/old.rs",
-            "rename_from",
-            Some(content),
-            None,
-            Some("mover"),
-            None,
-            2,
-        );
+        )
+        .await;
+        let from_id = rig
+            .append(
+                "/p/old.rs",
+                VersionOp::RenameFrom,
+                Some(content),
+                None,
+                Some("mover"),
+                None,
+                2,
+            )
+            .await;
         let moved = "kept one\nkept two\nmover's line\n";
         rig.append(
-            &mut conn,
             "/p/new.rs",
-            "rename_to",
+            VersionOp::RenameTo,
             None,
             Some(moved),
             Some("mover"),
             Some(&from_id),
             2,
-        );
+        )
+        .await;
         // The old path is reborn as something unrelated — must not leak in.
         rig.append(
-            &mut conn,
             "/p/old.rs",
-            "write",
+            VersionOp::Write,
             None,
             Some("impostor\n"),
             Some("stranger"),
             None,
             3,
-        );
+        )
+        .await;
 
-        let got = rig.blame(&mut conn, "/p/new.rs", moved);
+        let got = rig.blame("/p/new.rs", moved).await;
         assert_eq!(
             kinds(&got),
             vec![
@@ -817,18 +902,89 @@ mod tests {
         );
     }
 
+    /// A move of a move: the prefetch has to follow the link *inside* the
+    /// chain a first link led to, or the second hop's base is unknown and the
+    /// original author's lines come back as the first mover's.
+    #[tokio::test]
+    async fn a_rename_chain_is_followed_transitively() {
+        let rig = Rig::new().await;
+        let content = "kept\n";
+        rig.append(
+            "/p/a.rs",
+            VersionOp::Write,
+            None,
+            Some(content),
+            Some("author"),
+            None,
+            1,
+        )
+        .await;
+        let a_from = rig
+            .append(
+                "/p/a.rs",
+                VersionOp::RenameFrom,
+                Some(content),
+                None,
+                Some("mover1"),
+                None,
+                2,
+            )
+            .await;
+        rig.append(
+            "/p/b.rs",
+            VersionOp::RenameTo,
+            None,
+            Some(content),
+            Some("mover1"),
+            Some(&a_from),
+            2,
+        )
+        .await;
+        let b_from = rig
+            .append(
+                "/p/b.rs",
+                VersionOp::RenameFrom,
+                Some(content),
+                None,
+                Some("mover2"),
+                None,
+                3,
+            )
+            .await;
+        let moved = "kept\nmover2's line\n";
+        rig.append(
+            "/p/c.rs",
+            VersionOp::RenameTo,
+            None,
+            Some(moved),
+            Some("mover2"),
+            Some(&b_from),
+            3,
+        )
+        .await;
+
+        let got = rig.blame("/p/c.rs", moved).await;
+        assert_eq!(
+            kinds(&got),
+            vec![
+                (1, 1, "conversation", Some("author")),
+                (2, 2, "conversation", Some("mover2")),
+            ]
+        );
+    }
+
     /// The disk overlay: a hand edit after the last journalled version shows
     /// as `external` in the answer — and the answer only. Reading never
     /// writes, so a second blame sees the same chain length.
-    #[test]
-    fn the_disk_overlay_labels_unexplained_lines_without_writing() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn the_disk_overlay_labels_unexplained_lines_without_writing() {
+        let rig = Rig::new().await;
         let v1 = "a\nb\n";
-        rig.append(&mut conn, "/p/a.rs", "write", None, Some(v1), Some("conv1"), None, 1);
+        rig.append("/p/a.rs", VersionOp::Write, None, Some(v1), Some("conv1"), None, 1)
+            .await;
 
         let disk = "a\nzz\nb\n";
-        let got = rig.blame(&mut conn, "/p/a.rs", disk);
+        let got = rig.blame("/p/a.rs", disk).await;
         assert_eq!(
             kinds(&got),
             vec![
@@ -839,9 +995,9 @@ mod tests {
         );
         assert_ne!(got.current_sha, got.head_sha.clone().unwrap());
 
-        let file = ops::file_by_path(&mut conn, "/p/a.rs").unwrap().unwrap();
+        let file = ops::file_by_path(&rig.db, "/p/a.rs").await.unwrap().unwrap();
         assert_eq!(
-            ops::chain(&mut conn, &file.id).unwrap().len(),
+            ops::chain(&rig.db, &file.id).await.unwrap().len(),
             1,
             "blame must not append"
         );
@@ -850,19 +1006,20 @@ mod tests {
     /// A snapshot that fails its hash breaks every inheritance across it:
     /// what stood on it is written off as external, later hops attribute
     /// normally, and the whole answer says it is truncated.
-    #[test]
-    fn a_corrupt_snapshot_degrades_what_stood_on_it() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn a_corrupt_snapshot_degrades_what_stood_on_it() {
+        let rig = Rig::new().await;
         let v1 = "one\ntwo\n";
         let v2 = "one\ntwo\nthree\n";
-        rig.append(&mut conn, "/p/a.rs", "write", None, Some(v1), Some("conv1"), None, 1);
-        rig.append(&mut conn, "/p/a.rs", "edit", Some(v1), Some(v2), Some("conv2"), None, 2);
+        rig.append("/p/a.rs", VersionOp::Write, None, Some(v1), Some("conv1"), None, 1)
+            .await;
+        rig.append("/p/a.rs", VersionOp::Edit, Some(v1), Some(v2), Some("conv2"), None, 2)
+            .await;
         // Corrupt v1's snapshot on disk.
         let sha1 = blobs::sha256_of(v1);
         std::fs::write(blobs::blob_path(&rig.blob_root, &sha1), "rotten").unwrap();
 
-        let got = rig.blame(&mut conn, "/p/a.rs", v2);
+        let got = rig.blame("/p/a.rs", v2).await;
         assert!(got.truncated);
         // v2 loads fine but its base is gone. With no base there is no diff,
         // and crediting conv2 with every "inserted" line would hand it conv1's
@@ -872,24 +1029,23 @@ mod tests {
         assert_eq!(kinds(&got), vec![(1, 3, "external", None)]);
     }
 
-    #[test]
-    fn crlf_content_blames_line_by_line() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
+    #[tokio::test]
+    async fn crlf_content_blames_line_by_line() {
+        let rig = Rig::new().await;
         let before = "a\r\nb\r\n";
         let after = "a\r\nX\r\nb\r\n";
         rig.append(
-            &mut conn,
             "/p/a.rs",
-            "edit",
+            VersionOp::Edit,
             Some(before),
             Some(after),
             Some("conv1"),
             None,
             1,
-        );
+        )
+        .await;
 
-        let got = rig.blame(&mut conn, "/p/a.rs", after);
+        let got = rig.blame("/p/a.rs", after).await;
         assert_eq!(
             kinds(&got),
             vec![
@@ -900,12 +1056,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancellation_stops_the_walk() {
-        let rig = Rig::new();
-        let mut conn = rig.pool.get().unwrap();
-        rig.append(&mut conn, "/p/a.rs", "write", None, Some("x\n"), Some("conv1"), None, 1);
+    #[tokio::test]
+    async fn cancellation_stops_the_walk() {
+        let rig = Rig::new().await;
+        rig.append("/p/a.rs", VersionOp::Write, None, Some("x\n"), Some("conv1"), None, 1)
+            .await;
         rig.cancel.cancel();
-        assert!(blame(&mut conn, &rig.blob_root, "/p/a.rs", "x\n", &rig.cancel).is_err());
+        assert!(
+            blame(&rig.db, &rig.blob_root, "/p/a.rs", "x\n".to_owned(), rig.cancel.clone())
+                .await
+                .is_err()
+        );
     }
 }

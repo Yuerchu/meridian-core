@@ -9,6 +9,9 @@
 //! rather than a runtime surprise. Diesel gave that check for free at compile
 //! time through `schema.rs`; this is where it lives now.
 
+pub mod journal_blob;
+pub mod journal_file;
+pub mod journal_version;
 pub mod notification_alert_state;
 pub mod notification_webhook;
 pub mod preference;
@@ -34,9 +37,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "custom_tools",
     "emoji_packs",
     "emojis",
-    "journal_blobs",
-    "journal_files",
-    "journal_versions",
     "mcp_servers",
     "memories",
     "memory_proposals",
@@ -112,6 +112,9 @@ pub struct ForeignKeyShape {
 /// the union of both lists against the schema.
 pub fn registered() -> Vec<EntityShape> {
     vec![
+        shape_of::<journal_blob::Entity>(),
+        shape_of::<journal_file::Entity>(),
+        shape_of::<journal_version::Entity>(),
         shape_of::<notification_alert_state::Entity>(),
         shape_of::<notification_webhook::Entity>(),
         shape_of::<preference::Entity>(),

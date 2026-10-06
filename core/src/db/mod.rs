@@ -3,6 +3,7 @@ pub mod models;
 pub mod ops;
 pub mod schema;
 pub mod sea;
+pub mod sql;
 pub mod types;
 
 use diesel::RunQueryDsl;

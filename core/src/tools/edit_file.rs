@@ -139,7 +139,7 @@ mod tests {
 
         let blob_root = tempfile::tempdir().unwrap().keep();
         let journal = crate::journal::capture::JournalCtx::new(
-            crate::db::diesel_test_db(),
+            crate::db::sea::sea_test_db().await,
             blob_root,
             "conv".into(),
             "turn".into(),
@@ -161,14 +161,22 @@ mod tests {
             .unwrap();
 
         let real = crate::tools::verified::resolve_root(&file).unwrap();
-        let mut conn = journal.pool.get().unwrap();
-        let row = crate::db::ops::journal::file_by_path(&mut conn, &crate::journal::norm_path(&real).unwrap())
+        let row = crate::db::sea::ops::journal::file_by_path(&journal.sea, &crate::journal::norm_path(&real).unwrap())
+            .await
             .unwrap()
             .expect("the edit should be journalled");
-        let chain = crate::db::ops::journal::chain(&mut conn, &row.id).unwrap();
+        let chain = crate::db::sea::ops::journal::chain(&journal.sea, &row.id)
+            .await
+            .unwrap();
         assert_eq!(chain.len(), 1);
         let v = &chain[0];
-        assert_eq!((v.op.as_str(), v.source.as_str()), ("edit", "native"));
+        assert_eq!(
+            (v.op, v.source),
+            (
+                crate::db::entity::journal_version::VersionOp::Edit,
+                crate::db::entity::journal_version::VersionSource::Native
+            )
+        );
         assert_eq!(v.conversation_id.as_deref(), Some("conv"));
         assert_eq!(v.tool_name.as_deref(), Some("edit_file"));
         assert_eq!(
@@ -193,7 +201,7 @@ mod tests {
         let bad_root = dir.path().join("not-a-dir");
         std::fs::write(&bad_root, "x").unwrap();
         let journal = crate::journal::capture::JournalCtx::new(
-            crate::db::diesel_test_db(),
+            crate::db::sea::sea_test_db().await,
             bad_root,
             "conv".into(),
             "turn".into(),
