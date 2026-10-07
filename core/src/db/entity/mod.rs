@@ -28,6 +28,13 @@ pub mod message;
 pub mod message_sticker;
 pub mod notification_alert_state;
 pub mod notification_webhook;
+pub mod plan_comment;
+pub mod plan_document;
+pub mod plan_materialization;
+pub mod plan_review_delivery;
+pub mod plan_review_draft;
+pub mod plan_review_session;
+pub mod plan_revision;
 pub mod preference;
 pub mod project;
 pub mod provider;
@@ -59,13 +66,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "mode_artifacts",
     "model_configs",
     "model_profiles",
-    "plan_comments",
-    "plan_documents",
-    "plan_materializations",
-    "plan_review_deliveries",
-    "plan_review_drafts",
-    "plan_review_sessions",
-    "plan_revisions",
     "queued_prompt_context_items",
     "queued_prompts",
     "todo_items",
@@ -131,6 +131,13 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<message_sticker::Entity>(),
         shape_of::<notification_alert_state::Entity>(),
         shape_of::<notification_webhook::Entity>(),
+        shape_of::<plan_comment::Entity>(),
+        shape_of::<plan_document::Entity>(),
+        shape_of::<plan_materialization::Entity>(),
+        shape_of::<plan_review_delivery::Entity>(),
+        shape_of::<plan_review_draft::Entity>(),
+        shape_of::<plan_review_session::Entity>(),
+        shape_of::<plan_revision::Entity>(),
         shape_of::<preference::Entity>(),
         shape_of::<project::Entity>(),
         shape_of::<provider::Entity>(),
@@ -271,4 +278,29 @@ fn pragma_action(action: Option<sea_orm::sea_query::ForeignKeyAction>) -> String
         Some(other) => panic!("foreign key action {other:?} has no pragma spelling yet"),
     }
     .to_owned()
+}
+
+/// The names a `CHECK (<column> IN (…))` on `table` allows, read out of the
+/// schema snapshot, for tests that hold an enum's stored values to the live
+/// constraint. A table's DDL can span lines there (SQLite keeps the line
+/// breaks a migration wrote), so the statement is cut from its `CREATE
+/// TABLE` to the blank line that ends it.
+#[cfg(test)]
+pub(crate) fn allowed_by_check(table: &str, column: &str) -> std::collections::BTreeSet<String> {
+    let snapshot = include_str!("../../../schema.snapshot.sql");
+    let start = snapshot
+        .find(&format!("CREATE TABLE \"{table}\" ("))
+        .unwrap_or_else(|| panic!("the snapshot builds {table}"));
+    let statement = &snapshot[start..];
+    let statement = &statement[..statement.find("\n\n").unwrap_or(statement.len())];
+    let prefix = format!("CHECK ({column} IN (");
+    let start = statement
+        .find(&prefix)
+        .unwrap_or_else(|| panic!("a CHECK on {table}.{column}"))
+        + prefix.len();
+    let end = start + statement[start..].find("))").expect("the CHECK closes");
+    statement[start..end]
+        .split(',')
+        .map(|name| name.trim().trim_matches('\'').to_owned())
+        .collect()
 }

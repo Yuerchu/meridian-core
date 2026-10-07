@@ -5,116 +5,25 @@
 //! instead of exposing the strings.
 
 use diesel::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::db::schema::{
     plan_comments, plan_documents, plan_materializations, plan_review_deliveries, plan_review_drafts,
     plan_review_sessions, plan_revisions,
 };
 
-macro_rules! stored_enum {
-    ($name:ident { $($variant:ident),+ $(,)? }) => {
-        #[derive(
-            Debug,
-            Clone,
-            Copy,
-            PartialEq,
-            Eq,
-            Serialize,
-            strum::IntoStaticStr,
-            strum::EnumString,
-        )]
-        #[serde(rename_all = "snake_case")]
-        #[strum(serialize_all = "snake_case")]
-        pub enum $name { $($variant),+ }
-
-        impl $name {
-            pub fn as_str(self) -> &'static str { self.into() }
-
-            pub fn parse(value: &str) -> Result<Self, String> {
-                value
-                    .parse()
-                    .map_err(|_| format!("unknown {} '{}'", stringify!($name), value))
-            }
-        }
-    };
-}
-
-stored_enum!(PlanDocumentState {
-    Drafting,
-    Reviewing,
-    Approved,
-    Done,
-});
-stored_enum!(PlanRevisionAuthorKind {
-    Assistant,
-    UserSuggestion,
-    Legacy,
-});
-stored_enum!(PlanReviewProviderKind { Native, Acp, Legacy });
-stored_enum!(PlanReviewState {
-    Pending,
-    Approved,
-    ChangesRequested,
-    Orphaned,
-});
-stored_enum!(PlanReviewDraftMode { Rich, Source });
-stored_enum!(PlanCommentState {
-    Draft,
-    Active,
-    Orphaned,
-    Submitted,
-    Deleted,
-});
-stored_enum!(PlanCommentAnchorKind { Rich, Source });
-stored_enum!(PlanDeliveryTarget { Native, Acp });
-stored_enum!(PlanDeliveryState {
-    Queued,
-    Dispatched,
-    Acknowledged,
-    Held,
-    InDoubt,
-});
-stored_enum!(PlanMaterializationState {
-    Pending,
-    Applied,
-    Conflict,
-});
-
-/// The effective runtime selection of the native turn that submitted a plan.
-///
-/// This is deliberately strict JSON rather than a snapshot of the whole chat
-/// request. The continuation needs exactly these five values; consulting the
-/// conversation again would let a later preference/model change move the
-/// second half of one provider transcript to another upstream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NativePlanReviewRuntimeConfig {
-    pub provider_id: String,
-    pub model: String,
-    pub assistant_id: Option<String>,
-    pub thinking_level: Option<crate::provider::capabilities::StoredThinkingLevel>,
-    pub fast: bool,
-    pub project_id: Option<String>,
-    pub project_path: Option<String>,
-    pub accept_edits: bool,
-}
-
-#[cfg(test)]
-impl NativePlanReviewRuntimeConfig {
-    pub fn fixture() -> Self {
-        Self {
-            provider_id: "provider-fixture".into(),
-            model: "model-fixture".into(),
-            assistant_id: None,
-            thinking_level: None,
-            fast: false,
-            project_id: None,
-            project_path: None,
-            accept_edits: false,
-        }
-    }
-}
+// The stored enums and the native runtime config live with the entities,
+// which name them in their columns; re-exported here while the Diesel rows
+// and ops still use them.
+pub use crate::db::entity::plan_comment::{PlanCommentAnchorKind, PlanCommentState};
+pub use crate::db::entity::plan_document::PlanDocumentState;
+pub use crate::db::entity::plan_materialization::PlanMaterializationState;
+pub use crate::db::entity::plan_review_delivery::{PlanDeliveryState, PlanDeliveryTarget};
+pub use crate::db::entity::plan_review_draft::PlanReviewDraftMode;
+pub use crate::db::entity::plan_review_session::{
+    NativePlanReviewRuntimeConfig, PlanReviewProviderKind, PlanReviewState,
+};
+pub use crate::db::entity::plan_revision::PlanRevisionAuthorKind;
 
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]
 #[diesel(table_name = plan_documents)]

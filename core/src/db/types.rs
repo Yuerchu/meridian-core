@@ -268,6 +268,55 @@ macro_rules! text_enum_column {
 }
 pub(crate) use text_enum_column;
 
+/// A closed list stored as text under a `CHECK (<column> IN (…))`: the
+/// `DeriveActiveEnum` with each variant's stored value, and the `as_str` /
+/// `parse` pair the rest of the crate compares with, which take the same
+/// snake_case spelling through strum. The stored values are written out per
+/// variant because `DeriveActiveEnum` needs them as attributes; the entity's
+/// tests hold them to strum's spelling and to the schema's `CHECK`.
+///
+/// `parse` keeps the message the Diesel-era `stored_enum!` gave, since the
+/// plan-review code still reports it.
+macro_rules! checked_text_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident { $($(#[$variant_meta:meta])* $variant:ident = $value:literal),+ $(,)? }
+    ) => {
+        $(#[$meta])*
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            serde::Serialize,
+            strum::IntoStaticStr,
+            strum::EnumString,
+            sea_orm::EnumIter,
+            sea_orm::DeriveActiveEnum,
+        )]
+        #[serde(rename_all = "snake_case")]
+        #[strum(serialize_all = "snake_case")]
+        #[sea_orm(rs_type = "String", db_type = "Text")]
+        pub enum $name {
+            $($(#[$variant_meta])* #[sea_orm(string_value = $value)] $variant),+
+        }
+
+        impl $name {
+            pub fn as_str(self) -> &'static str {
+                self.into()
+            }
+
+            pub fn parse(value: &str) -> Result<Self, String> {
+                value
+                    .parse()
+                    .map_err(|_| format!("unknown {} '{}'", stringify!($name), value))
+            }
+        }
+    };
+}
+pub(crate) use checked_text_enum;
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
