@@ -5,7 +5,6 @@ pub mod assistant;
 pub mod assistant_emoji_pack;
 pub mod audit;
 pub mod cached_model;
-pub mod composer_draft;
 pub mod conversation;
 pub mod emoji;
 pub mod emoji_pack;
