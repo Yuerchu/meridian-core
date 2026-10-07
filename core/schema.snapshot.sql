@@ -28,10 +28,6 @@ CREATE TABLE "projects" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, 
 
 CREATE TABLE "cached_models" ( "id" integer PRIMARY KEY AUTOINCREMENT, "provider_id" text NOT NULL, "model_id" text NOT NULL, "model_name" text NOT NULL, "fetched_at" integer NOT NULL, FOREIGN KEY ("provider_id") REFERENCES "providers" ("id") ON DELETE CASCADE );
 
-CREATE TABLE "skills" ( "dir_name" text PRIMARY KEY, "llm_name" text NOT NULL, "llm_description" text NOT NULL, "display_name" text NOT NULL, "display_description" text, "source" text NOT NULL DEFAULT 'user', "is_enabled" integer NOT NULL DEFAULT 1, "is_builtin" integer NOT NULL DEFAULT 0, "mtime_hash" text, "created_at" integer NOT NULL, "updated_at" integer NOT NULL );
-
-CREATE TABLE "skill_bindings_global" ( "dir_name" text PRIMARY KEY, FOREIGN KEY ("dir_name") REFERENCES "skills" ("dir_name") ON DELETE CASCADE );
-
 CREATE TABLE "skill_bindings_project" ( "project_id" text NOT NULL, "dir_name" text NOT NULL, PRIMARY KEY ("project_id", "dir_name"), FOREIGN KEY ("dir_name") REFERENCES "skills" ("dir_name") ON DELETE CASCADE, FOREIGN KEY ("project_id") REFERENCES "projects" ("id") ON DELETE CASCADE );
 
 CREATE TABLE "skill_bindings_assistant" ( "assistant_id" text NOT NULL, "dir_name" text NOT NULL, PRIMARY KEY ("assistant_id", "dir_name"), FOREIGN KEY ("dir_name") REFERENCES "skills" ("dir_name") ON DELETE CASCADE, FOREIGN KEY ("assistant_id") REFERENCES "assistants" ("id") ON DELETE CASCADE );
@@ -367,8 +363,6 @@ CREATE INDEX "idx_queued_prompts_unreported" ON "queued_prompts" ("conversation_
 
 CREATE INDEX "idx_redaction_rules_scope" ON "redaction_rules" ("scope_type" ASC, "scope_id" ASC, "is_enabled" ASC);
 
-CREATE INDEX "idx_skills_llm_name" ON "skills" ("llm_name" ASC);
-
 CREATE INDEX "idx_todo_items_list" ON "todo_items" ("list_id" ASC, "sort_order" ASC);
 
 CREATE UNIQUE INDEX "idx_todo_lists_active" ON "todo_lists" ("conversation_id" ASC) WHERE status = 'in_progress';
@@ -392,4 +386,10 @@ CREATE TRIGGER trg_messages_count_delete AFTER DELETE ON messages BEGIN UPDATE c
 CREATE TRIGGER trg_messages_count_insert AFTER INSERT ON messages BEGIN UPDATE conversations SET message_count = message_count + 1, updated_at = NEW.created_at WHERE id = NEW.conversation_id; END;
 
 CREATE TRIGGER trg_messages_sort_order AFTER INSERT ON messages FOR EACH ROW WHEN NEW.sort_order = 0 BEGIN UPDATE messages SET sort_order = ( SELECT COALESCE(MAX(sort_order), 0) + 1 FROM messages WHERE conversation_id = NEW.conversation_id ) WHERE id = NEW.id; END;
+
+CREATE TABLE "skills" ( "dir_name" text NOT NULL PRIMARY KEY, "llm_name" text NOT NULL, "llm_description" text NOT NULL, "display_name" text NOT NULL, "display_description" text, "source" text NOT NULL DEFAULT 'user', "is_enabled" integer NOT NULL DEFAULT 1, "is_builtin" integer NOT NULL DEFAULT 0, "mtime_hash" text, "created_at" integer NOT NULL, "updated_at" integer NOT NULL, CHECK (length(dir_name) BETWEEN 1 AND 64 AND dir_name NOT GLOB '*[^-a-z0-9]*' AND dir_name NOT GLOB '-*' AND dir_name NOT GLOB '*-') );
+
+CREATE INDEX "idx_skills_llm_name" ON "skills" ("llm_name" ASC);
+
+CREATE TABLE "skill_bindings_global" ( "dir_name" text NOT NULL PRIMARY KEY, FOREIGN KEY ("dir_name") REFERENCES "skills" ("dir_name") ON DELETE CASCADE );
 
