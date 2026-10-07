@@ -17,6 +17,7 @@ pub mod mcp_server;
 pub mod notification_alert_state;
 pub mod notification_webhook;
 pub mod preference;
+pub mod redaction_rule;
 pub mod tool_category;
 pub mod tool_preset;
 pub mod voice_blob;
@@ -63,7 +64,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "providers",
     "queued_prompt_context_items",
     "queued_prompts",
-    "redaction_rules",
     "skill_bindings_assistant",
     "skill_bindings_global",
     "skill_bindings_project",
@@ -120,6 +120,7 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<notification_alert_state::Entity>(),
         shape_of::<notification_webhook::Entity>(),
         shape_of::<preference::Entity>(),
+        shape_of::<redaction_rule::Entity>(),
         shape_of::<tool_category::Entity>(),
         shape_of::<tool_preset::Entity>(),
         shape_of::<voice_blob::Entity>(),

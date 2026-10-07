@@ -114,6 +114,7 @@ fn context(job: &Job<'_>, cancel: &CancellationToken) -> ToolContext {
         job.conversation_id,
         job.turn_id,
         job.services.db.clone(),
+        Some(job.services.sea.clone()),
         cancel,
     )
 }
@@ -127,6 +128,7 @@ fn build_context(
     conversation_id: &str,
     turn_id: &str,
     db_pool: crate::db::DbPool,
+    sea: Option<crate::db::sea::cap::Db>,
     cancel: &CancellationToken,
 ) -> ToolContext {
     ToolContext {
@@ -150,6 +152,7 @@ fn build_context(
         turn_id: Some(turn_id.to_string()),
         assistant_id: None,
         db_pool: Some(db_pool),
+        sea,
         #[cfg(not(target_os = "android"))]
         sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
         // None of the four read a credential. An empty map is the honest
@@ -342,7 +345,15 @@ mod tests {
     use crate::db::diesel_test_db;
 
     fn context_under(access: FileAccess, cwd: Option<&str>) -> ToolContext {
-        build_context(cwd, &access, "c1", "t1", diesel_test_db(), &CancellationToken::new())
+        build_context(
+            cwd,
+            &access,
+            "c1",
+            "t1",
+            diesel_test_db(),
+            None,
+            &CancellationToken::new(),
+        )
     }
 
     /// The escalating pass must not be able to read anything the turn could

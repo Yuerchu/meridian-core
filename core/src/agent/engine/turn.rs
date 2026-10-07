@@ -2156,6 +2156,7 @@ mod tests {
             turn_id: Some("t1".into()),
             assistant_id: None,
             db_pool: Some(pool.clone()),
+            sea: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: Default::default(),
