@@ -29,11 +29,6 @@ pub fn update_provider(
     providers::table.find(id).first::<ProviderRow>(conn)
 }
 
-pub fn delete_provider(conn: &mut SqliteConnection, id: &str) -> QueryResult<()> {
-    diesel::delete(providers::table.find(id)).execute(conn)?;
-    Ok(())
-}
-
 pub fn count_providers(conn: &mut SqliteConnection) -> QueryResult<i64> {
     providers::table.count().get_result(conn)
 }

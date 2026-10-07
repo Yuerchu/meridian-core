@@ -47,6 +47,16 @@ pub async fn replace_models(
     Ok(())
 }
 
+/// How many rows went. A changed address, transport or key makes the list
+/// stale; the next open fetches it again.
+pub async fn delete_by_provider(tx: &WriteTx, pid: &str) -> Result<u64, DbErr> {
+    Ok(cached_model::Entity::delete_many()
+        .filter(cached_model::Column::ProviderId.eq(pid))
+        .exec(tx.conn()?)
+        .await?
+        .rows_affected)
+}
+
 /// What is cached for one provider, and nothing else: no request leaves the
 /// machine. For the settings page, which only needs to say which configured
 /// models the provider's list names, and must not make a network request (or

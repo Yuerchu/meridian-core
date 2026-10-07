@@ -56,6 +56,24 @@ impl Related<super::assistant::Entity> for Entity {
 
 impl ActiveModelBehavior for ActiveModel {}
 
+/// A partial update: a field left `None` is not written. `catalog_id` and
+/// `icon` are nullable, so `Some(None)` clears one.
+#[derive(Debug, Default, DeriveIntoActiveModel)]
+pub struct ProviderChangeset {
+    pub name: Option<String>,
+    pub provider_type: Option<ProviderType>,
+    pub base_url: Option<String>,
+    pub is_enabled: Option<SqlBool>,
+    pub sort_order: Option<i32>,
+    pub updated_at: Option<EpochMs>,
+    pub api_format: Option<ApiFormat>,
+    pub credential_kind: Option<CredentialKind>,
+    pub transport_profile: Option<TransportProfile>,
+    pub catalog_id: Option<Option<String>>,
+    pub icon: Option<Option<String>>,
+    pub codex_request_shape: Option<SqlBool>,
+}
+
 // The registry's enums are used far beyond this table; none of the four
 // columns has a `CHECK`, so each type's `parse` is what keeps it closed.
 text_enum_column!(ProviderType);

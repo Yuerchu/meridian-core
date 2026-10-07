@@ -5,10 +5,20 @@
 //! it, and stays a dual implementation (`docs/dual-impl.md`) until the last
 //! Diesel caller has moved.
 
-use sea_orm::{DbErr, EntityTrait};
+use sea_orm::{DbErr, EntityTrait, QuerySelect};
 
 use crate::db::entity::conversation;
 use crate::db::sea::cap::Read;
+
+/// Every conversation's id, in no particular order.
+pub async fn all_ids(db: &impl Read) -> Result<Vec<String>, DbErr> {
+    conversation::Entity::find()
+        .select_only()
+        .column(conversation::Column::Id)
+        .into_tuple()
+        .all(db.conn()?)
+        .await
+}
 
 /// `None` for an id with no row. The Diesel version answers `NotFound`
 /// instead, which its callers match on; here the absence is in the type.
@@ -36,5 +46,6 @@ mod tests {
             (Some("Hi"), true, 6)
         );
         assert_eq!(get_conversation(&db, "c2").await.unwrap(), None);
+        assert_eq!(all_ids(&db).await.unwrap(), ["c1"]);
     }
 }

@@ -113,6 +113,7 @@ pub async fn run(db: &Db, key: &[u8], app_data_dir: &Path, writable: bool) -> Re
     // 4. 没有任何 clip 指着的行——写完 blob、还没写 clip 就死了。**排在标坏
     //    之后**：一个刚被标坏又没人引用的行，排在前面就要再等一次启动才走得掉，
     //    而它的文件在那之前一直占着地方。
+    // pool-read-before-write: under the corpus lock (see step 1).
     let orphans = ops::orphaned(db).await.map_err(|e| e.to_string())?;
     if !orphans.is_empty() {
         let ids = {
@@ -136,6 +137,7 @@ pub async fn run(db: &Db, key: &[u8], app_data_dir: &Path, writable: bool) -> Re
     }
 
     // 5. 墓碑：接着删。删成功了行才走。
+    // pool-read-before-write: under the corpus lock (see step 1).
     let tombstones = ops::tombstones(db).await.map_err(|e| e.to_string())?;
     if !tombstones.is_empty() {
         let cleared = {

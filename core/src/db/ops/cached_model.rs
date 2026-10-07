@@ -1,8 +1,6 @@
-//! What is left of the Diesel cached-model ops: the two that run on a Diesel
-//! connection beside other Diesel work. `list_by_provider` is read by
-//! `agent::sub_agents::catalog` with the provider and model-config reads;
-//! `delete_by_provider` runs inside the provider commands' plan-barrier
-//! transactions. Everything else is `db::sea::ops::cached_model`.
+//! What is left of the Diesel cached-model ops: `list_by_provider`, read by
+//! `agent::sub_agents::catalog` on a Diesel connection beside the provider and
+//! model-config reads. Everything else is `db::sea::ops::cached_model`.
 
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
@@ -15,8 +13,4 @@ pub fn list_by_provider(conn: &mut SqliteConnection, pid: &str) -> QueryResult<V
         .filter(cached_models::provider_id.eq(pid))
         .order(cached_models::model_id.asc())
         .load::<CachedModelRow>(conn)
-}
-
-pub fn delete_by_provider(conn: &mut SqliteConnection, pid: &str) -> QueryResult<usize> {
-    diesel::delete(cached_models::table.filter(cached_models::provider_id.eq(pid))).execute(conn)
 }
