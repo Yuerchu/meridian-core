@@ -369,9 +369,12 @@ pub fn resolve_file_uris_in_messages(
 /// text/image parts. Confirmed stickers are semantic text. An unlabelled sticker
 /// is shown only on the current turn; old unknown stickers stay a placeholder so
 /// history does not repeatedly pay for the same pixels.
-pub fn resolve_sticker_parts_in_messages(
+///
+/// `db` is `None` for a runner with no services (tests); sticker parts are
+/// then left as they are, as they were when the pool could not be reached.
+pub async fn resolve_sticker_parts_in_messages(
     messages: &mut [ChatMessage],
-    pool: &crate::db::DbPool,
+    db: Option<&crate::db::sea::cap::Db>,
     data_dir: Option<&std::path::Path>,
     include_current_visual: bool,
 ) -> Result<(), String> {
@@ -386,7 +389,7 @@ pub fn resolve_sticker_parts_in_messages(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let current_user = decoded.iter().rposition(Option::is_some);
-    let Ok(mut conn) = pool.get() else { return Ok(()) };
+    let Some(db) = db else { return Ok(()) };
 
     for (message_index, (message, parts)) in messages.iter_mut().zip(decoded).enumerate() {
         let Some(parts) = parts else { continue };
@@ -398,13 +401,13 @@ pub fn resolve_sticker_parts_in_messages(
                 continue;
             };
             changed = true;
-            let Ok(sticker) = crate::db::ops::emoji::get_emoji(&mut conn, &sticker_id) else {
+            let Ok(Some(sticker)) = crate::db::sea::ops::emoji::get_emoji(db, &sticker_id).await else {
                 provider_parts.push(provider::MessageContentPart::Text {
                     text: "[unavailable sticker]".into(),
                 });
                 continue;
             };
-            if sticker.semantic_status == "confirmed" {
+            if sticker.semantic_status == crate::db::entity::emoji::EmojiSemanticStatus::Confirmed {
                 let tags = sticker.tags.as_deref().filter(|tags| !tags.trim().is_empty());
                 let description = match tags {
                     Some(tags) => format!("[sticker: {}; tags: {}]", sticker.name, tags),
@@ -954,55 +957,33 @@ mod tests {
         assert!(error.contains("invalid persisted message content parts"), "{error}");
     }
 
-    #[test]
-    fn sticker_parts_become_semantics_and_old_unknowns_do_not_resend_pixels() {
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::emoji_pack::create_pack(
-            &mut conn,
-            &crate::db::models::emoji_pack::EmojiPackInsert {
-                id: "p1",
-                name: "pack",
-                description: None,
-                cover_image: None,
-                is_builtin: 0,
-                sort_order: 0,
-                created_at: 1,
-                updated_at: 1,
-                kind: "manual",
-                source_account_id: None,
-            },
-        )
-        .unwrap();
-        let make = |id, name, status| crate::db::models::emoji::EmojiInsert {
-            id,
-            pack_id: "p1",
-            name,
-            tags: Some("reaction"),
-            file_name: "",
-            file_format: "",
-            sort_order: 0,
-            created_at: 1,
-            source: "local",
-            source_key: None,
-            native_payload: None,
-            semantic_status: status,
-            suggested_name: None,
-            suggested_tags: None,
-            file_size: 0,
-            seen_count: 1,
-            last_seen_at: Some(1),
+    #[tokio::test]
+    async fn sticker_parts_become_semantics_and_old_unknowns_do_not_resend_pixels() {
+        use crate::db::entity::emoji::EmojiSemanticStatus;
+        use crate::db::entity::emoji_pack::EmojiPackKind;
+        use crate::db::sea::ops::emoji::tests::{insert, sticker};
+        use crate::db::sea::ops::emoji_pack::tests::{insert as insert_pack, pack};
+
+        let db = crate::db::sea::sea_test_db().await;
+        insert_pack(&db, pack("p1", EmojiPackKind::Manual, None, 0)).await;
+        let make = |id: &str, name: &str, status| {
+            let mut row = sticker(id, "p1", status);
+            row.name = name.into();
+            row.tags = Some("reaction".into());
+            row.file_name = String::new();
+            row
         };
-        crate::db::ops::emoji::create_emoji(&mut conn, &make("known", "wave", "confirmed")).unwrap();
-        crate::db::ops::emoji::create_emoji(&mut conn, &make("unknown", "pending-x", "pending")).unwrap();
-        drop(conn);
+        insert(&db, make("known", "wave", EmojiSemanticStatus::Confirmed)).await;
+        insert(&db, make("unknown", "pending-x", EmojiSemanticStatus::Pending)).await;
 
         let mut messages = vec![
             ChatMessage::user(r#"[{"type":"sticker","sticker_id":"unknown"}]"#),
             ChatMessage::assistant("ok"),
             ChatMessage::user(r#"[{"type":"sticker","sticker_id":"known"},{"type":"sticker","sticker_id":"unknown"}]"#),
         ];
-        resolve_sticker_parts_in_messages(&mut messages, &pool, None, true).unwrap();
+        resolve_sticker_parts_in_messages(&mut messages, Some(&db), None, true)
+            .await
+            .unwrap();
         assert!(messages[0].content.contains("[unlabelled sticker]"));
         assert!(!messages[0].content.contains("image_url"));
         assert!(messages[2].content.contains("[sticker: wave; tags: reaction]"));

@@ -1,3 +1,9 @@
+//! What is left of the Diesel sticker ops. Linking a sticker to a message stays
+//! here because `message_stickers` references `messages`, which is still Diesel's;
+//! the other three are what `turn_config::resolve`, the composer-draft read and
+//! the tests still call on a Diesel connection, counted in `docs/dual-impl.md`. Everything
+//! else is `db::sea::ops::emoji`.
+
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
@@ -5,41 +11,9 @@ use crate::db::models::emoji::{EmojiInsert, EmojiRow};
 use crate::db::models::message_sticker::MessageStickerInsert;
 use crate::db::schema::{emojis, message_stickers};
 
-pub fn list_by_pack(conn: &mut SqliteConnection, pack_id: &str) -> QueryResult<Vec<EmojiRow>> {
-    emojis::table
-        .filter(emojis::pack_id.eq(pack_id))
-        .order(emojis::sort_order.asc())
-        .load::<EmojiRow>(conn)
-}
-
-pub fn get_emoji(conn: &mut SqliteConnection, id: &str) -> QueryResult<EmojiRow> {
-    emojis::table.find(id).first::<EmojiRow>(conn)
-}
-
 pub fn create_emoji(conn: &mut SqliteConnection, new: &EmojiInsert) -> QueryResult<EmojiRow> {
     diesel::insert_into(emojis::table).values(new).execute(conn)?;
     emojis::table.find(new.id).first::<EmojiRow>(conn)
-}
-
-pub fn rename_emoji(conn: &mut SqliteConnection, id: &str, new_name: &str) -> QueryResult<EmojiRow> {
-    diesel::update(emojis::table.find(id))
-        .set(emojis::name.eq(new_name))
-        .execute(conn)?;
-    emojis::table.find(id).first::<EmojiRow>(conn)
-}
-
-pub fn delete_emoji(conn: &mut SqliteConnection, id: &str) -> QueryResult<()> {
-    diesel::delete(emojis::table.find(id)).execute(conn)?;
-    Ok(())
-}
-
-pub fn search_emojis(conn: &mut SqliteConnection, query: &str) -> QueryResult<Vec<EmojiRow>> {
-    let pattern = format!("%{query}%");
-    emojis::table
-        .filter(emojis::name.like(&pattern).or(emojis::tags.like(&pattern)))
-        .order(emojis::sort_order.asc())
-        .limit(50)
-        .load::<EmojiRow>(conn)
 }
 
 pub fn list_confirmed_for_packs(conn: &mut SqliteConnection, pack_ids: &[String]) -> QueryResult<Vec<EmojiRow>> {
@@ -49,91 +23,6 @@ pub fn list_confirmed_for_packs(conn: &mut SqliteConnection, pack_ids: &[String]
         .filter(emojis::file_format.ne("lottie"))
         .order((emojis::pack_id.asc(), emojis::sort_order.asc()))
         .load::<EmojiRow>(conn)
-}
-
-pub fn list_candidates(conn: &mut SqliteConnection, pack_id: &str) -> QueryResult<Vec<EmojiRow>> {
-    emojis::table
-        .filter(emojis::pack_id.eq(pack_id))
-        .filter(emojis::semantic_status.ne("confirmed"))
-        .order((emojis::last_seen_at.desc(), emojis::seen_count.desc()))
-        .load(conn)
-}
-
-pub fn update_suggestion(
-    conn: &mut SqliteConnection,
-    id: &str,
-    name: &str,
-    tags: Option<&str>,
-) -> QueryResult<EmojiRow> {
-    diesel::update(emojis::table.find(id))
-        .set((
-            emojis::suggested_name.eq(Some(name)),
-            emojis::suggested_tags.eq(tags),
-            emojis::semantic_status.eq("suggested"),
-        ))
-        .execute(conn)?;
-    get_emoji(conn, id)
-}
-
-pub fn confirm_semantics(
-    conn: &mut SqliteConnection,
-    id: &str,
-    name: &str,
-    tags: Option<&str>,
-) -> QueryResult<EmojiRow> {
-    diesel::update(emojis::table.find(id))
-        .set((
-            emojis::name.eq(name),
-            emojis::tags.eq(tags),
-            emojis::suggested_name.eq::<Option<&str>>(None),
-            emojis::suggested_tags.eq::<Option<&str>>(None),
-            emojis::semantic_status.eq("confirmed"),
-        ))
-        .execute(conn)?;
-    get_emoji(conn, id)
-}
-
-pub fn find_by_source_key(
-    conn: &mut SqliteConnection,
-    pack_id: &str,
-    source: &str,
-    source_key: &str,
-) -> QueryResult<Option<EmojiRow>> {
-    emojis::table
-        .filter(emojis::pack_id.eq(pack_id))
-        .filter(emojis::source.eq(source))
-        .filter(emojis::source_key.eq(source_key))
-        .first(conn)
-        .optional()
-}
-
-pub fn mark_seen(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<EmojiRow> {
-    diesel::update(emojis::table.find(id))
-        .set((
-            emojis::seen_count.eq(emojis::seen_count + 1),
-            emojis::last_seen_at.eq(Some(now)),
-        ))
-        .execute(conn)?;
-    get_emoji(conn, id)
-}
-
-pub fn attach_captured_media(
-    conn: &mut SqliteConnection,
-    id: &str,
-    file_name: &str,
-    file_format: &str,
-    file_size: i64,
-    native_payload: &str,
-) -> QueryResult<EmojiRow> {
-    diesel::update(emojis::table.find(id))
-        .set((
-            emojis::file_name.eq(file_name),
-            emojis::file_format.eq(file_format),
-            emojis::file_size.eq(file_size),
-            emojis::native_payload.eq(Some(native_payload)),
-        ))
-        .execute(conn)?;
-    get_emoji(conn, id)
 }
 
 pub fn link_message_sticker(
@@ -167,18 +56,41 @@ pub fn link_stickers_in_content(conn: &mut SqliteConnection, message_id: &str, c
     Ok(())
 }
 
-pub fn is_referenced(conn: &mut SqliteConnection, sticker_id: &str) -> QueryResult<bool> {
-    use diesel::dsl::{exists, select};
-    select(exists(
-        message_stickers::table.filter(message_stickers::sticker_id.eq(sticker_id)),
-    ))
-    .get_result(conn)
-}
+/// One sticker, as the SeaORM model, for the composer-draft read that still
+/// runs on a Diesel connection beside its conversation lookups. Held to the
+/// checks a SeaORM read makes: an unknown source or status, and a payload that
+/// is not a JSON object, are errors.
+pub fn get_emoji(conn: &mut SqliteConnection, id: &str) -> Result<crate::db::entity::emoji::Model, String> {
+    use sea_orm::ActiveEnum;
 
-pub fn count_by_pack(conn: &mut SqliteConnection, pack_id: &str) -> QueryResult<i64> {
-    use diesel::dsl::count_star;
-    emojis::table
-        .filter(emojis::pack_id.eq(pack_id))
-        .select(count_star())
-        .first(conn)
+    use crate::db::entity::emoji;
+    use crate::db::entity::emoji::{EmojiSemanticStatus, EmojiSource};
+
+    let row = emojis::table
+        .find(id)
+        .first::<EmojiRow>(conn)
+        .map_err(|e| e.to_string())?;
+    Ok(emoji::Model {
+        source: EmojiSource::try_from_value(&row.source).map_err(|e| e.to_string())?,
+        semantic_status: EmojiSemanticStatus::try_from_value(&row.semantic_status).map_err(|e| e.to_string())?,
+        native_payload: row
+            .native_payload
+            .as_deref()
+            .map(crate::db::types::Json::decode)
+            .transpose()?,
+        id: row.id,
+        pack_id: row.pack_id,
+        name: row.name,
+        tags: row.tags,
+        file_name: row.file_name,
+        file_format: row.file_format,
+        sort_order: row.sort_order,
+        created_at: row.created_at,
+        source_key: row.source_key,
+        suggested_name: row.suggested_name,
+        suggested_tags: row.suggested_tags,
+        file_size: row.file_size,
+        seen_count: row.seen_count,
+        last_seen_at: row.last_seen_at,
+    })
 }

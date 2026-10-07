@@ -4,18 +4,6 @@ use image::AnimationDecoder;
 
 const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024; // 5MB
 
-pub fn parse_native_payload(sticker_id: &str, raw: Option<&str>) -> Result<serde_json::Value, String> {
-    let payload = match raw {
-        Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
-            .map_err(|error| format!("Sticker {sticker_id} has invalid native_payload JSON: {error}"))?,
-        None => serde_json::json!({}),
-    };
-    if !payload.is_object() {
-        return Err(format!("Sticker {sticker_id} native_payload must be a JSON object"));
-    }
-    Ok(payload)
-}
-
 pub fn packs_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("emoji_packs")
 }
@@ -412,18 +400,6 @@ mod tests {
             emoji_path(data, "p1", "wave.gif"),
             PathBuf::from("/app/data/emoji_packs/p1/wave.gif"),
         );
-    }
-
-    #[test]
-    fn native_payload_requires_a_json_object() {
-        assert_eq!(parse_native_payload("s1", None).unwrap(), serde_json::json!({}));
-        assert_eq!(
-            parse_native_payload("s1", Some(r#"{"url":"https://example.test/a.gif"}"#)).unwrap()["url"],
-            "https://example.test/a.gif"
-        );
-        assert!(parse_native_payload("s1", Some("not-json")).is_err());
-        assert!(parse_native_payload("s1", Some("[]")).is_err());
-        assert!(parse_native_payload("s1", Some("null")).is_err());
     }
 
     #[test]

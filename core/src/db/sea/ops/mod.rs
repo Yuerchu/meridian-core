@@ -5,6 +5,8 @@
 //! in step.
 
 pub mod custom_tool;
+pub mod emoji;
+pub mod emoji_pack;
 pub mod journal;
 pub mod mcp_server;
 pub mod notification;
