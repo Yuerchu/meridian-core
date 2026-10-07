@@ -9,12 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
-use diesel::sqlite::SqliteConnection;
-
 use super::project_instructions::{MAX_FILE_SIZE, compute_mtime_hash, read_file_utf8};
-use crate::db;
-use crate::db::models::skill::{SkillInsert, SkillRow};
-use crate::db::models::skill_binding::SkillLayer;
+use crate::db::entity::skill;
+use crate::db::entity::skill::SkillSource;
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops::skill_binding::SkillLayer;
+use crate::db::sea::ops::{preference as preference_ops, skill as skill_ops, skill_binding as skill_binding_ops};
+use crate::db::types::SqlBool;
 use crate::util::now_ms;
 
 /// Cap on how much of SKILL.md is read while scanning. Frontmatter sits at the
@@ -326,67 +327,77 @@ fn skill_dir(root: &Path, dir_name: &str) -> Option<PathBuf> {
 
 /// Reconcile the index with what is actually on disk. The filesystem wins:
 /// directories that vanished lose their rows (and, by cascade, their bindings).
-pub fn sync_index(conn: &mut SqliteConnection, root: &Path) -> Result<Vec<SkillRow>, String> {
-    let found = scan_skills(root);
-    let now = now_ms();
-
-    for meta in &found {
-        let source = if crate::agent::is_builtin_skill_dir(&meta.dir_name) {
-            "official"
-        } else {
-            "user"
-        };
-        let is_builtin = i32::from(source == "official");
-        // Display fields default to the LLM-facing ones on first sight; the user
-        // can rename them afterwards without a rescan clobbering the change.
-        let existing = db::ops::skill::get_skill(conn, &meta.dir_name).ok();
-        let display_name = existing
-            .as_ref()
-            .map(|s| s.display_name.clone())
-            .unwrap_or_else(|| meta.llm_name.clone());
-        let display_description = existing.as_ref().and_then(|s| s.display_description.clone());
-
-        db::ops::skill::upsert_skill(
-            conn,
-            &SkillInsert {
-                dir_name: &meta.dir_name,
-                llm_name: &meta.llm_name,
-                llm_description: &meta.llm_description,
-                display_name: &display_name,
-                display_description: display_description.as_deref(),
-                source,
-                is_enabled: 1,
-                is_builtin,
-                mtime_hash: Some(&meta.mtime_hash),
-                created_at: now,
-                updated_at: now,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    // A directory that cannot be read scans as empty, and `delete_missing` with
-    // an empty list deletes every row — taking all bindings with it by cascade.
-    // Guarding the destructive half means a transient read failure costs one
-    // launch's listing rather than the user's whole skill library.
-    if found.is_empty() && std::fs::read_dir(root).is_err() {
+///
+/// The scan runs off the runtime; the whole reconcile is one write, so two
+/// rescans (a launch and a settings click) cannot interleave their upserts and
+/// deletes, and a failure leaves the index as it was.
+pub async fn sync_index(db: &Db, root: &Path) -> Result<Vec<skill::Model>, String> {
+    let scan_root = root.to_path_buf();
+    let (found, unreadable) = tokio::task::spawn_blocking(move || {
+        let found = scan_skills(&scan_root);
+        // A directory that cannot be read scans as empty, and `delete_missing`
+        // with an empty list deletes every row — taking all bindings with it by
+        // cascade. Guarding the destructive half means a transient read failure
+        // costs one launch's listing rather than the user's whole skill library.
+        let unreadable = found.is_empty() && std::fs::read_dir(&scan_root).is_err();
+        (found, unreadable)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if unreadable {
+        // pool-read-before-write: this branch reads the index and returns; it
+        // never reaches the write below.
         tracing::error!(
             skills_root = %root.display(),
             "skills directory unreadable; keeping the existing index rather than clearing it"
         );
-        return db::ops::skill::list_skills(conn).map_err(|e| e.to_string());
+        return skill_ops::list_skills(db).await.map_err(|e| e.to_string());
     }
 
-    let present: Vec<String> = found.iter().map(|m| m.dir_name.clone()).collect();
-    let removed = db::ops::skill::delete_missing(conn, &present).map_err(|e| e.to_string())?;
-    if removed > 0 {
-        tracing::info!(
-            rows_deleted = removed,
-            scanned = found.len(),
-            "dropped skills that are no longer on disk"
-        );
-    }
-    db::ops::skill::list_skills(conn).map_err(|e| e.to_string())
+    let now = now_ms();
+    db.write(async |tx| {
+        for meta in &found {
+            let source = if crate::agent::is_builtin_skill_dir(&meta.dir_name) {
+                SkillSource::Official
+            } else {
+                SkillSource::User
+            };
+            // Display fields default to the LLM-facing ones on first sight; the
+            // user can rename them afterwards without a rescan clobbering the
+            // change.
+            let existing = skill_ops::get_skill(tx, &meta.dir_name).await?;
+            let row = skill::Model {
+                dir_name: meta.dir_name.clone(),
+                llm_name: meta.llm_name.clone(),
+                llm_description: meta.llm_description.clone(),
+                display_name: existing
+                    .as_ref()
+                    .map_or_else(|| meta.llm_name.clone(), |s| s.display_name.clone()),
+                display_description: existing.and_then(|s| s.display_description),
+                source,
+                // Only on insert: the upsert leaves an existing row's flag alone.
+                is_enabled: SqlBool::TRUE,
+                is_builtin: (source == SkillSource::Official).into(),
+                mtime_hash: Some(meta.mtime_hash.clone()),
+                created_at: now,
+                updated_at: now,
+            };
+            skill_ops::upsert_skill(tx, row).await?;
+        }
+
+        let present: Vec<String> = found.iter().map(|m| m.dir_name.clone()).collect();
+        let removed = skill_ops::delete_missing(tx, &present).await?;
+        if removed > 0 {
+            tracing::info!(
+                rows_deleted = removed,
+                scanned = found.len(),
+                "dropped skills that are no longer on disk"
+            );
+        }
+        skill_ops::list_skills(tx).await
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 fn autobind_key(dir_name: &str) -> String {
@@ -406,19 +417,25 @@ fn autobind_key(dir_name: &str) -> String {
 ///
 /// Must run after `sync_index`: the binding tables carry a foreign key onto
 /// `skills.dir_name`, and that row is what `sync_index` creates.
-pub fn seed_builtin_bindings(conn: &mut SqliteConnection) {
+pub async fn seed_builtin_bindings(db: &Db) {
     for dir_name in crate::agent::BUILTIN_SKILL_DIRS {
         let key = autobind_key(dir_name);
-        let already_seeded = db::ops::preference::get_preference(conn, &key).ok().flatten().is_some();
-        if already_seeded {
-            continue;
-        }
-        // The flag is written only once the binding lands, so a bind that failed
-        // because indexing did not happen retries on the next launch instead of
-        // being skipped for good. Deliberately skips the per-anchor cap that the
-        // command layer enforces: two built-ins are not what that limit is for.
-        if db::ops::skill_binding::bind(conn, SkillLayer::Global, None, dir_name).is_ok() {
-            let _ = db::ops::preference::set_preference(conn, &key, "1", now_ms());
+        // The flag and the binding commit together, so a bind that failed
+        // because indexing did not happen leaves no flag and retries on the
+        // next launch instead of being skipped for good. Deliberately skips the
+        // per-anchor cap that the command layer enforces: two built-ins are not
+        // what that limit is for.
+        let seeded = db
+            .write(async |tx| {
+                if preference_ops::get_preference(tx, &key).await?.is_some() {
+                    return Ok(());
+                }
+                skill_binding_ops::bind(tx, SkillLayer::Global, None, dir_name).await?;
+                preference_ops::set_preference(tx, &key, "1", now_ms()).await
+            })
+            .await;
+        if let Err(error) = seeded {
+            tracing::debug!(dir_name, error = %error, "built-in skill not bound this launch");
         }
     }
 }
@@ -623,22 +640,27 @@ mod tests {
         assert!(scan_skills(&dir.path().join("does-not-exist")).is_empty());
     }
 
-    use crate::db::diesel_test_db;
-    use crate::db::models::skill::SkillChangeset;
+    use crate::db::entity::skill::SkillChangeset;
+    use crate::db::sea::sea_test_db;
 
-    #[test]
-    fn sync_indexes_disk_and_drops_vanished_skills() {
+    async fn global_bindings(db: &Db) -> Vec<String> {
+        skill_binding_ops::list_layer(db, SkillLayer::Global, None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_indexes_disk_and_drops_vanished_skills() {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "one", "one", "First", "b").unwrap();
         write_skill_file(dir.path(), "two", "two", "Second", "b").unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        let indexed = sync_index(&mut conn, dir.path()).unwrap();
+        let db = sea_test_db().await;
+        let indexed = sync_index(&db, dir.path()).await.unwrap();
         assert_eq!(indexed.len(), 2);
 
         delete_skill_dir(dir.path(), "two").unwrap();
-        let after = sync_index(&mut conn, dir.path()).unwrap();
+        let after = sync_index(&db, dir.path()).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].dir_name, "one");
     }
@@ -646,114 +668,111 @@ mod tests {
     /// An unreadable directory scans as empty, and an empty scan used to mean
     /// "delete everything" — one bad launch would take the whole library and,
     /// by cascade, every binding.
-    #[test]
-    fn an_unreadable_skills_directory_does_not_wipe_the_index() {
+    #[tokio::test]
+    async fn an_unreadable_skills_directory_does_not_wipe_the_index() {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "one", "one", "First", "b").unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        assert_eq!(sync_index(&mut conn, dir.path()).unwrap().len(), 1);
+        let db = sea_test_db().await;
+        assert_eq!(sync_index(&db, dir.path()).await.unwrap().len(), 1);
 
         // Unmounted volume, revoked permissions, a path that moved.
         let gone = dir.path().join("not-here");
-        let after = sync_index(&mut conn, &gone).unwrap();
+        let after = sync_index(&db, &gone).await.unwrap();
 
         assert_eq!(after.len(), 1, "the index was cleared by a directory it could not read");
     }
 
     /// The guard must not overreach: a readable directory that is genuinely
     /// empty still means the skills are gone.
-    #[test]
-    fn an_empty_but_readable_directory_still_clears_the_index() {
+    #[tokio::test]
+    async fn an_empty_but_readable_directory_still_clears_the_index() {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "one", "one", "First", "b").unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        sync_index(&mut conn, dir.path()).unwrap();
+        let db = sea_test_db().await;
+        sync_index(&db, dir.path()).await.unwrap();
 
         let empty = tempfile::tempdir().unwrap();
-        let after = sync_index(&mut conn, empty.path()).unwrap();
+        let after = sync_index(&db, empty.path()).await.unwrap();
 
         assert!(after.is_empty(), "{after:?}");
     }
 
-    #[test]
-    fn sync_picks_up_edited_descriptions() {
+    #[tokio::test]
+    async fn sync_picks_up_edited_descriptions() {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "s", "s", "Before", "b").unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        sync_index(&mut conn, dir.path()).unwrap();
+        let db = sea_test_db().await;
+        sync_index(&db, dir.path()).await.unwrap();
 
         write_skill_file(dir.path(), "s", "s", "After", "b").unwrap();
-        let after = sync_index(&mut conn, dir.path()).unwrap();
+        let after = sync_index(&db, dir.path()).await.unwrap();
         assert_eq!(after[0].llm_description, "After");
     }
 
-    #[test]
-    fn sync_preserves_a_renamed_display_name() {
+    #[tokio::test]
+    async fn sync_preserves_a_renamed_display_name() {
         let dir = tempfile::tempdir().unwrap();
         write_skill_file(dir.path(), "s", "s", "D", "b").unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        sync_index(&mut conn, dir.path()).unwrap();
-        db::ops::skill::update_skill(
-            &mut conn,
-            "s",
-            &SkillChangeset {
-                display_name: Some("我的技能".into()),
-                ..Default::default()
-            },
-        )
+        let db = sea_test_db().await;
+        sync_index(&db, dir.path()).await.unwrap();
+        db.write(async |tx| {
+            skill_ops::update_skill(
+                tx,
+                "s",
+                SkillChangeset {
+                    display_name: Some("我的技能".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+        })
+        .await
         .unwrap();
 
-        let after = sync_index(&mut conn, dir.path()).unwrap();
+        let after = sync_index(&db, dir.path()).await.unwrap();
         assert_eq!(after[0].display_name, "我的技能");
     }
 
-    #[test]
-    fn the_generated_manual_is_marked_builtin() {
+    #[tokio::test]
+    async fn the_generated_manual_is_marked_builtin() {
         let dir = tempfile::tempdir().unwrap();
         crate::agent::manual::write_manual(dir.path(), &[]).unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        let indexed = sync_index(&mut conn, dir.path()).unwrap();
+        let db = sea_test_db().await;
+        let indexed = sync_index(&db, dir.path()).await.unwrap();
 
         assert_eq!(indexed.len(), 1);
-        assert_eq!(indexed[0].source, "official");
-        assert_eq!(indexed[0].is_builtin, 1);
+        assert_eq!(indexed[0].source, SkillSource::Official);
+        assert!(indexed[0].is_builtin.get());
     }
 
-    #[test]
-    fn the_diagnostics_skill_is_recognised_as_official_too() {
+    #[tokio::test]
+    async fn the_diagnostics_skill_is_recognised_as_official_too() {
         let dir = tempfile::tempdir().unwrap();
         crate::agent::diagnostics::write_diagnostics(dir.path()).unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        let indexed = sync_index(&mut conn, dir.path()).unwrap();
+        let db = sea_test_db().await;
+        let indexed = sync_index(&db, dir.path()).await.unwrap();
 
         assert_eq!(indexed.len(), 1);
-        assert_eq!(indexed[0].is_builtin, 1);
+        assert!(indexed[0].is_builtin.get());
     }
 
-    #[test]
-    fn built_in_skills_are_bound_on_first_launch() {
+    #[tokio::test]
+    async fn built_in_skills_are_bound_on_first_launch() {
         let dir = tempfile::tempdir().unwrap();
         crate::agent::manual::write_manual(dir.path(), &[]).unwrap();
         crate::agent::diagnostics::write_diagnostics(dir.path()).unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        sync_index(&mut conn, dir.path()).unwrap();
-        seed_builtin_bindings(&mut conn);
+        let db = sea_test_db().await;
+        sync_index(&db, dir.path()).await.unwrap();
+        seed_builtin_bindings(&db).await;
 
-        let bound = db::ops::skill_binding::list_layer(&mut conn, SkillLayer::Global, None).unwrap();
+        let bound = global_bindings(&db).await;
         for dir_name in crate::agent::BUILTIN_SKILL_DIRS {
             assert!(bound.iter().any(|b| b == dir_name), "{dir_name} not bound: {bound:?}");
         }
@@ -761,27 +780,24 @@ mod tests {
 
     /// The point of the per-skill flag: seeding is a one-time nudge, not a
     /// policy the app re-enforces on every launch.
-    #[test]
-    fn unbinding_a_built_in_skill_survives_the_next_launch() {
+    #[tokio::test]
+    async fn unbinding_a_built_in_skill_survives_the_next_launch() {
         let dir = tempfile::tempdir().unwrap();
         crate::agent::diagnostics::write_diagnostics(dir.path()).unwrap();
 
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        sync_index(&mut conn, dir.path()).unwrap();
-        seed_builtin_bindings(&mut conn);
+        let db = sea_test_db().await;
+        sync_index(&db, dir.path()).await.unwrap();
+        seed_builtin_bindings(&db).await;
 
-        db::ops::skill_binding::unbind(
-            &mut conn,
-            SkillLayer::Global,
-            None,
-            crate::agent::diagnostics::DIAGNOSTICS_DIR,
-        )
+        db.write(async |tx| {
+            skill_binding_ops::unbind(tx, SkillLayer::Global, None, crate::agent::diagnostics::DIAGNOSTICS_DIR).await
+        })
+        .await
         .unwrap();
 
-        seed_builtin_bindings(&mut conn);
+        seed_builtin_bindings(&db).await;
 
-        let bound = db::ops::skill_binding::list_layer(&mut conn, SkillLayer::Global, None).unwrap();
+        let bound = global_bindings(&db).await;
         assert!(
             !bound.iter().any(|b| b == crate::agent::diagnostics::DIAGNOSTICS_DIR),
             "the skill came back after being unbound: {bound:?}"
@@ -790,22 +806,21 @@ mod tests {
 
     /// A bind that could not land must not burn its flag, or the skill would
     /// never be seeded again.
-    #[test]
-    fn a_failed_bind_is_retried_on_the_next_launch() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn a_failed_bind_is_retried_on_the_next_launch() {
+        let db = sea_test_db().await;
 
         // No sync_index, so there is no skills row for the foreign key.
-        seed_builtin_bindings(&mut conn);
-        let bound = db::ops::skill_binding::list_layer(&mut conn, SkillLayer::Global, None).unwrap();
+        seed_builtin_bindings(&db).await;
+        let bound = global_bindings(&db).await;
         assert!(bound.is_empty(), "{bound:?}");
 
         let dir = tempfile::tempdir().unwrap();
         crate::agent::diagnostics::write_diagnostics(dir.path()).unwrap();
-        sync_index(&mut conn, dir.path()).unwrap();
-        seed_builtin_bindings(&mut conn);
+        sync_index(&db, dir.path()).await.unwrap();
+        seed_builtin_bindings(&db).await;
 
-        let bound = db::ops::skill_binding::list_layer(&mut conn, SkillLayer::Global, None).unwrap();
+        let bound = global_bindings(&db).await;
         assert!(
             bound.iter().any(|b| b == crate::agent::diagnostics::DIAGNOSTICS_DIR),
             "{bound:?}"

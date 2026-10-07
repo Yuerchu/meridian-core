@@ -82,21 +82,18 @@ impl Tool for LoadSkillTool {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let pool = context
-            .db_pool
-            .clone()
+        let db = context
+            .sea
+            .as_ref()
             .ok_or("Skills are unavailable without a database")?;
-        let project_id = context.project_id.clone();
-        let assistant_id = context.assistant_id.clone();
+        let project_id = context.project_id.as_deref();
+        let assistant_id = context.assistant_id.as_deref();
 
         let wanted = skill_name.clone();
-        let available = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            crate::db::ops::skill_binding::resolve_available(&mut conn, project_id.as_deref(), assistant_id.as_deref())
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let available = db
+            .read(async |tx| crate::db::sea::ops::skill_binding::resolve_available(tx, project_id, assistant_id).await)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let matches: Vec<_> = available.iter().filter(|s| s.llm_name == wanted).collect();
         let skill = match matches.len() {
@@ -150,9 +147,12 @@ impl Tool for LoadSkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::skill::SkillInsert;
-    use crate::db::models::skill_binding::SkillLayer;
-    use crate::db::{DbPool, diesel_test_db};
+    use crate::db::entity::skill::{self as skill_entity, SkillSource};
+    use crate::db::sea::cap::Db;
+    use crate::db::sea::ops::skill::upsert_skill;
+    use crate::db::sea::ops::skill_binding::{SkillLayer, bind};
+    use crate::db::sea::sea_test_db;
+    use crate::db::types::SqlBool;
     use crate::tools::{FileAccess, ShellType};
     use std::path::Path;
 
@@ -166,29 +166,35 @@ mod tests {
         .unwrap();
     }
 
-    fn index_and_bind(pool: &DbPool, dir: &str, name: &str) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::skill::upsert_skill(
-            &mut conn,
-            &SkillInsert {
-                dir_name: dir,
-                llm_name: name,
-                llm_description: "Test skill",
-                display_name: dir,
-                display_description: None,
-                source: "user",
-                is_enabled: 1,
-                is_builtin: 0,
-                mtime_hash: None,
-                created_at: 1,
-                updated_at: 1,
-            },
-        )
-        .unwrap();
-        crate::db::ops::skill_binding::bind(&mut conn, SkillLayer::Global, None, dir).unwrap();
+    fn row(dir: &str, name: &str) -> skill_entity::Model {
+        skill_entity::Model {
+            dir_name: dir.into(),
+            llm_name: name.into(),
+            llm_description: "Test skill".into(),
+            display_name: dir.into(),
+            display_description: None,
+            source: SkillSource::User,
+            is_enabled: SqlBool::TRUE,
+            is_builtin: SqlBool::FALSE,
+            mtime_hash: None,
+            created_at: 1,
+            updated_at: 1,
+        }
     }
 
-    fn ctx(pool: DbPool) -> ToolContext {
+    async fn index(db: &Db, dir: &str, name: &str) {
+        let model = row(dir, name);
+        db.write(async |tx| upsert_skill(tx, model).await).await.unwrap();
+    }
+
+    async fn index_and_bind(db: &Db, dir: &str, name: &str) {
+        index(db, dir, name).await;
+        db.write(async |tx| bind(tx, SkillLayer::Global, None, dir).await)
+            .await
+            .unwrap();
+    }
+
+    fn ctx(db: &Db) -> ToolContext {
         ToolContext {
             working_directory: None,
             shell: ShellType::Bash,
@@ -197,8 +203,8 @@ mod tests {
             conversation_id: None,
             turn_id: None,
             assistant_id: None,
-            db_pool: Some(pool),
-            sea: None,
+            db_pool: None,
+            sea: Some(db.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             tool_secrets: std::collections::HashMap::new(),
@@ -215,11 +221,11 @@ mod tests {
         std::fs::create_dir_all(&refs).unwrap();
         std::fs::write(refs.join("forms.md"), "Form details").unwrap();
 
-        let pool = diesel_test_db();
-        index_and_bind(&pool, "pdf-tools", "pdf-tools");
+        let db = sea_test_db().await;
+        index_and_bind(&db, "pdf-tools", "pdf-tools").await;
 
         let out = LoadSkillTool::new(dir.path().to_path_buf())
-            .execute(json!({"skill_name": "pdf-tools"}), &ctx(pool))
+            .execute(json!({"skill_name": "pdf-tools"}), &ctx(&db))
             .await
             .unwrap();
 
@@ -236,11 +242,11 @@ mod tests {
         std::fs::create_dir_all(&refs).unwrap();
         std::fs::write(refs.join("deep.md"), "Deep content").unwrap();
 
-        let pool = diesel_test_db();
-        index_and_bind(&pool, "s", "s");
+        let db = sea_test_db().await;
+        index_and_bind(&db, "s", "s").await;
 
         let out = LoadSkillTool::new(dir.path().to_path_buf())
-            .execute(json!({"skill_name": "s", "path": "references/deep.md"}), &ctx(pool))
+            .execute(json!({"skill_name": "s", "path": "references/deep.md"}), &ctx(&db))
             .await
             .unwrap();
 
@@ -254,31 +260,13 @@ mod tests {
         write_skill(dir.path(), "bound", "bound", "Visible");
         write_skill(dir.path(), "unbound", "unbound", "Hidden");
 
-        let pool = diesel_test_db();
-        index_and_bind(&pool, "bound", "bound");
+        let db = sea_test_db().await;
+        index_and_bind(&db, "bound", "bound").await;
         // Indexed but never bound.
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::skill::upsert_skill(
-            &mut conn,
-            &SkillInsert {
-                dir_name: "unbound",
-                llm_name: "unbound",
-                llm_description: "d",
-                display_name: "unbound",
-                display_description: None,
-                source: "user",
-                is_enabled: 1,
-                is_builtin: 0,
-                mtime_hash: None,
-                created_at: 1,
-                updated_at: 1,
-            },
-        )
-        .unwrap();
-        drop(conn);
+        index(&db, "unbound", "unbound").await;
 
         let err = LoadSkillTool::new(dir.path().to_path_buf())
-            .execute(json!({"skill_name": "unbound"}), &ctx(pool))
+            .execute(json!({"skill_name": "unbound"}), &ctx(&db))
             .await
             .unwrap_err();
 
@@ -292,12 +280,12 @@ mod tests {
         write_skill(dir.path(), "mine-pdf", "pdf", "Mine");
         write_skill(dir.path(), "theirs-pdf", "pdf", "Theirs");
 
-        let pool = diesel_test_db();
-        index_and_bind(&pool, "mine-pdf", "pdf");
-        index_and_bind(&pool, "theirs-pdf", "pdf");
+        let db = sea_test_db().await;
+        index_and_bind(&db, "mine-pdf", "pdf").await;
+        index_and_bind(&db, "theirs-pdf", "pdf").await;
 
         let err = LoadSkillTool::new(dir.path().to_path_buf())
-            .execute(json!({"skill_name": "pdf"}), &ctx(pool))
+            .execute(json!({"skill_name": "pdf"}), &ctx(&db))
             .await
             .unwrap_err();
 
@@ -311,11 +299,11 @@ mod tests {
         write_skill(dir.path(), "s", "s", "Body");
         std::fs::write(dir.path().join("secret.txt"), "TOP SECRET").unwrap();
 
-        let pool = diesel_test_db();
-        index_and_bind(&pool, "s", "s");
+        let db = sea_test_db().await;
+        index_and_bind(&db, "s", "s").await;
 
         let err = LoadSkillTool::new(dir.path().to_path_buf())
-            .execute(json!({"skill_name": "s", "path": "../secret.txt"}), &ctx(pool))
+            .execute(json!({"skill_name": "s", "path": "../secret.txt"}), &ctx(&db))
             .await
             .unwrap_err();
 

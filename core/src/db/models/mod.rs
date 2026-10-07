@@ -23,7 +23,6 @@ pub mod provider;
 pub mod queue;
 pub mod queued_prompt_context_item;
 pub mod skill;
-pub mod skill_binding;
 pub mod todo;
 pub mod tool_preset;
 pub mod turn;

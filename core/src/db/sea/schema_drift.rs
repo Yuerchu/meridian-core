@@ -24,6 +24,15 @@ use super::introspect::{self, Schema};
 use super::sea_test_db;
 use crate::db::entity::{EntityShape, ForeignKeyShape, PENDING_TABLES, registered, shape_of};
 
+/// Text primary keys the baseline declares without `NOT NULL`, which SQLite
+/// therefore lets hold NULL (any number of them: NULLs are distinct). Their
+/// entities declare the key `String`, because nothing writes a NULL there and a
+/// row that had one would be unusable anyway — reading it fails the query. A
+/// schema change adding `NOT NULL` would retire this list; until then it is
+/// closed, and `nullable_text_keys_are_exactly_the_ones_listed` fails on a
+/// stale or a missing entry.
+pub const NULLABLE_TEXT_KEYS: &[(&str, &str)] = &[("skill_bindings_global", "dir_name"), ("skills", "dir_name")];
+
 /// Every way `shape` disagrees with the table of the same name in `schema`,
 /// one line each. Empty means the entity is a complete description of its
 /// table: same columns with the same affinity and nullability, same primary
@@ -58,9 +67,15 @@ pub fn drift(shape: &EntityShape, schema: &Schema) -> Vec<String> {
             ));
         }
         // SQLite reports `INTEGER PRIMARY KEY` with notnull=0 although it can
-        // never hold NULL; a key column is NOT NULL whatever the pragma says.
-        let live_not_null = live.not_null || live.in_primary_key;
-        if live_not_null == column.nullable {
+        // never hold NULL: that column is the rowid. Any other key column
+        // without `NOT NULL` really is nullable — SQLite kept that bug for
+        // compatibility — so only the rowid gets the exemption.
+        let rowid =
+            live.in_primary_key && actual.primary_key.len() == 1 && live.declared_type.eq_ignore_ascii_case("integer");
+        let live_not_null = live.not_null || rowid;
+        let excused =
+            NULLABLE_TEXT_KEYS.contains(&(table.as_str(), column.name.as_str())) && !live_not_null && !column.nullable;
+        if live_not_null == column.nullable && !excused {
             problems.push(format!(
                 "column `{table}.{}`: entity declares it {}, schema has it {}",
                 column.name,
@@ -495,4 +510,55 @@ async fn each_kind_of_drift_is_reported() {
         drift(&shape_of::<fixtures::extra_column::Entity>(), &schema),
         "entity for `queued_prompts` declares column `priority` the schema lacks",
     );
+}
+
+/// `NULLABLE_TEXT_KEYS` is the schema's list, not a wish: every key column
+/// that is not the rowid and has no `NOT NULL` is on it, and nothing else is.
+#[tokio::test]
+async fn nullable_text_keys_are_exactly_the_ones_listed() {
+    let db = sea_test_db().await;
+    let schema = Schema::read(db.conn().unwrap()).await.unwrap();
+    let mut found = BTreeSet::new();
+    for table in &schema.tables {
+        for column in &table.columns {
+            let rowid = table.primary_key.len() == 1 && column.declared_type.eq_ignore_ascii_case("integer");
+            if column.in_primary_key && !column.not_null && !rowid {
+                found.insert((table.name.as_str(), column.name.as_str()));
+            }
+        }
+    }
+    let listed: BTreeSet<(&str, &str)> = NULLABLE_TEXT_KEYS.iter().copied().collect();
+    assert_eq!(found, listed);
+}
+
+/// A text key without `NOT NULL` is nullable and an entity calling it NOT NULL
+/// is drift (unless listed above); an `INTEGER PRIMARY KEY` is the rowid and is
+/// NOT NULL whatever the pragma reports.
+#[tokio::test]
+async fn only_the_rowid_key_is_not_null_without_saying_so() {
+    use crate::db::entity::ColumnShape;
+
+    let db = sea_test_db().await;
+    super::execute_for_tests(&db, "CREATE TABLE probe_text (code text PRIMARY KEY)")
+        .await
+        .unwrap();
+    super::execute_for_tests(&db, "CREATE TABLE probe_rowid (id integer PRIMARY KEY)")
+        .await
+        .unwrap();
+    let schema = Schema::read(db.conn().unwrap()).await.unwrap();
+    let shape = |table: &str, column: &str, affinity: &'static str| EntityShape {
+        table: table.to_owned(),
+        columns: vec![ColumnShape {
+            name: column.to_owned(),
+            affinity,
+            nullable: false,
+        }],
+        primary_key: vec![column.to_owned()],
+        foreign_keys: Vec::new(),
+    };
+    assert_eq!(
+        drift(&shape("probe_text", "code", "TEXT"), &schema),
+        ["column `probe_text.code`: entity declares it NOT NULL, schema has it nullable"]
+    );
+    assert!(drift(&shape("probe_rowid", "id", "INTEGER"), &schema).is_empty());
 }

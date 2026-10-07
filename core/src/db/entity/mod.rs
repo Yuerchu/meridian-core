@@ -21,6 +21,10 @@ pub mod preference;
 pub mod project;
 pub mod provider;
 pub mod redaction_rule;
+pub mod skill;
+pub mod skill_binding_assistant;
+pub mod skill_binding_global;
+pub mod skill_binding_project;
 pub mod tool_category;
 pub mod tool_preset;
 pub mod voice_blob;
@@ -64,10 +68,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "plan_revisions",
     "queued_prompt_context_items",
     "queued_prompts",
-    "skill_bindings_assistant",
-    "skill_bindings_global",
-    "skill_bindings_project",
-    "skills",
     "todo_items",
     "todo_lists",
     "turns",
@@ -124,6 +124,10 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<project::Entity>(),
         shape_of::<provider::Entity>(),
         shape_of::<redaction_rule::Entity>(),
+        shape_of::<skill::Entity>(),
+        shape_of::<skill_binding_assistant::Entity>(),
+        shape_of::<skill_binding_global::Entity>(),
+        shape_of::<skill_binding_project::Entity>(),
         shape_of::<tool_category::Entity>(),
         shape_of::<tool_preset::Entity>(),
         shape_of::<voice_blob::Entity>(),

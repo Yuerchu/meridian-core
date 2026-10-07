@@ -290,6 +290,9 @@ pub async fn apply(
     }
 
     let named: Vec<&str> = config.webhook.iter().map(|webhook| webhook.id.as_str()).collect();
+    // pool-read-before-write: disabling what the file no longer names. A webhook
+    // added after this read is not one the file meant to disable, and each
+    // update is idempotent, so the gap changes nothing a later apply would undo.
     for row in notification_ops::list_webhooks(sea)
         .await
         .map_err(|error| error.to_string())?

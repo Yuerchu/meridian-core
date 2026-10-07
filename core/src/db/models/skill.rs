@@ -26,32 +26,3 @@ pub struct SkillRow {
     pub created_at: i64,
     pub updated_at: i64,
 }
-
-#[derive(Debug, Insertable)]
-#[diesel(table_name = skills)]
-pub struct SkillInsert<'a> {
-    pub dir_name: &'a str,
-    pub llm_name: &'a str,
-    pub llm_description: &'a str,
-    pub display_name: &'a str,
-    pub display_description: Option<&'a str>,
-    pub source: &'a str,
-    pub is_enabled: i32,
-    pub is_builtin: i32,
-    pub mtime_hash: Option<&'a str>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, AsChangeset, Default)]
-#[diesel(table_name = skills)]
-pub struct SkillChangeset {
-    pub llm_name: Option<String>,
-    pub llm_description: Option<String>,
-    pub display_name: Option<String>,
-    pub display_description: Option<Option<String>>,
-    pub source: Option<String>,
-    pub is_enabled: Option<i32>,
-    pub mtime_hash: Option<Option<String>>,
-    pub updated_at: Option<i64>,
-}

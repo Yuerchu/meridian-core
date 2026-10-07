@@ -684,6 +684,9 @@ impl JournalCtx {
             key: prefix.clone(),
         };
 
+        // pool-read-before-write: a pre-filter only. `reconcile_external` re-reads
+        // the head inside its write and does nothing when it already matches, and
+        // the per-path lock below serialises this with `record`.
         let tracked = journal_ops::chains_under_prefix(&self.sea, &prefix, BRACKET_MAX_FILES + 1).await;
         let tracked = match tracked {
             Ok(t) => t,
