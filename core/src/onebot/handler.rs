@@ -1449,18 +1449,31 @@ async fn dispatch_memory(
         command::MemorySub::OptOut => {
             // One write: an extraction pass storing a memory about this person
             // cannot land between the flag and the clear-out.
-            let n = db
+            let forgotten = db
                 .write(async |tx| {
                     mem_ops::touch_subject(tx, &scope_id, None, false, now).await?;
-                    // Only the pin ceiling refuses, and this sets no pin.
+                    // The only refusal is for pinning, and this pins nobody.
                     let _ = mem_ops::set_subject_flags(tx, &scope_id, None, Some(true)).await?;
                     // Clears memories held about them anywhere, including group
                     // entries that name them — otherwise opting out would leave
                     // the parts most likely to be repeated in front of others.
                     mem_ops::forget_subject(tx, &scope_id, false, DeletedBy::SelfRemoved, now).await
                 })
-                .await
-                .unwrap_or(0);
+                .await;
+            // A failed opt-out is answered as one. The reply below is a promise,
+            // and "deleted 0, no longer remembering you" for a write that never
+            // happened would be a false one about the person's own data.
+            let n = match forgotten {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::warn!(error = %error, "an opt-out could not be recorded");
+                    return build_reply(
+                        event,
+                        "操作失败,什么都没有改变。请稍后再发一次 /memory optout。",
+                        reply_to,
+                    );
+                }
+            };
             // The second line is not decoration. This command used to promise to
             // "stop remembering you" while the operator's audit log went on
             // recording every message regardless, which made the promise false
