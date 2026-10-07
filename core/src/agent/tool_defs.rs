@@ -5,7 +5,7 @@
 //! assembly here is what makes the manual a single source of truth: a tool that
 //! disappears from the registry disappears from the manual with it.
 
-use crate::db::models::skill::SkillRow;
+use crate::db::entity::skill;
 use crate::provider::ToolDefinition;
 use crate::tools::ToolRegistry;
 
@@ -96,7 +96,7 @@ pub(crate) fn collect(
 /// The enum is why this matters — without it a model will confidently invent
 /// skill names. With no skills bound the tool is dropped entirely rather than
 /// offered with an empty menu.
-pub(crate) fn apply_skill_catalog(defs: &mut Vec<ToolDefinition>, skills: &[SkillRow]) {
+pub(crate) fn apply_skill_catalog(defs: &mut Vec<ToolDefinition>, skills: &[skill::Model]) {
     let Some(idx) = defs.iter().position(|d| d.name == LOAD_SKILL_TOOL) else {
         return;
     };
@@ -104,7 +104,7 @@ pub(crate) fn apply_skill_catalog(defs: &mut Vec<ToolDefinition>, skills: &[Skil
     // Names come off disk and so bypassed every Rust-side check; validate here,
     // at the boundary where they turn into a provider payload. An illegal name
     // reaching the API fails the whole completion, not just this tool.
-    let usable: Vec<&SkillRow> = skills
+    let usable: Vec<&skill::Model> = skills
         .iter()
         .filter(|s| is_valid_slug(&s.llm_name))
         .take(MAX_AVAILABLE_SKILLS)
@@ -191,16 +191,16 @@ pub(crate) fn apply_sub_agent_catalog(defs: &mut Vec<ToolDefinition>, catalog: O
 mod tests {
     use super::*;
 
-    fn skill(dir: &str, name: &str, desc: &str) -> SkillRow {
-        SkillRow {
+    fn skill(dir: &str, name: &str, desc: &str) -> skill::Model {
+        skill::Model {
             dir_name: dir.into(),
             llm_name: name.into(),
             llm_description: desc.into(),
             display_name: dir.into(),
             display_description: None,
-            source: "user".into(),
-            is_enabled: 1,
-            is_builtin: 0,
+            source: crate::db::entity::skill::SkillSource::User,
+            is_enabled: crate::db::types::SqlBool::TRUE,
+            is_builtin: crate::db::types::SqlBool::FALSE,
             mtime_hash: None,
             created_at: 0,
             updated_at: 0,
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn catalog_is_capped() {
-        let skills: Vec<SkillRow> = (0..MAX_AVAILABLE_SKILLS + 20)
+        let skills: Vec<skill::Model> = (0..MAX_AVAILABLE_SKILLS + 20)
             .map(|i| skill(&format!("s-{i:03}"), &format!("s-{i:03}"), "d"))
             .collect();
         let mut defs = defs_with_load_skill();

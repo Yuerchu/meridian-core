@@ -248,12 +248,11 @@ pub async fn bootstrap_with_secrets(
         if let Err(e) = agent::diagnostics::write_diagnostics(&skills_root) {
             tracing::error!(error = %e, "failed to write the diagnostics skill");
         }
-        let mut conn = pool.get().expect("db connection");
-        if let Err(e) = agent::skills::sync_index(&mut conn, &skills_root) {
+        if let Err(e) = agent::skills::sync_index(&sea, &skills_root).await {
             tracing::error!(error = %e, "failed to index skills");
         }
         // After the index, which creates the rows the bindings point at.
-        agent::skills::seed_builtin_bindings(&mut conn);
+        agent::skills::seed_builtin_bindings(&sea).await;
     }
 
     Ok(Services::new(ServicesInner {
@@ -299,6 +298,9 @@ pub async fn bootstrap_with_secrets(
 /// it fails startup, because the repair below would otherwise have to guess
 /// what the list meant.
 async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
+    // pool-read-before-write: startup, before `Services` exists and before
+    // anything else can write; each seed is its own write so one row that will
+    // not insert is skipped rather than undoing the rest.
     use crate::db::entity::{tool_category, tool_preset};
     use crate::db::sea::ops;
     use crate::db::types::{Json, SqlBool};

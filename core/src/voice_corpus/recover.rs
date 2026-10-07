@@ -81,6 +81,9 @@ pub async fn run(db: &Db, key: &[u8], app_data_dir: &Path, writable: bool) -> Re
     //
     //    核的是 sha 而不只是大小，理由在 `file_matches` 上：这份语料要拿去训练，
     //    一条内容错了的样本会被当成真的用。整个目录哈希一遍是一条阻塞线程的活。
+    // pool-read-before-write: recovery runs under the corpus lock, so no other
+    // writer exists, and the hashing between these reads and their writes is
+    // blocking work that must not hold the write lock.
     let ready = ops::all_ready(db).await.map_err(|e| e.to_string())?;
     let damaged_ids = {
         let key = key.clone();

@@ -10,6 +10,8 @@ pub mod mcp_server;
 pub mod notification;
 pub mod preference;
 pub mod redaction_rule;
+pub mod skill;
+pub mod skill_binding;
 pub mod tool_category;
 pub mod tool_preset;
 pub mod voice_corpus;
