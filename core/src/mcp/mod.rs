@@ -7,13 +7,15 @@ pub mod streamable_http;
 mod tests;
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::db::models::mcp_server::{McpServerRow, McpTransport as McpTransportKind};
+use crate::db::entity::mcp_server;
+use crate::db::entity::mcp_server::McpTransport as McpTransportKind;
+use crate::db::types::Json;
 use crate::provider::ToolDefinition;
 use actor::{ActorHandle, ActorObituary};
 use protocol::{McpCallToolResult, McpToolsListResult};
@@ -273,7 +275,7 @@ impl McpRegistry {
     /// waits on the first rather than starting a second process. Returning
     /// `Ok(())` immediately instead would tell the settings page a connection
     /// was established while the handshake was still running.
-    pub async fn connect(self: &Arc<Self>, server: &McpServerRow) -> Result<(), String> {
+    pub async fn connect(self: &Arc<Self>, server: &mcp_server::Model) -> Result<(), String> {
         enum Start {
             /// Someone else is already doing this; wait for their answer.
             Join(watch::Receiver<ConnectResult>),
@@ -377,13 +379,16 @@ impl McpRegistry {
     }
 
     /// Build the transport and complete the handshake. Runs with no lock held.
-    async fn dial(&self, server: &McpServerRow) -> Result<(Box<dyn McpTransport>, Vec<protocol::McpToolInfo>), String> {
+    async fn dial(
+        &self,
+        server: &mcp_server::Model,
+    ) -> Result<(Box<dyn McpTransport>, Vec<protocol::McpToolInfo>), String> {
         let started = std::time::Instant::now();
         let fail = |stage: &'static str, error: String| -> String {
             tracing::warn!(
                 server_id = %server.id,
                 server_name = %server.name,
-                transport = %server.transport_type,
+                transport = server.transport_type.as_str(),
                 stage,
                 error = %error,
                 "MCP server connection failed"
@@ -396,7 +401,7 @@ impl McpRegistry {
         #[cfg(not(test))]
         let staged: Option<Box<dyn McpTransport>> = None;
 
-        let transport_type = McpTransportKind::parse(&server.transport_type).map_err(|error| fail("config", error))?;
+        let transport_type = server.transport_type;
         let mut transport: Box<dyn McpTransport> = match staged {
             Some(t) => t,
             None => match transport_type {
@@ -405,13 +410,13 @@ impl McpRegistry {
                         .command
                         .as_deref()
                         .ok_or_else(|| fail("config", "missing command".into()))?;
-                    let args = parse_config_field::<Vec<String>>(server.args.as_deref(), "args")
-                        .map_err(|error| fail("config", error))?;
-                    // A malformed env is the worst of the three: the server starts
-                    // without its token and fails every call with a 401 that looks
-                    // like the user's key is wrong.
-                    let env = parse_config_field::<HashMap<String, String>>(server.env.as_deref(), "env")
-                        .map_err(|error| fail("config", error))?;
+                    // Absence means an empty collection. A malformed value never
+                    // gets this far: the row failed to decode at the read, which
+                    // matters most for `env` — a server started without its token
+                    // fails every call with a 401 that looks like the user's key
+                    // is wrong.
+                    let args = server.args.as_ref().map(|args| args.0.clone()).unwrap_or_default();
+                    let env = string_map(server.env.as_ref());
                     Box::new(
                         StdioTransport::spawn(command, &args, &env, None)
                             .await
@@ -423,8 +428,7 @@ impl McpRegistry {
                         .url
                         .as_deref()
                         .ok_or_else(|| fail("config", "missing URL".into()))?;
-                    let headers = parse_config_field::<HashMap<String, String>>(server.headers.as_deref(), "headers")
-                        .map_err(|error| fail("config", error))?;
+                    let headers = string_map(server.headers.as_ref());
                     Box::new(StreamableHttpTransport::new(url, &headers).map_err(|e| fail("connect", e))?)
                 }
             },
@@ -469,7 +473,7 @@ impl McpRegistry {
     /// happened while we were dialling, and this transport is already stale.
     fn commit(
         self: &Arc<Self>,
-        server: &McpServerRow,
+        server: &mcp_server::Model,
         generation: u64,
         transport: Box<dyn McpTransport>,
         tools: Vec<protocol::McpToolInfo>,
@@ -549,7 +553,7 @@ impl McpRegistry {
         tracing::info!(
             server_id = %server.id,
             server_name = %server.name,
-            transport = %server.transport_type,
+            transport = server.transport_type.as_str(),
             tool_count,
             "MCP server connected"
         );
@@ -787,18 +791,10 @@ impl ActorObituary for McpRegistry {
     }
 }
 
-/// Parse one JSON-encoded config field. Absence means an empty collection;
-/// malformed persisted JSON is a configuration error.
-///
-/// The value is never logged: `env` and `headers` are exactly where tokens
-/// live. serde's message carries a position, not the contents.
-fn parse_config_field<T: Default + serde::de::DeserializeOwned>(
-    raw: Option<&str>,
-    field: &'static str,
-) -> Result<T, String> {
-    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
-        return Ok(T::default());
-    };
-    serde_json::from_str(raw)
-        .map_err(|error| format!("invalid MCP {field} JSON at {}:{}", error.line(), error.column()))
+/// A decoded `env` or `headers` column as the transports take it. Absence means
+/// an empty map.
+fn string_map(column: Option<&Json<BTreeMap<String, String>>>) -> HashMap<String, String> {
+    column
+        .map(|map| map.0.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
 }

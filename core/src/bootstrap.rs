@@ -20,8 +20,6 @@ use tokio::sync::Mutex;
 use crate::agent::provider_secret_name;
 use crate::db::models::assistant::{AssistantChangeset, AssistantInsert};
 use crate::db::models::provider::ProviderInsert;
-use crate::db::models::tool_category::ToolCategoryInsert;
-use crate::db::models::tool_preset::ToolPresetInsert;
 use crate::events::EventBus;
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
 use crate::services::{Paths, Services, ServicesInner};
@@ -208,125 +206,7 @@ pub async fn bootstrap_with_secrets(
         }
     }
 
-    // Seed built-in tool categories and presets
-    {
-        let mut conn = pool.get().expect("db connection");
-        if db::ops::tool_category::count_categories(&mut conn).unwrap_or(0) == 0 {
-            let now = now_ms();
-            let cats = [
-                ("cat_interaction", "Interaction", "User interaction tools", 0),
-                ("cat_filesystem", "Filesystem", "File and directory operations", 1),
-                ("cat_system", "System", "System and shell commands", 2),
-                ("cat_coding", "Coding", "Code analysis and editing", 3),
-            ];
-            for (id, name, desc, order) in &cats {
-                let _ = db::ops::tool_category::create_category(
-                    &mut conn,
-                    &ToolCategoryInsert {
-                        id,
-                        name,
-                        description: Some(desc),
-                        icon: None,
-                        sort_order: *order,
-                        created_at: now,
-                    },
-                );
-            }
-        }
-        {
-            let now = now_ms();
-            let presets = [
-                (
-                    "preset_coding",
-                    "Coding Agent",
-                    "All tools for coding tasks",
-                    r#"["ask_user","update_todos","read_file","write_file","edit_file","apply_patch","run_command","list_directory","search_files","glob","read_app_logs"]"#,
-                    0,
-                ),
-                (
-                    "preset_research",
-                    "Research",
-                    "Minimal tools for research and reading",
-                    r#"["ask_user","read_file","list_directory","search_files","glob","web_search","read_app_logs"]"#,
-                    1,
-                ),
-                (
-                    "preset_writing",
-                    "Writing",
-                    "Tools for writing and editing files",
-                    r#"["ask_user","read_file","write_file","edit_file"]"#,
-                    2,
-                ),
-            ];
-            // Seed per id (not only on an empty table) so existing installs
-            // pick up newly added built-in presets.
-            for (id, name, desc, tools_json, order) in &presets {
-                if db::ops::tool_preset::get_preset(&mut conn, id).is_err() {
-                    let _ = db::ops::tool_preset::create_preset(
-                        &mut conn,
-                        &ToolPresetInsert {
-                            id,
-                            name,
-                            description: Some(desc),
-                            icon: None,
-                            tool_names: tools_json,
-                            is_builtin: 1,
-                            sort_order: *order,
-                            created_at: now,
-                            updated_at: now,
-                        },
-                    );
-                }
-            }
-            // Repair presets from earlier seeds: "glob_files" never existed
-            // (real tool name is "glob"), the built-in Research preset
-            // gained web_search, and Coding gained update_todos.
-            if let Ok(existing) = db::ops::tool_preset::list_presets(&mut conn) {
-                for p in existing {
-                    let mut names = parse_tool_preset_names(&p.id, &p.tool_names)?;
-                    let mut changed = false;
-                    for n in names.iter_mut() {
-                        if n == "glob_files" {
-                            *n = "glob".into();
-                            changed = true;
-                        }
-                    }
-                    if p.id == "preset_research" && p.is_builtin == 1 && !names.iter().any(|n| n == "web_search") {
-                        names.push("web_search".into());
-                        changed = true;
-                    }
-                    if p.id == "preset_coding" && p.is_builtin == 1 && !names.iter().any(|n| n == "update_todos") {
-                        names.push("update_todos".into());
-                        changed = true;
-                    }
-                    // Diagnosing a failure is useful in both, and this
-                    // backfill is what reaches installs that already ran
-                    // the seed above.
-                    if matches!(p.id.as_str(), "preset_coding" | "preset_research")
-                        && p.is_builtin == 1
-                        && !names.iter().any(|n| n == "read_app_logs")
-                    {
-                        names.push("read_app_logs".into());
-                        changed = true;
-                    }
-                    if changed {
-                        let _ = db::ops::tool_preset::update_preset(
-                            &mut conn,
-                            &p.id,
-                            &db::models::tool_preset::ToolPresetChangeset {
-                                tool_names: Some(
-                                    serde_json::to_string(&names)
-                                        .map_err(|error| format!("could not encode tool preset `{}`: {error}", p.id))?,
-                                ),
-                                updated_at: Some(now),
-                                ..Default::default()
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
+    seed_tool_catalog(&sea).await?;
 
     let redaction = Arc::new(crate::redaction::RedactionEngine::new());
     {
@@ -336,28 +216,17 @@ pub async fn bootstrap_with_secrets(
 
     // Load custom tools from DB into tool registry
     let registry = tools::ToolRegistry::new(skills_root.clone(), data_dir.join("logs"), redaction.clone());
-    {
-        let mut conn = pool.get().expect("db connection");
-        match db::ops::custom_tool::list_enabled_tools(&mut conn) {
-            Ok(custom_tools) => {
-                let loaded = custom_tools
-                    .iter()
-                    .map(|ct| {
-                        tools::custom::CustomToolExecutor::from_db(ct)
-                            .map(|tool| Arc::new(tool) as Arc<dyn tools::Tool>)
-                    })
-                    .collect::<Result<Vec<_>, _>>();
-                match loaded {
-                    Ok(tools) => registry.set_custom_tools(tools),
-                    Err(e) => {
-                        tracing::error!(error = %e, "custom tools contain an invalid contract and were not loaded")
-                    }
-                }
-            }
-            // Silently leaves the registry with no custom tools at all,
-            // which the user reads as "my tools are gone".
-            Err(e) => tracing::error!(error = %e, "custom tools could not be loaded at startup"),
-        }
+    match db::sea::ops::custom_tool::list_enabled_tools(&sea).await {
+        Ok(custom_tools) => registry.set_custom_tools(
+            custom_tools
+                .iter()
+                .map(|ct| Arc::new(tools::custom::CustomToolExecutor::from_db(ct)) as Arc<dyn tools::Tool>)
+                .collect(),
+        ),
+        // Silently leaves the registry with no custom tools at all,
+        // which the user reads as "my tools are gone". A row with an
+        // invalid contract fails the read, so it lands here too.
+        Err(e) => tracing::error!(error = %e, "custom tools could not be loaded at startup"),
     }
 
     // Regenerate the manual against this build's tool set, then index
@@ -422,6 +291,138 @@ pub async fn bootstrap_with_secrets(
         redaction,
         redaction_mappings: crate::redaction::RedactionMappings::new(),
     }))
+}
+
+/// The built-in tool categories and presets, and the repairs earlier seeds
+/// need.
+///
+/// Categories are seeded only into an empty table; presets per id, so an
+/// existing install picks up a preset added since. A single row that will not
+/// insert is skipped, as it always was. A preset that will not *decode* is not:
+/// it fails startup, because the repair below would otherwise have to guess
+/// what the list meant.
+async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
+    use crate::db::entity::{tool_category, tool_preset};
+    use crate::db::sea::ops;
+    use crate::db::types::{Json, SqlBool};
+
+    let unreadable = |error: sea_orm::DbErr| format!("could not read the tool presets: {error}");
+
+    if ops::tool_category::count_categories(sea).await.unwrap_or(0) == 0 {
+        let now = now_ms();
+        let cats = [
+            ("cat_interaction", "Interaction", "User interaction tools", 0),
+            ("cat_filesystem", "Filesystem", "File and directory operations", 1),
+            ("cat_system", "System", "System and shell commands", 2),
+            ("cat_coding", "Coding", "Code analysis and editing", 3),
+        ];
+        for (id, name, desc, order) in cats {
+            let row = tool_category::Model {
+                id: id.into(),
+                name: name.into(),
+                description: Some(desc.into()),
+                icon: None,
+                sort_order: order,
+                created_at: now,
+            };
+            let _ = sea
+                .write(async |tx| ops::tool_category::create_category(tx, row).await)
+                .await;
+        }
+    }
+
+    let now = now_ms();
+    let presets = [
+        (
+            "preset_coding",
+            "Coding Agent",
+            "All tools for coding tasks",
+            r#"["ask_user","update_todos","read_file","write_file","edit_file","apply_patch","run_command","list_directory","search_files","glob","read_app_logs"]"#,
+            0,
+        ),
+        (
+            "preset_research",
+            "Research",
+            "Minimal tools for research and reading",
+            r#"["ask_user","read_file","list_directory","search_files","glob","web_search","read_app_logs"]"#,
+            1,
+        ),
+        (
+            "preset_writing",
+            "Writing",
+            "Tools for writing and editing files",
+            r#"["ask_user","read_file","write_file","edit_file"]"#,
+            2,
+        ),
+    ];
+    // Seed per id (not only on an empty table) so existing installs
+    // pick up newly added built-in presets.
+    for (id, name, desc, tools_json, order) in presets {
+        if ops::tool_preset::get_preset(sea, id)
+            .await
+            .map_err(unreadable)?
+            .is_some()
+        {
+            continue;
+        }
+        let row = tool_preset::Model {
+            id: id.into(),
+            name: name.into(),
+            description: Some(desc.into()),
+            icon: None,
+            tool_names: Json(parse_tool_preset_names(id, tools_json)?),
+            is_builtin: SqlBool::TRUE,
+            sort_order: order,
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = sea
+            .write(async |tx| ops::tool_preset::create_preset(tx, row).await)
+            .await;
+    }
+    // Repair presets from earlier seeds: "glob_files" never existed
+    // (real tool name is "glob"), the built-in Research preset
+    // gained web_search, and Coding gained update_todos.
+    for p in ops::tool_preset::list_presets(sea).await.map_err(unreadable)? {
+        let builtin = p.is_builtin.get();
+        let mut names = p.tool_names.into_inner();
+        let mut changed = false;
+        for n in names.iter_mut() {
+            if n == "glob_files" {
+                *n = "glob".into();
+                changed = true;
+            }
+        }
+        if p.id == "preset_research" && builtin && !names.iter().any(|n| n == "web_search") {
+            names.push("web_search".into());
+            changed = true;
+        }
+        if p.id == "preset_coding" && builtin && !names.iter().any(|n| n == "update_todos") {
+            names.push("update_todos".into());
+            changed = true;
+        }
+        // Diagnosing a failure is useful in both, and this
+        // backfill is what reaches installs that already ran
+        // the seed above.
+        if matches!(p.id.as_str(), "preset_coding" | "preset_research")
+            && builtin
+            && !names.iter().any(|n| n == "read_app_logs")
+        {
+            names.push("read_app_logs".into());
+            changed = true;
+        }
+        if changed {
+            let changeset = tool_preset::ToolPresetChangeset {
+                tool_names: Some(Json(names)),
+                updated_at: Some(now),
+                ..Default::default()
+            };
+            let _ = sea
+                .write(async |tx| ops::tool_preset::update_preset(tx, &p.id, changeset).await)
+                .await;
+        }
+    }
+    Ok(())
 }
 
 /// Repairs and housekeeping that need the migrated schema and have to happen
@@ -500,15 +501,16 @@ pub(crate) fn startup_recovery(pool: &db::DbPool, plan_files: &crate::plan_files
 /// idempotence is what stops this and a hand-clicked Connect from starting two
 /// processes for one server.
 pub async fn reconnect_mcp(services: Services) {
-    let pool = services.db.clone();
-    let servers = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().ok()?;
-        db::ops::mcp_server::list_enabled_mcp_servers(&mut conn).ok()
-    })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default();
+    let servers = match db::sea::ops::mcp_server::list_enabled_mcp_servers(&services.sea).await {
+        Ok(servers) => servers,
+        // A row that does not decode fails the whole list, and with it every
+        // auto-connect; said here, since nobody is looking at the settings
+        // page yet.
+        Err(error) => {
+            tracing::error!(error = %error, "could not read the MCP servers to reconnect");
+            return;
+        }
+    };
     if servers.is_empty() {
         return;
     }

@@ -9,12 +9,16 @@
 //! rather than a runtime surprise. Diesel gave that check for free at compile
 //! time through `schema.rs`; this is where it lives now.
 
+pub mod custom_tool;
 pub mod journal_blob;
 pub mod journal_file;
 pub mod journal_version;
+pub mod mcp_server;
 pub mod notification_alert_state;
 pub mod notification_webhook;
 pub mod preference;
+pub mod tool_category;
+pub mod tool_preset;
 pub mod voice_blob;
 pub mod voice_clip;
 pub mod voice_sender_optout;
@@ -37,10 +41,8 @@ pub const PENDING_TABLES: &[&str] = &[
     "cached_models",
     "composer_drafts",
     "conversations",
-    "custom_tools",
     "emoji_packs",
     "emojis",
-    "mcp_servers",
     "memories",
     "memory_proposals",
     "memory_subjects",
@@ -68,8 +70,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "skills",
     "todo_items",
     "todo_lists",
-    "tool_categories",
-    "tool_presets",
     "turns",
 ];
 
@@ -112,12 +112,16 @@ pub struct ForeignKeyShape {
 /// the union of both lists against the schema.
 pub fn registered() -> Vec<EntityShape> {
     vec![
+        shape_of::<custom_tool::Entity>(),
         shape_of::<journal_blob::Entity>(),
         shape_of::<journal_file::Entity>(),
         shape_of::<journal_version::Entity>(),
+        shape_of::<mcp_server::Entity>(),
         shape_of::<notification_alert_state::Entity>(),
         shape_of::<notification_webhook::Entity>(),
         shape_of::<preference::Entity>(),
+        shape_of::<tool_category::Entity>(),
+        shape_of::<tool_preset::Entity>(),
         shape_of::<voice_blob::Entity>(),
         shape_of::<voice_clip::Entity>(),
         shape_of::<voice_sender_optout::Entity>(),

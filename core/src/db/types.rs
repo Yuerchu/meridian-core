@@ -2,6 +2,8 @@
 
 use sea_orm::sea_query::{ArrayType, ColumnType, Nullable, ValueType, ValueTypeErr};
 use sea_orm::{ActiveValue, ColIdx, DbErr, IntoActiveValue, QueryResult, TryGetError, TryGetable, Value};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Milliseconds since the Unix epoch, which is what every `*_at` column holds.
 /// An alias rather than a newtype: timestamps are compared and subtracted
@@ -93,5 +95,146 @@ impl Nullable for SqlBool {
 impl IntoActiveValue<SqlBool> for SqlBool {
     fn into_active_value(self) -> ActiveValue<SqlBool> {
         ActiveValue::Set(self)
+    }
+}
+
+/// A `TEXT` column that holds JSON, decoded into `T` at the read.
+///
+/// `TEXT` is storage, not a contract: a row whose JSON does not parse as `T`
+/// fails the query, rather than arriving as an empty list or an empty object.
+/// One generic type rather than a hand-written newtype per column, because the
+/// rule is the same for each and the shape is already `T`; a column that needs
+/// more than serde's own checking (a closed set of names, no repeats) still
+/// gets its own type, the way `notification_webhook::NotificationEvents` does.
+/// `FromJsonQueryResult` is not used for this: it is forbidden, because it
+/// leaves the column's error handling to a default nobody wrote down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Json<T>(pub T);
+
+impl<T: DeserializeOwned> Json<T> {
+    /// The error names a position and a category, never serde's own message:
+    /// that message quotes the offending value (`invalid type: string "sk-…"`),
+    /// and `env` and `headers` columns are exactly where tokens live. An error
+    /// here can end up in a log, which leaves the machine.
+    pub fn decode(raw: &str) -> Result<Self, String> {
+        serde_json::from_str(raw).map(Self).map_err(|error| {
+            format!(
+                "malformed {} JSON ({:?} error at {}:{})",
+                short_type_name::<T>(),
+                error.classify(),
+                error.line(),
+                error.column()
+            )
+        })
+    }
+}
+
+impl<T: Serialize> Json<T> {
+    pub fn encode(&self) -> String {
+        // A `T` with a non-string map key could fail here; none of the columns
+        // holds one, and the type for a new column is chosen by whoever adds it.
+        serde_json::to_string(&self.0).expect("a JSON column's value serializes")
+    }
+}
+
+impl<T> Json<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> std::ops::Deref for Json<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+fn short_type_name<T>() -> &'static str {
+    let full = std::any::type_name::<T>();
+    let outer = full.split('<').next().unwrap_or(full);
+    outer.rsplit("::").next().unwrap_or(outer)
+}
+
+impl<T: Serialize> From<Json<T>> for Value {
+    fn from(value: Json<T>) -> Self {
+        Value::String(Some(value.encode()))
+    }
+}
+
+impl<T: DeserializeOwned> TryGetable for Json<T> {
+    fn try_get_by<I: ColIdx>(res: &QueryResult, index: I) -> Result<Self, TryGetError> {
+        let raw = String::try_get_by(res, index)?;
+        Self::decode(&raw).map_err(|error| TryGetError::DbErr(DbErr::Type(error)))
+    }
+}
+
+impl<T: Serialize + DeserializeOwned> ValueType for Json<T> {
+    fn try_from(value: Value) -> Result<Self, ValueTypeErr> {
+        match value {
+            Value::String(Some(raw)) => Self::decode(&raw).map_err(|_| ValueTypeErr),
+            _ => Err(ValueTypeErr),
+        }
+    }
+
+    fn type_name() -> String {
+        format!("Json<{}>", std::any::type_name::<T>())
+    }
+
+    fn array_type() -> ArrayType {
+        ArrayType::String
+    }
+
+    fn column_type() -> ColumnType {
+        ColumnType::Text
+    }
+}
+
+impl<T> Nullable for Json<T> {
+    fn null() -> Value {
+        Value::String(None)
+    }
+}
+
+impl<T: Serialize> IntoActiveValue<Json<T>> for Json<T> {
+    fn into_active_value(self) -> ActiveValue<Json<T>> {
+        ActiveValue::Set(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn json_round_trips_and_refuses_the_wrong_shape() {
+        let list = Json(vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(list.encode(), r#"["a","b"]"#);
+        assert_eq!(Json::<Vec<String>>::decode(r#"["a","b"]"#).unwrap(), list);
+
+        // Each of these is a row that must fail, not read as empty.
+        for raw in ["", "null", "{}", r#"[1]"#, "not json"] {
+            assert!(Json::<Vec<String>>::decode(raw).is_err(), "{raw:?} decoded");
+        }
+        assert!(Json::<BTreeMap<String, String>>::decode(r#"["a"]"#).is_err());
+        assert!(Json::<BTreeMap<String, String>>::decode(r#"{"k":1}"#).is_err());
+        assert!(Json::<serde_json::Map<String, serde_json::Value>>::decode("[]").is_err());
+    }
+
+    /// What a failure says is a position, not the value: these columns hold
+    /// tokens, and the message can reach a log.
+    #[test]
+    fn a_decode_error_does_not_quote_the_value() {
+        let error = Json::<Vec<String>>::decode(r#"{"TOKEN": "sk-secret"}"#).unwrap_err();
+        assert!(!error.contains("sk-secret"), "{error}");
+        let error = Json::<BTreeMap<String, String>>::decode(r#"{"TOKEN": 987654}"#).unwrap_err();
+        assert!(!error.contains("987654"), "{error}");
+        assert!(
+            error.starts_with("malformed BTreeMap JSON (Data error at 1:"),
+            "{error}"
+        );
     }
 }

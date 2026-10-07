@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use super::{Permission, Tool, ToolContext};
+use crate::db::entity::custom_tool;
 
 pub struct CustomToolExecutor {
     tool_name: String,
@@ -17,27 +18,21 @@ pub struct CustomToolExecutor {
 }
 
 impl CustomToolExecutor {
-    pub fn from_db(tool: &crate::db::models::custom_tool::CustomToolRow) -> Result<Self, String> {
-        let schema: Value = serde_json::from_str(&tool.parameters_schema)
-            .map_err(|error| format!("custom tool {} has invalid parameters_schema JSON: {error}", tool.name))?;
-        if !schema.is_object() {
-            return Err(format!(
-                "custom tool {} parameters_schema must be a JSON object",
-                tool.name
-            ));
-        }
-        let perm = Permission::parse(&tool.permission)?;
-        Ok(Self {
+    /// Infallible: a row whose schema is not a JSON object, or whose permission
+    /// is not one of the three, failed to decode at the read and never became a
+    /// `Model` (see `db::sea::ops::custom_tool`'s malformed-row test).
+    pub fn from_db(tool: &custom_tool::Model) -> Self {
+        Self {
             tool_name: tool.name.clone(),
             tool_description: tool.description.clone(),
-            schema,
+            schema: Value::Object(tool.parameters_schema.0.clone()),
             command: tool.command.clone(),
             args_template: tool.args_template.clone(),
             tool_working_directory: tool.working_directory.clone(),
             // domain-default: a user's custom tool with no timeout configured gets this app's own thirty-second ceiling
             timeout: Duration::from_millis(tool.timeout_ms.unwrap_or(30000) as u64),
-            perm,
-        })
+            perm: tool.permission,
+        }
     }
 }
 
@@ -185,51 +180,25 @@ impl Tool for CustomToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::custom_tool::CustomToolRow;
+    use crate::db::types::{Json, SqlBool};
 
-    fn row(schema: &str) -> CustomToolRow {
-        CustomToolRow {
+    fn row() -> custom_tool::Model {
+        custom_tool::Model {
             id: "t1".into(),
             name: "strict_tool".into(),
             description: "test".into(),
             category_id: None,
-            parameters_schema: schema.into(),
+            parameters_schema: Json(serde_json::Map::from_iter([("type".to_owned(), Value::from("object"))])),
             command: "true".into(),
             args_template: None,
             working_directory: None,
             timeout_ms: None,
-            permission: "ask".into(),
-            is_enabled: 1,
+            permission: Permission::Ask,
+            is_enabled: SqlBool::TRUE,
             sort_order: 0,
             created_at: 1,
             updated_at: 1,
         }
-    }
-
-    #[test]
-    fn stored_parameter_schema_must_be_valid_json() {
-        let Err(error) = CustomToolExecutor::from_db(&row("not json")) else {
-            panic!("malformed schema must fail");
-        };
-        assert!(error.contains("invalid parameters_schema JSON"), "{error}");
-    }
-
-    #[test]
-    fn stored_parameter_schema_must_be_an_object() {
-        let Err(error) = CustomToolExecutor::from_db(&row("[]")) else {
-            panic!("non-object schema must fail");
-        };
-        assert!(error.contains("must be a JSON object"), "{error}");
-    }
-
-    #[test]
-    fn stored_permission_must_be_declared() {
-        let mut stored = row(r#"{"type":"object"}"#);
-        stored.permission = "future".into();
-        let Err(error) = CustomToolExecutor::from_db(&stored) else {
-            panic!("unknown permission must fail");
-        };
-        assert!(error.contains("unknown tool permission"), "{error}");
     }
 
     /// A user's own command tool is a command like any other: with the
@@ -240,9 +209,9 @@ mod tests {
     async fn unreadable_settings_run_no_custom_command() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
-        let mut stored = row(r#"{"type":"object"}"#);
+        let mut stored = row();
         stored.command = format!("echo ran > \"{}\"", marker.display().to_string().replace('\\', "/"));
-        let tool = CustomToolExecutor::from_db(&stored).unwrap();
+        let tool = CustomToolExecutor::from_db(&stored);
         let context = ToolContext {
             working_directory: Some(dir.path().display().to_string()),
             shell: crate::tools::ShellType::default_for_platform(),
