@@ -85,10 +85,10 @@ pub async fn bootstrap_with_secrets(
     }
     let pool = db::init_db(db_path.to_str().expect("invalid db path"));
     let plan_files = Arc::new(crate::plan_files::PlanFileStore::new(&data_dir));
-    startup_recovery(&pool, &plan_files);
     let sea = db::sea::open(&db_path)
         .await
         .map_err(|error| format!("could not open the database through SeaORM: {error}"))?;
+    startup_recovery(&pool, &sea, &plan_files).await;
     // The preference lives in the database, so the first few lines above
     // are recorded at the default level.
     crate::logging::apply_saved_level(&sea).await?;
@@ -432,7 +432,11 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
 /// A list, not a loop over anything, so a change of order or a dropped item
 /// shows up in review; `a_turn_killed_by_a_crash_holds_its_queue_at_the_next_start`
 /// fails if the interrupted-turn reconciliation stops running at startup.
-pub(crate) fn startup_recovery(pool: &db::DbPool, plan_files: &crate::plan_files::PlanFileStore) {
+pub(crate) async fn startup_recovery(
+    pool: &db::DbPool,
+    sea: &db::sea::cap::Db,
+    plan_files: &crate::plan_files::PlanFileStore,
+) {
     let mut conn = pool.get().expect("db connection");
     let now = now_ms();
 
@@ -451,13 +455,25 @@ pub(crate) fn startup_recovery(pool: &db::DbPool, plan_files: &crate::plan_files
         Ok(n) => tracing::warn!(deliveries = n, "reconciled plan review deliveries after restart"),
         Err(error) => tracing::error!(error = %error, "could not reconcile plan review deliveries"),
     }
-    let orphans = db::ops::memory::purge_orphan_project_memories(&mut conn).unwrap_or(0);
-    let proposals = db::ops::memory::expire_proposals(&mut conn, now).unwrap_or(0);
+    // Each its own write, as each was its own statement: one failing leaves the
+    // others done, and the next startup retries it.
+    use db::sea::ops::memory as mem_ops;
+    let orphans = sea
+        .write(async |tx| mem_ops::purge_orphan_project_memories(tx).await)
+        .await
+        .unwrap_or(0);
+    let proposals = sea
+        .write(async |tx| mem_ops::expire_proposals(tx, now).await)
+        .await
+        .unwrap_or(0);
     // Bounded-growth housekeeping. Kept off the write path: neither sweep
     // depends on what was just written, and the trash purge has no usable index
     // (both are partial on `deleted_at IS NULL`), so doing it per write meant a
     // full table scan each time.
-    let swept = db::ops::memory::sweep_untracked_subjects(&mut conn, now).unwrap_or(0);
+    let swept = sea
+        .write(async |tx| mem_ops::sweep_untracked_subjects(tx, now).await)
+        .await
+        .unwrap_or(0);
     // Startup housekeeping deletes rows the user may later go looking for. When
     // it removed nothing there is nothing to say, but when it did, this is the
     // only record that it happened.

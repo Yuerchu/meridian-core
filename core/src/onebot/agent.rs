@@ -510,6 +510,7 @@ pub(super) async fn oneshot_completion(
 #[allow(clippy::too_many_arguments)]
 pub async fn headless_chat(
     pool: &DbPool,
+    sea: &crate::db::sea::cap::Db,
     secrets: &Arc<SecretsManager>,
     tool_registry: &Arc<ToolRegistry>,
     mcp_registry: &Arc<McpRegistry>,
@@ -535,6 +536,7 @@ pub async fn headless_chat(
     let mut progress = TurnProgress::default();
     let reply = headless_chat_inner(
         pool,
+        sea,
         secrets,
         tool_registry,
         mcp_registry,
@@ -561,6 +563,7 @@ pub async fn headless_chat(
 #[allow(clippy::too_many_arguments)]
 async fn headless_chat_inner(
     pool: &DbPool,
+    sea: &crate::db::sea::cap::Db,
     // The `Arc` rather than a plain reference: provider resolution is handed to
     // `spawn_blocking`, which needs an owned handle.
     secrets: &Arc<SecretsManager>,
@@ -866,7 +869,7 @@ async fn headless_chat_inner(
     // path could change under us — see the desktop loop, where this has to wait.
     let t0 = now_ms();
     let roster = crate::agent::roster_block(&memory_request);
-    let injection = crate::agent::plan_injection_async(pool, memory_request, ctx.live().to_vec(), t0).await?;
+    let injection = crate::agent::plan_injection_async(sea, memory_request, ctx.live().to_vec(), t0).await?;
     // The checklist, frozen the same way and placed right after memory. A QQ
     // group never has one and this is a no-op there; a private admin chat can.
     let todo = crate::agent::plan_todo_injection_async(pool, conversation_id.to_string(), ctx.live().to_vec()).await?;
@@ -882,25 +885,19 @@ async fn headless_chat_inner(
 
     // Nicknames are not on the message row (they change), so history is
     // re-attributed from the subject table.
-    let sender_names = {
-        let pool2 = pool.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool2)?;
-            let subjects = crate::db::ops::memory::list_subjects(&mut conn).map_err(|e| e.to_string())?;
-            Ok::<_, String>(
-                subjects
-                    .into_iter()
-                    .filter_map(|s| {
-                        let uid = s.user_id()?;
-                        Some((uid, s.display_name?))
-                    })
-                    .collect::<crate::agent::SenderNames>(),
-            )
-        })
+    // Cosmetic: a failed read renders speakers by number for one turn.
+    let sender_names = crate::db::sea::ops::memory::list_subjects(sea)
         .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default()
-    };
+        .map(|subjects| {
+            subjects
+                .into_iter()
+                .filter_map(|s| {
+                    let uid = s.user_id()?;
+                    Some((uid, s.display_name?))
+                })
+                .collect::<crate::agent::SenderNames>()
+        })
+        .unwrap_or_default();
 
     // How the previous turns stopped, for any that did not stop cleanly. Same
     // block the desktop gets: a QQ turn is just as capable of dying with a tool

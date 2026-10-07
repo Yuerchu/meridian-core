@@ -20,6 +20,9 @@ pub mod journal_blob;
 pub mod journal_file;
 pub mod journal_version;
 pub mod mcp_server;
+pub mod memory;
+pub mod memory_proposal;
+pub mod memory_subject;
 pub mod message;
 pub mod message_sticker;
 pub mod notification_alert_state;
@@ -52,9 +55,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "acp_sessions",
     "audit_messages",
     "cached_models",
-    "memories",
-    "memory_proposals",
-    "memory_subjects",
     "message_context_items",
     "mode_artifacts",
     "model_configs",
@@ -123,6 +123,9 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<journal_file::Entity>(),
         shape_of::<journal_version::Entity>(),
         shape_of::<mcp_server::Entity>(),
+        shape_of::<memory::Entity>(),
+        shape_of::<memory_proposal::Entity>(),
+        shape_of::<memory_subject::Entity>(),
         shape_of::<message::Entity>(),
         shape_of::<message_sticker::Entity>(),
         shape_of::<notification_alert_state::Entity>(),
