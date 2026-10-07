@@ -6,26 +6,31 @@ use serde_json::{Value, json};
 
 use super::{Permission, Tool, ToolContext};
 
-fn context_parts(context: &ToolContext) -> Result<(crate::db::DbPool, String), String> {
-    let pool = context
-        .db_pool
-        .clone()
-        .ok_or("Sticker tools require a database context")?;
+use crate::db::entity::emoji;
+use crate::db::entity::emoji::EmojiSemanticStatus;
+use crate::db::sea::cap::{Db, Snapshot};
+use crate::db::sea::ops::{emoji as emoji_ops, emoji_pack as pack_ops};
+
+fn context_parts(context: &ToolContext) -> Result<(&Db, &str), String> {
+    let db = context.sea.as_ref().ok_or("Sticker tools require a database context")?;
     let assistant_id = context
         .assistant_id
-        .clone()
+        .as_deref()
         .ok_or("Sticker tools require an active assistant")?;
-    Ok((pool, assistant_id))
+    Ok((db, assistant_id))
 }
 
-fn assigned_sticker(
-    conn: &mut diesel::SqliteConnection,
-    assistant_id: &str,
-    sticker_id: &str,
-) -> Result<crate::db::models::emoji::EmojiRow, String> {
-    let sticker = crate::db::ops::emoji::get_emoji(conn, sticker_id).map_err(|_| "Unknown sticker id".to_string())?;
-    let packs = crate::db::ops::emoji_pack::list_assigned_pack_ids(conn, assistant_id).map_err(|e| e.to_string())?;
-    if sticker.semantic_status != "confirmed" || !packs.contains(&sticker.pack_id) {
+/// The sticker, if this assistant may send it: confirmed, and in one of its
+/// packs. Two reads joined, so one snapshot.
+async fn assigned_sticker(db: &impl Snapshot, assistant_id: &str, sticker_id: &str) -> Result<emoji::Model, String> {
+    let sticker = emoji_ops::get_emoji(db, sticker_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Unknown sticker id")?;
+    let packs = pack_ops::list_assigned_pack_ids(db, assistant_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if sticker.semantic_status != EmojiSemanticStatus::Confirmed || !packs.contains(&sticker.pack_id) {
         return Err("That sticker is not in this assistant's confirmed roster".into());
     }
     Ok(sticker)
@@ -68,19 +73,21 @@ impl Tool for ListStickersTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
-        let (pool, assistant_id) = context_parts(context)?;
+        let (db, assistant_id) = context_parts(context)?;
         let query = args
             .get("query")
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim()
             .to_lowercase();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            let pack_ids = crate::db::ops::emoji_pack::list_assigned_pack_ids(&mut conn, &assistant_id)
-                .map_err(|e| e.to_string())?;
-            let stickers =
-                crate::db::ops::emoji::list_confirmed_for_packs(&mut conn, &pack_ids).map_err(|e| e.to_string())?;
+        let stickers = db
+            .read(async |tx| {
+                let pack_ids = pack_ops::list_assigned_pack_ids(tx, assistant_id).await?;
+                emoji_ops::list_confirmed_for_packs(tx, &pack_ids).await
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        {
             let items: Vec<Value> = stickers
                 .into_iter()
                 .filter(|sticker| {
@@ -99,9 +106,7 @@ impl Tool for ListStickersTool {
                 })
                 .collect();
             serde_json::to_string(&items).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        }
     }
 }
 
@@ -161,13 +166,11 @@ impl Tool for SendStickerTool {
             .ok_or("Missing required parameter: sticker_id")?
             .to_string();
         let turn_id = context.turn_id.clone().ok_or("Sticker send requires a turn context")?;
-        let (pool, assistant_id) = context_parts(context)?;
-        let sticker = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            assigned_sticker(&mut conn, &assistant_id, &sticker_id)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let (db, assistant_id) = context_parts(context)?;
+        let sticker = db
+            .read(async |tx| Ok::<_, sea_orm::DbErr>(assigned_sticker(tx, assistant_id, &sticker_id).await))
+            .await
+            .map_err(|e| e.to_string())??;
 
         let mut sent = self.sent_turns.lock().unwrap_or_else(|e| e.into_inner());
         if sent.contains(&turn_id) {

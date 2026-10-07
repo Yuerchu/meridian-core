@@ -10,7 +10,10 @@
 //! time through `schema.rs`; this is where it lives now.
 
 pub mod assistant;
+pub mod assistant_emoji_pack;
 pub mod custom_tool;
+pub mod emoji;
+pub mod emoji_pack;
 pub mod journal_blob;
 pub mod journal_file;
 pub mod journal_version;
@@ -43,13 +46,10 @@ pub const PENDING_TABLES: &[&str] = &[
     "acp_context_deliveries",
     "acp_session_notices",
     "acp_sessions",
-    "assistant_emoji_packs",
     "audit_messages",
     "cached_models",
     "composer_drafts",
     "conversations",
-    "emoji_packs",
-    "emojis",
     "memories",
     "memory_proposals",
     "memory_subjects",
@@ -113,7 +113,10 @@ pub struct ForeignKeyShape {
 pub fn registered() -> Vec<EntityShape> {
     vec![
         shape_of::<assistant::Entity>(),
+        shape_of::<assistant_emoji_pack::Entity>(),
         shape_of::<custom_tool::Entity>(),
+        shape_of::<emoji::Entity>(),
+        shape_of::<emoji_pack::Entity>(),
         shape_of::<journal_blob::Entity>(),
         shape_of::<journal_file::Entity>(),
         shape_of::<journal_version::Entity>(),

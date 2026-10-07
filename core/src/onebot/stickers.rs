@@ -5,8 +5,11 @@ use sha2::{Digest, Sha256};
 
 use super::SharedState;
 use super::format::StickerRef;
-use crate::db::models::emoji::EmojiInsert;
-use crate::db::models::emoji_pack::EmojiPackInsert;
+use crate::db::entity::emoji::EmojiSemanticStatus;
+use crate::db::entity::emoji_pack::EmojiPackKind;
+use crate::db::entity::{emoji, emoji_pack};
+use crate::db::sea::ops::{emoji as emoji_ops, emoji_pack as pack_ops};
+use crate::db::types::{Json, SqlBool};
 
 const MAX_CANDIDATES: usize = 500;
 const MAX_CANDIDATE_BYTES: i64 = 500 * 1024 * 1024;
@@ -37,43 +40,74 @@ fn short_hash(bytes: &[u8]) -> String {
     digest[..12].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn ensure_pack(state: &SharedState, account_id: &str) -> Result<String, String> {
-    let mut conn = state.services.db.get().map_err(|e| e.to_string())?;
-    if let Some(pack) =
-        crate::db::ops::emoji_pack::get_by_source_account(&mut conn, account_id).map_err(|e| e.to_string())?
-    {
-        return Ok(pack.id);
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    let name = format!("QQ {account_id} 表情池");
-    let now = crate::util::now_ms();
-    match crate::db::ops::emoji_pack::create_pack(
-        &mut conn,
-        &EmojiPackInsert {
-            id: &id,
-            name: &name,
-            description: Some("OneBot 自动收集；确认语义后可由助手发送"),
-            cover_image: None,
-            is_builtin: 0,
-            sort_order: 0,
-            created_at: now,
-            updated_at: now,
-            kind: "onebot",
-            source_account_id: Some(account_id),
-        },
-    ) {
-        Ok(_) => {}
-        Err(_) => {
-            return crate::db::ops::emoji_pack::get_by_source_account(&mut conn, account_id)
-                .map_err(|e| e.to_string())?
-                .map(|pack| pack.id)
-                .ok_or_else(|| "could not create OneBot sticker pack".to_string());
-        }
-    }
-    if let Some(assistant_id) = state.config.assistant_id.as_deref() {
-        crate::db::ops::emoji_pack::assign_pack(&mut conn, assistant_id, &id, now).map_err(|e| e.to_string())?;
-    }
-    Ok(id)
+/// The platform payload as the column stores it. A segment whose `data` is not
+/// an object carries nothing a native resend could use, so it is not stored.
+fn stored_payload(sticker: &StickerRef) -> Option<Json<serde_json::Map<String, serde_json::Value>>> {
+    sticker.native_payload.as_object().cloned().map(Json)
+}
+
+/// The account's sticker pool, opened (and assigned to the configured
+/// assistant) on first use. One write: the lookup, the insert and the
+/// assignment cannot interleave with another capture opening the same pool.
+async fn ensure_pack(state: &SharedState, account_id: &str) -> Result<String, String> {
+    let assistant_id = state.config.assistant_id.clone();
+    state
+        .services
+        .sea
+        .write(async |tx| {
+            if let Some(pack) = pack_ops::get_by_source_account(tx, account_id).await? {
+                return Ok(pack.id);
+            }
+            let now = crate::util::now_ms();
+            let pack = pack_ops::create_pack(
+                tx,
+                emoji_pack::Model {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: format!("QQ {account_id} 表情池"),
+                    description: Some("OneBot 自动收集；确认语义后可由助手发送".into()),
+                    cover_image: None,
+                    is_builtin: SqlBool::FALSE,
+                    sort_order: 0,
+                    created_at: now,
+                    updated_at: now,
+                    kind: EmojiPackKind::Onebot,
+                    source_account_id: Some(account_id.to_owned()),
+                },
+            )
+            .await?;
+            if let Some(assistant_id) = assistant_id.as_deref() {
+                pack_ops::assign_pack(tx, assistant_id, &pack.id, now).await?;
+            }
+            Ok(pack.id)
+        })
+        .await
+        .map_err(|e: sea_orm::DbErr| e.to_string())
+}
+
+/// Record a sighting of a sticker that is not yet known by its key, or find
+/// it if another capture recorded it first. The lookup, the name check and the
+/// insert are one write, so two captures of the same new sticker leave one row.
+async fn record_new(state: &SharedState, row: emoji::Model, hint: Option<&str>, suffix: &str) -> Option<String> {
+    let key = row.source_key.clone().unwrap_or_default();
+    state
+        .services
+        .sea
+        .write(async |tx| {
+            if let Some(existing) = emoji_ops::find_by_source_key(tx, &row.pack_id, row.source, &key).await? {
+                emoji_ops::mark_seen(tx, &existing.id, crate::util::now_ms()).await?;
+                return Ok(existing.id);
+            }
+            let mut row = row;
+            if let Some(hint) = hint
+                && emoji_ops::name_in_use(tx, &row.pack_id, hint).await?
+            {
+                row.name = format!("{hint}-{suffix}");
+            }
+            emoji_ops::create_emoji(tx, row).await.map(|created| created.id)
+        })
+        .await
+        .map_err(|e: sea_orm::DbErr| tracing::warn!(error = %e, "could not record a captured sticker"))
+        .ok()
 }
 
 pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: &[StickerRef]) -> Vec<Option<String>> {
@@ -81,7 +115,7 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
         return vec![None; stickers.len()];
     }
     let account_id = self_id.to_string();
-    let pack_id = match ensure_pack(state, &account_id) {
+    let pack_id = match ensure_pack(state, &account_id).await {
         Ok(pack) => pack,
         Err(error) => {
             tracing::warn!(%error, self_id, "could not open OneBot sticker pool");
@@ -93,15 +127,20 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
         tracing::warn!(%error, "could not create OneBot sticker directory");
         return vec![None; stickers.len()];
     }
+    let sea = &state.services.sea;
 
     let mut captured = Vec::with_capacity(stickers.len());
     for sticker in stickers {
-        let known = sticker.source_key.as_deref().and_then(|key| {
-            let mut conn = state.services.db.get().ok()?;
-            crate::db::ops::emoji::find_by_source_key(&mut conn, &pack_id, sticker.source, key)
+        // pool-read-before-write: this lookup only decides whether to download.
+        // The download is network I/O that must not hold the write lock, and
+        // `record_new` repeats the lookup inside its write before inserting.
+        let known = match sticker.source_key.as_deref() {
+            Some(key) => emoji_ops::find_by_source_key(sea, &pack_id, sticker.source, key)
+                .await
                 .ok()
-                .flatten()
-        });
+                .flatten(),
+            None => None,
+        };
         if let Some(mut known) = known {
             let url = sticker
                 .url
@@ -114,24 +153,21 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
                 let file_name = format!("{}.{}", known.id, extension);
                 let path = crate::emoji::emoji_path(data_dir, &pack_id, &file_name);
                 if std::fs::write(path, &bytes).is_ok() {
-                    let payload = serde_json::to_string(&sticker.native_payload).unwrap_or_else(|_| "{}".into());
-                    if let Ok(mut conn) = state.services.db.get()
-                        && let Ok(updated) = crate::db::ops::emoji::attach_captured_media(
-                            &mut conn,
-                            &known.id,
-                            &file_name,
-                            &extension,
-                            bytes.len() as i64,
-                            &payload,
-                        )
+                    let payload = stored_payload(sticker).unwrap_or_else(|| Json(Default::default()));
+                    let size = bytes.len() as i64;
+                    if let Ok(updated) = sea
+                        .write(async |tx| {
+                            emoji_ops::attach_captured_media(tx, &known.id, &file_name, &extension, size, payload).await
+                        })
+                        .await
                     {
                         known = updated;
                     }
                 }
             }
-            if let Ok(mut conn) = state.services.db.get() {
-                let _ = crate::db::ops::emoji::mark_seen(&mut conn, &known.id, crate::util::now_ms());
-            }
+            let _ = sea
+                .write(async |tx| emoji_ops::mark_seen(tx, &known.id, crate::util::now_ms()).await)
+                .await;
             captured.push(Some(known.id));
             continue;
         }
@@ -144,21 +180,18 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
             Some(url) => super::media::download_image(url).await.ok(),
             None => None,
         };
-        let payload = serde_json::to_string(&sticker.native_payload).unwrap_or_else(|_| "{}".into());
         let key = sticker.source_key.clone().unwrap_or_else(|| {
             downloaded
                 .as_ref()
                 .map(|(bytes, _)| short_hash(bytes))
-                .unwrap_or_else(|| short_hash(payload.as_bytes()))
+                .unwrap_or_else(|| {
+                    short_hash(
+                        serde_json::to_string(&sticker.native_payload)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    )
+                })
         });
-        if let Ok(mut conn) = state.services.db.get()
-            && let Ok(Some(existing)) =
-                crate::db::ops::emoji::find_by_source_key(&mut conn, &pack_id, sticker.source, &key)
-        {
-            let _ = crate::db::ops::emoji::mark_seen(&mut conn, &existing.id, crate::util::now_ms());
-            captured.push(Some(existing.id));
-            continue;
-        }
 
         let id = uuid::Uuid::new_v4().to_string();
         let (file_name, file_format, file_size) = match downloaded {
@@ -175,61 +208,44 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
             None => (String::new(), String::new(), 0),
         };
         let hint = meaningful_summary(sticker.summary.as_deref());
-        let suffix = &key[..key.len().min(8)];
-        let name = match hint.as_ref() {
-            Some(hint) => {
-                let collides = state
-                    .services
-                    .db
-                    .get()
-                    .ok()
-                    .and_then(|mut conn| crate::db::ops::emoji::list_by_pack(&mut conn, &pack_id).ok())
-                    .is_some_and(|items| items.iter().any(|item| item.name == *hint));
-                if collides {
-                    format!("{hint}-{suffix}")
-                } else {
-                    hint.clone()
-                }
-            }
-            None => format!("pending-{suffix}"),
-        };
-        let status = if hint.is_some() { "confirmed" } else { "pending" };
+        let suffix = key[..key.len().min(8)].to_string();
         let now = crate::util::now_ms();
-        let inserted = state.services.db.get().ok().and_then(|mut conn| {
-            crate::db::ops::emoji::create_emoji(
-                &mut conn,
-                &EmojiInsert {
-                    id: &id,
-                    pack_id: &pack_id,
-                    name: &name,
-                    tags: hint.as_deref(),
-                    file_name: &file_name,
-                    file_format: &file_format,
-                    sort_order: 0,
-                    created_at: now,
-                    source: sticker.source,
-                    source_key: Some(&key),
-                    native_payload: Some(&payload),
-                    semantic_status: status,
-                    suggested_name: None,
-                    suggested_tags: None,
-                    file_size,
-                    seen_count: 1,
-                    last_seen_at: Some(now),
-                },
-            )
-            .ok()
-        });
-        captured.push(inserted.map(|sticker| sticker.id));
+        let row = emoji::Model {
+            id,
+            pack_id: pack_id.clone(),
+            name: hint.clone().unwrap_or_else(|| format!("pending-{suffix}")),
+            tags: hint.clone(),
+            file_name,
+            file_format,
+            sort_order: 0,
+            created_at: now,
+            source: sticker.source,
+            source_key: Some(key),
+            native_payload: stored_payload(sticker),
+            semantic_status: if hint.is_some() {
+                EmojiSemanticStatus::Confirmed
+            } else {
+                EmojiSemanticStatus::Pending
+            },
+            suggested_name: None,
+            suggested_tags: None,
+            file_size,
+            seen_count: 1,
+            last_seen_at: Some(now),
+        };
+        captured.push(record_new(state, row, hint.as_deref(), &suffix).await);
     }
 
-    evict_candidates(state, &pack_id, data_dir);
+    evict_candidates(state, &pack_id, data_dir).await;
     captured
 }
 
-fn evict_candidates(state: &SharedState, pack_id: &str, data_dir: &std::path::Path) {
-    let Ok(mut conn) = state.services.db.get() else { return };
-    let Ok(mut candidates) = crate::db::ops::emoji::list_candidates(&mut conn, pack_id) else {
+async fn evict_candidates(state: &SharedState, pack_id: &str, data_dir: &std::path::Path) {
+    let sea = &state.services.sea;
+    // pool-read-before-write: eviction is best effort. Each delete is its own
+    // write, and a sticker some message still shows is refused by
+    // `message_stickers`' ON DELETE RESTRICT whatever this list said.
+    let Ok(mut candidates) = emoji_ops::list_candidates(sea, pack_id).await else {
         return;
     };
     let mut bytes: i64 = candidates.iter().map(|sticker| sticker.file_size).sum();
@@ -242,10 +258,12 @@ fn evict_candidates(state: &SharedState, pack_id: &str, data_dir: &std::path::Pa
         if count <= MAX_CANDIDATES && bytes <= MAX_CANDIDATE_BYTES {
             break;
         }
-        if crate::db::ops::emoji::is_referenced(&mut conn, &sticker.id).unwrap_or(true) {
-            continue;
-        }
-        if crate::db::ops::emoji::delete_emoji(&mut conn, &sticker.id).is_ok() {
+        // A referenced sticker fails here, with the key, and is kept.
+        if sea
+            .write(async |tx| emoji_ops::delete_emoji(tx, &sticker.id).await)
+            .await
+            .is_ok_and(|deleted| deleted > 0)
+        {
             if !sticker.file_name.is_empty() {
                 crate::emoji::delete_file(data_dir, &sticker.pack_id, &sticker.file_name);
             }
@@ -269,5 +287,92 @@ mod tests {
     #[test]
     fn descriptive_labels_can_be_confirmed_without_content_filtering() {
         assert_eq!(meaningful_summary(Some("[害羞贴贴]")), Some("害羞贴贴".into()));
+    }
+
+    /// The capture path end to end: the same sticker captured twice is one row
+    /// seen twice, under the name its summary gave it. (Whether the second
+    /// capture takes the known path or the in-write lookup depends on
+    /// scheduling; the race itself is the next test.)
+    #[tokio::test]
+    async fn two_captures_of_one_new_sticker_leave_one_row() {
+        use crate::db::entity::emoji::EmojiSource;
+        use crate::db::sea::ops::emoji as emoji_ops;
+
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::services::bare_services(dir.path()).await;
+        let server = super::super::OneBotServer::new(services, super::super::OneBotConfig::default());
+        let state = server.state.clone();
+        let sticker = super::StickerRef {
+            source: EmojiSource::OnebotFace,
+            source_key: Some("14".into()),
+            native_payload: serde_json::json!({ "id": "14" }),
+            url: None,
+            file: None,
+            summary: Some("微笑".into()),
+        };
+
+        let first = [sticker.clone()];
+        let second = [sticker];
+        let (a, b) = tokio::join!(
+            super::capture_stickers(&state, 42, &first),
+            super::capture_stickers(&state, 42, &second),
+        );
+        assert!(a[0].is_some(), "{a:?}");
+        assert_eq!(a, b, "both captures name the same sticker");
+
+        let pack = crate::db::sea::ops::emoji_pack::get_by_source_account(&state.services.sea, "42")
+            .await
+            .unwrap()
+            .unwrap();
+        let rows = emoji_ops::list_by_pack(&state.services.sea, &pack.id).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].seen_count, 2);
+        assert_eq!(rows[0].name, "微笑");
+    }
+
+    /// The race itself: two captures that both missed the lookup outside the
+    /// lock (as two captures arriving together do) record the same new
+    /// sticker. The lookup inside the write is what lets the second find the
+    /// first's row; without it the second insert hits the unique key and the
+    /// capture comes back empty.
+    #[tokio::test]
+    async fn two_records_of_one_new_sticker_name_one_row() {
+        use crate::db::entity::emoji::{EmojiSemanticStatus, EmojiSource};
+        use crate::db::sea::ops::emoji as emoji_ops;
+
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::services::bare_services(dir.path()).await;
+        let server = super::super::OneBotServer::new(services, super::super::OneBotConfig::default());
+        let state = server.state.clone();
+        let pack_id = super::ensure_pack(&state, "42").await.unwrap();
+        let row = |id: &str| super::emoji::Model {
+            id: id.into(),
+            pack_id: pack_id.clone(),
+            name: "pending-14".into(),
+            tags: None,
+            file_name: String::new(),
+            file_format: String::new(),
+            sort_order: 0,
+            created_at: 1,
+            source: EmojiSource::OnebotFace,
+            source_key: Some("14".into()),
+            native_payload: None,
+            semantic_status: EmojiSemanticStatus::Pending,
+            suggested_name: None,
+            suggested_tags: None,
+            file_size: 0,
+            seen_count: 1,
+            last_seen_at: Some(1),
+        };
+
+        let (a, b) = tokio::join!(
+            super::record_new(&state, row("first"), None, "14"),
+            super::record_new(&state, row("second"), None, "14"),
+        );
+        assert!(a.is_some() && b.is_some(), "{a:?} {b:?}");
+        assert_eq!(a, b);
+        let rows = emoji_ops::list_by_pack(&state.services.sea, &pack_id).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].seen_count, 2);
     }
 }

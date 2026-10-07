@@ -13,6 +13,7 @@ use super::protocol::MessageSegment;
 use super::protocol::OneBotAction;
 use super::session::{SessionKey, SessionKind};
 use super::{SharedState, call_api};
+use crate::db::entity::emoji::EmojiSource;
 
 const MAX_HISTORY_COUNT: i64 = 50;
 const MAX_OUTPUT_CHARS: usize = 8000;
@@ -609,16 +610,19 @@ impl QqToolExecutor {
             .unwrap_or("")
             .trim()
             .to_lowercase();
-        let pool = self.state.services.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            let Some(pack) =
-                crate::db::ops::emoji_pack::get_by_source_account(&mut conn, &self_id).map_err(|e| e.to_string())?
-            else {
-                return Ok("[]".to_string());
-            };
-            let stickers =
-                crate::db::ops::emoji::list_confirmed_for_packs(&mut conn, &[pack.id]).map_err(|e| e.to_string())?;
+        let stickers = self
+            .state
+            .services
+            .sea
+            .read(
+                async |tx| match crate::db::sea::ops::emoji_pack::get_by_source_account(tx, &self_id).await? {
+                    Some(pack) => crate::db::sea::ops::emoji::list_confirmed_for_packs(tx, &[pack.id]).await,
+                    None => Ok(Vec::new()),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        {
             let values: Vec<_> = stickers
                 .into_iter()
                 .filter(|sticker| {
@@ -637,9 +641,7 @@ impl QqToolExecutor {
                 })
                 .collect();
             serde_json::to_string(&values).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        }
     }
 
     /// 把一段话念出来，发到这个会话。
@@ -782,24 +784,28 @@ impl QqToolExecutor {
             }
         }
         let self_id = self.self_id.ok_or("OneBot event did not include self_id")?.to_string();
-        let pool = self.state.services.db.clone();
         let data_dir = self.state.services.paths.data_dir.clone();
-        let sticker = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            let pack = crate::db::ops::emoji_pack::get_by_source_account(&mut conn, &self_id)
-                .map_err(|e| e.to_string())?
-                .ok_or("No sticker pool exists for this bot account")?;
-            let sticker = crate::db::ops::emoji::get_emoji(&mut conn, &sticker_id)
-                .map_err(|_| "Unknown sticker id".to_string())?;
-            if sticker.pack_id != pack.id || sticker.semantic_status != "confirmed" {
-                return Err("That sticker is not in this bot account's confirmed roster".into());
-            }
-            Ok::<_, String>(sticker)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        // The pool and the sticker are read in one snapshot: two reads joined.
+        let (pack, sticker) = self
+            .state
+            .services
+            .sea
+            .read(async |tx| {
+                let pack = crate::db::sea::ops::emoji_pack::get_by_source_account(tx, &self_id).await?;
+                let sticker = crate::db::sea::ops::emoji::get_emoji(tx, &sticker_id).await?;
+                Ok::<_, sea_orm::DbErr>((pack, sticker))
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let pack = pack.ok_or("No sticker pool exists for this bot account")?;
+        let sticker = sticker.ok_or("Unknown sticker id")?;
+        if sticker.pack_id != pack.id
+            || sticker.semantic_status != crate::db::entity::emoji::EmojiSemanticStatus::Confirmed
+        {
+            return Err("That sticker is not in this bot account's confirmed roster".into());
+        }
 
-        let payload = crate::emoji::parse_native_payload(&sticker.id, sticker.native_payload.as_deref())?;
+        let payload = sticker.native_payload();
         let cached_image = || -> Result<MessageSegment, String> {
             use base64::Engine;
             if sticker.file_name.is_empty() {
@@ -815,14 +821,14 @@ impl QqToolExecutor {
             SessionKind::Private => OneBotAction::send_private_msg(self.session.id, vec![segment]).with_echo(echo),
         };
 
-        let first = match sticker.source.as_str() {
-            "onebot_face" => MessageSegment::raw("face", payload),
-            "onebot_mface" => MessageSegment::raw("mface", payload),
-            _ => cached_image()?,
+        let first = match sticker.source {
+            EmojiSource::OnebotFace => MessageSegment::raw("face", payload),
+            EmojiSource::OnebotMface => MessageSegment::raw("mface", payload),
+            EmojiSource::OnebotImage | EmojiSource::Local => cached_image()?,
         };
         let direct = call_api(&self.state, send(first, echo())).await;
         if let Err(error) = direct {
-            if sticker.source != "onebot_mface" {
+            if sticker.source != EmojiSource::OnebotMface {
                 return Err(error);
             }
             call_api(&self.state, send(cached_image()?, echo())).await?;

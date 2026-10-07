@@ -941,7 +941,13 @@ async fn headless_chat_inner(
 
     let mut chat_messages = build_messages_with_senders(&system_prompt, &ctx, trailing, &sender_names)?;
     let data_dir = services.map(|s| s.paths.data_dir.as_path());
-    crate::agent::resolve_sticker_parts_in_messages(&mut chat_messages, pool, data_dir, supports_images)?;
+    crate::agent::resolve_sticker_parts_in_messages(
+        &mut chat_messages,
+        services.map(|s| &s.sea),
+        data_dir,
+        supports_images,
+    )
+    .await?;
     let files_root = data_dir.map(crate::files::files_dir);
     crate::agent::resolve_file_uris_in_messages(&mut chat_messages, files_root.as_deref())?;
     microcompact(&mut chat_messages, &budget, keep_recent);

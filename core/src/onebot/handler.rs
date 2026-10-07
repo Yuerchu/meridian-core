@@ -2209,7 +2209,7 @@ mod tests {
 
     fn sticker(key: &str) -> super::format::StickerRef {
         super::format::StickerRef {
-            source: "onebot_mface",
+            source: crate::db::entity::emoji::EmojiSource::OnebotMface,
             source_key: Some(key.into()),
             native_payload: serde_json::json!({}),
             url: None,

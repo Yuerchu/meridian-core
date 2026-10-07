@@ -354,7 +354,9 @@ mod tests {
             ..ComposerDraftContent::default()
         };
         save(&mut conn, &slot("c1"), &content, 1, 100).unwrap();
-        crate::db::ops::emoji::delete_emoji(&mut conn, "e1").unwrap();
+        diesel::delete(crate::db::schema::emojis::table.find("e1"))
+            .execute(&mut conn)
+            .unwrap();
 
         let row = get(&mut conn, &slot("c1")).unwrap().unwrap();
         assert_eq!(row.sticker_id, None);

@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::protocol::MessageSegment;
+use crate::db::entity::emoji::EmojiSource;
 
 const MAX_MSG_LEN: usize = 4000;
 
@@ -194,7 +195,7 @@ pub struct MediaRef {
 
 #[derive(Debug, Clone)]
 pub struct StickerRef {
-    pub source: &'static str,
+    pub source: EmojiSource,
     pub source_key: Option<String>,
     pub native_payload: serde_json::Value,
     pub url: Option<String>,
@@ -357,9 +358,9 @@ pub fn parse_segments(message: &serde_json::Value, self_id: Option<i64>) -> Pars
                     };
                     parsed.stickers.push(StickerRef {
                         source: if emoji_id.is_some() {
-                            "onebot_mface"
+                            EmojiSource::OnebotMface
                         } else {
-                            "onebot_image"
+                            EmojiSource::OnebotImage
                         },
                         source_key,
                         native_payload: data.cloned().unwrap_or_else(|| serde_json::json!({})),
@@ -384,7 +385,7 @@ pub fn parse_segments(message: &serde_json::Value, self_id: Option<i64>) -> Pars
                         .or_else(|| value.as_i64().map(|v| v.to_string()))
                 });
                 parsed.stickers.push(StickerRef {
-                    source: "onebot_face",
+                    source: EmojiSource::OnebotFace,
                     source_key: id.clone(),
                     native_payload: data.cloned().unwrap_or_else(|| serde_json::json!({})),
                     url: id.map(|id| format!("https://qzonestyle.gtimg.cn/qzone/em/e{id}.gif")),
@@ -403,7 +404,7 @@ pub fn parse_segments(message: &serde_json::Value, self_id: Option<i64>) -> Pars
                     _ => get_str("key"),
                 };
                 parsed.stickers.push(StickerRef {
-                    source: "onebot_mface",
+                    source: EmojiSource::OnebotMface,
                     source_key,
                     native_payload: data.cloned().unwrap_or_else(|| serde_json::json!({})),
                     url: get_str("url").or_else(|| get_str("temp_url")),
@@ -924,7 +925,7 @@ mod tests {
         let parsed = parse_segments(&msg, None);
         assert!(parsed.images.is_empty());
         assert_eq!(parsed.stickers.len(), 1);
-        assert_eq!(parsed.stickers[0].source, "onebot_mface");
+        assert_eq!(parsed.stickers[0].source, EmojiSource::OnebotMface);
         assert_eq!(parsed.stickers[0].source_key.as_deref(), Some("42:99"));
         assert_eq!(parsed.text, STICKER_SENTINEL.to_string());
     }
@@ -943,7 +944,7 @@ mod tests {
         let parsed = parse_segments(&msg, None);
         assert!(parsed.images.is_empty());
         assert_eq!(parsed.stickers.len(), 1);
-        assert_eq!(parsed.stickers[0].source, "onebot_image");
+        assert_eq!(parsed.stickers[0].source, EmojiSource::OnebotImage);
         assert_eq!(parsed.stickers[0].source_key.as_deref(), Some("custom-sticker.gif"));
         assert_eq!(parsed.stickers[0].summary, None);
         assert_eq!(parsed.text, STICKER_SENTINEL.to_string());
