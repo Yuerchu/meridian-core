@@ -13,9 +13,9 @@ use crate::db::types::{EpochMs, SqlBool};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "skills")]
 pub struct Model {
-    /// The directory under the skills root, and the key. The schema leaves it
-    /// nullable (a non-integer primary key without `NOT NULL`); nothing writes
-    /// a NULL, and this type would refuse to read one.
+    /// The directory under the skills root, and the key: a slug, which the
+    /// schema checks (`m0002_skill_keys`), so a path has one spelling and appears
+    /// once.
     #[sea_orm(primary_key, auto_increment = false)]
     pub dir_name: String,
     pub llm_name: String,

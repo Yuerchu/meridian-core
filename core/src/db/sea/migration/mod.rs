@@ -15,6 +15,7 @@
 //! the tree there is one source for the schema and two readers of it.
 
 pub mod m0001_baseline;
+pub mod m0002_skill_keys;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -28,7 +29,7 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(M0001Baseline)]
+        vec![Box::new(M0001Baseline), Box::new(M0002SkillKeys)]
     }
 }
 
@@ -69,6 +70,86 @@ impl MigrationTrait for M0001Baseline {
                 "the baseline is rendered for SQLite only; {other:?} is not shipped yet"
             ))),
         }
+    }
+}
+
+/// Every statement this build's migrations run on SQLite, in order: what
+/// `diesel_test_db` executes, so the Diesel tests see the schema the SeaORM
+/// migrator builds.
+pub fn sqlite_statements() -> Vec<String> {
+    let mut all = m0001_baseline::sqlite_statements();
+    all.extend(m0002_skill_keys::sqlite_statements());
+    all
+}
+
+pub struct M0002SkillKeys;
+
+impl MigrationName for M0002SkillKeys {
+    fn name(&self) -> &str {
+        "m0002_skill_keys"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0002SkillKeys {
+    /// The rebuild and its ledger row commit together, as the baseline's do.
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "m0002_skill_keys rebuilds SQLite tables; other backends start from the constrained schema".into(),
+            ));
+        }
+        // With foreign keys on, dropping `skills` would cascade into every
+        // binding. Refused before anything is touched rather than trusted.
+        let on = conn
+            .query_one_raw(sea_orm::Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys",
+            ))
+            .await?
+            .map(|row| row.try_get_by_index::<i64>(0))
+            .transpose()?
+            .unwrap_or(0);
+        if on != 0 {
+            return Err(DbErr::Migration(
+                "m0002_skill_keys must run with foreign keys off; dropping skills would cascade into its bindings"
+                    .into(),
+            ));
+        }
+        for statement in m0002_skill_keys::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        // What the rebuild leaves must satisfy the references it touched —
+        // every foreign key that points at `skills` — checked before the
+        // transaction commits. Only those: a binding whose assistant was
+        // deleted while foreign keys were off is an older violation of another
+        // key, real databases have them, and they are not this migration's to
+        // judge or to delete (`foreign_key_check` names the parent in column 2).
+        for table in m0002_skill_keys::CHECKED_TABLES {
+            let rows = conn
+                .query_all_raw(sea_orm::Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("PRAGMA foreign_key_check(\"{table}\")"),
+                ))
+                .await?;
+            let mut onto_skills = 0;
+            for row in rows {
+                if row.try_get_by_index::<String>(2)? == "skills" {
+                    onto_skills += 1;
+                }
+            }
+            if onto_skills > 0 {
+                return Err(DbErr::Migration(format!(
+                    "m0002_skill_keys left {onto_skills} reference(s) from {table} to a skill that is not there"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 

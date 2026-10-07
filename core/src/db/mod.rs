@@ -102,9 +102,9 @@ pub fn diesel_test_db() -> DbPool {
 
     // The statements the SeaORM baseline runs, run here through Diesel: one
     // source for the schema while both ORMs read it. A migration after the
-    // baseline adds its own statements to this list.
+    // baseline adds its own statements to `migration::sqlite_statements`.
     let mut conn = pool.get().expect("failed to get test db connection");
-    let schema = sea::migration::m0001_baseline::sqlite_statements().join(";\n") + ";";
+    let schema = sea::migration::sqlite_statements().join(";\n") + ";";
     diesel::connection::SimpleConnection::batch_execute(&mut *conn, &schema).expect("failed to build the test schema");
 
     pool

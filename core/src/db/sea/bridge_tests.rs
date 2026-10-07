@@ -10,8 +10,8 @@ use super::bridge::{Ledger, classify, migrate, migrate_file, migrate_with, previ
 use super::introspect::Schema;
 use super::legacy::{LEGACY, replay_all};
 use super::memory_connection;
+use super::migration::Migrator;
 use super::migration::m0001_baseline::sqlite_statements;
-use super::migration::{BASELINE_NAME, M0001Baseline, Migrator};
 
 const DIESEL_LEDGER: &str = "__diesel_schema_migrations";
 
@@ -94,12 +94,19 @@ fn all_legacy_versions() -> Vec<String> {
         .collect()
 }
 
-/// A migration after the baseline, for the tests that need one to exist.
+/// The migrations this build ships, by name, in the order they run: what a
+/// database is recorded as once `migrate` is done with it.
+fn shipped() -> Vec<String> {
+    Migrator::migrations().iter().map(|m| m.name().to_owned()).collect()
+}
+
+/// A migration after every shipped one, for the tests that need a later
+/// migration to exist.
 struct Probe;
 
 impl MigrationName for Probe {
     fn name(&self) -> &str {
-        "m0002_probe"
+        "m9999_probe"
     }
 }
 
@@ -119,7 +126,9 @@ struct WithProbe;
 #[async_trait::async_trait]
 impl MigratorTrait for WithProbe {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(M0001Baseline), Box::new(Probe)]
+        let mut all = Migrator::migrations();
+        all.push(Box::new(Probe));
+        all
     }
 }
 
@@ -127,7 +136,7 @@ impl MigratorTrait for WithProbe {
 async fn a_fresh_database_is_built_by_the_baseline_and_recorded_as_such() {
     let conn = fresh().await;
     assert_eq!(classify(&conn).await.unwrap(), Ledger::Bridged);
-    assert_eq!(versions(&conn, "seaql_migrations").await, [BASELINE_NAME]);
+    assert_eq!(versions(&conn, "seaql_migrations").await, shipped());
     let tables = table_names(&conn).await;
     assert!(tables.iter().any(|t| t == "conversations"), "{tables:?}");
     assert!(
@@ -147,7 +156,7 @@ async fn a_diesel_database_is_replayed_to_the_end_and_then_recorded() {
         let conn = diesel_at(applied).await;
         assert_eq!(migrate(&conn).await.unwrap(), Ledger::Diesel { applied }, "{applied}");
         assert_eq!(versions(&conn, DIESEL_LEDGER).await, all_legacy_versions(), "{applied}");
-        assert_eq!(versions(&conn, "seaql_migrations").await, [BASELINE_NAME], "{applied}");
+        assert_eq!(versions(&conn, "seaql_migrations").await, shipped(), "{applied}");
         assert_eq!(classify(&conn).await.unwrap(), Ledger::Bridged, "{applied}");
         assert_eq!(Schema::read(&conn).await.unwrap().normalized(), expected, "{applied}");
     }
@@ -170,10 +179,9 @@ async fn migrating_again_changes_nothing() {
 async fn a_migration_after_the_baseline_runs_once_on_every_kind_of_database() {
     for conn in [blank().await, diesel_at(60).await, fresh().await] {
         migrate_with::<WithProbe>(&conn).await.unwrap();
-        assert_eq!(
-            versions(&conn, "seaql_migrations").await,
-            [BASELINE_NAME, "m0002_probe"]
-        );
+        let mut expected = shipped();
+        expected.push("m9999_probe".into());
+        assert_eq!(versions(&conn, "seaql_migrations").await, expected);
         assert!(table_names(&conn).await.iter().any(|t| t == "probe"));
         let before = snapshot(&conn).await;
         assert_eq!(migrate_with::<WithProbe>(&conn).await.unwrap(), Ledger::Bridged);
@@ -186,7 +194,7 @@ async fn ledgers_no_release_produced_are_refused_before_any_write() {
     let later_without_baseline = diesel_at(65).await;
     Migrator::install(&later_without_baseline).await.unwrap();
     later_without_baseline
-        .execute_unprepared("INSERT INTO seaql_migrations (version, applied_at) VALUES ('m0002_probe', 1)")
+        .execute_unprepared("INSERT INTO seaql_migrations (version, applied_at) VALUES ('m9999_probe', 1)")
         .await
         .unwrap();
 
