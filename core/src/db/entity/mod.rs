@@ -11,6 +11,7 @@
 
 pub mod assistant;
 pub mod assistant_emoji_pack;
+pub mod conversation;
 pub mod custom_tool;
 pub mod emoji;
 pub mod emoji_pack;
@@ -18,6 +19,8 @@ pub mod journal_blob;
 pub mod journal_file;
 pub mod journal_version;
 pub mod mcp_server;
+pub mod message;
+pub mod message_sticker;
 pub mod notification_alert_state;
 pub mod notification_webhook;
 pub mod preference;
@@ -49,13 +52,10 @@ pub const PENDING_TABLES: &[&str] = &[
     "audit_messages",
     "cached_models",
     "composer_drafts",
-    "conversations",
     "memories",
     "memory_proposals",
     "memory_subjects",
     "message_context_items",
-    "message_stickers",
-    "messages",
     "mode_artifacts",
     "model_configs",
     "model_profiles",
@@ -114,6 +114,7 @@ pub fn registered() -> Vec<EntityShape> {
     vec![
         shape_of::<assistant::Entity>(),
         shape_of::<assistant_emoji_pack::Entity>(),
+        shape_of::<conversation::Entity>(),
         shape_of::<custom_tool::Entity>(),
         shape_of::<emoji::Entity>(),
         shape_of::<emoji_pack::Entity>(),
@@ -121,6 +122,8 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<journal_file::Entity>(),
         shape_of::<journal_version::Entity>(),
         shape_of::<mcp_server::Entity>(),
+        shape_of::<message::Entity>(),
+        shape_of::<message_sticker::Entity>(),
         shape_of::<notification_alert_state::Entity>(),
         shape_of::<notification_webhook::Entity>(),
         shape_of::<preference::Entity>(),
