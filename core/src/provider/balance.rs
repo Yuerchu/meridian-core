@@ -906,10 +906,29 @@ mod tests {
     /// reported rather than refused. Refusing is `BalanceOutcome::Unknown`,
     /// which is silence — at the one moment silence is most expensive.
     ///
+    /// All three upstreams, because this was argued from Moonshot's
+    /// documentation and then **observed on DeepSeek**: a watcher running a
+    /// build from before the fix logged
+    /// `total_balance must be non-negative` twice, six hours apart, and said
+    /// nothing to anybody either time. That is the failure in full — the
+    /// account was past zero, the daemon was up, the endpoints were healthy,
+    /// and the only trace was a warning in a file.
+    ///
     /// Mutation check: restoring `require_non_negative` inside
-    /// `required_amount` turns this and its Moonshot twin red.
+    /// `required_amount` turns all three halves red.
     #[test]
     fn an_overdrawn_account_is_reported_rather_than_refused() {
+        // The shape actually seen in production, with its sibling components
+        // still positive — an expiring grant can prop those up while the
+        // spendable total has already gone past zero.
+        let deepseek_owed = parse(
+            r#"{"is_available":false,"balance_infos":[
+                {"currency":"CNY","total_balance":"-3.42",
+                 "granted_balance":"0.00","topped_up_balance":"0.00"}]}"#,
+        );
+        assert_eq!(deepseek_owed.accounts[0].total_balance, decimal("-3.42"));
+        assert!(deepseek_owed.is_low(&decimal("0")), "a zero threshold still reports it");
+
         let owed = siliconflow(
             r#"{"code":20000,"status":true,"data":{"totalBalance":"-1.50","status":"normal"}}"#,
             "CNY",
