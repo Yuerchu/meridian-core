@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{Permission, Tool, ToolContext};
-use crate::db::models::redaction_rule::*;
+use crate::db::entity::redaction_rule;
+use crate::db::entity::redaction_rule::{GLOBAL_SCOPE_ID, RedactionExample, RuleCategory, RuleOrigin, RuleScope};
+use crate::db::sea::ops::redaction_rule as rule_ops;
+use crate::db::types::{Json, SqlBool};
 use crate::redaction::RedactionEngine;
 
 // ── AddRedactionRuleTool ────────────────────────────────────────────────────
@@ -130,54 +133,42 @@ impl Tool for AddRedactionRuleTool {
 
         crate::redaction::rule::validate_spec(&spec)?;
 
-        let pool = context.db_pool.clone().ok_or("no database available")?;
-        let engine = self.engine.clone();
-        let scope_type_str = scope.as_str().to_string();
-        let scope_id_owned = scope_id.clone();
-        let conversation_id = context.conversation_id.clone();
-
-        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-
-            crate::db::ops::redaction_rule::validate_new_rule(&mut conn, &scope_type_str, &scope_id_owned, &spec)?;
-
-            let id = uuid::Uuid::new_v4().to_string();
-            let now = crate::util::now_ms();
-            let examples_json = encode_examples(&examples)?;
-
-            crate::db::ops::redaction_rule::create_rule(
-                &mut conn,
-                &RedactionRuleInsert {
-                    id: &id,
-                    scope_type: &scope_type_str,
-                    scope_id: &scope_id_owned,
-                    name: &spec.name,
-                    description: &spec.description,
-                    pattern: &spec.pattern,
-                    category: category.as_str(),
-                    examples: &examples_json,
-                    origin: RuleOrigin::Model.as_str(),
-                    source_conversation_id: conversation_id.as_deref(),
-                    is_enabled: 1,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-
-            engine.reload(&mut conn)?;
-
-            Ok(format!(
-                "Rule `{}` added ({}). It applies from the next request; \
-                 what was already sent cannot be recalled. \
-                 Do not repeat the value in your reply.",
-                spec.name, scope_type_str
-            ))
+        let db = context.sea.as_ref().ok_or("no database available")?;
+        let now = crate::util::now_ms();
+        let row = redaction_rule::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope_type: scope,
+            scope_id,
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+            pattern: spec.pattern.clone(),
+            category,
+            examples: Json(examples),
+            origin: RuleOrigin::Model,
+            source_conversation_id: context.conversation_id.clone(),
+            is_enabled: SqlBool::TRUE,
+            created_at: now,
+            updated_at: now,
+        };
+        // The checks and the insert share one write lock, so two concurrent
+        // adds cannot both pass the name check or the per-scope count.
+        db.write(async |tx| {
+            if let Err(refused) = rule_ops::validate_new_rule(tx, scope, &row.scope_id, &spec).await {
+                return Ok(Err(refused));
+            }
+            rule_ops::create_rule(tx, row).await.map(Ok)
         })
         .await
         .map_err(|e| e.to_string())??;
+        self.engine.reload(db).await?;
 
-        Ok(result)
+        Ok(format!(
+            "Rule `{}` added ({}). It applies from the next request; \
+             what was already sent cannot be recalled. \
+             Do not repeat the value in your reply.",
+            spec.name,
+            scope.as_str()
+        ))
     }
 }
 
@@ -317,34 +308,128 @@ impl Tool for RemoveRedactionRuleTool {
             ));
         }
 
-        let pool = context.db_pool.clone().ok_or("no database available")?;
-        let engine = self.engine.clone();
-        let name_owned = name.to_string();
-        let scope_type_str = scope.as_str().to_string();
+        let db = context.sea.as_ref().ok_or("no database available")?;
+        let refused = db
+            .write(async |tx| {
+                let Some(row) = rule_ops::get_rule_by_name(tx, scope, &scope_id, name).await? else {
+                    return Ok(Some(format!(
+                        "no rule named `{name}` found in {} scope",
+                        scope.as_str()
+                    )));
+                };
+                if row.origin == RuleOrigin::User {
+                    return Ok(Some(format!(
+                        "`{name}` was created by the user; ask them to change it in Settings"
+                    )));
+                }
+                rule_ops::delete_rule(tx, &row.id).await?;
+                Ok::<_, sea_orm::DbErr>(None)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(refused) = refused {
+            return Err(refused);
+        }
+        self.engine.reload(db).await?;
 
-        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
+        Ok(format!("Rule `{name}` removed."))
+    }
+}
 
-            let row =
-                crate::db::ops::redaction_rule::get_rule_by_name(&mut conn, &scope_type_str, &scope_id, &name_owned)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("no rule named `{name_owned}` found in {scope_type_str} scope"))?;
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
 
-            let origin = row.origin()?;
-            if origin == RuleOrigin::User {
-                return Err(format!(
-                    "`{name_owned}` was created by the user; ask them to change it in Settings"
-                ));
-            }
+    use super::*;
+    use crate::db::entity::redaction_rule::MAX_RULES_PER_SCOPE;
+    use crate::db::sea::cap::Db;
+    use crate::db::sea::sea_test_db;
 
-            crate::db::ops::redaction_rule::delete_rule(&mut conn, &row.id).map_err(|e| e.to_string())?;
-            engine.reload(&mut conn)?;
+    fn context(db: &Db) -> ToolContext {
+        ToolContext {
+            working_directory: None,
+            shell: crate::tools::ShellType::default_for_platform(),
+            file_access: crate::tools::FileAccess::Roots(vec![]),
+            project_id: None,
+            conversation_id: Some("c1".into()),
+            turn_id: None,
+            assistant_id: None,
+            db_pool: None,
+            sea: Some(db.clone()),
+            #[cfg(not(target_os = "android"))]
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            tool_secrets: HashMap::new(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            journal: None,
+        }
+    }
 
-            Ok(format!("Rule `{name_owned}` removed."))
+    fn add_args(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "description": "test token",
+            "pattern": "zq_[0-9]{6}",
+            "examples": [
+                {"text": "zq_123456", "should_match": true},
+                {"text": "zq_12", "should_match": false},
+            ],
         })
-        .await
-        .map_err(|e| e.to_string())??;
+    }
 
-        Ok(result)
+    #[tokio::test]
+    async fn an_added_rule_applies_and_a_removed_one_stops() {
+        let db = sea_test_db().await;
+        let engine = Arc::new(RedactionEngine::disabled());
+        let add = AddRedactionRuleTool::new(engine.clone());
+        let remove = RemoveRedactionRuleTool::new(engine.clone());
+
+        add.execute(add_args("zq_token"), &context(&db)).await.unwrap();
+        assert!(engine.redact("zq_123456", None).text.contains("[REDACTED:zq_token]"));
+        let again = add.execute(add_args("zq_token"), &context(&db)).await.unwrap_err();
+        assert!(again.contains("already exists"), "{again}");
+
+        remove
+            .execute(json!({"name": "zq_token"}), &context(&db))
+            .await
+            .unwrap();
+        assert_eq!(engine.redact("zq_123456", None).text, "zq_123456");
+        let gone = remove
+            .execute(json!({"name": "zq_token"}), &context(&db))
+            .await
+            .unwrap_err();
+        assert!(gone.contains("no rule named"), "{gone}");
+    }
+
+    /// The name check, the per-scope count and the insert share one write
+    /// lock. With one slot left, of several adds racing for it exactly one
+    /// gets in; checked outside the lock, each would count the same 199.
+    #[tokio::test]
+    async fn concurrent_adds_cannot_overfill_a_scope() {
+        let db = sea_test_db().await;
+        for i in 0..MAX_RULES_PER_SCOPE - 1 {
+            let row = redaction_rule::Model {
+                id: format!("seed{i}"),
+                scope_type: RuleScope::Global,
+                scope_id: GLOBAL_SCOPE_ID.into(),
+                name: format!("seed{i}"),
+                description: "d".into(),
+                pattern: "x".into(),
+                category: RuleCategory::Secret,
+                examples: Json(Vec::new()),
+                origin: RuleOrigin::User,
+                source_conversation_id: None,
+                is_enabled: SqlBool::TRUE,
+                created_at: 1,
+                updated_at: 1,
+            };
+            db.write(async |tx| rule_ops::create_rule(tx, row).await).await.unwrap();
+        }
+        let engine = Arc::new(RedactionEngine::disabled());
+        let add = AddRedactionRuleTool::new(engine);
+        let ctx = context(&db);
+        let attempts = (0..8).map(|i| add.execute(add_args(&format!("racer{i}")), &ctx));
+        let results = futures::future::join_all(attempts).await;
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(admitted, 1, "{results:?}");
     }
 }

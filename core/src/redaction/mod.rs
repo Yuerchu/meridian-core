@@ -5,10 +5,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use diesel::SqliteConnection;
-
-use crate::db::models::redaction_rule::RuleCategory;
-use crate::db::ops::redaction_rule as ops;
+use crate::db::entity::redaction_rule::{RuleCategory, RuleScope};
+use crate::db::sea::cap::Read;
+use crate::db::sea::ops::{preference as preference_ops, redaction_rule as rule_ops};
 use crate::provider::ChatMessage;
 
 use self::builtin::BUILTIN_RULES;
@@ -139,10 +138,18 @@ impl RedactionEngine {
         }
     }
 
-    pub fn reload(&self, conn: &mut SqliteConnection) -> Result<(), String> {
-        use crate::db::ops::preference::get_preference;
-
-        let mode_raw = get_preference(conn, MODE_PREFERENCE).map_err(|e| e.to_string())?;
+    /// Re-read the mode and the custom rules, and swap the compiled set in.
+    ///
+    /// A rule whose pattern no longer compiles is skipped and logged rather than
+    /// failing the reload: the pattern is checked when the rule is added, so
+    /// this only happens across a regex-engine change, and one stale pattern
+    /// should not take every other rule down with it. The closed columns —
+    /// scope and category — cannot be wrong here: they decode at the read, and
+    /// the schema's `CHECK` would not have stored a bad one.
+    pub async fn reload(&self, db: &impl Read) -> Result<(), String> {
+        let mode_raw = preference_ops::get_preference(db, MODE_PREFERENCE)
+            .await
+            .map_err(|e| e.to_string())?;
         let mode = RedactionMode::parse(mode_raw.as_deref())?;
 
         let builtin = compile_builtins();
@@ -150,15 +157,8 @@ impl RedactionEngine {
         let mut by_project: HashMap<String, Vec<CompiledRule>> = HashMap::new();
 
         if mode.is_enabled() {
-            let rows = ops::list_enabled_rules(conn).map_err(|e| e.to_string())?;
-            for row in &rows {
-                let category = match row.category() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(rule_id = %row.id, name = %row.name, "skipping rule with bad category: {e}");
-                        continue;
-                    }
-                };
+            let rows = rule_ops::list_enabled_rules(db).await.map_err(|e| e.to_string())?;
+            for row in rows {
                 let regex = match compile(&row.pattern) {
                     Ok(r) => r,
                     Err(e) => {
@@ -166,19 +166,15 @@ impl RedactionEngine {
                         continue;
                     }
                 };
-                let kind = match row.scope_type.as_str() {
-                    "global" => RuleKind::Global,
-                    "project" => RuleKind::Project(row.scope_id.clone()),
-                    other => {
-                        tracing::error!(rule_id = %row.id, "skipping rule with unknown scope_type: {other}");
-                        continue;
-                    }
+                let kind = match row.scope_type {
+                    RuleScope::Global => RuleKind::Global,
+                    RuleScope::Project => RuleKind::Project(row.scope_id.clone()),
                 };
-                let compiled = CompiledRule::new(row.name.clone(), kind.clone(), category, regex, None);
+                let compiled = CompiledRule::new(row.name, kind.clone(), row.category, regex, None);
 
                 match kind {
                     RuleKind::Global | RuleKind::Builtin => global.push(compiled),
-                    RuleKind::Project(ref pid) => by_project.entry(pid.clone()).or_default().push(compiled),
+                    RuleKind::Project(pid) => by_project.entry(pid).or_default().push(compiled),
                 }
             }
         }
@@ -888,5 +884,66 @@ mod tests {
         assert!(should_scan_role("tool"));
         assert!(should_scan_role("system"));
         assert!(should_scan_role("context"));
+    }
+
+    /// The engine reads its custom rules and its mode from the database: a
+    /// global rule applies everywhere, a project rule only to its project, a
+    /// pattern that no longer compiles is skipped without taking the others
+    /// down, and mode `off` turns the whole set off.
+    #[tokio::test]
+    async fn reload_reads_rules_and_mode_from_the_database() {
+        use crate::db::entity::redaction_rule::{self as entity, GLOBAL_SCOPE_ID, RedactionExample, RuleOrigin};
+        use crate::db::sea::{execute_for_tests, sea_test_db};
+        use crate::db::types::{Json, SqlBool};
+
+        fn rule(id: &str, scope: RuleScope, scope_id: &str, pattern: &str) -> entity::Model {
+            entity::Model {
+                id: id.into(),
+                scope_type: scope,
+                scope_id: scope_id.into(),
+                name: id.into(),
+                description: "d".into(),
+                pattern: pattern.into(),
+                category: RuleCategory::Secret,
+                examples: Json(vec![RedactionExample {
+                    text: "x".into(),
+                    should_match: false,
+                }]),
+                origin: RuleOrigin::Model,
+                source_conversation_id: None,
+                is_enabled: SqlBool::TRUE,
+                created_at: 1,
+                updated_at: 1,
+            }
+        }
+
+        let db = sea_test_db().await;
+        for row in [
+            rule("zq_token", RuleScope::Global, GLOBAL_SCOPE_ID, r"zq_[0-9]{6}"),
+            rule("pj_token", RuleScope::Project, "p1", r"pj_[0-9]{4}"),
+            rule("stale", RuleScope::Global, GLOBAL_SCOPE_ID, r"ok_[0-9]{4}"),
+        ] {
+            db.write(async |tx| rule_ops::create_rule(tx, row).await).await.unwrap();
+        }
+        // Written past the validation the tool does, the way a regex-engine
+        // change would leave it.
+        execute_for_tests(&db, "UPDATE redaction_rules SET pattern = '(' WHERE id = 'stale'")
+            .await
+            .unwrap();
+
+        let engine = RedactionEngine::disabled();
+        engine.reload(&db).await.unwrap();
+        let text = "zq_123456 pj_1234";
+        let anywhere = engine.redact(text, None).text.into_owned();
+        assert!(anywhere.contains("[REDACTED:zq_token]"), "{anywhere}");
+        assert!(anywhere.contains("pj_1234"), "{anywhere}");
+        let in_project = engine.redact(text, Some("p1")).text.into_owned();
+        assert!(in_project.contains("[REDACTED:pj_token]"), "{in_project}");
+
+        db.write(async |tx| preference_ops::set_preference(tx, MODE_PREFERENCE, "off", 2).await)
+            .await
+            .unwrap();
+        engine.reload(&db).await.unwrap();
+        assert_eq!(engine.redact(text, Some("p1")).text, text);
     }
 }

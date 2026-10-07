@@ -327,6 +327,7 @@ mod tests {
             turn_id: None,
             assistant_id: None,
             db_pool: None,
+            sea: None,
             sandbox_policy: crate::sandbox::CommandSandbox::Unreadable("database is locked".into()),
             tool_secrets: Default::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -423,6 +424,7 @@ mod tests {
             turn_id: None,
             assistant_id: None,
             db_pool: None,
+            sea: None,
             sandbox_policy: crate::sandbox::CommandSandbox::Resolved(Some(crate::sandbox::SandboxPolicy {
                 project_dir: Some(std::path::PathBuf::from("/the/project")),
                 backend: SandboxBackend::Container,

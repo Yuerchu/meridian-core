@@ -209,10 +209,7 @@ pub async fn bootstrap_with_secrets(
     seed_tool_catalog(&sea).await?;
 
     let redaction = Arc::new(crate::redaction::RedactionEngine::new());
-    {
-        let mut conn = pool.get().expect("db connection");
-        redaction.reload(&mut conn)?;
-    }
+    redaction.reload(&sea).await?;
 
     // Load custom tools from DB into tool registry
     let registry = tools::ToolRegistry::new(skills_root.clone(), data_dir.join("logs"), redaction.clone());

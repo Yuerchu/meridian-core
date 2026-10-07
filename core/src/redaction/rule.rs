@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use regex::Regex;
 
-use crate::db::models::redaction_rule::{
+use crate::db::entity::redaction_rule::{
     MAX_EXAMPLE_LEN, MAX_EXAMPLES, MAX_PATTERN_LEN, RedactionExample, RuleCategory,
 };
 

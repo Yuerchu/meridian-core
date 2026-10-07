@@ -1,4 +1,4 @@
-use crate::db::models::redaction_rule::RuleCategory;
+use crate::db::entity::redaction_rule::RuleCategory;
 
 pub struct BuiltinRule {
     pub name: &'static str,
