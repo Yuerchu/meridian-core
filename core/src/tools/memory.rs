@@ -2,7 +2,10 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{Permission, Tool, ToolContext};
-use crate::db::models::memory::{GLOBAL_SCOPE_ID, MemoryInsert, MemoryScope, Origin, Visibility};
+use crate::db::entity::memory;
+use crate::db::entity::memory::{DeletedBy, GLOBAL_SCOPE_ID, MemoryScope, MemoryType, Origin, Visibility};
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops::memory as mem_ops;
 
 /// Where a memory tool call reads and writes.
 ///
@@ -13,15 +16,14 @@ use crate::db::models::memory::{GLOBAL_SCOPE_ID, MemoryInsert, MemoryScope, Orig
 ///
 /// Never `OnebotGlobal` — that layer belongs to the bot side and is not injected
 /// into client conversations, so writing there would store rows nobody reads.
-fn get_pool_and_scope(context: &ToolContext) -> Result<(crate::db::DbPool, MemoryScope, String), String> {
-    let pool = context
-        .db_pool
+fn get_db_and_scope(context: &ToolContext) -> Result<(&Db, MemoryScope, String), String> {
+    let db = context
+        .sea
         .as_ref()
-        .ok_or("Memory tools are unavailable: no database handle")?
-        .clone();
+        .ok_or("Memory tools are unavailable: no database handle")?;
     match context.project_id.as_ref() {
-        Some(pid) => Ok((pool, MemoryScope::Project, pid.clone())),
-        None => Ok((pool, MemoryScope::ClientGlobal, GLOBAL_SCOPE_ID.to_string())),
+        Some(pid) => Ok((db, MemoryScope::Project, pid.clone())),
+        None => Ok((db, MemoryScope::ClientGlobal, GLOBAL_SCOPE_ID.to_string())),
     }
 }
 
@@ -84,7 +86,7 @@ impl Tool for SaveMemoryTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
-        let (pool, scope, scope_id) = get_pool_and_scope(context)?;
+        let (db, scope, scope_id) = get_db_and_scope(context)?;
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
@@ -95,51 +97,42 @@ impl Tool for SaveMemoryTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing required parameter: content")?
             .to_string();
-        let memory_type = args
-            .get("memory_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("general")
-            .to_string();
+        let memory_type = MemoryType::parse(args.get("memory_type").and_then(|v| v.as_str()).unwrap_or("general"))?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
+        let now = crate::util::now_ms();
+        let row = memory::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope_type: scope,
+            scope_id: scope_id.clone(),
+            key: key.clone(),
+            content,
+            memory_type,
+            subject_scope_id: None,
+            origin: Origin::Desktop,
+            visibility: Visibility::Normal,
+            source_session_id: None,
+            deleted_at: None,
+            deleted_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        // Length and quota live in ops so this path and the IPC path cannot
+        // disagree, and so neither can bypass the other. The lookup that picks
+        // the wording runs in the same write, so it describes what the write did.
+        let existed = db
+            .write(async |tx| {
+                let existed = mem_ops::get_memory_by_key(tx, scope, &scope_id, &key).await?.is_some();
+                Ok::<_, crate::db::sea::DbErr>(mem_ops::remember(tx, row).await?.map(|_| existed))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
 
-            // Length and quota live in ops so this path and the IPC path cannot
-            // disagree, and so neither can bypass the other.
-            crate::db::ops::memory::validate_memory(&mut conn, scope, &scope_id, &key, &content)?;
-            let existing = crate::db::ops::memory::get_memory_by_key(&mut conn, scope, &scope_id, &key)
-                .map_err(|e| e.to_string())?;
-
-            let id = uuid::Uuid::new_v4().to_string();
-            let now = crate::util::now_ms();
-            crate::db::ops::memory::upsert_memory(
-                &mut conn,
-                &MemoryInsert {
-                    id: &id,
-                    scope_type: scope.as_str(),
-                    scope_id: &scope_id,
-                    key: &key,
-                    content: &content,
-                    memory_type: &memory_type,
-                    subject_scope_id: None,
-                    origin: Origin::Desktop.as_str(),
-                    visibility: Visibility::Normal.as_str(),
-                    source_session_id: None,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-
-            let where_ = scope_label(scope);
-            if existing.is_some() {
-                Ok(format!("Updated memory '{key}' for {where_}."))
-            } else {
-                Ok(format!("Saved memory '{key}' for {where_}."))
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        let where_ = scope_label(scope);
+        if existed {
+            Ok(format!("Updated memory '{key}' for {where_}."))
+        } else {
+            Ok(format!("Saved memory '{key}' for {where_}."))
+        }
     }
 }
 
@@ -184,24 +177,20 @@ impl Tool for RecallMemoryTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
-        let (pool, scope, scope_id) = get_pool_and_scope(context)?;
+        let (db, scope, scope_id) = get_db_and_scope(context)?;
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or("Missing required parameter: key")?
             .to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            match crate::db::ops::memory::get_memory_by_key(&mut conn, scope, &scope_id, &key)
-                .map_err(|e| e.to_string())?
-            {
-                Some(m) => Ok(format!("[{}] {}: {}", m.memory_type, m.key, m.content)),
-                None => Ok(format!("No memory found for key '{key}'.")),
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        match mem_ops::get_memory_by_key(db, scope, &scope_id, &key)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Some(m) => Ok(format!("[{}] {}: {}", m.memory_type.as_str(), m.key, m.content)),
+            None => Ok(format!("No memory found for key '{key}'.")),
+        }
     }
 }
 
@@ -240,27 +229,29 @@ impl Tool for ListMemoriesTool {
     }
 
     async fn execute(&self, _args: Value, context: &ToolContext) -> Result<String, String> {
-        let (pool, scope, scope_id) = get_pool_and_scope(context)?;
+        let (db, scope, scope_id) = get_db_and_scope(context)?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            let memories =
-                crate::db::ops::memory::list_by_scope(&mut conn, scope, &scope_id).map_err(|e| e.to_string())?;
+        let memories = mem_ops::list_by_scope(db, scope, &scope_id)
+            .await
+            .map_err(|e| e.to_string())?;
 
-            if memories.is_empty() {
-                return Ok("No memories stored.".to_string());
-            }
+        if memories.is_empty() {
+            return Ok("No memories stored.".to_string());
+        }
 
-            let mut out = format!("{} memories:\n", memories.len());
-            for m in &memories {
-                let preview: String = m.content.chars().take(80).collect();
-                let ellipsis = if m.content.len() > 80 { "..." } else { "" };
-                out.push_str(&format!("- [{}] {}: {}{}\n", m.memory_type, m.key, preview, ellipsis));
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        let mut out = format!("{} memories:\n", memories.len());
+        for m in &memories {
+            let preview: String = m.content.chars().take(80).collect();
+            let ellipsis = if m.content.len() > 80 { "..." } else { "" };
+            out.push_str(&format!(
+                "- [{}] {}: {}{}\n",
+                m.memory_type.as_str(),
+                m.key,
+                preview,
+                ellipsis
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -305,32 +296,30 @@ impl Tool for DeleteMemoryTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
-        let (pool, scope, scope_id) = get_pool_and_scope(context)?;
+        let (db, scope, scope_id) = get_db_and_scope(context)?;
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or("Missing required parameter: key")?
             .to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            let existing = crate::db::ops::memory::get_memory_by_key(&mut conn, scope, &scope_id, &key)
-                .map_err(|e| e.to_string())?;
-            let Some(existing) = existing else {
-                return Ok(format!("No memory found for key '{key}'."));
-            };
-            // Soft delete, like every other delete path, so the row stays
-            // recoverable from the trash.
-            crate::db::ops::memory::soft_delete_memories(
-                &mut conn,
-                &[existing.id],
-                crate::db::models::memory::DeletedBy::Admin,
-                crate::util::now_ms(),
-            )
+        // Soft delete, like every other delete path, so the row stays
+        // recoverable from the trash. The lookup and the delete are one write.
+        let deleted = db
+            .write(async |tx| {
+                let Some(existing) = mem_ops::get_memory_by_key(tx, scope, &scope_id, &key).await? else {
+                    return Ok(false);
+                };
+                mem_ops::soft_delete_memories(tx, &[existing.id], DeletedBy::Admin, crate::util::now_ms())
+                    .await
+                    .map(|n| n > 0)
+            })
+            .await
             .map_err(|e| e.to_string())?;
+        if deleted {
             Ok(format!("Deleted memory '{key}'."))
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        } else {
+            Ok(format!("No memory found for key '{key}'."))
+        }
     }
 }

@@ -212,7 +212,7 @@ fn snapshot_of(conn: &mut SqliteConnection, subject: Subject<'_>) -> QueryResult
         .map_or((None, None), |(origin, self_id)| (Some(origin), self_id));
 
     let sender_name = subject.sender_id.and_then(|uid| {
-        let scope = crate::db::models::memory::onebot_user_scope_id(uid);
+        let scope = crate::db::entity::memory::onebot_user_scope_id(uid);
         memory_subjects::table
             .find(scope)
             .select(memory_subjects::display_name)

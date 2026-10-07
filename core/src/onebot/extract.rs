@@ -11,16 +11,19 @@
 
 use std::collections::HashMap;
 
-use diesel::connection::Connection;
-
 use serde::Deserialize;
 
-use crate::db::DbPool;
-use crate::db::models::memory::{
-    GLOBAL_SCOPE_ID, MemoryInsert, MemoryProposalInsert, MemoryScope, Origin, ProposalStatus, Visibility,
-    onebot_user_scope_id,
+#[cfg(test)]
+use crate::db::entity::memory::{DeletedBy, MAX_ONEBOT_GLOBAL_MEMORIES};
+use crate::db::entity::memory::{
+    GLOBAL_SCOPE_ID, MemoryScope, MemoryType, Origin, Visibility, onebot_user_scope_id, parse_onebot_user_scope_id,
 };
-use crate::db::ops::memory::VisibilityCtx;
+use crate::db::entity::memory_proposal::ProposalStatus;
+use crate::db::entity::{memory, memory_proposal};
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::{Db, Read, Snapshot, WriteTx};
+use crate::db::sea::ops::memory as mem_ops;
+use crate::db::sea::ops::memory::VisibilityCtx;
 use crate::util::{extract_json_object, now_ms};
 
 /// How long an operator has to act on a bot-wide proposal.
@@ -165,13 +168,20 @@ pub fn validate(candidate: &MemoryCandidate, facts: &TurnFacts, subject_opted_ou
 }
 
 /// Store an accepted candidate, or park it for approval.
-pub fn commit(
-    conn: &mut diesel::sqlite::SqliteConnection,
+///
+/// Takes the write the caller's opt-out check ran in, so the person cannot opt
+/// out between the check and the row. The inner `Err` is a refusal: the quota,
+/// the length limit, or a memory type outside the closed list.
+pub async fn commit(
+    tx: &WriteTx,
     candidate: &MemoryCandidate,
     facts: &TurnFacts,
     now: i64,
-) -> Result<Accepted, String> {
-    let memory_type = candidate.memory_type.as_deref().unwrap_or("general");
+) -> Result<Result<Accepted, String>, DbErr> {
+    let memory_type = match MemoryType::parse(candidate.memory_type.as_deref().unwrap_or("general")) {
+        Ok(memory_type) => memory_type,
+        Err(refused) => return Ok(Err(refused)),
+    };
 
     if candidate.intent == MemoryIntent::BotSelf {
         let proposer = candidate
@@ -179,89 +189,91 @@ pub fn commit(
             .first()
             .and_then(|s| facts.messages.get(&s.inbound_message_id))
             .copied();
-        let p = crate::db::ops::memory::create_proposal(
-            conn,
-            &MemoryProposalInsert {
-                key: &candidate.key,
-                content: &candidate.content,
+        let p = mem_ops::create_proposal(
+            tx,
+            memory_proposal::Model {
+                id: 0,
+                key: candidate.key.clone(),
+                content: candidate.content.clone(),
                 memory_type,
-                origin_session: Some(&facts.session_label),
+                origin_session: Some(facts.session_label.clone()),
                 proposer_id: proposer,
-                status: ProposalStatus::Pending.as_str(),
+                status: ProposalStatus::Pending,
                 created_at: now,
                 expires_at: now + PROPOSAL_TTL_MS,
+                resolved_at: None,
+                resolved_by: None,
             },
         )
-        .map_err(|e| e.to_string())?;
-        return Ok(Accepted::Proposed(p.id));
+        .await?;
+        return Ok(Ok(Accepted::Proposed(p.id)));
     }
 
     let (scope, scope_id, subject) = match candidate.intent {
-        MemoryIntent::Chat => (
-            MemoryScope::Project,
-            facts.project_id.clone().ok_or("no project for this session")?,
-            candidate.subject_user_id.map(onebot_user_scope_id),
-        ),
-        MemoryIntent::AboutUser => {
-            let uid = candidate.subject_user_id.ok_or("missing subject")?;
-            let scope_id = onebot_user_scope_id(uid);
-            (MemoryScope::OnebotUser, scope_id.clone(), Some(scope_id))
-        }
+        MemoryIntent::Chat => match facts.project_id.clone() {
+            Some(project_id) => (
+                MemoryScope::Project,
+                project_id,
+                candidate.subject_user_id.map(onebot_user_scope_id),
+            ),
+            None => return Ok(Err("no project for this session".into())),
+        },
+        MemoryIntent::AboutUser => match candidate.subject_user_id {
+            Some(uid) => {
+                let scope_id = onebot_user_scope_id(uid);
+                (MemoryScope::OnebotUser, scope_id.clone(), Some(scope_id))
+            }
+            None => return Ok(Err("missing subject".into())),
+        },
         MemoryIntent::BotSelf => unreachable!("handled above"),
     };
 
-    crate::db::ops::memory::validate_memory(conn, scope, &scope_id, &candidate.key, &candidate.content)?;
-
     let origin = if facts.is_group { Origin::Group } else { Origin::Private };
-    let id = uuid::Uuid::new_v4().to_string();
-    crate::db::ops::memory::upsert_memory(
-        conn,
-        &MemoryInsert {
-            id: &id,
-            scope_type: scope.as_str(),
-            scope_id: &scope_id,
-            key: &candidate.key,
-            content: &candidate.content,
+    let stored = mem_ops::remember(
+        tx,
+        memory::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope_type: scope,
+            scope_id: scope_id.clone(),
+            key: candidate.key.clone(),
+            content: candidate.content.clone(),
             memory_type,
-            subject_scope_id: subject.as_deref(),
+            subject_scope_id: subject,
             // Origin and visibility are ours to assign. A model that could set
             // them would be able to write a note about someone that the person
             // can neither see nor delete.
-            origin: origin.as_str(),
-            visibility: Visibility::Normal.as_str(),
-            source_session_id: Some(&facts.session_label),
+            origin,
+            visibility: Visibility::Normal,
+            source_session_id: Some(facts.session_label.clone()),
+            deleted_at: None,
+            deleted_by: None,
             created_at: now,
             updated_at: now,
         },
     )
-    .map_err(|e| e.to_string())?;
+    .await?;
+    if let Err(refused) = stored {
+        return Ok(Err(refused));
+    }
 
     // Only the subject just written can have gone over its own cap.
     let touched = matches!(scope, MemoryScope::OnebotUser).then_some(scope_id.as_str());
-    crate::db::ops::memory::enforce_subject_lru(conn, touched, now).map_err(|e| e.to_string())?;
-    Ok(Accepted::Stored)
+    mem_ops::enforce_subject_lru(tx, touched, now).await?;
+    Ok(Ok(Accepted::Stored))
 }
 
 /// Approve a parked bot-wide proposal and store it.
-pub fn approve_proposal(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    id: i32,
-    approver: i64,
-    now: i64,
-) -> Result<Option<String>, String> {
-    let Some(p) = crate::db::ops::memory::get_proposal(conn, id).map_err(|e| e.to_string())? else {
-        return Ok(None);
-    };
-
-    /// diesel requires a transaction's error to convert from its own, so a
-    /// rejected write travels in this wrapper rather than as a bare string.
+pub async fn approve_proposal(db: &Db, id: i32, approver: i64, now: i64) -> Result<Option<String>, String> {
+    /// A refused write has to leave the transaction as an error, or the
+    /// approval before it would commit; this carries it out beside a database
+    /// error.
     enum ApprovalError {
-        Db(diesel::result::Error),
+        Db(DbErr),
         Rejected(String),
     }
 
-    impl From<diesel::result::Error> for ApprovalError {
-        fn from(e: diesel::result::Error) -> Self {
+    impl From<DbErr> for ApprovalError {
+        fn from(e: DbErr) -> Self {
             Self::Db(e)
         }
     }
@@ -271,38 +283,42 @@ pub fn approve_proposal(
     // the proposal consumed with nothing stored: `resolve_proposal` only matches
     // `pending`, so a retry reported "already handled" and the content was gone
     // while the audit trail claimed an approval that never took effect.
-    let result = conn.transaction::<_, ApprovalError, _>(|conn| {
-        let changed =
-            crate::db::ops::memory::resolve_proposal(conn, id, ProposalStatus::Approved, Some(approver), now)?;
-        if changed == 0 {
-            return Ok(None);
-        }
-
-        crate::db::ops::memory::validate_memory(conn, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID, &p.key, &p.content)
-            .map_err(ApprovalError::Rejected)?;
-        let mem_id = uuid::Uuid::new_v4().to_string();
-        crate::db::ops::memory::upsert_memory(
-            conn,
-            &MemoryInsert {
-                id: &mem_id,
-                scope_type: MemoryScope::OnebotGlobal.as_str(),
-                scope_id: GLOBAL_SCOPE_ID,
-                key: &p.key,
-                content: &p.content,
-                memory_type: &p.memory_type,
-                subject_scope_id: None,
-                // Taught by the operator, and visible to the model: this is the
-                // one kind of memory whose whole purpose is to be acted on
-                // everywhere.
-                origin: Origin::Admin.as_str(),
-                visibility: Visibility::Normal.as_str(),
-                source_session_id: p.origin_session.as_deref(),
-                created_at: now,
-                updated_at: now,
-            },
-        )?;
-        Ok(Some(p.key.clone()))
-    });
+    let result = db
+        .write(async |tx| {
+            let Some(p) = mem_ops::get_proposal(tx, id).await? else {
+                return Ok(None);
+            };
+            let changed = mem_ops::resolve_proposal(tx, id, ProposalStatus::Approved, Some(approver), now).await?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let stored = mem_ops::remember(
+                tx,
+                memory::Model {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    scope_type: MemoryScope::OnebotGlobal,
+                    scope_id: GLOBAL_SCOPE_ID.to_owned(),
+                    key: p.key.clone(),
+                    content: p.content,
+                    memory_type: p.memory_type,
+                    subject_scope_id: None,
+                    // Taught by the operator, and visible to the model: this is
+                    // the one kind of memory whose whole purpose is to be acted
+                    // on everywhere.
+                    origin: Origin::Admin,
+                    visibility: Visibility::Normal,
+                    source_session_id: p.origin_session,
+                    deleted_at: None,
+                    deleted_by: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await?;
+            stored.map_err(ApprovalError::Rejected)?;
+            Ok(Some(p.key))
+        })
+        .await;
 
     // A rejected write rolled the approval back, so the proposal is still
     // pending and the operator can retry once they have made room.
@@ -316,20 +332,14 @@ pub fn approve_proposal(
 /// The proposal's key if this id belongs to a still-actionable proposal.
 /// Lets the decision dispatcher tell "not mine" apart from "mine, but stale",
 /// so an unrelated number falls through to ordinary chat.
-pub fn is_known_proposal(conn: &mut diesel::sqlite::SqliteConnection, id: i32) -> Option<String> {
-    crate::db::ops::memory::get_proposal(conn, id)
-        .ok()
-        .flatten()
-        .map(|p| p.key)
+pub async fn is_known_proposal(db: &impl Read, id: i32) -> Option<String> {
+    mem_ops::get_proposal(db, id).await.ok().flatten().map(|p| p.key)
 }
 
-pub fn reject_proposal(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    id: i32,
-    rejecter: i64,
-    now: i64,
-) -> Result<bool, String> {
-    let changed = crate::db::ops::memory::resolve_proposal(conn, id, ProposalStatus::Rejected, Some(rejecter), now)
+pub async fn reject_proposal(db: &Db, id: i32, rejecter: i64, now: i64) -> Result<bool, String> {
+    let changed = db
+        .write(async |tx| mem_ops::resolve_proposal(tx, id, ProposalStatus::Rejected, Some(rejecter), now).await)
+        .await
         .map_err(|e| e.to_string())?;
     Ok(changed > 0)
 }
@@ -374,11 +384,7 @@ Write the durable fact, not the moment you learned it. Do not quote anyone's exa
 /// Load the memories the extraction pass is allowed to see when deciding what is
 /// new. Reuses the injection visibility rules: a group extraction that could
 /// read private memories would quietly launder them into group-visible ones.
-pub fn existing_for_extraction(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    facts: &TurnFacts,
-    subjects: &[i64],
-) -> String {
+pub async fn existing_for_extraction(db: &impl Snapshot, facts: &TurnFacts, subjects: &[i64]) -> String {
     let ctx = if facts.is_group {
         VisibilityCtx::group_injection()
     } else {
@@ -388,21 +394,20 @@ pub fn existing_for_extraction(
 
     let mut lines: Vec<String> = Vec::new();
     if let Some(pid) = facts.project_id.as_ref()
-        && let Ok(rows) =
-            crate::db::ops::memory::list_by_scopes(conn, MemoryScope::Project, std::slice::from_ref(pid), &ctx, None)
+        && let Ok(rows) = mem_ops::list_by_scopes(db, MemoryScope::Project, std::slice::from_ref(pid), &ctx, None).await
     {
         for m in rows {
             lines.push(format!("- [chat] {}: {}", m.key, m.content));
         }
     }
     if !scope_ids.is_empty()
-        && let Ok(rows) = crate::db::ops::memory::list_by_scopes(conn, MemoryScope::OnebotUser, &scope_ids, &ctx, None)
+        && let Ok(rows) = mem_ops::list_by_scopes(db, MemoryScope::OnebotUser, &scope_ids, &ctx, None).await
     {
         for m in rows {
             let uid = m
                 .subject_scope_id
                 .as_deref()
-                .and_then(crate::db::models::memory::parse_onebot_user_scope_id)
+                .and_then(parse_onebot_user_scope_id)
                 .unwrap_or_default();
             lines.push(format!("- [about {uid}] {}: {}", m.key, m.content));
         }
@@ -412,17 +417,13 @@ pub fn existing_for_extraction(
     lines.join("\n")
 }
 
-/// Whether a person has opted out of being remembered.
-pub fn is_opted_out(conn: &mut diesel::sqlite::SqliteConnection, user_id: i64) -> bool {
-    crate::db::ops::memory::get_subject(conn, &onebot_user_scope_id(user_id))
-        .ok()
-        .flatten()
-        .is_some_and(|s| s.is_opted_out())
-}
-
 /// Run the pass for a finished turn and store whatever survives validation.
 /// Returns the ids of any bot-wide proposals raised.
-pub async fn run_extraction(pool: &DbPool, raw_response: &str, facts: TurnFacts) -> Result<Vec<i32>, String> {
+///
+/// Each candidate is its own write, and its opt-out check runs inside it: read
+/// outside, a person opting out while the pass ran would still have the
+/// candidate about them stored.
+pub async fn run_extraction(db: &Db, raw_response: &str, facts: TurnFacts) -> Result<Vec<i32>, String> {
     #[derive(Deserialize)]
     struct Envelope {
         #[serde(default)]
@@ -435,40 +436,35 @@ pub async fn run_extraction(pool: &DbPool, raw_response: &str, facts: TurnFacts)
         return Ok(Vec::new());
     }
 
-    let pool = pool.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|e| e.to_string())?;
-        let now = now_ms();
-        let mut proposals = Vec::new();
-
-        for candidate in &envelope.candidates {
-            // Resolved before validating: the check takes a predicate so it can
-            // stay a pure function, and it cannot borrow the connection while
-            // the surrounding loop holds it.
-            let opted_out_subject = candidate
-                .subject_user_id
-                .is_some_and(|uid| is_opted_out(&mut conn, uid));
-            let check = validate(candidate, &facts, opted_out_subject);
-            if let Err(reason) = check {
-                tracing::debug!(?reason, key = %candidate.key, "memory candidate rejected");
-                continue;
-            }
-            match commit(&mut conn, candidate, &facts, now) {
-                Ok(Accepted::Proposed(id)) => proposals.push(id),
-                Ok(Accepted::Stored) => {}
-                Err(e) => tracing::warn!("failed to store memory '{}': {e}", candidate.key),
-            }
+    let now = now_ms();
+    let mut proposals = Vec::new();
+    for candidate in &envelope.candidates {
+        let outcome = db
+            .write(async |tx| {
+                let opted_out_subject = match candidate.subject_user_id {
+                    Some(uid) => mem_ops::is_opted_out(tx, &onebot_user_scope_id(uid)).await?,
+                    None => false,
+                };
+                if let Err(reason) = validate(candidate, &facts, opted_out_subject) {
+                    return Ok(Err(format!("{reason:?}")));
+                }
+                commit(tx, candidate, &facts, now).await
+            })
+            .await;
+        match outcome {
+            Ok(Ok(Accepted::Proposed(id))) => proposals.push(id),
+            Ok(Ok(Accepted::Stored)) => {}
+            Ok(Err(reason)) => tracing::debug!(%reason, key = %candidate.key, "memory candidate rejected"),
+            Err(e) => tracing::warn!("failed to store memory '{}': {e}", candidate.key),
         }
-        Ok(proposals)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    }
+    Ok(proposals)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
+    use crate::db::sea::sea_test_db;
 
     fn facts(is_group: bool) -> TurnFacts {
         let mut messages = HashMap::new();
@@ -496,6 +492,26 @@ mod tests {
     }
 
     const NOBODY_OPTED_OUT: bool = false;
+
+    async fn store(db: &Db, c: &MemoryCandidate, at: i64) -> Result<Accepted, String> {
+        db.write(async |tx| commit(tx, c, &facts(true), at).await)
+            .await
+            .unwrap()
+    }
+
+    async fn propose(db: &Db, at: i64) -> i32 {
+        let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
+        match store(db, &c, at).await.unwrap() {
+            Accepted::Proposed(id) => id,
+            Accepted::Stored => panic!("expected a proposal"),
+        }
+    }
+
+    async fn globals(db: &Db) -> Vec<memory::Model> {
+        mem_ops::list_by_scope(db, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID)
+            .await
+            .unwrap()
+    }
 
     /// The attack this exists to stop: Bob narrates something about Alice, and
     /// Alice happens to have spoken in the same turn.
@@ -575,135 +591,136 @@ mod tests {
         assert_eq!(validate(&c, &facts(true), true), Err(Rejected::OptedOut));
     }
 
-    /// Bot-wide memory is parked, never stored on the model's say-so.
-    #[test]
-    fn bot_self_becomes_a_proposal_not_a_memory() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
-
-        let result = commit(conn, &c, &facts(true), 1000).unwrap();
-        assert!(matches!(result, Accepted::Proposed(_)));
-
-        let stored = crate::db::ops::memory::list_by_scope(conn, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID).unwrap();
-        assert!(stored.is_empty(), "bot-wide memory must not land without approval");
+    /// The type is the model's to suggest and ours to check: a name outside the
+    /// closed list is refused, not stored for a later read to choke on.
+    #[tokio::test]
+    async fn an_unknown_memory_type_is_refused() {
+        let db = sea_test_db().await;
+        let mut c = candidate(MemoryIntent::AboutUser, Some(1), "m-alice");
+        c.memory_type = Some("opinion".into());
+        assert!(store(&db, &c, 1000).await.is_err());
+        c.memory_type = Some("preference".into());
+        assert!(matches!(store(&db, &c, 1000).await, Ok(Accepted::Stored)));
     }
 
-    #[test]
-    fn approval_stores_the_memory_exactly_once() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
-        let Accepted::Proposed(id) = commit(conn, &c, &facts(true), 1000).unwrap() else {
-            panic!("expected a proposal");
-        };
+    /// The opt-out check runs inside the write: the pass stores nothing about a
+    /// person who opted out while it ran.
+    #[tokio::test]
+    async fn an_opted_out_subject_is_checked_at_the_write() {
+        let db = sea_test_db().await;
+        let alice = onebot_user_scope_id(1);
+        db.write(async |tx| {
+            mem_ops::touch_subject(tx, &alice, None, false, 1).await?;
+            mem_ops::set_subject_flags(tx, &alice, None, Some(true)).await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let raw = r#"{"candidates":[{"intent":"about_user","subject_user_id":1,"key":"k","content":"c","sources":[{"inbound_message_id":"m-alice"}]}]}"#;
+        run_extraction(&db, raw, facts(true)).await.unwrap();
+        assert!(mem_ops::list_by_subject(&db, &alice).await.unwrap().is_empty());
+    }
 
-        assert_eq!(approve_proposal(conn, id, 99, 2000).unwrap().as_deref(), Some("k"));
-        assert_eq!(
-            crate::db::ops::memory::list_by_scope(conn, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID)
-                .unwrap()
-                .len(),
-            1
+    /// Bot-wide memory is parked, never stored on the model's say-so.
+    #[tokio::test]
+    async fn bot_self_becomes_a_proposal_not_a_memory() {
+        let db = sea_test_db().await;
+        propose(&db, 1000).await;
+        assert!(
+            globals(&db).await.is_empty(),
+            "bot-wide memory must not land without approval"
         );
+    }
+
+    #[tokio::test]
+    async fn approval_stores_the_memory_exactly_once() {
+        let db = sea_test_db().await;
+        let id = propose(&db, 1000).await;
+
+        assert_eq!(approve_proposal(&db, id, 99, 2000).await.unwrap().as_deref(), Some("k"));
+        assert_eq!(globals(&db).await.len(), 1);
 
         // A second approval of the same id must do nothing.
-        assert_eq!(approve_proposal(conn, id, 99, 2001).unwrap(), None);
-        assert_eq!(
-            crate::db::ops::memory::list_by_scope(conn, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID)
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(approve_proposal(&db, id, 99, 2001).await.unwrap(), None);
+        assert_eq!(globals(&db).await.len(), 1);
     }
 
     /// A failed write must roll the approval back. Consuming the proposal and
     /// storing nothing loses the content for good: the retry sees `approved`,
     /// reports "already handled", and the audit trail claims an approval that
     /// never took effect.
-    #[test]
-    fn a_rejected_write_leaves_the_proposal_retryable() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn a_rejected_write_leaves_the_proposal_retryable() {
+        let db = sea_test_db().await;
 
         // Fill the bot-wide scope to its ceiling so the next write is refused.
-        for i in 0..crate::db::models::memory::MAX_ONEBOT_GLOBAL_MEMORIES {
-            crate::db::ops::memory::upsert_memory(
-                conn,
-                &MemoryInsert {
-                    id: &format!("g{i}"),
-                    scope_type: MemoryScope::OnebotGlobal.as_str(),
-                    scope_id: GLOBAL_SCOPE_ID,
-                    key: &format!("k{i}"),
-                    content: "x",
-                    memory_type: "general",
-                    subject_scope_id: None,
-                    origin: Origin::Admin.as_str(),
-                    visibility: Visibility::Normal.as_str(),
-                    source_session_id: None,
-                    created_at: 1,
-                    updated_at: 1,
-                },
-            )
-            .unwrap();
-        }
+        db.write(async |tx| {
+            for i in 0..MAX_ONEBOT_GLOBAL_MEMORIES {
+                mem_ops::upsert_memory(
+                    tx,
+                    memory::Model {
+                        id: format!("g{i}"),
+                        scope_type: MemoryScope::OnebotGlobal,
+                        scope_id: GLOBAL_SCOPE_ID.into(),
+                        key: format!("k{i}"),
+                        content: "x".into(),
+                        memory_type: MemoryType::General,
+                        subject_scope_id: None,
+                        origin: Origin::Admin,
+                        visibility: Visibility::Normal,
+                        source_session_id: None,
+                        deleted_at: None,
+                        deleted_by: None,
+                        created_at: 1,
+                        updated_at: 1,
+                    },
+                )
+                .await?;
+            }
+            Ok::<_, DbErr>(())
+        })
+        .await
+        .unwrap();
 
-        let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
-        let Accepted::Proposed(id) = commit(conn, &c, &facts(true), 1000).unwrap() else {
-            panic!("expected a proposal");
-        };
-
+        let id = propose(&db, 1000).await;
         assert!(
-            approve_proposal(conn, id, 99, 2000).is_err(),
+            approve_proposal(&db, id, 99, 2000).await.is_err(),
             "quota must refuse the write"
         );
 
         // Still pending, so the operator can free a slot and try again.
-        let p = crate::db::ops::memory::get_proposal(conn, id).unwrap().unwrap();
-        assert_eq!(p.status, ProposalStatus::Pending.as_str());
+        let p = mem_ops::get_proposal(&db, id).await.unwrap().unwrap();
+        assert_eq!(p.status, ProposalStatus::Pending);
 
-        crate::db::ops::memory::soft_delete_memories(
-            conn,
-            &["g0".to_string()],
-            crate::db::models::memory::DeletedBy::Admin,
-            2500,
-        )
-        .unwrap();
-        assert_eq!(approve_proposal(conn, id, 99, 3000).unwrap().as_deref(), Some("k"));
+        db.write(async |tx| mem_ops::soft_delete_memories(tx, &["g0".to_string()], DeletedBy::Admin, 2500).await)
+            .await
+            .unwrap();
+        assert_eq!(approve_proposal(&db, id, 99, 3000).await.unwrap().as_deref(), Some("k"));
     }
 
-    #[test]
-    fn expired_proposals_cannot_be_approved() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
-        let Accepted::Proposed(id) = commit(conn, &c, &facts(true), 1000).unwrap() else {
-            panic!("expected a proposal");
-        };
+    #[tokio::test]
+    async fn expired_proposals_cannot_be_approved() {
+        let db = sea_test_db().await;
+        let id = propose(&db, 1000).await;
 
         let after_ttl = 1000 + PROPOSAL_TTL_MS + 1;
-        assert_eq!(approve_proposal(conn, id, 99, after_ttl).unwrap(), None);
-        assert!(
-            crate::db::ops::memory::list_by_scope(conn, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID)
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(approve_proposal(&db, id, 99, after_ttl).await.unwrap(), None);
+        assert!(globals(&db).await.is_empty());
     }
 
     /// An approved bot rule must be usable by the model, so it is `normal`, not
     /// an owner-only note.
-    #[test]
-    fn approved_bot_memory_is_visible_to_the_model() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        let c = candidate(MemoryIntent::BotSelf, None, "m-alice");
-        let Accepted::Proposed(id) = commit(conn, &c, &facts(true), 1000).unwrap() else {
-            panic!("expected a proposal");
-        };
-        approve_proposal(conn, id, 99, 2000).unwrap();
+    #[tokio::test]
+    async fn approved_bot_memory_is_visible_to_the_model() {
+        let db = sea_test_db().await;
+        let id = propose(&db, 1000).await;
+        approve_proposal(&db, id, 99, 2000).await.unwrap();
 
-        let rows = crate::db::ops::memory::list_by_scope(conn, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID).unwrap();
-        assert_eq!(rows[0].visibility, Visibility::Normal.as_str());
-        assert_eq!(rows[0].origin, Origin::Admin.as_str());
+        let rows = globals(&db).await;
+        assert_eq!(
+            (rows[0].visibility, rows[0].origin),
+            (Visibility::Normal, Origin::Admin)
+        );
     }
 
     // The scanner's own tests moved with it, to `util`.
@@ -712,42 +729,48 @@ mod tests {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
-    use crate::db::diesel_test_db;
+    use crate::db::sea::sea_test_db;
 
     /// The decision dispatcher asks each queue in turn. An id nobody holds must
     /// report "not mine" so the message falls through to ordinary chat rather
     /// than being swallowed — and, critically, a non-empty friend-request queue
     /// must not stop a proposal from being found.
-    #[test]
-    fn unknown_ids_are_not_claimed() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        assert_eq!(is_known_proposal(conn, 42), None);
+    #[tokio::test]
+    async fn unknown_ids_are_not_claimed() {
+        let db = sea_test_db().await;
+        assert_eq!(is_known_proposal(&db, 42).await, None);
     }
 
-    #[test]
-    fn a_parked_proposal_is_claimable_by_id() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        let p = crate::db::ops::memory::create_proposal(
-            conn,
-            &MemoryProposalInsert {
-                key: "tone",
-                content: "be brief",
-                memory_type: "instruction",
-                origin_session: Some("group:1"),
-                proposer_id: Some(7),
-                status: ProposalStatus::Pending.as_str(),
-                created_at: 1,
-                expires_at: 1 + PROPOSAL_TTL_MS,
-            },
-        )
-        .unwrap();
+    #[tokio::test]
+    async fn a_parked_proposal_is_claimable_by_id() {
+        let db = sea_test_db().await;
+        let p = db
+            .write(async |tx| {
+                mem_ops::create_proposal(
+                    tx,
+                    memory_proposal::Model {
+                        id: 0,
+                        key: "tone".into(),
+                        content: "be brief".into(),
+                        memory_type: MemoryType::Instruction,
+                        origin_session: Some("group:1".into()),
+                        proposer_id: Some(7),
+                        status: ProposalStatus::Pending,
+                        created_at: 1,
+                        expires_at: 1 + PROPOSAL_TTL_MS,
+                        resolved_at: None,
+                        resolved_by: None,
+                    },
+                )
+                .await
+            })
+            .await
+            .unwrap();
 
-        assert_eq!(is_known_proposal(conn, p.id).as_deref(), Some("tone"));
-        assert!(reject_proposal(conn, p.id, 7, 100).unwrap());
+        assert_eq!(is_known_proposal(&db, p.id).await.as_deref(), Some("tone"));
+        assert!(reject_proposal(&db, p.id, 7, 100).await.unwrap());
         // Rejected proposals stay on record and cannot be acted on again.
-        assert!(!reject_proposal(conn, p.id, 7, 101).unwrap());
+        assert!(!reject_proposal(&db, p.id, 7, 101).await.unwrap());
     }
 }
 

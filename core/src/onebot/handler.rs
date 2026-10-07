@@ -571,22 +571,24 @@ pub(super) async fn run_agent_turn(
     // subject table. Touched afterwards, that speaker would not be in the table
     // yet, and their first message would render with a bare number.
     {
-        let pool = state.services.db.clone();
         let scope_id = sender.scope_id();
-        let display = sender.nickname.clone();
-        let protected = sender.is_admin;
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(mut conn) = pool.get() {
-                let _ = crate::db::ops::memory::touch_subject(
-                    &mut conn,
+        let touched = state
+            .services
+            .sea
+            .write(async |tx| {
+                crate::db::sea::ops::memory::touch_subject(
+                    tx,
                     &scope_id,
-                    display.as_deref(),
-                    protected,
+                    sender.nickname.as_deref(),
+                    sender.is_admin,
                     crate::util::now_ms(),
-                );
-            }
-        })
-        .await;
+                )
+                .await
+            })
+            .await;
+        if let Err(error) = touched {
+            tracing::debug!(error = %error, "could not refresh a speaker's interaction clock");
+        }
     }
 
     // The one instant this message is known by: the inbox item's `created_at`,
@@ -689,6 +691,7 @@ pub(super) async fn run_agent_turn(
 
         let outcome = agent::headless_chat(
             &state.services.db,
+            &state.services.sea,
             &state.services.secrets,
             &state.services.tools,
             &state.services.mcp,
@@ -985,22 +988,20 @@ async fn run_extraction_pass(
         .join("\n");
 
     let existing = {
-        let pool = state.services.db.clone();
         let facts_ref = extract::TurnFacts {
             messages: messages.clone(),
             is_group,
             project_id: Some(project_id.to_string()),
             session_label: session_key.to_string(),
         };
-        let subs = subjects.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().ok()?;
-            Some(extract::existing_for_extraction(&mut conn, &facts_ref, &subs))
-        })
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+        state
+            .services
+            .sea
+            .read(async |tx| {
+                Ok::<_, crate::db::sea::DbErr>(extract::existing_for_extraction(tx, &facts_ref, &subjects).await)
+            })
+            .await
+            .unwrap_or_default()
     };
 
     let user_prompt = format!(
@@ -1022,7 +1023,7 @@ async fn run_extraction_pass(
         }
     };
 
-    let proposals = match extract::run_extraction(&state.services.db, &raw, facts).await {
+    let proposals = match extract::run_extraction(&state.services.sea, &raw, facts).await {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!("memory extraction produced nothing usable: {e}");
@@ -1036,21 +1037,12 @@ async fn run_extraction_pass(
 
     // Bot-wide memory changes how the bot behaves everywhere, so it waits for a
     // person. The notice goes to the operator privately, wherever it came from.
-    let pool = state.services.db.clone();
-    let ids = proposals.clone();
-    let summaries = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().ok()?;
-        Some(
-            ids.iter()
-                .filter_map(|id| crate::db::ops::memory::get_proposal(&mut conn, *id).ok().flatten())
-                .map(|p| format!("M{} {}: {}", p.id, p.key, p.content))
-                .collect::<Vec<_>>(),
-        )
-    })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default();
+    let mut summaries = Vec::new();
+    for id in &proposals {
+        if let Ok(Some(p)) = crate::db::sea::ops::memory::get_proposal(&state.services.sea, *id).await {
+            summaries.push(format!("M{} {}: {}", p.id, p.key, p.content));
+        }
+    }
 
     if summaries.is_empty() {
         return vec![];
@@ -1103,31 +1095,28 @@ async fn dispatch_decision(
         command::DecisionTarget::MemoryProposal(id) => id,
     };
 
-    let pool = state.services.db.clone();
-    let approve = decision.approve;
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().ok()?;
-        let Some(proposal) = super::extract::is_known_proposal(&mut conn, id) else {
-            return Some(format!("没有找到编号 M{id} 的提议。"));
-        };
-        let now = crate::util::now_ms();
-        if approve {
-            match super::extract::approve_proposal(&mut conn, id, decider, now) {
-                Ok(Some(key)) => Some(format!("已记住全局记忆「{key}」。")),
-                Ok(None) => Some(format!("提议 M{id} 已处理或已过期。")),
-                Err(e) => Some(format!("写入失败: {e}\n可稍后重试「同意 M{id}」。")),
-            }
-        } else {
-            match super::extract::reject_proposal(&mut conn, id, decider, now) {
-                Ok(true) => Some(format!("已拒绝提议 M{id}(「{}」)。", proposal)),
-                Ok(false) => Some(format!("提议 M{id} 已处理或已过期。")),
-                Err(e) => Some(format!("操作失败: {e}")),
+    let db = &state.services.sea;
+    let outcome = match super::extract::is_known_proposal(db, id).await {
+        None => format!("没有找到编号 M{id} 的提议。"),
+        // The approval and the reject each check `pending` inside their own
+        // write, so a proposal handled since the lookup is reported as such.
+        Some(proposal) => {
+            let now = crate::util::now_ms();
+            if decision.approve {
+                match super::extract::approve_proposal(db, id, decider, now).await {
+                    Ok(Some(key)) => format!("已记住全局记忆「{key}」。"),
+                    Ok(None) => format!("提议 M{id} 已处理或已过期。"),
+                    Err(e) => format!("写入失败: {e}\n可稍后重试「同意 M{id}」。"),
+                }
+            } else {
+                match super::extract::reject_proposal(db, id, decider, now).await {
+                    Ok(true) => format!("已拒绝提议 M{id}(「{}」)。", proposal),
+                    Ok(false) => format!("提议 M{id} 已处理或已过期。"),
+                    Err(e) => format!("操作失败: {e}"),
+                }
             }
         }
-    })
-    .await
-    .ok()
-    .flatten()?;
+    };
 
     Some(build_reply(event, &outcome, None))
 }
@@ -1204,7 +1193,7 @@ async fn present_listing(
     session_key: &SessionKey,
     user_id: i64,
     kind: super::MemoryListingKind,
-    rows: &[crate::db::models::memory::MemoryRow],
+    rows: &[crate::db::entity::memory::Model],
     header: &str,
     footer: &str,
 ) -> String {
@@ -1221,7 +1210,7 @@ async fn present_listing(
         if m.content.chars().count() > MAX_CHARS {
             preview.push('…');
         }
-        out.push_str(&format!("{}. [{}] {preview}\n", i + 1, m.memory_type));
+        out.push_str(&format!("{}. [{}] {preview}\n", i + 1, m.memory_type.as_str()));
     }
     if rows.len() > shown {
         out.push_str(&format!("还有 {} 条,私聊我查看完整列表\n", rows.len() - shown));
@@ -1285,12 +1274,13 @@ async fn dispatch_memory(
     args: &str,
     reply_to: Option<i64>,
 ) -> Vec<OneBotAction> {
-    use crate::db::models::memory::{DeletedBy, MemoryScope, Origin, Visibility};
-    use crate::db::ops::memory as mem_ops;
+    use crate::db::entity::memory::{DeletedBy, GLOBAL_SCOPE_ID, MemoryScope, MemoryType, Origin, Visibility};
+    use crate::db::sea::DbErr;
+    use crate::db::sea::ops::memory as mem_ops;
 
     let is_group = session_key.kind == SessionKind::Group;
     let user_id = event.user_id.unwrap_or(0);
-    let scope_id = crate::db::models::memory::onebot_user_scope_id(user_id);
+    let scope_id = crate::db::entity::memory::onebot_user_scope_id(user_id);
 
     let Some(sub) = command::parse_memory_sub(args) else {
         return build_reply(event, "用法: /memory [me|forget N|undo|optout|group]", reply_to);
@@ -1307,8 +1297,30 @@ async fn dispatch_memory(
         }
     }
 
-    let pool = state.services.db.clone();
+    // pool-read-before-write: each arm is its own subcommand. The listing arms read to
+    // show rows and write nothing; the forget arms act on ids from an earlier listing,
+    // which is the contract of a numbered list, and the soft delete skips rows already gone.
+    let db = &state.services.sea;
     let now = crate::util::now_ms();
+    // An operator's note or rule, as the two `add` commands write it.
+    let note = |scope: MemoryScope, scope_id: &str, key: String, content: String, memory_type, visibility| {
+        crate::db::entity::memory::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope_type: scope,
+            scope_id: scope_id.to_owned(),
+            key,
+            content,
+            memory_type,
+            subject_scope_id: (scope == MemoryScope::OnebotUser).then(|| scope_id.to_owned()),
+            origin: Origin::Admin,
+            visibility,
+            source_session_id: None,
+            deleted_at: None,
+            deleted_by: None,
+            created_at: now,
+            updated_at: now,
+        }
+    };
 
     match sub {
         command::MemorySub::Help => build_reply(
@@ -1324,20 +1336,14 @@ async fn dispatch_memory(
         ),
 
         command::MemorySub::Overview => {
-            let sid = scope_id.clone();
-            let counts = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                let ctx = mem_ops::VisibilityCtx::self_view(is_group);
-                let mine = mem_ops::visible_user_memories(&mut conn, &sid, &ctx).ok()?.len();
-                let opted = mem_ops::get_subject(&mut conn, &sid)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|s| s.is_opted_out());
-                Some((mine, opted))
-            })
-            .await
-            .ok()
-            .flatten();
+            let counts = db
+                .read(async |tx| {
+                    let ctx = mem_ops::VisibilityCtx::self_view(is_group);
+                    let mine = mem_ops::visible_user_memories(tx, &scope_id, &ctx).await?.len();
+                    Ok::<_, DbErr>((mine, mem_ops::is_opted_out(tx, &scope_id).await?))
+                })
+                .await
+                .ok();
 
             let text = match counts {
                 Some((_, true)) => "你已选择不被记住。输入 /memory optin 可恢复。".to_string(),
@@ -1348,19 +1354,13 @@ async fn dispatch_memory(
         }
 
         command::MemorySub::Me => {
-            let sid = scope_id.clone();
-            let rows = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                // Exactly what would be injected here, minus the operator's
-                // private notes — visibility is a subset of injection, so the
-                // two can never disagree.
-                let ctx = mem_ops::VisibilityCtx::self_view(is_group);
-                mem_ops::visible_user_memories(&mut conn, &sid, &ctx).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+            // Exactly what would be injected here, minus the operator's private
+            // notes — visibility is a subset of injection, so the two can never
+            // disagree.
+            let ctx = mem_ops::VisibilityCtx::self_view(is_group);
+            let rows = mem_ops::visible_user_memories(db, &scope_id, &ctx)
+                .await
+                .unwrap_or_default();
 
             let header = if rows.is_empty() {
                 "我还没有记住关于你的事。".to_string()
@@ -1384,14 +1384,10 @@ async fn dispatch_memory(
             match resolve_listing(state, session_key, user_id, super::MemoryListingKind::Own, &indices).await {
                 Err(e) => build_reply(event, &e, reply_to),
                 Ok(ids) => {
-                    let n = tokio::task::spawn_blocking(move || {
-                        let mut conn = pool.get().ok()?;
-                        mem_ops::soft_delete_memories(&mut conn, &ids, DeletedBy::SelfRemoved, now).ok()
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
+                    let n = db
+                        .write(async |tx| mem_ops::soft_delete_memories(tx, &ids, DeletedBy::SelfRemoved, now).await)
+                        .await
+                        .unwrap_or(0);
                     build_reply(
                         event,
                         &format!("已删除 {n} 条。5 分钟内可用 /memory undo 撤销。"),
@@ -1409,16 +1405,11 @@ async fn dispatch_memory(
                     reply_to,
                 );
             }
-            let sid = scope_id.clone();
-            let n = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                // Operator notes are not the subject's to clear; the reply says so.
-                mem_ops::forget_subject(&mut conn, &sid, false, DeletedBy::SelfRemoved, now).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0);
+            // Operator notes are not the subject's to clear; the reply says so.
+            let n = db
+                .write(async |tx| mem_ops::forget_subject(tx, &scope_id, false, DeletedBy::SelfRemoved, now).await)
+                .await
+                .unwrap_or(0);
             build_reply(
                 event,
                 &format!("已删除 {n} 条。管理员另行记录的备注不受影响。"),
@@ -1427,28 +1418,26 @@ async fn dispatch_memory(
         }
 
         command::MemorySub::Undo => {
-            let sid = scope_id.clone();
-            let n = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                // Only this person's own recent deletions, so one member cannot
-                // restore what another chose to remove.
-                let cutoff = now - 5 * 60 * 1000;
-                let rows = mem_ops::list_trash(&mut conn, 200).ok()?;
-                let ids: Vec<String> = rows
-                    .into_iter()
-                    .filter(|m| {
-                        m.deleted_by.as_deref() == Some(DeletedBy::SelfRemoved.as_str())
-                            && m.deleted_at.is_some_and(|t| t >= cutoff)
-                            && (m.subject_scope_id.as_deref() == Some(sid.as_str()) || m.scope_id == sid)
-                    })
-                    .map(|m| m.id)
-                    .collect();
-                mem_ops::restore_memories(&mut conn, &ids, crate::util::now_ms()).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0);
+            // Only this person's own recent deletions, so one member cannot
+            // restore what another chose to remove. The trash read and the
+            // restore are one write, so a second undo finds nothing left.
+            let n = db
+                .write(async |tx| {
+                    let cutoff = now - 5 * 60 * 1000;
+                    let ids: Vec<String> = mem_ops::list_trash(tx, 200)
+                        .await?
+                        .into_iter()
+                        .filter(|m| {
+                            m.deleted_by == Some(DeletedBy::SelfRemoved)
+                                && m.deleted_at.is_some_and(|t| t >= cutoff)
+                                && (m.subject_scope_id.as_deref() == Some(scope_id.as_str()) || m.scope_id == scope_id)
+                        })
+                        .map(|m| m.id)
+                        .collect();
+                    mem_ops::restore_memories(tx, &ids, crate::util::now_ms()).await
+                })
+                .await
+                .unwrap_or(0);
             let text = if n == 0 {
                 "没有可撤销的删除(仅限 5 分钟内)。".to_string()
             } else {
@@ -1458,20 +1447,20 @@ async fn dispatch_memory(
         }
 
         command::MemorySub::OptOut => {
-            let sid = scope_id.clone();
-            let n = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                mem_ops::touch_subject(&mut conn, &sid, None, false, now).ok()?;
-                mem_ops::set_subject_flags(&mut conn, &sid, None, Some(true)).ok()?;
-                // Clears memories held about them anywhere, including group
-                // entries that name them — otherwise opting out would leave the
-                // parts most likely to be repeated in front of others.
-                mem_ops::forget_subject(&mut conn, &sid, false, DeletedBy::SelfRemoved, now).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0);
+            // One write: an extraction pass storing a memory about this person
+            // cannot land between the flag and the clear-out.
+            let n = db
+                .write(async |tx| {
+                    mem_ops::touch_subject(tx, &scope_id, None, false, now).await?;
+                    // Only the pin ceiling refuses, and this sets no pin.
+                    let _ = mem_ops::set_subject_flags(tx, &scope_id, None, Some(true)).await?;
+                    // Clears memories held about them anywhere, including group
+                    // entries that name them — otherwise opting out would leave
+                    // the parts most likely to be repeated in front of others.
+                    mem_ops::forget_subject(tx, &scope_id, false, DeletedBy::SelfRemoved, now).await
+                })
+                .await
+                .unwrap_or(0);
             // The second line is not decoration. This command used to promise to
             // "stop remembering you" while the operator's audit log went on
             // recording every message regardless, which made the promise false
@@ -1491,14 +1480,13 @@ async fn dispatch_memory(
         }
 
         command::MemorySub::OptIn => {
-            let sid = scope_id.clone();
-            let ok = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                mem_ops::touch_subject(&mut conn, &sid, None, false, now).ok()?;
-                mem_ops::set_subject_flags(&mut conn, &sid, None, Some(false)).ok()
-            })
-            .await
-            .is_ok();
+            let ok = db
+                .write(async |tx| {
+                    mem_ops::touch_subject(tx, &scope_id, None, false, now).await?;
+                    mem_ops::set_subject_flags(tx, &scope_id, None, Some(false)).await
+                })
+                .await
+                .is_ok();
             build_reply(
                 event,
                 if ok {
@@ -1531,41 +1519,26 @@ async fn dispatch_memory(
                 {
                     Err(e) => build_reply(event, &e, reply_to),
                     Ok(ids) => {
-                        let n = tokio::task::spawn_blocking(move || {
-                            let mut conn = pool.get().ok()?;
-                            mem_ops::soft_delete_memories(&mut conn, &ids, DeletedBy::SelfRemoved, now).ok()
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or(0);
+                        let n = db
+                            .write(async |tx| {
+                                mem_ops::soft_delete_memories(tx, &ids, DeletedBy::SelfRemoved, now).await
+                            })
+                            .await
+                            .unwrap_or(0);
                         build_reply(event, &format!("已删除 {n} 条群记忆。"), reply_to)
                     }
                 };
             }
 
-            let rows = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                mem_ops::list_by_scope(&mut conn, MemoryScope::Project, &project_id).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+            let rows = match mem_ops::list_by_scope(db, MemoryScope::Project, &project_id).await {
+                Ok(rows) => rows,
+                Err(error) => return build_reply(event, &format!("读取记忆失败：{error}"), reply_to),
+            };
             // Any member may delete these. A group memory can just as easily be
             // an embarrassing story about one person as a piece of shared slang,
             // and leaving removal to the operator only would reopen the hole
             // that per-person deletion exists to close.
-            let rows = rows.into_iter().try_fold(Vec::new(), |mut visible, memory| {
-                if !memory.is_owner_only()? {
-                    visible.push(memory);
-                }
-                Ok::<_, String>(visible)
-            });
-            let rows = match rows {
-                Ok(rows) => rows,
-                Err(error) => return build_reply(event, &format!("读取记忆失败：{error}"), reply_to),
-            };
+            let rows: Vec<_> = rows.into_iter().filter(|memory| !memory.is_owner_only()).collect();
             let header = if rows.is_empty() {
                 "本群还没有记忆。".to_string()
             } else {
@@ -1585,15 +1558,8 @@ async fn dispatch_memory(
         }
 
         command::MemorySub::User(target) => {
-            let target_scope = crate::db::models::memory::onebot_user_scope_id(target);
-            let rows = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                mem_ops::list_by_subject(&mut conn, &target_scope).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+            let target_scope = crate::db::entity::memory::onebot_user_scope_id(target);
+            let rows = mem_ops::list_by_subject(db, &target_scope).await.unwrap_or_default();
             let header = if rows.is_empty() {
                 format!("没有关于 {target} 的记忆。")
             } else {
@@ -1616,58 +1582,34 @@ async fn dispatch_memory(
             user_id: target,
             content,
         } => {
-            let target_scope = crate::db::models::memory::onebot_user_scope_id(target);
+            let target_scope = crate::db::entity::memory::onebot_user_scope_id(target);
             let key = format!("note_{}", now % 100_000);
-            let result = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().map_err(|e| e.to_string())?;
-                mem_ops::validate_memory(&mut conn, MemoryScope::OnebotUser, &target_scope, &key, &content)?;
-                let id = uuid::Uuid::new_v4().to_string();
-                mem_ops::upsert_memory(
-                    &mut conn,
-                    &crate::db::models::memory::MemoryInsert {
-                        id: &id,
-                        scope_type: MemoryScope::OnebotUser.as_str(),
-                        scope_id: &target_scope,
-                        key: &key,
-                        content: &content,
-                        memory_type: "fact",
-                        subject_scope_id: Some(&target_scope),
-                        origin: Origin::Admin.as_str(),
-                        // The operator's own annotation: the subject can neither
-                        // see nor remove it.
-                        visibility: Visibility::OwnerOnly.as_str(),
-                        source_session_id: None,
-                        created_at: now,
-                        updated_at: now,
-                    },
-                )
-                .map_err(|e| e.to_string())?;
-                Ok::<_, String>(())
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r);
+            // The operator's own annotation: the subject can neither see nor
+            // remove it.
+            let row = note(
+                MemoryScope::OnebotUser,
+                &target_scope,
+                key,
+                content,
+                MemoryType::Fact,
+                Visibility::OwnerOnly,
+            );
+            let result = db
+                .write(async |tx| mem_ops::remember(tx, row).await)
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
             let text = match result {
-                Ok(()) => format!("已记录关于 {target} 的备注(仅你可见)。"),
+                Ok(_) => format!("已记录关于 {target} 的备注(仅你可见)。"),
                 Err(e) => format!("写入失败: {e}"),
             };
             build_reply(event, &text, reply_to)
         }
 
         command::MemorySub::Global => {
-            let rows = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                mem_ops::list_by_scope(
-                    &mut conn,
-                    MemoryScope::OnebotGlobal,
-                    crate::db::models::memory::GLOBAL_SCOPE_ID,
-                )
-                .ok()
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+            let rows = mem_ops::list_by_scope(db, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID)
+                .await
+                .unwrap_or_default();
             let header = if rows.is_empty() {
                 "还没有全局记忆。".to_string()
             } else {
@@ -1687,52 +1629,35 @@ async fn dispatch_memory(
         }
 
         command::MemorySub::GlobalAdd { key, content } => {
-            let result = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().map_err(|e| e.to_string())?;
-                let gid = crate::db::models::memory::GLOBAL_SCOPE_ID;
-                mem_ops::validate_memory(&mut conn, MemoryScope::OnebotGlobal, gid, &key, &content)?;
-                let id = uuid::Uuid::new_v4().to_string();
-                mem_ops::upsert_memory(
-                    &mut conn,
-                    &crate::db::models::memory::MemoryInsert {
-                        id: &id,
-                        scope_type: MemoryScope::OnebotGlobal.as_str(),
-                        scope_id: gid,
-                        key: &key,
-                        content: &content,
-                        memory_type: "instruction",
-                        subject_scope_id: None,
-                        origin: Origin::Admin.as_str(),
-                        // Taught deliberately, and meant to be acted on.
-                        visibility: Visibility::Normal.as_str(),
-                        source_session_id: None,
-                        created_at: now,
-                        updated_at: now,
-                    },
-                )
-                .map_err(|e| e.to_string())?;
-                Ok::<_, String>(())
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r);
+            // Taught deliberately, and meant to be acted on.
+            let row = note(
+                MemoryScope::OnebotGlobal,
+                GLOBAL_SCOPE_ID,
+                key,
+                content,
+                MemoryType::Instruction,
+                Visibility::Normal,
+            );
+            let result = db
+                .write(async |tx| mem_ops::remember(tx, row).await)
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
             let text = match result {
-                Ok(()) => "已加入全局记忆。".to_string(),
+                Ok(_) => "已加入全局记忆。".to_string(),
                 Err(e) => format!("写入失败: {e}"),
             };
             build_reply(event, &text, reply_to)
         }
 
         command::MemorySub::Pending => {
-            let rows = tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().ok()?;
-                mem_ops::expire_proposals(&mut conn, now).ok()?;
-                mem_ops::list_proposals(&mut conn, true).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+            let rows = db
+                .write(async |tx| {
+                    mem_ops::expire_proposals(tx, now).await?;
+                    mem_ops::list_proposals(tx, true).await
+                })
+                .await
+                .unwrap_or_default();
             let text = if rows.is_empty() {
                 "没有待处理的全局记忆提议。".to_string()
             } else {

@@ -244,7 +244,7 @@ pub struct SenderContext {
 
 impl SenderContext {
     pub fn scope_id(&self) -> String {
-        crate::db::models::memory::onebot_user_scope_id(self.user_id)
+        crate::db::entity::memory::onebot_user_scope_id(self.user_id)
     }
 }
 

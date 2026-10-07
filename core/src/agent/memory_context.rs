@@ -4,12 +4,13 @@
 //! (desktop chat, its token-counting mirror, and OneBot) cannot drift apart on
 //! privacy rules the way three hand-copied loaders would.
 
-use diesel::sqlite::SqliteConnection;
-
 use crate::db::DbPool;
-use crate::db::models::memory::{GLOBAL_SCOPE_ID, MemoryRow, MemoryScope, Visibility, onebot_user_scope_id};
+use crate::db::entity::memory;
+use crate::db::entity::memory::{GLOBAL_SCOPE_ID, MemoryScope, Visibility, onebot_user_scope_id};
 use crate::db::models::message::MessageRow;
-use crate::db::ops::memory::{
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::{Db, Snapshot};
+use crate::db::sea::ops::memory::{
     Cursor, ReadWindow, TRASH_RETENTION_MS, VisibilityCtx, escape_attr, format_memory_section, list_by_scopes,
     list_deleted_by_scopes,
 };
@@ -204,10 +205,10 @@ fn layer_budgets(total: usize) -> LayerBudgets {
 /// a cursor that steps past an entry nobody sent would never come back for it,
 /// and at these budgets — a few hundred tokens per person — dropping is the
 /// ordinary case rather than the exceptional one.
-fn fit_to_budget(memories: Vec<MemoryRow>, budget: usize) -> (Vec<MemoryRow>, Vec<MemoryRow>) {
+fn fit_to_budget(memories: Vec<memory::Model>, budget: usize) -> (Vec<memory::Model>, Vec<memory::Model>) {
     let mut used = 0usize;
-    let mut kept: Vec<MemoryRow> = Vec::new();
-    let mut dropped: Vec<MemoryRow> = Vec::new();
+    let mut kept: Vec<memory::Model> = Vec::new();
+    let mut dropped: Vec<memory::Model> = Vec::new();
     for m in memories {
         let cost = estimate_tokens(&m.content) + estimate_tokens(&m.key) + 8;
         // Always admit the first entry. A section whose smallest row exceeds its
@@ -236,7 +237,7 @@ pub(crate) struct Accounting {
 }
 
 impl Accounting {
-    fn take(&mut self, kept: &[MemoryRow], dropped: &[MemoryRow], key: fn(&MemoryRow) -> i64) {
+    fn take(&mut self, kept: &[memory::Model], dropped: &[memory::Model], key: fn(&memory::Model) -> i64) {
         self.sent.extend(kept.iter().map(|m| (key(m), m.id.clone())));
         self.unsent.extend(dropped.iter().map(|m| (key(m), m.id.clone())));
     }
@@ -246,7 +247,7 @@ impl Accounting {
 /// only: their name and standing live on the roster, which is rebuilt every turn
 /// because both of those change while what is remembered does not.
 fn person_attrs(scope_id: &str) -> String {
-    let qq = crate::db::models::memory::parse_onebot_user_scope_id(scope_id)
+    let qq = crate::db::entity::memory::parse_onebot_user_scope_id(scope_id)
         .map(|id| id.to_string())
         .unwrap_or_else(|| scope_id.to_string());
     format!("qq=\"{}\"", escape_attr(&qq))
@@ -293,11 +294,11 @@ pub(crate) fn roster_block(req: &MemoryRequest) -> Option<String> {
     Some(out)
 }
 
-fn by_updated(m: &MemoryRow) -> i64 {
+fn by_updated(m: &memory::Model) -> i64 {
     m.updated_at
 }
 
-fn by_deleted(m: &MemoryRow) -> i64 {
+fn by_deleted(m: &memory::Model) -> i64 {
     m.deleted_at.unwrap_or(m.updated_at)
 }
 
@@ -492,16 +493,25 @@ fn advance_cursor(mut sent: Vec<(i64, String)>, unsent: Vec<(i64, String)>) -> O
     .map(|(ts, id)| Cursor { ts, id })
 }
 
-fn partition_visibility(rows: Vec<MemoryRow>) -> Result<(Vec<MemoryRow>, Vec<MemoryRow>), String> {
-    let mut ordinary = Vec::new();
-    let mut owner_only = Vec::new();
-    for row in rows {
-        match row.visibility()? {
-            Visibility::Normal => ordinary.push(row),
-            Visibility::OwnerOnly => owner_only.push(row),
+fn partition_visibility(rows: Vec<memory::Model>) -> (Vec<memory::Model>, Vec<memory::Model>) {
+    rows.into_iter().partition(|row| row.visibility == Visibility::Normal)
+}
+
+/// A layer's rows, or none when the read failed. A query that fails leaves the
+/// layer empty, and an empty layer is indistinguishable from "nothing was ever
+/// remembered" — the model simply stops knowing things the user taught it —
+/// so it is logged. A stored value outside its column's type (`DbErr::Type`)
+/// is different: the row itself is wrong, and the injection is refused rather
+/// than sent without it, as an unknown visibility always was.
+fn layer_rows(rows: Result<Vec<memory::Model>, DbErr>, layer: &'static str) -> Result<Vec<memory::Model>, String> {
+    match rows {
+        Ok(rows) => Ok(rows),
+        Err(DbErr::Type(error)) => Err(format!("a stored memory is outside its contract: {error}")),
+        Err(error) => {
+            tracing::warn!(layer, error = %error, "memory layer could not be read; it will be missing from this turn");
+            Ok(Vec::new())
         }
     }
-    Ok((ordinary, owner_only))
 }
 
 /// Assemble the block. `None` when there is nothing to say.
@@ -513,43 +523,37 @@ fn partition_visibility(rows: Vec<MemoryRow>) -> Result<(Vec<MemoryRow>, Vec<Mem
 /// and working forward would open a conversation with whatever happened to be
 /// written first. What the budget refuses is reported through `acct`, and the
 /// cursor stops short of it, so the following rounds pick those up as deltas.
-pub(crate) fn load_memory_block_sync(
-    conn: &mut SqliteConnection,
+pub(crate) async fn load_memory_block(
+    db: &impl Snapshot,
     req: &MemoryRequest,
     acct: &mut Accounting,
 ) -> Result<Option<String>, String> {
     let budgets = layer_budgets(req.budget_tokens);
 
-    // A query that fails leaves the layer empty, and an empty layer is
-    // indistinguishable from "nothing was ever remembered" — the model simply
-    // stops knowing things the user taught it, with no error anywhere.
-    let layer_or_empty = |rows: Result<Vec<_>, _>, layer: &'static str, budget: usize| match rows {
-        Ok(rows) => fit_to_budget(rows, budget),
-        Err(e) => {
-            tracing::warn!(layer, error = %e, "memory layer could not be read; it will be missing from this turn");
-            (Vec::new(), Vec::new())
-        }
+    let layer_or_empty = |rows, layer: &'static str, budget: usize| -> Result<_, String> {
+        Ok(fit_to_budget(layer_rows(rows, layer)?, budget))
     };
 
     // The two global layers share one budget line: a turn only ever includes one
     // of them, so splitting the allowance would just shrink whichever is in play.
-    let mut load_global = |scope: MemoryScope| {
+    let load_global = async |scope: MemoryScope| {
         layer_or_empty(
             list_by_scopes(
-                conn,
+                db,
                 scope,
                 &[GLOBAL_SCOPE_ID.to_string()],
                 &VisibilityCtx::private_injection(),
                 None,
-            ),
+            )
+            .await,
             "global",
             budgets.global,
         )
     };
     let (global, global_dropped) = if req.include_onebot_global {
-        load_global(MemoryScope::OnebotGlobal)
+        load_global(MemoryScope::OnebotGlobal).await?
     } else if req.include_client_global {
-        load_global(MemoryScope::ClientGlobal)
+        load_global(MemoryScope::ClientGlobal).await?
     } else {
         (Vec::new(), Vec::new())
     };
@@ -558,15 +562,16 @@ pub(crate) fn load_memory_block_sync(
     let (project, project_dropped) = match req.project_id.as_ref() {
         Some(pid) => layer_or_empty(
             list_by_scopes(
-                conn,
+                db,
                 MemoryScope::Project,
                 std::slice::from_ref(pid),
                 &VisibilityCtx::private_injection(),
                 None,
-            ),
+            )
+            .await,
             "project",
             budgets.project,
-        ),
+        )?,
         None => (Vec::new(), Vec::new()),
     };
     acct.take(&project, &project_dropped, by_updated);
@@ -587,18 +592,10 @@ pub(crate) fn load_memory_block_sync(
     let subject_rows = if scope_ids.is_empty() {
         Vec::new()
     } else {
-        match list_by_scopes(conn, MemoryScope::OnebotUser, &scope_ids, &req.subject_visibility, None) {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!(
-                    layer = "subject",
-                    subject_count = scope_ids.len(),
-                    error = %e,
-                    "memory layer could not be read; it will be missing from this turn"
-                );
-                Vec::new()
-            }
-        }
+        layer_rows(
+            list_by_scopes(db, MemoryScope::OnebotUser, &scope_ids, &req.subject_visibility, None).await,
+            "subject",
+        )?
     };
 
     // Owner notes get their own section: the "never quote" rule attaches to the
@@ -606,9 +603,9 @@ pub(crate) fn load_memory_block_sync(
     // to read out. Partitioned across *every* layer, not just the subject one —
     // the project and bot layers can hold owner-only rows too, and the desktop
     // UI exposes the flag for all of them.
-    let (subject_rows, mut owner_notes) = partition_visibility(subject_rows)?;
-    let (global, global_notes) = partition_visibility(global)?;
-    let (project, project_notes) = partition_visibility(project)?;
+    let (subject_rows, mut owner_notes) = partition_visibility(subject_rows);
+    let (global, global_notes) = partition_visibility(global);
+    let (project, project_notes) = partition_visibility(project);
     owner_notes.extend(global_notes);
     owner_notes.extend(project_notes);
     // Stable order regardless of which layer contributed.
@@ -669,7 +666,7 @@ pub(crate) fn load_memory_block_sync(
         let per_subject = budgets.subjects / scope_ids.len().max(1);
         let mut people = String::new();
         for scope_id in &scope_ids {
-            let rows: Vec<MemoryRow> = subject_rows
+            let rows: Vec<memory::Model> = subject_rows
                 .iter()
                 .filter(|m| &m.scope_id == scope_id)
                 .cloned()
@@ -793,26 +790,26 @@ fn subject_scope_ids(req: &MemoryRequest) -> Vec<String> {
 /// Decide what this turn injects. Reads only — the caller persists the result if
 /// it is running a real turn, and the context estimator uses the same answer
 /// without writing anything.
-pub fn plan_injection(
-    conn: &mut SqliteConnection,
+pub async fn plan_injection(
+    db: &impl Snapshot,
     req: &MemoryRequest,
     live: &[MessageRow],
     t0: i64,
 ) -> Result<Injection, String> {
     match scan_prior_state(live, t0)? {
-        Some(prior) => delta_injection(conn, req, &prior, t0),
-        None => full_injection(conn, req, t0),
+        Some(prior) => delta_injection(db, req, &prior, t0).await,
+        None => full_injection(db, req, t0).await,
     }
 }
 
-fn full_injection(conn: &mut SqliteConnection, req: &MemoryRequest, t0: i64) -> Result<Injection, String> {
+async fn full_injection(db: &impl Snapshot, req: &MemoryRequest, t0: i64) -> Result<Injection, String> {
     let mut acct = Accounting::default();
-    let text = load_memory_block_sync(conn, req, &mut acct)?;
+    let text = load_memory_block(db, req, &mut acct).await?;
     // A full block states what is remembered *now*, so every delete up to this
     // moment is already accounted for by the rows it does not contain. The
     // delete cursor therefore jumps to the present rather than replaying a
     // history of removals the model was never told about in the first place.
-    let delete = latest_delete_cursor(conn, req, t0);
+    let delete = latest_delete_cursor(db, req, t0).await;
     Ok(Injection {
         text,
         kind: InjectionKind::Full,
@@ -826,14 +823,14 @@ fn full_injection(conn: &mut SqliteConnection, req: &MemoryRequest, t0: i64) -> 
 
 /// The most recent delete anyone could have been told about, for a full block to
 /// resume from.
-fn latest_delete_cursor(conn: &mut SqliteConnection, req: &MemoryRequest, t0: i64) -> Option<Cursor> {
+async fn latest_delete_cursor(db: &impl Snapshot, req: &MemoryRequest, t0: i64) -> Option<Cursor> {
     let window = ReadWindow {
         after: None,
         before_ts: t0,
     };
     let mut all: Vec<(i64, String)> = Vec::new();
     for (scope, ids, ctx) in delete_layers(req) {
-        if let Ok(rows) = list_deleted_by_scopes(conn, scope, &ids, &ctx, &window) {
+        if let Ok(rows) = list_deleted_by_scopes(db, scope, &ids, &ctx, &window).await {
             all.extend(rows.iter().map(|m| (by_deleted(m), m.id.clone())));
         }
     }
@@ -871,8 +868,8 @@ fn delete_layers(req: &MemoryRequest) -> Vec<(MemoryScope, Vec<String>, Visibili
 /// someone the model has already been told about, "what changed" is a window on
 /// the cursor. For someone it has not, the answer is everything — their memories
 /// are as old as they are, so no cursor would ever reach back far enough.
-fn delta_injection(
-    conn: &mut SqliteConnection,
+async fn delta_injection(
+    db: &impl Snapshot,
     req: &MemoryRequest,
     prior: &InjectionState,
     t0: i64,
@@ -885,22 +882,21 @@ fn delta_injection(
     };
     let mut out = String::new();
 
-    let changed = |conn: &mut SqliteConnection, scope, ids: Vec<String>, ctx: &VisibilityCtx| {
-        list_by_scopes(conn, scope, &ids, ctx, Some(&window)).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "a memory layer could not be read; its changes wait for the next turn");
-            Vec::new()
-        })
+    // A layer that cannot be read sends nothing this round, and its changes
+    // wait for the next one: the cursor only moves past what was read.
+    let changed = async |scope, ids: Vec<String>, ctx: &VisibilityCtx| {
+        layer_rows(list_by_scopes(db, scope, &ids, ctx, Some(&window)).await, "changed")
     };
 
-    let mut owner_notes: Vec<MemoryRow> = Vec::new();
+    let mut owner_notes: Vec<memory::Model> = Vec::new();
     let section = |out: &mut String,
-                   rows: Vec<MemoryRow>,
+                   rows: Vec<memory::Model>,
                    tag: &str,
                    budget: usize,
                    acct: &mut Accounting,
-                   notes: &mut Vec<MemoryRow>|
+                   notes: &mut Vec<memory::Model>|
      -> Result<(), String> {
-        let (rows, mine) = partition_visibility(rows)?;
+        let (rows, mine) = partition_visibility(rows);
         notes.extend(mine);
         // Trimmed in cursor order — the order the query returned — so that what
         // survives is a prefix the cursor can advance through. Sorting by key
@@ -918,11 +914,11 @@ fn delta_injection(
 
     if let Some(scope) = global_scope(req) {
         let rows = changed(
-            conn,
             scope,
             vec![GLOBAL_SCOPE_ID.to_string()],
             &VisibilityCtx::private_injection(),
-        );
+        )
+        .await?;
         section(
             &mut out,
             rows,
@@ -934,11 +930,11 @@ fn delta_injection(
     }
     if let Some(pid) = req.project_id.as_ref() {
         let rows = changed(
-            conn,
             MemoryScope::Project,
             vec![pid.clone()],
             &VisibilityCtx::private_injection(),
-        );
+        )
+        .await?;
         section(
             &mut out,
             rows,
@@ -966,21 +962,21 @@ fn delta_injection(
             .cloned()
             .collect();
 
-        let mut rows: Vec<MemoryRow> = Vec::new();
+        let mut rows: Vec<memory::Model> = Vec::new();
         if !known.is_empty() {
-            rows.extend(changed(conn, MemoryScope::OnebotUser, known, &req.subject_visibility));
+            rows.extend(changed(MemoryScope::OnebotUser, known, &req.subject_visibility).await?);
         }
         if !newcomers.is_empty() {
-            rows.extend(
-                list_by_scopes(conn, MemoryScope::OnebotUser, &newcomers, &req.subject_visibility, None)
-                    .unwrap_or_default(),
-            );
+            rows.extend(layer_rows(
+                list_by_scopes(db, MemoryScope::OnebotUser, &newcomers, &req.subject_visibility, None).await,
+                "newcomers",
+            )?);
         }
-        let (rows, notes) = partition_visibility(rows)?;
+        let (rows, notes) = partition_visibility(rows);
         owner_notes.extend(notes);
 
         for scope_id in &scope_ids {
-            let mine: Vec<MemoryRow> = rows.iter().filter(|m| &m.scope_id == scope_id).cloned().collect();
+            let mine: Vec<memory::Model> = rows.iter().filter(|m| &m.scope_id == scope_id).cloned().collect();
             let is_newcomer = !prior.people.contains(scope_id);
             if mine.is_empty() && !is_newcomer {
                 continue;
@@ -1014,7 +1010,7 @@ fn delta_injection(
         out.push_str(&s);
     }
 
-    let (forgotten, delete) = forgotten_section(conn, req, prior, t0, budgets.owner_notes);
+    let (forgotten, delete) = forgotten_section(db, req, prior, t0, budgets.owner_notes).await;
     if let Some(s) = forgotten {
         out.push_str(&s);
     }
@@ -1058,8 +1054,8 @@ fn delta_injection(
 /// Each line names the section its entry came from. A key is only unique inside
 /// its scope — `global`, a project and any number of people can each hold one
 /// called the same thing — so a bare key names no particular memory.
-fn forgotten_section(
-    conn: &mut SqliteConnection,
+async fn forgotten_section(
+    db: &impl Snapshot,
     req: &MemoryRequest,
     prior: &InjectionState,
     t0: i64,
@@ -1069,14 +1065,14 @@ fn forgotten_section(
         after: prior.delete.as_ref(),
         before_ts: t0,
     };
-    let mut rows: Vec<(String, MemoryRow)> = Vec::new();
+    let mut rows: Vec<(String, memory::Model)> = Vec::new();
     for (scope, ids, ctx) in delete_layers(req) {
         let label = match scope {
             MemoryScope::Project => "chat_memories".to_string(),
             MemoryScope::OnebotUser => String::new(),
             _ => "bot_memories".to_string(),
         };
-        if let Ok(found) = list_deleted_by_scopes(conn, scope, &ids, &ctx, &window) {
+        if let Ok(found) = list_deleted_by_scopes(db, scope, &ids, &ctx, &window).await {
             for m in found {
                 let label = if label.is_empty() {
                     format!("person {}", person_attrs(&m.scope_id))
@@ -1232,51 +1228,73 @@ pub(crate) async fn persist_context_row(
     parent
 }
 
-/// Async wrapper for the call sites that hold a pool rather than a connection.
+/// [`plan_injection`] in a read transaction of its own: its dozen reads have to
+/// describe one moment, or a memory written between two of them could be sent
+/// by one layer and skipped by the cursor of another.
 pub async fn plan_injection_async(
-    pool: &DbPool,
+    db: &Db,
     req: MemoryRequest,
     live: Vec<MessageRow>,
     t0: i64,
 ) -> Result<Option<Injection>, String> {
-    let pool = pool.clone();
-    tokio::task::spawn_blocking(move || -> Result<Option<Injection>, String> {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        plan_injection(&mut conn, &req, &live, t0).map(Some)
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    db.read(async |tx| Ok::<_, DbErr>(plan_injection(tx, &req, &live, t0).await))
+        .await
+        .map_err(|error| error.to_string())?
+        .map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
-    use crate::db::models::memory::{MemoryInsert, Origin};
-    use crate::db::models::project::ProjectInsert;
-    use crate::db::ops::memory::upsert_memory;
+    use crate::db::entity::memory::{MemoryType, Origin};
+    use crate::db::sea::ops::memory::upsert_memory;
+    use crate::db::sea::{execute_for_tests, sea_test_db};
 
-    fn project(conn: &mut SqliteConnection, id: &str) {
-        crate::db::ops::project::create_project(
+    async fn project(conn: &Db, id: &str) {
+        execute_for_tests(
             conn,
-            &ProjectInsert {
-                id,
-                name: "P",
-                path: None,
-                source_type: "local",
-                source_id: None,
-                assistant_id: None,
-                description: None,
-                created_at: 1,
-                updated_at: 1,
-            },
+            &format!("INSERT INTO projects (id, name, source_type, created_at, updated_at) VALUES ('{id}', 'P', 'local', 1, 1)"),
         )
+        .await
         .unwrap();
     }
 
+    /// Written straight through `upsert_memory`, past the quota, as the
+    /// fixtures need.
     #[allow(clippy::too_many_arguments)]
-    fn add(
-        conn: &mut SqliteConnection,
+    async fn put(
+        conn: &Db,
+        id: &str,
+        scope: MemoryScope,
+        scope_id: &str,
+        key: &str,
+        content: &str,
+        origin: Origin,
+        vis: Visibility,
+        updated_at: i64,
+    ) {
+        let row = memory::Model {
+            id: id.into(),
+            scope_type: scope,
+            scope_id: scope_id.into(),
+            key: key.into(),
+            content: content.into(),
+            memory_type: MemoryType::General,
+            subject_scope_id: (scope == MemoryScope::OnebotUser).then(|| scope_id.to_owned()),
+            origin,
+            visibility: vis,
+            source_session_id: None,
+            deleted_at: None,
+            deleted_by: None,
+            created_at: 1,
+            updated_at,
+        };
+        conn.write(async |tx| upsert_memory(tx, row).await).await.unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add(
+        conn: &Db,
         id: &str,
         scope: MemoryScope,
         scope_id: &str,
@@ -1285,31 +1303,22 @@ mod tests {
         origin: Origin,
         vis: Visibility,
     ) {
-        let subject = (scope == MemoryScope::OnebotUser).then_some(scope_id);
-        upsert_memory(
-            conn,
-            &MemoryInsert {
-                id,
-                scope_type: scope.as_str(),
-                scope_id,
-                key,
-                content,
-                memory_type: "general",
-                subject_scope_id: subject,
-                origin: origin.as_str(),
-                visibility: vis.as_str(),
-                source_session_id: None,
-                created_at: 1,
-                updated_at: 1,
-            },
-        )
-        .unwrap();
+        put(conn, id, scope, scope_id, key, content, origin, vis, 1).await;
     }
 
     /// The full block, with the cursor bookkeeping discarded. Most of these
     /// tests are about what the model reads.
-    fn block(conn: &mut SqliteConnection, req: &MemoryRequest) -> Option<String> {
-        load_memory_block_sync(conn, req, &mut Accounting::default()).unwrap()
+    async fn block(conn: &Db, req: &MemoryRequest) -> Option<String> {
+        conn.read(async |tx| Ok::<_, DbErr>(load_memory_block(tx, req, &mut Accounting::default()).await))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn plan(conn: &Db, req: &MemoryRequest, live: &[MessageRow], t0: i64) -> Result<Injection, String> {
+        conn.read(async |tx| Ok::<_, DbErr>(plan_injection(tx, req, live, t0).await))
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1327,13 +1336,11 @@ mod tests {
         assert!(parse_source("todo|list").unwrap().is_none());
     }
 
-    #[test]
-    fn invalid_stored_visibility_aborts_injection() {
-        use diesel::prelude::*;
-
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        project(conn, "p1");
+    #[tokio::test]
+    async fn invalid_stored_visibility_aborts_injection() {
+        let db = sea_test_db().await;
+        let conn = &db;
+        project(conn, "p1").await;
         add(
             conn,
             "m1",
@@ -1343,40 +1350,33 @@ mod tests {
             "value",
             Origin::Desktop,
             Visibility::Normal,
-        );
-        diesel::update(crate::db::schema::memories::table.find("m1"))
-            .set(crate::db::schema::memories::visibility.eq("public"))
-            .execute(conn)
+        )
+        .await;
+        execute_for_tests(conn, "UPDATE memories SET visibility = 'public' WHERE id = 'm1'")
+            .await
             .unwrap();
 
-        let error = match plan_injection(conn, &MemoryRequest::desktop(Some("p1".into()), 8_000), &[], 2) {
+        let error = match plan(conn, &MemoryRequest::desktop(Some("p1".into()), 8_000), &[], 2).await {
             Err(error) => error,
             Ok(_) => panic!("an unknown visibility must reject the injection"),
         };
-        assert!(error.contains("unknown memory visibility"));
+        assert!(error.contains("outside its contract"), "{error}");
     }
 
     /// One person, one memory, written at `updated_at`.
-    fn add_at(conn: &mut SqliteConnection, id: &str, scope: MemoryScope, scope_id: &str, key: &str, updated_at: i64) {
-        let subject = (scope == MemoryScope::OnebotUser).then_some(scope_id);
-        upsert_memory(
+    async fn add_at(conn: &Db, id: &str, scope: MemoryScope, scope_id: &str, key: &str, updated_at: i64) {
+        put(
             conn,
-            &MemoryInsert {
-                id,
-                scope_type: scope.as_str(),
-                scope_id,
-                key,
-                content: "v",
-                memory_type: "general",
-                subject_scope_id: subject,
-                origin: Origin::Group.as_str(),
-                visibility: Visibility::Normal.as_str(),
-                source_session_id: None,
-                created_at: 1,
-                updated_at,
-            },
+            id,
+            scope,
+            scope_id,
+            key,
+            "v",
+            Origin::Group,
+            Visibility::Normal,
+            updated_at,
         )
-        .unwrap();
+        .await;
     }
 
     /// A frozen injection row, as `plan_injection` would have left it.
@@ -1434,13 +1434,8 @@ mod tests {
 
         /// Run a round the way a surface would: plan against the rows frozen so
         /// far, then append this round's row to them.
-        fn round(
-            conn: &mut SqliteConnection,
-            req: &MemoryRequest,
-            history: &mut Vec<MessageRow>,
-            t0: i64,
-        ) -> Injection {
-            let injection = plan_injection(conn, req, history, t0).unwrap();
+        async fn round(conn: &Db, req: &MemoryRequest, history: &mut Vec<MessageRow>, t0: i64) -> Injection {
+            let injection = plan(conn, req, history, t0).await.unwrap();
             if injection.text.is_some() {
                 history.push(frozen(&injection));
             }
@@ -1449,20 +1444,20 @@ mod tests {
 
         /// Nothing changed, so nothing is sent — the row from the earlier round
         /// is still in the history and the model can still read it.
-        #[test]
-        fn an_unchanged_turn_injects_nothing() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn an_unchanged_turn_injects_nothing() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100);
+            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
-            let first = round(conn, &req, &mut history, 1_000);
+            let first = round(conn, &req, &mut history, 1_000).await;
             assert_eq!(first.kind, InjectionKind::Full);
             assert!(first.text.is_some());
 
-            let second = round(conn, &req, &mut history, 2_000);
+            let second = round(conn, &req, &mut history, 2_000).await;
             assert_eq!(second.kind, InjectionKind::Delta);
             assert!(second.text.is_none(), "nothing changed: {:?}", second.text);
             assert_eq!(history.len(), 1);
@@ -1471,25 +1466,32 @@ mod tests {
         /// A delete leaves `deleted_at` and does not touch `updated_at`, so a
         /// memory written long before any cursor still has to be reported when
         /// it goes. Reading the upsert side alone loses this entirely.
-        #[test]
-        fn an_old_row_deleted_today_is_still_reported() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn an_old_row_deleted_today_is_still_reported() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
-            add_at(conn, "old", MemoryScope::OnebotUser, &alice, "coffee", 10);
+            add_at(conn, "old", MemoryScope::OnebotUser, &alice, "coffee", 10).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
-            round(conn, &req, &mut history, 1_000);
-            crate::db::ops::memory::soft_delete_memories(
-                conn,
-                &["old".into()],
-                crate::db::models::memory::DeletedBy::Admin,
-                1_500,
-            )
+            round(conn, &req, &mut history, 1_000).await;
+            conn.write(async |tx| {
+                crate::db::sea::ops::memory::soft_delete_memories(
+                    tx,
+                    &["old".into()],
+                    crate::db::entity::memory::DeletedBy::Admin,
+                    1_500,
+                )
+                .await
+            })
+            .await
             .unwrap();
 
-            let text = round(conn, &req, &mut history, 2_000).text.expect("a forgotten event");
+            let text = round(conn, &req, &mut history, 2_000)
+                .await
+                .text
+                .expect("a forgotten event");
             assert!(text.contains("<memory_forgotten>"), "{text}");
             assert!(text.contains("coffee"), "{text}");
             // And it names the section, because a key is only unique inside one.
@@ -1500,37 +1502,46 @@ mod tests {
         /// went back to NULL and `updated_at` stayed behind the cursor, so the
         /// memory existed, the model had been told to forget it, and nothing
         /// would ever say otherwise.
-        #[test]
-        fn a_restored_memory_comes_back() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn a_restored_memory_comes_back() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
-            add_at(conn, "old", MemoryScope::OnebotUser, &alice, "coffee", 10);
+            add_at(conn, "old", MemoryScope::OnebotUser, &alice, "coffee", 10).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
-            round(conn, &req, &mut history, 1_000);
-            crate::db::ops::memory::soft_delete_memories(
-                conn,
-                &["old".into()],
-                crate::db::models::memory::DeletedBy::Admin,
-                1_500,
-            )
+            round(conn, &req, &mut history, 1_000).await;
+            conn.write(async |tx| {
+                crate::db::sea::ops::memory::soft_delete_memories(
+                    tx,
+                    &["old".into()],
+                    crate::db::entity::memory::DeletedBy::Admin,
+                    1_500,
+                )
+                .await
+            })
+            .await
             .unwrap();
-            round(conn, &req, &mut history, 2_000);
-            crate::db::ops::memory::restore_memories(conn, &["old".into()], 2_500).unwrap();
+            round(conn, &req, &mut history, 2_000).await;
+            conn.write(async |tx| crate::db::sea::ops::memory::restore_memories(tx, &["old".into()], 2_500).await)
+                .await
+                .unwrap();
 
-            let text = round(conn, &req, &mut history, 3_000).text.expect("it comes back");
+            let text = round(conn, &req, &mut history, 3_000)
+                .await
+                .text
+                .expect("it comes back");
             assert!(text.contains("coffee"), "{text}");
         }
 
         /// A batch write stamps every row with the same millisecond. Without the
         /// id as a tie-breaker the cursor cannot tell those rows apart, and a
         /// budget that fits only some of them re-reads the same prefix forever.
-        #[test]
-        fn rows_sharing_a_millisecond_all_get_through() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn rows_sharing_a_millisecond_all_get_through() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
             for i in 0..5 {
                 add_at(
@@ -1540,7 +1551,8 @@ mod tests {
                     &alice,
                     &format!("k{i}"),
                     100,
-                );
+                )
+                .await;
             }
             // Small enough that a round carries one or two entries, not five.
             let req = group_req(None, &[1], 60);
@@ -1549,7 +1561,7 @@ mod tests {
             let mut seen: Vec<String> = Vec::new();
             for round_no in 0..8 {
                 let t0 = 1_000 + round_no * 1_000;
-                if let Some(text) = round(conn, &req, &mut history, t0).text {
+                if let Some(text) = round(conn, &req, &mut history, t0).await.text {
                     for i in 0..5 {
                         let key = format!("k{i}");
                         if text.contains(&key) && !seen.contains(&key) {
@@ -1565,23 +1577,26 @@ mod tests {
         /// has nothing to do with when rows were written. Here the entry that
         /// gets dropped is the *older* one, so a cursor that resumed from "the
         /// newest thing I sent" would jump straight over it.
-        #[test]
-        fn a_dropped_entry_is_not_stepped_over() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn a_dropped_entry_is_not_stepped_over() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
             // `aaa` sorts first and is kept; `zzz` sorts last and is dropped —
             // and `zzz` is the older of the two.
-            add_at(conn, "z", MemoryScope::OnebotUser, &alice, "zzz", 50);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "aaa", 200);
+            add_at(conn, "z", MemoryScope::OnebotUser, &alice, "zzz", 50).await;
+            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "aaa", 200).await;
             let req = group_req(None, &[1], 40);
             let mut history = Vec::new();
 
-            let first = round(conn, &req, &mut history, 1_000).text.unwrap();
+            let first = round(conn, &req, &mut history, 1_000).await.text.unwrap();
             assert!(first.contains("aaa"));
             assert!(!first.contains("zzz"), "the budget was too small to be a test");
 
-            let second = round(conn, &req, &mut history, 2_000).text.expect("zzz still owed");
+            let second = round(conn, &req, &mut history, 2_000)
+                .await
+                .text
+                .expect("zzz still owed");
             assert!(
                 second.contains("zzz"),
                 "the cursor stepped over a dropped entry: {second}"
@@ -1592,23 +1607,23 @@ mod tests {
         /// trimming, a branch switch — shows up the same way: the scan never
         /// reaches a `Full`. Trusting the deltas that remain would hold back
         /// memories the model can no longer see.
-        #[test]
-        fn a_history_with_no_full_row_starts_over() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn a_history_with_no_full_row_starts_over() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100);
+            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
-            round(conn, &req, &mut history, 1_000);
-            add_at(conn, "b", MemoryScope::OnebotUser, &alice, "coffee", 1_200);
-            round(conn, &req, &mut history, 2_000);
+            round(conn, &req, &mut history, 1_000).await;
+            add_at(conn, "b", MemoryScope::OnebotUser, &alice, "coffee", 1_200).await;
+            round(conn, &req, &mut history, 2_000).await;
             assert_eq!(history.len(), 2);
 
             // Compaction keeps the tail and drops everything before the anchor.
             let tail = history.split_off(1);
-            let next = plan_injection(conn, &req, &tail, 3_000).unwrap();
+            let next = plan(conn, &req, &tail, 3_000).await.unwrap();
             assert_eq!(next.kind, InjectionKind::Full);
             let text = next.text.expect("a full block");
             assert!(text.contains("style") && text.contains("coffee"), "{text}");
@@ -1617,19 +1632,19 @@ mod tests {
         /// A cursor older than the trash retention cannot be trusted: the
         /// tombstones it would need are gone, so "nothing was deleted" and "the
         /// evidence expired" are the same answer.
-        #[test]
-        fn a_cursor_past_the_retention_horizon_starts_over() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn a_cursor_past_the_retention_horizon_starts_over() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100);
+            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
-            round(conn, &req, &mut history, 1_000);
+            round(conn, &req, &mut history, 1_000).await;
             let much_later = 1_000 + TRASH_RETENTION_MS + 1;
             assert_eq!(
-                plan_injection(conn, &req, &history, much_later).unwrap().kind,
+                plan(conn, &req, &history, much_later).await.unwrap().kind,
                 InjectionKind::Full
             );
         }
@@ -1637,23 +1652,29 @@ mod tests {
         /// The window's upper bound is exclusive, so a write landing in the very
         /// millisecond a round starts belongs to the next round — and belongs to
         /// it exactly once.
-        #[test]
-        fn a_write_in_the_starting_millisecond_waits_for_the_next_round() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn a_write_in_the_starting_millisecond_waits_for_the_next_round() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100);
+            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
-            round(conn, &req, &mut history, 1_000);
+            round(conn, &req, &mut history, 1_000).await;
 
             // Written at exactly the next round's t0.
-            add_at(conn, "b", MemoryScope::OnebotUser, &alice, "coffee", 2_000);
-            assert!(round(conn, &req, &mut history, 2_000).text.is_none());
+            add_at(conn, "b", MemoryScope::OnebotUser, &alice, "coffee", 2_000).await;
+            assert!(round(conn, &req, &mut history, 2_000).await.text.is_none());
 
-            let text = round(conn, &req, &mut history, 3_000).text.expect("it arrives now");
+            let text = round(conn, &req, &mut history, 3_000)
+                .await
+                .text
+                .expect("it arrives now");
             assert!(text.contains("coffee"), "{text}");
-            assert!(round(conn, &req, &mut history, 4_000).text.is_none(), "sent twice");
+            assert!(
+                round(conn, &req, &mut history, 4_000).await.text.is_none(),
+                "sent twice"
+            );
         }
 
         /// A newcomer whose memories are older than everything else in the round,
@@ -1665,16 +1686,16 @@ mod tests {
         /// leftovers and they are never read again. Going back to the beginning
         /// costs a re-send of what the model already has, which is the direction
         /// this is allowed to be wrong in.
-        #[test]
-        fn a_newcomer_left_half_delivered_is_not_stepped_over() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn a_newcomer_left_half_delivered_is_not_stepped_over() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
             let bob = onebot_user_scope_id(2);
             // Alice is established and her memory is recent.
-            add_at(conn, "a1", MemoryScope::OnebotUser, &alice, "alice_key", 900);
+            add_at(conn, "a1", MemoryScope::OnebotUser, &alice, "alice_key", 900).await;
             let mut history = Vec::new();
-            round(conn, &group_req(None, &[1], 8_000), &mut history, 1_000);
+            round(conn, &group_req(None, &[1], 8_000), &mut history, 1_000).await;
 
             // Bob turns up. Everything of his is ancient, there is more of it
             // than his slice of the budget can carry, and — this is the part
@@ -1690,16 +1711,17 @@ mod tests {
                     &bob,
                     &format!("bob_{i}"),
                     100 - i * 10,
-                );
+                )
+                .await;
             }
             // Alice also changes, so the round has something recent to send too —
             // that recent row is what a naive cursor would resume from.
-            add_at(conn, "a1", MemoryScope::OnebotUser, &alice, "alice_key", 1_500);
+            add_at(conn, "a1", MemoryScope::OnebotUser, &alice, "alice_key", 1_500).await;
 
             let req = group_req(None, &[1, 2], 90);
             let mut seen: Vec<String> = Vec::new();
             for r in 0..10 {
-                if let Some(text) = round(conn, &req, &mut history, 2_000 + r * 1_000).text {
+                if let Some(text) = round(conn, &req, &mut history, 2_000 + r * 1_000).await.text {
                     for i in 0..4 {
                         let key = format!("bob_{i}");
                         if text.contains(&key) && !seen.contains(&key) {
@@ -1714,19 +1736,20 @@ mod tests {
         /// Someone who has not been seen before gets everything, because their
         /// memories are as old as they are and no cursor reaches back that far.
         /// Everyone already accounted for gets nothing.
-        #[test]
-        fn a_newcomer_gets_their_whole_history_and_nobody_else_does() {
-            let pool = diesel_test_db();
-            let conn = &mut pool.get().unwrap();
+        #[tokio::test]
+        async fn a_newcomer_gets_their_whole_history_and_nobody_else_does() {
+            let db = sea_test_db().await;
+            let conn = &db;
             let alice = onebot_user_scope_id(1);
             let bob = onebot_user_scope_id(2);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "alice_key", 100);
-            add_at(conn, "b", MemoryScope::OnebotUser, &bob, "bob_key", 100);
+            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "alice_key", 100).await;
+            add_at(conn, "b", MemoryScope::OnebotUser, &bob, "bob_key", 100).await;
 
             let mut history = Vec::new();
-            round(conn, &group_req(None, &[1], 8_000), &mut history, 1_000);
+            round(conn, &group_req(None, &[1], 8_000), &mut history, 1_000).await;
 
             let text = round(conn, &group_req(None, &[1, 2], 8_000), &mut history, 2_000)
+                .await
                 .text
                 .expect("bob is new");
             assert!(text.contains("bob_key"), "{text}");
@@ -1735,11 +1758,11 @@ mod tests {
     }
 
     /// Desktop output must not change: existing assistants are tuned against it.
-    #[test]
-    fn desktop_block_is_unchanged_from_the_legacy_format() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        project(conn, "p1");
+    #[tokio::test]
+    async fn desktop_block_is_unchanged_from_the_legacy_format() {
+        let db = sea_test_db().await;
+        let conn = &db;
+        project(conn, "p1").await;
         add(
             conn,
             "m1",
@@ -1749,9 +1772,12 @@ mod tests {
             "Rust + Tauri",
             Origin::Desktop,
             Visibility::Normal,
-        );
+        )
+        .await;
 
-        let block = block(conn, &MemoryRequest::desktop(Some("p1".into()), 8_000)).unwrap();
+        let block = block(conn, &MemoryRequest::desktop(Some("p1".into()), 8_000))
+            .await
+            .unwrap();
 
         assert_eq!(
             block, "\n\n<project_memories>\n- [general] stack: Rust + Tauri\n</project_memories>",
@@ -1762,10 +1788,10 @@ mod tests {
     /// A conversation with no project writes to the client-global scope, so the
     /// desktop has to read it back — otherwise those memories are stored and
     /// never seen again. Still no policy preamble: one speaker, nothing to leak.
-    #[test]
-    fn desktop_reads_global_memories_without_the_policy_preamble() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn desktop_reads_global_memories_without_the_policy_preamble() {
+        let db = sea_test_db().await;
+        let conn = &db;
         add(
             conn,
             "g1",
@@ -1775,9 +1801,10 @@ mod tests {
             "用 Zed 写代码",
             Origin::Desktop,
             Visibility::Normal,
-        );
+        )
+        .await;
 
-        let block = block(conn, &MemoryRequest::desktop(None, 8_000)).unwrap();
+        let block = block(conn, &MemoryRequest::desktop(None, 8_000)).await.unwrap();
 
         assert_eq!(
             block,
@@ -1788,11 +1815,11 @@ mod tests {
 
     /// Both layers render, global first so the stabler rows stay in the cached
     /// prefix.
-    #[test]
-    fn desktop_renders_global_before_project() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        project(conn, "p1");
+    #[tokio::test]
+    async fn desktop_renders_global_before_project() {
+        let db = sea_test_db().await;
+        let conn = &db;
+        project(conn, "p1").await;
         add(
             conn,
             "g1",
@@ -1802,7 +1829,8 @@ mod tests {
             "用 Zed 写代码",
             Origin::Desktop,
             Visibility::Normal,
-        );
+        )
+        .await;
         add(
             conn,
             "m1",
@@ -1812,9 +1840,12 @@ mod tests {
             "Rust + Tauri",
             Origin::Desktop,
             Visibility::Normal,
-        );
+        )
+        .await;
 
-        let block = block(conn, &MemoryRequest::desktop(Some("p1".into()), 8_000)).unwrap();
+        let block = block(conn, &MemoryRequest::desktop(Some("p1".into()), 8_000))
+            .await
+            .unwrap();
 
         let global_at = block.find("<global_memories>").unwrap();
         let project_at = block.find("<project_memories>").unwrap();
@@ -1824,10 +1855,10 @@ mod tests {
 
     /// The two global layers are siblings, not a hierarchy: what the bot learned
     /// over QQ is not background for a desktop chat, and vice versa.
-    #[test]
-    fn the_two_global_layers_do_not_leak_into_each_other() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn the_two_global_layers_do_not_leak_into_each_other() {
+        let db = sea_test_db().await;
+        let conn = &db;
         add(
             conn,
             "bot",
@@ -1837,10 +1868,11 @@ mod tests {
             "群里少说话",
             Origin::Admin,
             Visibility::Normal,
-        );
+        )
+        .await;
 
         // Desktop sees nothing: the only row lives on the bot side.
-        assert!(block(conn, &MemoryRequest::desktop(None, 8_000)).is_none());
+        assert!(block(conn, &MemoryRequest::desktop(None, 8_000)).await.is_none());
 
         add(
             conn,
@@ -1851,9 +1883,10 @@ mod tests {
             "用 Zed 写代码",
             Origin::Desktop,
             Visibility::Normal,
-        );
+        )
+        .await;
 
-        let desktop = block(conn, &MemoryRequest::desktop(None, 8_000)).unwrap();
+        let desktop = block(conn, &MemoryRequest::desktop(None, 8_000)).await.unwrap();
         assert!(desktop.contains("editor_choice"));
         assert!(!desktop.contains("bot_rule"));
 
@@ -1861,16 +1894,17 @@ mod tests {
             conn,
             &MemoryRequest::onebot_private(MemorySubjectRef::from_user(1, None), 8_000),
         )
+        .await
         .unwrap();
         assert!(private.contains("bot_rule"));
         assert!(!private.contains("editor_choice"));
     }
 
     /// The privacy boundary, end to end through the renderer.
-    #[test]
-    fn group_block_omits_private_memories() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn group_block_omits_private_memories() {
+        let db = sea_test_db().await;
+        let conn = &db;
         let alice = onebot_user_scope_id(1);
         add(
             conn,
@@ -1881,7 +1915,8 @@ mod tests {
             "told in DM",
             Origin::Private,
             Visibility::Normal,
-        );
+        )
+        .await;
         add(
             conn,
             "grp",
@@ -1891,12 +1926,14 @@ mod tests {
             "likes terse",
             Origin::Group,
             Visibility::Normal,
-        );
+        )
+        .await;
 
         let block = block(
             conn,
             &MemoryRequest::onebot_group(None, vec![MemorySubjectRef::from_user(1, Some("Alice".into()))], 8_000),
         )
+        .await
         .unwrap();
 
         assert!(block.contains("likes terse"));
@@ -1907,10 +1944,10 @@ mod tests {
         assert!(!block.contains("Alice"), "a name here would freeze into the history");
     }
 
-    #[test]
-    fn owner_notes_are_a_separate_section() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn owner_notes_are_a_separate_section() {
+        let db = sea_test_db().await;
+        let conn = &db;
         let alice = onebot_user_scope_id(1);
         add(
             conn,
@@ -1921,7 +1958,8 @@ mod tests {
             "owes money",
             Origin::Admin,
             Visibility::OwnerOnly,
-        );
+        )
+        .await;
         add(
             conn,
             "pref",
@@ -1931,12 +1969,14 @@ mod tests {
             "likes terse",
             Origin::Group,
             Visibility::Normal,
-        );
+        )
+        .await;
 
         let block = block(
             conn,
             &MemoryRequest::onebot_group(None, vec![MemorySubjectRef::from_user(1, Some("Alice".into()))], 8_000),
         )
+        .await
         .unwrap();
 
         // Matched with surrounding newlines: the policy preamble mentions the
@@ -1965,10 +2005,10 @@ mod tests {
     /// The newcomer is the case the roster exists for. Each message is tagged
     /// with a number; with no line naming it, the model has someone present it
     /// cannot address — worst for whoever just arrived.
-    #[test]
-    fn everyone_present_appears_even_without_memories() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn everyone_present_appears_even_without_memories() {
+        let db = sea_test_db().await;
+        let conn = &db;
         let known = onebot_user_scope_id(1);
         add(
             conn,
@@ -1979,7 +2019,8 @@ mod tests {
             "likes terse",
             Origin::Group,
             Visibility::Normal,
-        );
+        )
+        .await;
 
         let block = block(
             conn,
@@ -1992,6 +2033,7 @@ mod tests {
                 8_000,
             ),
         )
+        .await
         .unwrap();
 
         assert!(block.contains(r#"<person qq="1">"#));
@@ -2000,10 +2042,10 @@ mod tests {
 
     /// Nothing is stored about anyone yet and the roster still ships: it alone
     /// is what turns the id on each message into a name.
-    #[test]
-    fn a_roster_ships_when_nothing_is_remembered_yet() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn a_roster_ships_when_nothing_is_remembered_yet() {
+        let db = sea_test_db().await;
+        let conn = &db;
         let req = group_req(None, &[7], 8_000);
         let req = MemoryRequest {
             subjects: vec![MemorySubjectRef::from_user(7, Some("Newcomer".into()))],
@@ -2014,6 +2056,7 @@ mod tests {
         // And the frozen half still says it has met nobody.
         assert!(
             block(conn, &req)
+                .await
                 .unwrap()
                 .contains(r#"<person qq="7" first_time="true" />"#)
         );
@@ -2057,10 +2100,10 @@ mod tests {
     }
 
     /// Order must not depend on anything that changes between turns.
-    #[test]
-    fn subject_order_follows_scope_id_not_request_order() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn subject_order_follows_scope_id_not_request_order() {
+        let db = sea_test_db().await;
+        let conn = &db;
         for uid in [2i64, 1] {
             let scope = onebot_user_scope_id(uid);
             add(
@@ -2072,7 +2115,8 @@ mod tests {
                 &format!("about {uid}"),
                 Origin::Group,
                 Visibility::Normal,
-            );
+            )
+            .await;
         }
 
         let a = block(
@@ -2086,6 +2130,7 @@ mod tests {
                 8_000,
             ),
         )
+        .await
         .unwrap();
         let b = block(
             conn,
@@ -2098,14 +2143,15 @@ mod tests {
                 8_000,
             ),
         )
+        .await
         .unwrap();
         assert_eq!(a, b, "block must be a pure function of the memory set");
     }
 
-    #[test]
-    fn every_layer_is_capped_including_the_bot_layer() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
+    #[tokio::test]
+    async fn every_layer_is_capped_including_the_bot_layer() {
+        let db = sea_test_db().await;
+        let conn = &db;
         for i in 0..40 {
             add(
                 conn,
@@ -2116,10 +2162,13 @@ mod tests {
                 &"word ".repeat(60),
                 Origin::Admin,
                 Visibility::Normal,
-            );
+            )
+            .await;
         }
 
-        let block = block(conn, &MemoryRequest::onebot_group(None, vec![], 512)).unwrap();
+        let block = block(conn, &MemoryRequest::onebot_group(None, vec![], 512))
+            .await
+            .unwrap();
 
         assert!(
             estimate_tokens(&block) < 1_200,
@@ -2127,21 +2176,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nothing_to_say_yields_no_block() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        assert!(block(conn, &MemoryRequest::desktop(None, 8_000)).is_none());
+    #[tokio::test]
+    async fn nothing_to_say_yields_no_block() {
+        let db = sea_test_db().await;
+        let conn = &db;
+        assert!(block(conn, &MemoryRequest::desktop(None, 8_000)).await.is_none());
     }
 
     /// An owner-only row in ANY layer must land in <owner_notes>. Left inline in
     /// <chat_memories> or <bot_memories> it is a note the model is free to read
     /// out, while its subject still cannot see or delete it.
-    #[test]
-    fn owner_only_rows_are_sectioned_from_every_layer() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        project(conn, "p1");
+    #[tokio::test]
+    async fn owner_only_rows_are_sectioned_from_every_layer() {
+        let db = sea_test_db().await;
+        let conn = &db;
+        project(conn, "p1").await;
         add(
             conn,
             "pub",
@@ -2151,7 +2200,8 @@ mod tests {
             "in-joke",
             Origin::Group,
             Visibility::Normal,
-        );
+        )
+        .await;
         add(
             conn,
             "note",
@@ -2161,7 +2211,8 @@ mod tests {
             "do not mention pricing",
             Origin::Desktop,
             Visibility::OwnerOnly,
-        );
+        )
+        .await;
         add(
             conn,
             "gnote",
@@ -2171,9 +2222,12 @@ mod tests {
             "operator only",
             Origin::Admin,
             Visibility::OwnerOnly,
-        );
+        )
+        .await;
 
-        let block = block(conn, &MemoryRequest::onebot_group(Some("p1".into()), vec![], 8_000)).unwrap();
+        let block = block(conn, &MemoryRequest::onebot_group(Some("p1".into()), vec![], 8_000))
+            .await
+            .unwrap();
 
         let notes_at = block.find("\n\n<owner_notes>\n").expect("owner notes section");
         assert!(block.contains("in-joke"));
@@ -2185,11 +2239,11 @@ mod tests {
     }
 
     /// Desktop keeps the legacy block only while there is nothing to protect.
-    #[test]
-    fn desktop_owner_notes_force_the_sectioned_path() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        project(conn, "p1");
+    #[tokio::test]
+    async fn desktop_owner_notes_force_the_sectioned_path() {
+        let db = sea_test_db().await;
+        let conn = &db;
+        project(conn, "p1").await;
         add(
             conn,
             "note",
@@ -2199,9 +2253,12 @@ mod tests {
             "hidden thing",
             Origin::Desktop,
             Visibility::OwnerOnly,
-        );
+        )
+        .await;
 
-        let block = block(conn, &MemoryRequest::desktop(Some("p1".into()), 8_000)).unwrap();
+        let block = block(conn, &MemoryRequest::desktop(Some("p1".into()), 8_000))
+            .await
+            .unwrap();
 
         assert!(block.contains("<owner_notes>"), "must not be silently dropped");
         assert!(!block.contains("<project_memories>"));
@@ -2209,11 +2266,11 @@ mod tests {
 
     /// Owner-only rows are exempt from per-subject trimming, so the renderer is
     /// the only thing bounding them.
-    #[test]
-    fn owner_notes_are_bounded_by_the_budget() {
-        let pool = diesel_test_db();
-        let conn = &mut pool.get().unwrap();
-        project(conn, "p1");
+    #[tokio::test]
+    async fn owner_notes_are_bounded_by_the_budget() {
+        let db = sea_test_db().await;
+        let conn = &db;
+        project(conn, "p1").await;
         for i in 0..40 {
             add(
                 conn,
@@ -2224,10 +2281,13 @@ mod tests {
                 &"word ".repeat(60),
                 Origin::Desktop,
                 Visibility::OwnerOnly,
-            );
+            )
+            .await;
         }
 
-        let block = block(conn, &MemoryRequest::onebot_group(Some("p1".into()), vec![], 512)).unwrap();
+        let block = block(conn, &MemoryRequest::onebot_group(Some("p1".into()), vec![], 512))
+            .await
+            .unwrap();
 
         assert!(estimate_tokens(&block) < 1_200);
     }
