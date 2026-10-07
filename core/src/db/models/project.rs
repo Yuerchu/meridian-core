@@ -1,26 +1,9 @@
 use diesel::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::db::schema::projects;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString, strum::IntoStaticStr)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum ProjectSource {
-    Local,
-    OnebotPrivate,
-    OnebotGroup,
-}
-
-impl ProjectSource {
-    pub fn as_str(self) -> &'static str {
-        self.into()
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        value.parse().map_err(|_| format!("unknown project source `{value}`"))
-    }
-}
+pub use crate::db::entity::project::ProjectSource;
 
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]
 #[diesel(table_name = projects)]

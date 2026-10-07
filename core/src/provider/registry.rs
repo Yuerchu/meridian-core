@@ -8,7 +8,16 @@ use super::openai_compat::OpenAICompatProvider;
 use super::openai_responses::OpenAIResponsesProvider;
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, strum::EnumString, strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -32,7 +41,16 @@ impl ApiFormat {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, strum::EnumString, strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -55,7 +73,16 @@ impl ProviderType {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, strum::EnumString, strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -77,7 +104,16 @@ impl TransportProfile {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, strum::EnumString, strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]

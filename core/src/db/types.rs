@@ -203,6 +203,71 @@ impl<T: Serialize> IntoActiveValue<Json<T>> for Json<T> {
     }
 }
 
+/// Column impls for a domain enum stored as `TEXT` through its own `as_str`
+/// and `parse`.
+///
+/// For a type that belongs to another module and is used far beyond its
+/// table — `tools::Permission`, the provider registry's enums — so the
+/// persistence impls are written in the entity file that stores it rather than
+/// as a `DeriveActiveEnum` on the type itself. An enum that exists only for
+/// its column should be a `DeriveActiveEnum` in the entity instead. Reading an
+/// unknown spelling fails the row, through `parse`'s own error.
+macro_rules! text_enum_column {
+    ($ty:ty) => {
+        impl From<$ty> for sea_orm::Value {
+            fn from(value: $ty) -> Self {
+                sea_orm::Value::String(Some(value.as_str().to_owned()))
+            }
+        }
+
+        impl sea_orm::TryGetable for $ty {
+            fn try_get_by<I: sea_orm::ColIdx>(
+                res: &sea_orm::QueryResult,
+                index: I,
+            ) -> Result<Self, sea_orm::TryGetError> {
+                let raw = String::try_get_by(res, index)?;
+                <$ty>::parse(&raw).map_err(|error| sea_orm::TryGetError::DbErr(sea_orm::DbErr::Type(error)))
+            }
+        }
+
+        impl sea_orm::sea_query::ValueType for $ty {
+            fn try_from(value: sea_orm::Value) -> Result<Self, sea_orm::sea_query::ValueTypeErr> {
+                match value {
+                    sea_orm::Value::String(Some(raw)) => {
+                        <$ty>::parse(&raw).map_err(|_| sea_orm::sea_query::ValueTypeErr)
+                    }
+                    _ => Err(sea_orm::sea_query::ValueTypeErr),
+                }
+            }
+
+            fn type_name() -> String {
+                stringify!($ty).to_owned()
+            }
+
+            fn array_type() -> sea_orm::sea_query::ArrayType {
+                sea_orm::sea_query::ArrayType::String
+            }
+
+            fn column_type() -> sea_orm::sea_query::ColumnType {
+                sea_orm::sea_query::ColumnType::Text
+            }
+        }
+
+        impl sea_orm::sea_query::Nullable for $ty {
+            fn null() -> sea_orm::Value {
+                sea_orm::Value::String(None)
+            }
+        }
+
+        impl sea_orm::IntoActiveValue<$ty> for $ty {
+            fn into_active_value(self) -> sea_orm::ActiveValue<$ty> {
+                sea_orm::ActiveValue::Set(self)
+            }
+        }
+    };
+}
+pub(crate) use text_enum_column;
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
