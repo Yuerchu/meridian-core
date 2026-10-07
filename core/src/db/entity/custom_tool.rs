@@ -6,10 +6,8 @@
 //! never to run.
 
 use sea_orm::entity::prelude::*;
-use sea_orm::sea_query::{ArrayType, ColumnType, Nullable, ValueType, ValueTypeErr};
-use sea_orm::{ActiveValue, ColIdx, IntoActiveValue, QueryResult, TryGetError, TryGetable, Value};
 
-use crate::db::types::{EpochMs, Json, SqlBool};
+use crate::db::types::{EpochMs, Json, SqlBool, text_enum_column};
 use crate::tools::Permission;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -70,59 +68,15 @@ pub struct CustomToolChangeset {
     pub updated_at: Option<EpochMs>,
 }
 
-// `Permission` is the tool system's own type, used far beyond this table, so
-// the column impls are written here rather than deriving `ActiveEnum` on it:
-// the persistence derive stays in `db/entity`. The column has no `CHECK`;
-// `Permission::parse` is what keeps the stored set closed.
-
-impl From<Permission> for Value {
-    fn from(permission: Permission) -> Self {
-        Value::String(Some(permission.as_str().to_owned()))
-    }
-}
-
-impl TryGetable for Permission {
-    fn try_get_by<I: ColIdx>(res: &QueryResult, index: I) -> Result<Self, TryGetError> {
-        let raw = String::try_get_by(res, index)?;
-        Permission::parse(&raw).map_err(|error| TryGetError::DbErr(DbErr::Type(error)))
-    }
-}
-
-impl ValueType for Permission {
-    fn try_from(value: Value) -> Result<Self, ValueTypeErr> {
-        match value {
-            Value::String(Some(raw)) => Permission::parse(&raw).map_err(|_| ValueTypeErr),
-            _ => Err(ValueTypeErr),
-        }
-    }
-
-    fn type_name() -> String {
-        "Permission".to_owned()
-    }
-
-    fn array_type() -> ArrayType {
-        ArrayType::String
-    }
-
-    fn column_type() -> ColumnType {
-        ColumnType::Text
-    }
-}
-
-impl Nullable for Permission {
-    fn null() -> Value {
-        Value::String(None)
-    }
-}
-
-impl IntoActiveValue<Permission> for Permission {
-    fn into_active_value(self) -> ActiveValue<Permission> {
-        ActiveValue::Set(self)
-    }
-}
+// `Permission` is the tool system's own type, used far beyond this table. The
+// column has no `CHECK`; `Permission::parse` is what keeps the stored set
+// closed.
+text_enum_column!(Permission);
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::sea_query::ValueType;
+
     use super::*;
 
     /// The stored spelling is the wire spelling, for each of the three.

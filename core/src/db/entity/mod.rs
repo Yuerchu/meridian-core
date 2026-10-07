@@ -9,6 +9,7 @@
 //! rather than a runtime surprise. Diesel gave that check for free at compile
 //! time through `schema.rs`; this is where it lives now.
 
+pub mod assistant;
 pub mod custom_tool;
 pub mod journal_blob;
 pub mod journal_file;
@@ -17,6 +18,8 @@ pub mod mcp_server;
 pub mod notification_alert_state;
 pub mod notification_webhook;
 pub mod preference;
+pub mod project;
+pub mod provider;
 pub mod redaction_rule;
 pub mod tool_category;
 pub mod tool_preset;
@@ -37,7 +40,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "acp_session_notices",
     "acp_sessions",
     "assistant_emoji_packs",
-    "assistants",
     "audit_messages",
     "cached_models",
     "composer_drafts",
@@ -60,8 +62,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "plan_review_drafts",
     "plan_review_sessions",
     "plan_revisions",
-    "projects",
-    "providers",
     "queued_prompt_context_items",
     "queued_prompts",
     "skill_bindings_assistant",
@@ -112,6 +112,7 @@ pub struct ForeignKeyShape {
 /// the union of both lists against the schema.
 pub fn registered() -> Vec<EntityShape> {
     vec![
+        shape_of::<assistant::Entity>(),
         shape_of::<custom_tool::Entity>(),
         shape_of::<journal_blob::Entity>(),
         shape_of::<journal_file::Entity>(),
@@ -120,6 +121,8 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<notification_alert_state::Entity>(),
         shape_of::<notification_webhook::Entity>(),
         shape_of::<preference::Entity>(),
+        shape_of::<project::Entity>(),
+        shape_of::<provider::Entity>(),
         shape_of::<redaction_rule::Entity>(),
         shape_of::<tool_category::Entity>(),
         shape_of::<tool_preset::Entity>(),
