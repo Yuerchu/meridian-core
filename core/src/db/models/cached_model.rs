@@ -12,12 +12,3 @@ pub struct CachedModelRow {
     pub model_name: String,
     pub fetched_at: i64,
 }
-
-#[derive(Debug, Insertable)]
-#[diesel(table_name = cached_models)]
-pub struct CachedModelInsert<'a> {
-    pub provider_id: &'a str,
-    pub model_id: &'a str,
-    pub model_name: &'a str,
-    pub fetched_at: i64,
-}

@@ -11,6 +11,7 @@
 
 pub mod assistant;
 pub mod assistant_emoji_pack;
+pub mod cached_model;
 pub mod composer_draft;
 pub mod conversation;
 pub mod custom_tool;
@@ -54,7 +55,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "acp_session_notices",
     "acp_sessions",
     "audit_messages",
-    "cached_models",
     "message_context_items",
     "mode_artifacts",
     "model_configs",
@@ -114,6 +114,7 @@ pub fn registered() -> Vec<EntityShape> {
     vec![
         shape_of::<assistant::Entity>(),
         shape_of::<assistant_emoji_pack::Entity>(),
+        shape_of::<cached_model::Entity>(),
         shape_of::<conversation::Entity>(),
         shape_of::<composer_draft::Entity>(),
         shape_of::<custom_tool::Entity>(),
