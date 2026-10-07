@@ -1,7 +1,7 @@
 //! What is left of the Diesel sticker ops. Linking a sticker to a message stays
-//! here because `message_stickers` references `messages`, which is still Diesel's;
-//! the other three are what `turn_config::resolve`, the composer-draft read and
-//! the tests still call on a Diesel connection, counted in `docs/dual-impl.md`. Everything
+//! here because a sticker is linked inside the transaction that writes the message,
+//! which is still Diesel's; the other two are what `turn_config::resolve` and the
+//! tests still call on a Diesel connection, counted in `docs/dual-impl.md`. Everything
 //! else is `db::sea::ops::emoji`.
 
 use diesel::prelude::*;
@@ -54,43 +54,4 @@ pub fn link_stickers_in_content(conn: &mut SqliteConnection, message_id: &str, c
         link_message_sticker(conn, message_id, sticker_id, position as i32)?;
     }
     Ok(())
-}
-
-/// One sticker, as the SeaORM model, for the composer-draft read that still
-/// runs on a Diesel connection beside its conversation lookups. Held to the
-/// checks a SeaORM read makes: an unknown source or status, and a payload that
-/// is not a JSON object, are errors.
-pub fn get_emoji(conn: &mut SqliteConnection, id: &str) -> Result<crate::db::entity::emoji::Model, String> {
-    use sea_orm::ActiveEnum;
-
-    use crate::db::entity::emoji;
-    use crate::db::entity::emoji::{EmojiSemanticStatus, EmojiSource};
-
-    let row = emojis::table
-        .find(id)
-        .first::<EmojiRow>(conn)
-        .map_err(|e| e.to_string())?;
-    Ok(emoji::Model {
-        source: EmojiSource::try_from_value(&row.source).map_err(|e| e.to_string())?,
-        semantic_status: EmojiSemanticStatus::try_from_value(&row.semantic_status).map_err(|e| e.to_string())?,
-        native_payload: row
-            .native_payload
-            .as_deref()
-            .map(crate::db::types::Json::decode)
-            .transpose()?,
-        id: row.id,
-        pack_id: row.pack_id,
-        name: row.name,
-        tags: row.tags,
-        file_name: row.file_name,
-        file_format: row.file_format,
-        sort_order: row.sort_order,
-        created_at: row.created_at,
-        source_key: row.source_key,
-        suggested_name: row.suggested_name,
-        suggested_tags: row.suggested_tags,
-        file_size: row.file_size,
-        seen_count: row.seen_count,
-        last_seen_at: row.last_seen_at,
-    })
 }
