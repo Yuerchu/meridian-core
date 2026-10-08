@@ -46,7 +46,7 @@ pub fn reject(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<Mo
 /// Retire the artifact in force because the work it described is finished.
 /// Without this an approved plan would keep being injected into every later
 /// request, long after it stopped being what the conversation is about.
-pub fn complete_active(conn: &mut SqliteConnection, conversation_id: &str, now: i64) -> QueryResult<usize> {
+pub(super) fn complete_active(conn: &mut SqliteConnection, conversation_id: &str, now: i64) -> QueryResult<usize> {
     conn.transaction(|conn| {
         let legacy = retire_approved(conn, conversation_id, KIND_PLAN, PlanStatus::Done, now)?;
         // The old table remains readable during the compatibility release, but

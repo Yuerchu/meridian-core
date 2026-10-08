@@ -2,15 +2,16 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{Permission, Tool, ToolContext};
-use crate::db::models::todo::ItemStatus;
-use crate::db::ops::todo::TodoItemSpec;
+use crate::db::entity::todo_item::ItemStatus;
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops::todo::TodoItemSpec;
 
 const MAX_ITEMS: usize = 50;
 const MAX_CONTENT_LEN: usize = 200;
 
-fn get_pool_and_conversation(context: &ToolContext) -> Result<(crate::db::DbPool, String), String> {
-    let pool = context
-        .db_pool
+fn get_db_and_conversation(context: &ToolContext) -> Result<(Db, String), String> {
+    let db = context
+        .sea
         .as_ref()
         .ok_or("The todo list requires a conversation context")?
         .clone();
@@ -19,7 +20,7 @@ fn get_pool_and_conversation(context: &ToolContext) -> Result<(crate::db::DbPool
         .as_ref()
         .ok_or("The todo list requires a conversation context")?
         .clone();
-    Ok((pool, conversation_id))
+    Ok((db, conversation_id))
 }
 
 /// Pull one step out of the model's payload, rejecting anything the checklist
@@ -133,7 +134,7 @@ impl Tool for UpdateTodosTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<String, String> {
-        let (pool, conversation_id) = get_pool_and_conversation(context)?;
+        let (db, conversation_id) = get_db_and_conversation(context)?;
 
         let title = args
             .get("title")
@@ -184,47 +185,43 @@ impl Tool for UpdateTodosTool {
             ));
         }
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            let now = crate::util::now_ms();
-            let (view, retired_plans) = crate::db::ops::todo::replace_active_list_with_plan_completion(
-                &mut conn,
-                &conversation_id,
-                &title,
-                &items,
-                now,
-            )
+        let now = crate::util::now_ms();
+        let (view, retired_plans) = db
+            .write(async |tx| {
+                crate::db::sea::ops::todo::replace_active_list_with_plan_completion(
+                    tx,
+                    &conversation_id,
+                    &title,
+                    &items,
+                    now,
+                )
+                .await
+            })
+            .await
             .map_err(|e| e.to_string())?;
 
-            let total = view.items.len();
-            let done = view
-                .items
-                .iter()
-                .filter(|i| i.status == ItemStatus::Completed.as_str())
-                .count();
+        let total = view.items.len();
+        let done = view.items.iter().filter(|i| i.status == ItemStatus::Completed).count();
 
-            if done == total {
-                let plan_note = if retired_plans > 0 {
-                    " The approved plan is complete and no longer in force."
-                } else {
-                    ""
-                };
-                return Ok(format!(
-                    "Checklist \"{title}\" finished ({done}/{total}). The next update starts a new one.{plan_note}"
-                ));
-            }
-            match view.items.iter().find(|i| i.status == ItemStatus::InProgress.as_str()) {
-                Some(current) => Ok(format!(
-                    "Checklist \"{title}\" updated ({done}/{total} done). Now: {}",
-                    current.content
-                )),
-                None => Ok(format!(
-                    "Checklist \"{title}\" updated ({done}/{total} done). No step is marked in_progress."
-                )),
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if done == total {
+            let plan_note = if retired_plans > 0 {
+                " The approved plan is complete and no longer in force."
+            } else {
+                ""
+            };
+            return Ok(format!(
+                "Checklist \"{title}\" finished ({done}/{total}). The next update starts a new one.{plan_note}"
+            ));
+        }
+        match view.items.iter().find(|i| i.status == ItemStatus::InProgress) {
+            Some(current) => Ok(format!(
+                "Checklist \"{title}\" updated ({done}/{total} done). Now: {}",
+                current.content
+            )),
+            None => Ok(format!(
+                "Checklist \"{title}\" updated ({done}/{total} done). No step is marked in_progress."
+            )),
+        }
     }
 }
 
@@ -234,7 +231,7 @@ mod tests {
     use crate::db::DbPool;
     use crate::tools::{FileAccess, ShellType};
 
-    fn ctx(pool: DbPool, conversation_id: &str) -> ToolContext {
+    fn ctx(sea: Db, conversation_id: &str) -> ToolContext {
         ToolContext {
             working_directory: None,
             shell: ShellType::Bash,
@@ -243,8 +240,8 @@ mod tests {
             conversation_id: Some(conversation_id.to_string()),
             turn_id: Some("t1".into()),
             assistant_id: None,
-            db_pool: Some(pool),
-            sea: None,
+            db_pool: None,
+            sea: Some(sea),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]
@@ -255,18 +252,24 @@ mod tests {
         }
     }
 
-    fn seed_conversation(pool: &DbPool, id: &str) {
-        use crate::db::schema::conversations;
-        use diesel::prelude::*;
-        let mut conn = pool.get().unwrap();
-        diesel::insert_into(conversations::table)
-            .values((
-                conversations::id.eq(id),
-                conversations::created_at.eq(1),
-                conversations::updated_at.eq(1),
-            ))
-            .execute(&mut conn)
-            .unwrap();
+    /// A file both pools open, holding conversation `c1`: the tool writes
+    /// through SeaORM, and the checklist freezer still reads through Diesel.
+    async fn shared() -> (tempfile::TempDir, DbPool, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, sea) = crate::db::sea::shared_test_db(dir.path()).await;
+        crate::db::sea::execute_for_tests(
+            &sea,
+            "INSERT INTO conversations (id, created_at, updated_at) VALUES ('c1', 1, 1)",
+        )
+        .await
+        .unwrap();
+        (dir, pool, sea)
+    }
+
+    async fn active(sea: &Db) -> Option<crate::db::sea::ops::todo::TodoListView> {
+        sea.read(async |tx| crate::db::sea::ops::todo::get_active_view(tx, "c1").await)
+            .await
+            .unwrap()
     }
 
     fn step(content: &str, status: &str) -> Value {
@@ -279,9 +282,8 @@ mod tests {
 
     #[tokio::test]
     async fn writes_the_checklist_and_reports_the_current_step() {
-        let pool = crate::db::diesel_test_db();
-        seed_conversation(&pool, "c1");
-        let ctx = ctx(pool.clone(), "c1");
+        let (_dir, _pool, sea) = shared().await;
+        let ctx = ctx(sea.clone(), "c1");
 
         let out = UpdateTodosTool
             .execute(
@@ -297,16 +299,13 @@ mod tests {
         assert!(out.contains("0/2 done"), "{out}");
         assert!(out.contains("Now: Extract token check"), "{out}");
 
-        let mut conn = pool.get().unwrap();
-        let view = crate::db::ops::todo::get_active_view(&mut conn, "c1").unwrap().unwrap();
-        assert_eq!(view.items.len(), 2);
+        assert_eq!(active(&sea).await.unwrap().items.len(), 2);
     }
 
     #[tokio::test]
     async fn rejects_two_steps_in_progress() {
-        let pool = crate::db::diesel_test_db();
-        seed_conversation(&pool, "c1");
-        let ctx = ctx(pool.clone(), "c1");
+        let (_dir, _pool, sea) = shared().await;
+        let ctx = ctx(sea.clone(), "c1");
 
         let err = UpdateTodosTool
             .execute(
@@ -321,19 +320,13 @@ mod tests {
 
         assert!(err.contains("Only one step may be in_progress"), "{err}");
         // Nothing was written, so the model can retry from a clean slate.
-        let mut conn = pool.get().unwrap();
-        assert!(
-            crate::db::ops::todo::get_active_view(&mut conn, "c1")
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(active(&sea).await, None);
     }
 
     #[tokio::test]
     async fn rejects_blank_and_unknown_fields() {
-        let pool = crate::db::diesel_test_db();
-        seed_conversation(&pool, "c1");
-        let ctx = ctx(pool.clone(), "c1");
+        let (_dir, _pool, sea) = shared().await;
+        let ctx = ctx(sea.clone(), "c1");
 
         let blank = UpdateTodosTool
             .execute(json!({ "title": "T", "todos": [step("   ", "pending")] }), &ctx)
@@ -358,42 +351,41 @@ mod tests {
     /// stays in the system prompt for the rest of the conversation.
     #[tokio::test]
     async fn finishing_the_checklist_retires_the_approved_plan() {
-        let pool = crate::db::diesel_test_db();
-        seed_conversation(&pool, "c1");
-        let ctx = ctx(pool.clone(), "c1");
-        {
-            let mut conn = pool.get().unwrap();
-            let plan = crate::db::ops::plan::record_plan(&mut conn, "c1", "the plan", 1).unwrap();
-            crate::db::ops::plan::approve(&mut conn, &plan.id, 2).unwrap();
-        }
+        let (_dir, _pool, sea) = shared().await;
+        let ctx = ctx(sea.clone(), "c1");
+        crate::db::sea::execute_for_tests(
+            &sea,
+            "INSERT INTO mode_artifacts (id, conversation_id, kind, content, status, created_at, updated_at)
+                 VALUES ('p1', 'c1', 'plan', 'the plan', 'approved', 1, 2)",
+        )
+        .await
+        .unwrap();
 
         UpdateTodosTool
             .execute(json!({ "title": "Ship it", "todos": [step("a", "in_progress")] }), &ctx)
             .await
             .unwrap();
-        {
-            let mut conn = pool.get().unwrap();
-            assert!(
-                crate::db::ops::plan::get_active(&mut conn, "c1").unwrap().is_some(),
-                "still in force while work is outstanding"
-            );
-        }
+        assert!(
+            crate::db::sea::ops::plan::get_active(&sea, "c1")
+                .await
+                .unwrap()
+                .is_some(),
+            "still in force while work is outstanding"
+        );
 
         let out = UpdateTodosTool
             .execute(json!({ "title": "Ship it", "todos": [step("a", "completed")] }), &ctx)
             .await
             .unwrap();
 
-        let mut conn = pool.get().unwrap();
-        assert!(crate::db::ops::plan::get_active(&mut conn, "c1").unwrap().is_none());
+        assert_eq!(crate::db::sea::ops::plan::get_active(&sea, "c1").await.unwrap(), None);
         assert!(out.contains("no longer in force"), "{out}");
     }
 
     #[tokio::test]
     async fn reports_completion_when_every_step_is_done() {
-        let pool = crate::db::diesel_test_db();
-        seed_conversation(&pool, "c1");
-        let ctx = ctx(pool.clone(), "c1");
+        let (_dir, _pool, sea) = shared().await;
+        let ctx = ctx(sea.clone(), "c1");
 
         let out = UpdateTodosTool
             .execute(
@@ -413,9 +405,8 @@ mod tests {
     /// back.
     #[tokio::test]
     async fn the_prompt_block_follows_the_tool_across_calls() {
-        let pool = crate::db::diesel_test_db();
-        seed_conversation(&pool, "c1");
-        let ctx = ctx(pool.clone(), "c1");
+        let (_dir, pool, sea) = shared().await;
+        let ctx = ctx(sea.clone(), "c1");
 
         let block_now = || {
             let mut conn = pool.get().unwrap();
@@ -471,8 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_conversation_it_says_so_instead_of_panicking() {
-        let pool = crate::db::diesel_test_db();
-        let mut ctx = ctx(pool, "c1");
+        let mut ctx = ctx(crate::db::sea::sea_test_db().await, "c1");
         ctx.conversation_id = None;
 
         let err = UpdateTodosTool

@@ -13,7 +13,7 @@ pub struct TodoItemSpec {
     pub status: ItemStatus,
 }
 
-pub fn get_active_list(conn: &mut SqliteConnection, conversation_id: &str) -> QueryResult<Option<TodoListRow>> {
+fn get_active_list(conn: &mut SqliteConnection, conversation_id: &str) -> QueryResult<Option<TodoListRow>> {
     todo_lists::table
         .filter(todo_lists::conversation_id.eq(conversation_id))
         .filter(todo_lists::status.eq(ListStatus::InProgress.as_str()))
@@ -21,7 +21,7 @@ pub fn get_active_list(conn: &mut SqliteConnection, conversation_id: &str) -> Qu
         .optional()
 }
 
-pub fn list_items(conn: &mut SqliteConnection, list_id: &str) -> QueryResult<Vec<TodoItemRow>> {
+fn list_items(conn: &mut SqliteConnection, list_id: &str) -> QueryResult<Vec<TodoItemRow>> {
     todo_items::table
         .filter(todo_items::list_id.eq(list_id))
         .order(todo_items::sort_order.asc())
@@ -67,7 +67,7 @@ pub fn replace_active_list(
 /// The same checklist write plus whether it retired an approved plan. Keeping
 /// both state changes in one transaction prevents a crash after the last todo
 /// is archived from leaving the just-finished plan permanently active.
-pub fn replace_active_list_with_plan_completion(
+fn replace_active_list_with_plan_completion(
     conn: &mut SqliteConnection,
     conversation_id: &str,
     title: &str,
@@ -153,16 +153,12 @@ fn archive(conn: &mut SqliteConnection, list_id: &str, now: i64) -> QueryResult<
 /// does not carry a hollow tag around; the leading blank lines are trimmed by
 /// the freezer, the way every injected block is.
 pub fn format_todo_block(view: &TodoListView) -> Option<String> {
-    if view.items.is_empty() {
-        return None;
-    }
-    let mut block = String::from("\n\n<todo_list>\n");
-    block.push_str(&format!("Title: {}\n", view.list.title));
-    for (idx, item) in view.items.iter().enumerate() {
-        block.push_str(&format!("{}. [{}] {}\n", idx + 1, item.status, item.content));
-    }
-    block.push_str("</todo_list>");
-    Some(block)
+    crate::db::sea::ops::todo::render_todo_block(
+        &view.list.title,
+        view.items
+            .iter()
+            .map(|item| (item.status.as_str(), item.content.as_str())),
+    )
 }
 
 #[cfg(test)]
