@@ -5,13 +5,19 @@
 //! to the repository rather than inside it, so it never shows in the
 //! repository's own status, search or editor tree.
 //!
-//! A worktree is added **detached**. The branch is the agent's to name, once it
-//! knows what the work is; a name chosen up front from a title would be a guess
-//! the person then has to live with in every log. Git refuses a name that is
-//! taken, and the agent picks another — no collision handling is needed here.
+//! A worktree is added **detached**, at the repository's current `HEAD`, and
+//! that commit is only a place to stand. The branch — its name *and* what it
+//! starts from — is the agent's to choose once it knows what the work is. A
+//! name from a title would be a guess the person lives with in every log, and
+//! the default branch is not every project's base: a dev/test/main project
+//! defaults to main and starts work from dev. Git refuses a name that is taken
+//! and the agent picks another, so no collision handling is needed here.
 //!
-//! Removal is a person's act and refuses a worktree with uncommitted changes
-//! unless told otherwise. A branch the agent made is never deleted with it.
+//! Removal is a person's act. Unless forced it refuses a worktree with
+//! uncommitted changes, and one whose `HEAD` holds commits no branch or remote
+//! does — an agent that committed before branching — since removing that
+//! would leave the work reachable from nothing. A branch the agent made is
+//! never deleted with the worktree.
 //!
 //! These are the writes `workspace::git` deliberately does not make; they go
 //! through the same subprocess runner with a longer deadline, since adding a
@@ -41,6 +47,8 @@ pub enum WorktreeError {
     BadName(String),
     #[error("the worktree has {files} uncommitted change(s)")]
     Dirty { files: usize },
+    #[error("the worktree has {commits} commit(s) that are on no branch")]
+    Unbranched { commits: usize },
     #[error("git: {0}")]
     Git(String),
 }
@@ -190,12 +198,21 @@ pub async fn current_branch(dir: &Path) -> Result<Option<String>, WorktreeError>
     }
 }
 
-/// Whether `HEAD` in `dir` has commits `base` does not. On a detached worktree
-/// that is work no branch holds yet.
-pub async fn has_commits_beyond(dir: &Path, base: &str) -> Result<bool, WorktreeError> {
-    let range = format!("{base}..HEAD");
-    let count = run_ok(dir, &["rev-list", "--count", &range], READ_TIMEOUT).await?;
-    Ok(count.trim() != "0")
+/// How many commits `HEAD` in `dir` holds that no local branch and no remote
+/// does: work an agent committed before it branched. Zero once it has, whatever
+/// it branched from — which is why this, and not a count beyond the commit the
+/// worktree was added at, is what decides.
+pub async fn unbranched_commits(dir: &Path) -> Result<usize, WorktreeError> {
+    let count = run_ok(
+        dir,
+        &["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes"],
+        READ_TIMEOUT,
+    )
+    .await?;
+    count
+        .trim()
+        .parse()
+        .map_err(|_| WorktreeError::Git(format!("unexpected rev-list output: {count:?}")))
 }
 
 /// How many paths in `dir`'s worktree are changed or untracked.
@@ -224,8 +241,8 @@ pub async fn git_common_dir(dir: &Path) -> Result<Option<PathBuf>, WorktreeError
     Ok(Some(PathBuf::from(common)))
 }
 
-/// Remove the worktree `dir` is in. Refuses one with uncommitted changes unless
-/// `force`; never deletes a branch.
+/// Remove the worktree `dir` is in. Unless `force`, refuses one with
+/// uncommitted changes or with commits no branch holds; never deletes a branch.
 pub async fn remove(dir: &Path, force: bool) -> Result<(), WorktreeError> {
     ensure_repo(dir).await?;
     if !force {
@@ -233,26 +250,30 @@ pub async fn remove(dir: &Path, force: bool) -> Result<(), WorktreeError> {
         if files > 0 {
             return Err(WorktreeError::Dirty { files });
         }
+        let commits = unbranched_commits(dir).await?;
+        if commits > 0 {
+            return Err(WorktreeError::Unbranched { commits });
+        }
     }
     let top = PathBuf::from(run_ok(dir, &["rev-parse", "--show-toplevel"], READ_TIMEOUT).await?);
-    // Asked of the main checkout: a worktree is not removed from inside itself.
     let Some(common) = git_common_dir(&top).await? else {
         return Err(WorktreeError::Git(format!(
             "{} is the main checkout, not a worktree",
             top.display()
         )));
     };
-    let main = common
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| WorktreeError::Git(format!("no checkout around {}", common.display())))?;
+    // Run in the shared git directory itself. Not inside the worktree: Windows
+    // will not delete the directory a process is standing in. And not in the
+    // common directory's parent, which is the main checkout only when the git
+    // directory is that checkout's `.git` — a repository made with
+    // `--separate-git-dir` keeps it anywhere, and its parent is no repository.
     let top_arg = top.to_string_lossy().into_owned();
     let mut args = vec!["worktree", "remove"];
     if force {
         args.push("--force");
     }
     args.push(&top_arg);
-    run_ok(&main, &args, WRITE_TIMEOUT).await?;
+    run_ok(&common, &args, WRITE_TIMEOUT).await?;
     Ok(())
 }
 
@@ -356,24 +377,60 @@ mod tests {
         assert_eq!(verified::resolve_root(&common).unwrap(), repo.join(".git"));
         assert_eq!(git_common_dir(&repo).await.unwrap(), None);
 
-        // The agent names its branch; work on it is seen beyond the base.
+        // Uncommitted work refuses removal.
+        std::fs::write(wt.dir.join("main.txt"), "two\n").unwrap();
+        assert_eq!(remove(&wt.dir, false).await, Err(WorktreeError::Dirty { files: 1 }));
+
+        // Committed before branching: clean, but the commit is on no branch,
+        // and removing the worktree would strand it.
+        git(&wt.root, &["commit", "-q", "-am", "work"]);
+        assert_eq!(unbranched_commits(&wt.dir).await.unwrap(), 1);
+        assert_eq!(
+            remove(&wt.dir, false).await,
+            Err(WorktreeError::Unbranched { commits: 1 })
+        );
+
+        // The agent names its branch: the work is held, removal may go ahead.
         git(&wt.root, &["switch", "-q", "-c", "agent/fix-login"]);
         assert_eq!(
             current_branch(&wt.dir).await.unwrap().as_deref(),
             Some("agent/fix-login")
         );
-        assert!(!has_commits_beyond(&wt.dir, &wt.head).await.unwrap());
-        std::fs::write(wt.dir.join("main.txt"), "two\n").unwrap();
-
-        // Uncommitted work refuses removal.
-        assert_eq!(remove(&wt.dir, false).await, Err(WorktreeError::Dirty { files: 1 }));
-        git(&wt.root, &["commit", "-q", "-am", "work"]);
-        assert!(has_commits_beyond(&wt.dir, &wt.head).await.unwrap());
+        assert_eq!(unbranched_commits(&wt.dir).await.unwrap(), 0);
 
         // Clean: removed, and the branch the agent made outlives it.
         remove(&wt.dir, false).await.unwrap();
         assert!(!wt.root.exists());
         assert_eq!(list(&repo).await.unwrap().len(), 1);
         git(&repo, &["rev-parse", "--verify", "-q", "agent/fix-login"]);
+    }
+
+    /// A repository whose git directory lives elsewhere (`--separate-git-dir`):
+    /// the shared git directory's parent is no checkout, and removal asked there
+    /// failed with "not a git repository".
+    #[tokio::test]
+    async fn a_worktree_of_a_repository_with_a_separate_git_dir() {
+        if !git::git_available().await {
+            eprintln!("skipping: git not installed");
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let work = parent.path().join("work");
+        let gitdir = parent.path().join("store").join("work.git");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
+        let work = verified::resolve_root(&work).unwrap();
+        git(&work, &["init", "-q", "--separate-git-dir", gitdir.to_str().unwrap()]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        std::fs::write(work.join("a.txt"), "a\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+
+        let wt = add_detached(&work, "card1", None).await.unwrap();
+        assert!(wt.dir.join("a.txt").is_file());
+        remove(&wt.dir, false).await.unwrap();
+        assert!(!wt.root.exists());
+        assert_eq!(list(&work).await.unwrap().len(), 1);
     }
 }
