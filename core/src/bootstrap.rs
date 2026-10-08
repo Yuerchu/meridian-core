@@ -307,6 +307,7 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
 
     let unreadable = |error: sea_orm::DbErr| format!("could not read the tool presets: {error}");
 
+    // pool-read-before-write: startup, nothing else writes yet (see the top of this function).
     if ops::tool_category::count_categories(sea).await.unwrap_or(0) == 0 {
         let now = now_ms();
         let cats = [
@@ -357,6 +358,7 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
     // Seed per id (not only on an empty table) so existing installs
     // pick up newly added built-in presets.
     for (id, name, desc, tools_json, order) in presets {
+        // pool-read-before-write: startup, nothing else writes yet (see the top of this function).
         if ops::tool_preset::get_preset(sea, id)
             .await
             .map_err(unreadable)?
@@ -382,6 +384,7 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
     // Repair presets from earlier seeds: "glob_files" never existed
     // (real tool name is "glob"), the built-in Research preset
     // gained web_search, and Coding gained update_todos.
+    // pool-read-before-write: startup, nothing else writes yet (see the top of this function).
     for p in ops::tool_preset::list_presets(sea).await.map_err(unreadable)? {
         let builtin = p.is_builtin.get();
         let mut names = p.tool_names.into_inner();

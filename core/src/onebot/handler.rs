@@ -1297,9 +1297,10 @@ async fn dispatch_memory(
         }
     }
 
-    // pool-read-before-write: each arm is its own subcommand. The listing arms read to
-    // show rows and write nothing; the forget arms act on ids from an earlier listing,
-    // which is the contract of a numbered list, and the soft delete skips rows already gone.
+    // Each arm is its own subcommand. The listing arms read to show rows and
+    // write nothing (each says so where it reads); the forget arms act on ids
+    // from an earlier listing, which is the contract of a numbered list, and the
+    // soft delete skips rows already gone.
     let db = &state.services.sea;
     let now = crate::util::now_ms();
     // An operator's note or rule, as the two `add` commands write it.
@@ -1358,6 +1359,7 @@ async fn dispatch_memory(
             // notes — visibility is a subset of injection, so the two can never
             // disagree.
             let ctx = mem_ops::VisibilityCtx::self_view(is_group);
+            // pool-read-before-write: a listing; this arm writes nothing.
             let rows = mem_ops::visible_user_memories(db, &scope_id, &ctx)
                 .await
                 .unwrap_or_default();
@@ -1543,6 +1545,7 @@ async fn dispatch_memory(
                 };
             }
 
+            // pool-read-before-write: a listing; this arm writes nothing.
             let rows = match mem_ops::list_by_scope(db, MemoryScope::Project, &project_id).await {
                 Ok(rows) => rows,
                 Err(error) => return build_reply(event, &format!("读取记忆失败：{error}"), reply_to),
@@ -1572,6 +1575,7 @@ async fn dispatch_memory(
 
         command::MemorySub::User(target) => {
             let target_scope = crate::db::entity::memory::onebot_user_scope_id(target);
+            // pool-read-before-write: a listing; this arm writes nothing.
             let rows = mem_ops::list_by_subject(db, &target_scope).await.unwrap_or_default();
             let header = if rows.is_empty() {
                 format!("没有关于 {target} 的记忆。")
@@ -1620,6 +1624,7 @@ async fn dispatch_memory(
         }
 
         command::MemorySub::Global => {
+            // pool-read-before-write: a listing; this arm writes nothing.
             let rows = mem_ops::list_by_scope(db, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID)
                 .await
                 .unwrap_or_default();

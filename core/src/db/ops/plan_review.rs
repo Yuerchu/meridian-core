@@ -777,38 +777,6 @@ pub fn barrier_conversations_for_assistant(
     Ok(blocked)
 }
 
-/// Conversations whose currently blocked native continuation depends on this
-/// provider. Frozen runtime identity is authoritative; the conversation value
-/// is consulted only for an active legacy row with no frozen snapshot.
-pub fn barrier_conversations_for_provider(
-    conn: &mut SqliteConnection,
-    provider_id: &str,
-) -> PlanReviewStoreResult<Vec<String>> {
-    let mut blocked = Vec::new();
-    for conversation_id in crate::db::ops::conversation::all_ids(conn)? {
-        let active_reviews = active_barrier_reviews_for_conversation(conn, &conversation_id)?;
-        if active_reviews.is_empty() {
-            continue;
-        }
-        let conversation = crate::db::ops::conversation::get_conversation(conn, &conversation_id)?;
-        let mut missing_runtime = false;
-        let mut frozen = false;
-        for review in active_reviews {
-            match review.native_runtime_config()? {
-                Some(runtime) => frozen |= runtime.provider_id == provider_id,
-                None => missing_runtime = true,
-            }
-        }
-        let standing_fallback = missing_runtime && conversation.agent_provider_id.as_deref() == Some(provider_id);
-        if frozen || standing_fallback {
-            blocked.push(conversation_id);
-        }
-    }
-    blocked.sort();
-    blocked.dedup();
-    Ok(blocked)
-}
-
 /// Conversations whose blocked native continuation was resolved against this
 /// exact provider/model capability record.
 pub fn barrier_conversations_for_model(
@@ -2842,15 +2810,6 @@ mod tests {
         );
         assert_eq!(
             barrier_conversations_for_assistant(&mut conn, "assistant-b").unwrap(),
-            ["c1"]
-        );
-        assert!(
-            barrier_conversations_for_provider(&mut conn, "provider-a")
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            barrier_conversations_for_provider(&mut conn, "provider-b").unwrap(),
             ["c1"]
         );
         assert!(

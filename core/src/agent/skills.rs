@@ -345,12 +345,12 @@ pub async fn sync_index(db: &Db, root: &Path) -> Result<Vec<skill::Model>, Strin
     .await
     .map_err(|e| e.to_string())?;
     if unreadable {
-        // pool-read-before-write: this branch reads the index and returns; it
-        // never reaches the write below.
         tracing::error!(
             skills_root = %root.display(),
             "skills directory unreadable; keeping the existing index rather than clearing it"
         );
+        // pool-read-before-write: this branch reads the index and returns; it
+        // never reaches the write below.
         return skill_ops::list_skills(db).await.map_err(|e| e.to_string());
     }
 
