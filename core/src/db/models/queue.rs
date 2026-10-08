@@ -53,3 +53,26 @@ pub struct QueuedPromptInsert<'a> {
     pub position: i32,
     pub created_at: i64,
 }
+
+/// The Diesel reads hand out the entity model; a delivery mode this build does
+/// not know fails the read, as it does on the SeaORM side. Goes with them.
+impl TryFrom<QueuedPromptRow> for crate::db::entity::queued_prompt::Model {
+    type Error = String;
+
+    fn try_from(row: QueuedPromptRow) -> Result<Self, String> {
+        Ok(Self {
+            delivery: Delivery::parse(&row.delivery)?,
+            id: row.id,
+            conversation_id: row.conversation_id,
+            content: row.content,
+            position: row.position,
+            created_at: row.created_at,
+            dispatched_at: row.dispatched_at,
+            dispatched_turn_id: row.dispatched_turn_id,
+            settled_at: row.settled_at,
+            settled_message_id: row.settled_message_id,
+            held_at: row.held_at,
+            reported_at: row.reported_at,
+        })
+    }
+}

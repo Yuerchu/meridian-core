@@ -27,9 +27,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::engine::transcript::{append_tool_result, begin_assistant, complete_assistant, write_steering};
 use crate::agent::tool_calls::serialize_tool_calls_openai;
+use crate::db::entity::queued_prompt;
 use crate::db::models::acp_session_notice::AcpSessionNoticeInsert;
 use crate::db::models::message::MessageUsage;
-use crate::db::models::queue::QueuedPromptRow;
 use crate::db::models::turn::{TurnPhase, TurnStatus};
 use crate::events::{
     AcpNoticeSeverity, AcpSessionNoticeEvent, ChatStopReason, ChatStreamEvent, ToolCallDiff, ToolOutcome,
@@ -3063,7 +3063,7 @@ impl AcpSession {
     /// *recorded turn*, which either answers or is written down as having
     /// failed. Marking it in doubt instead would warn the next agent about a
     /// message sitting in plain sight a few rows above.
-    pub async fn deliver_queued(&self, services: &Services, item: &QueuedPromptRow) -> Result<(), String> {
+    pub async fn deliver_queued(&self, services: &Services, item: &queued_prompt::Model) -> Result<(), String> {
         let pool = services.db.clone();
         let queue_id = item.id.clone();
         let context = tokio::task::spawn_blocking(move || {

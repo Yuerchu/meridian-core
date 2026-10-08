@@ -150,7 +150,7 @@ pub trait StartTurn: Send + Sync {
     async fn start(
         &self,
         conversation_id: &str,
-        queued: &crate::db::models::queue::QueuedPromptRow,
+        queued: &crate::db::entity::queued_prompt::Model,
     ) -> Result<(), String>;
 
     /// Run one turn with nothing typed, to tell the model a background task

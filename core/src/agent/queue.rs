@@ -26,7 +26,8 @@
 //! report. A hosted turn's history lives in the adapter, so a row here proves
 //! nothing and the doubt is real.
 
-use crate::db::models::queue::{Delivery, QueuedPromptRow};
+use crate::db::entity::queued_prompt;
+use crate::db::models::queue::Delivery;
 use crate::db::models::turn::TurnStatus;
 use crate::services::Services;
 use crate::util::{get_conn, now_ms};
@@ -278,7 +279,7 @@ pub async fn owed(services: &Services, conversation_id: &str) -> Option<Doubtful
     .ok()
     .flatten()?;
 
-    let items: Vec<QueuedPromptRow> = items.into_iter().take(AT_MOST).collect();
+    let items: Vec<queued_prompt::Model> = items.into_iter().take(AT_MOST).collect();
     if items.is_empty() {
         return None;
     }
@@ -317,7 +318,7 @@ pub async fn confirm_reported(services: &Services, report: Doubtful) {
 /// doing it once. So the text asks for the state to be checked rather than for
 /// the work to be repeated, and it never says which of the two happened —
 /// because nothing here knows.
-fn describe(items: &[QueuedPromptRow]) -> String {
+fn describe(items: &[queued_prompt::Model]) -> String {
     // Verbatim, in a tag of its own. A queued message is the user's own words
     // and gets the same treatment an ordinary prompt does — quoting it into one
     // line would fold a multi-line instruction into `\n`s and escaped quotes,
@@ -388,7 +389,7 @@ fn spoken(content: &str) -> String {
 /// `steerable` narrows to interjections; idle takes the front of the queue
 /// whatever mode it is in, because with no turn to interrupt the distinction
 /// has nothing to refer to.
-async fn read(services: &Services, conversation_id: &str, steerable: bool) -> Option<QueuedPromptRow> {
+async fn read(services: &Services, conversation_id: &str, steerable: bool) -> Option<queued_prompt::Model> {
     let pool = services.db.clone();
     let id = conversation_id.to_string();
     let found = tokio::task::spawn_blocking(move || {
@@ -449,7 +450,7 @@ mod tests {
         async fn start(
             &self,
             _conversation_id: &str,
-            _queued: &crate::db::models::queue::QueuedPromptRow,
+            _queued: &crate::db::entity::queued_prompt::Model,
         ) -> Result<(), String> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -662,12 +663,12 @@ mod tests {
         assert_eq!(queued[0].state(), crate::db::models::queue::QueueState::Queued);
     }
 
-    fn doubtful(content: &str) -> QueuedPromptRow {
-        QueuedPromptRow {
+    fn doubtful(content: &str) -> queued_prompt::Model {
+        queued_prompt::Model {
             id: format!("q-{content}"),
             conversation_id: "c1".into(),
             content: content.into(),
-            delivery: "interject".into(),
+            delivery: Delivery::Interject,
             position: 0,
             created_at: 0,
             dispatched_at: Some(1),
@@ -738,7 +739,8 @@ mod hosted {
     use super::{announce, read, write};
     use crate::acp::AcpSession;
     use crate::acp::protocol::SteerOutcome;
-    use crate::db::models::queue::{Delivery, QueuedPromptRow};
+    use crate::db::entity::queued_prompt;
+    use crate::db::models::queue::Delivery;
     use crate::services::Services;
     use crate::util::now_ms;
 
@@ -767,13 +769,8 @@ mod hosted {
             return;
         };
 
-        let next_delivery = match next.delivery() {
-            Ok(delivery) => delivery,
-            Err(error) => {
-                tracing::error!(%error, conversation_id, queue_id = %next.id, "queued prompt has an invalid delivery mode");
-                return;
-            }
-        };
+        // Held to the known modes at the read.
+        let next_delivery = next.delivery;
 
         let next = match steerable.filter(|_| next_delivery == Delivery::Interject) {
             None => next,
@@ -820,7 +817,12 @@ mod hosted {
         Unknown,
     }
 
-    async fn steer(services: &Services, session: &Arc<AcpSession>, item: &QueuedPromptRow, turn_id: &str) -> Steered {
+    async fn steer(
+        services: &Services,
+        session: &Arc<AcpSession>,
+        item: &queued_prompt::Model,
+        turn_id: &str,
+    ) -> Steered {
         // The record of the attempt goes down *before* the attempt, and this is
         // the whole reason the ledger exists. Killed in the gap, the agent may
         // already have run a command — and a command's effects outlive both
