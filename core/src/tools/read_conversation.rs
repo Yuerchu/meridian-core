@@ -77,7 +77,7 @@ fn granted_targets(
         crate::db::ops::message_context_item::list_for_messages(conn, &message_ids).map_err(|e| e.to_string())?;
     let mut granted = std::collections::HashSet::new();
     for item in items.into_values().flatten() {
-        if item.kind == crate::workspace::reference::MessageContextKind::Conversation.as_str()
+        if item.kind == crate::workspace::reference::MessageContextKind::Conversation
             && let Some(id) = referenced_conversation_id(item.metadata.as_deref())?
         {
             granted.insert(id);

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::db::entity::message as message_entity;
-use crate::db::models::message_context_item::MessageContextItemRow;
+use crate::db::entity::message_context_item;
 use crate::db::ops::message::ActiveContext;
 use crate::provider::{self, ChatMessage, SenderRef};
 
@@ -55,7 +55,7 @@ pub fn build_messages_with_context_items(
     context: &ActiveContext,
     trailing: Vec<ChatMessage>,
     sender_names: &SenderNames,
-    context_items: &HashMap<String, Vec<MessageContextItemRow>>,
+    context_items: &HashMap<String, Vec<message_context_item::Model>>,
 ) -> Result<Vec<ChatMessage>, String> {
     let mut msgs = Vec::new();
     if !system_prompt.is_empty() {
@@ -176,7 +176,7 @@ fn push_history_message(
     msgs: &mut Vec<ChatMessage>,
     m: &message_entity::Model,
     names: &SenderNames,
-    context_items: Option<&[MessageContextItemRow]>,
+    context_items: Option<&[message_context_item::Model]>,
 ) -> Result<(), String> {
     use crate::db::models::message::MessageRole;
 
@@ -276,7 +276,7 @@ fn push_history_message(
     Ok(())
 }
 
-fn push_message_context(msgs: &mut Vec<ChatMessage>, items: &[MessageContextItemRow]) -> Result<(), String> {
+fn push_message_context(msgs: &mut Vec<ChatMessage>, items: &[message_context_item::Model]) -> Result<(), String> {
     for rendered in render_message_context_items(items)? {
         msgs.push(ChatMessage::user_provided_context(&rendered));
     }
@@ -287,32 +287,30 @@ fn push_message_context(msgs: &mut Vec<ChatMessage>, items: &[MessageContextItem
 /// history replay does. Compaction uses the same projection so a summary does
 /// not silently replace an `@` marker or `!` command with none of the evidence
 /// the original turn received.
-pub(super) fn render_message_context_items(items: &[MessageContextItemRow]) -> Result<Vec<String>, String> {
-    for item in items {
-        crate::workspace::reference::MessageContextKind::parse(&item.kind)?;
-    }
+pub(super) fn render_message_context_items(items: &[message_context_item::Model]) -> Result<Vec<String>, String> {
+    use crate::workspace::reference::MessageContextKind;
     // A shell retry stores every attempt for diagnosis, but only the final one
     // is evidence for the next model turn. File and directory references all
     // remain in request order.
     let final_shell = items
         .iter()
-        .filter(|item| item.kind == "shell_output")
+        .filter(|item| item.kind == MessageContextKind::ShellOutput)
         .max_by_key(|item| item.position)
         .map(|item| item.id.as_str());
-    items
+    Ok(items
         .iter()
-        .filter(|item| item.kind != "shell_output" || final_shell == Some(item.id.as_str()))
+        .filter(|item| item.kind != MessageContextKind::ShellOutput || final_shell == Some(item.id.as_str()))
         .map(|item| {
-            Ok(crate::workspace::reference::render_context_item(
-                crate::workspace::reference::MessageContextKind::parse(&item.kind)?,
+            crate::workspace::reference::render_context_item(
+                item.kind,
                 item.display_path.as_deref(),
                 item.line_start,
                 item.line_end,
                 &item.content,
-                item.truncated != 0,
-            ))
+                item.truncated.get(),
+            )
         })
-        .collect()
+        .collect())
 }
 
 fn has_stored_user_content(message: &ChatMessage) -> bool {
@@ -1485,11 +1483,11 @@ mod injected_context_tests {
 
     #[test]
     fn only_the_final_shell_attempt_enters_native_history() {
-        let item = |id: &str, position: i32, content: &str| MessageContextItemRow {
+        let item = |id: &str, position: i32, content: &str| crate::db::entity::message_context_item::Model {
             id: id.into(),
             message_id: "m".into(),
             position,
-            kind: "shell_output".into(),
+            kind: crate::workspace::reference::MessageContextKind::ShellOutput,
             content: content.into(),
             display_path: None,
             line_start: None,
@@ -1498,7 +1496,7 @@ mod injected_context_tests {
             byte_count: content.len() as i32,
             line_count: 1,
             token_count: 1,
-            truncated: 0,
+            truncated: crate::db::types::SqlBool::FALSE,
             metadata: None,
             created_at: 1,
         };

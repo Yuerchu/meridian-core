@@ -1766,7 +1766,7 @@ const MAX_ACP_PENDING_SHELL_ITEMS: usize = 4;
 const MAX_ACP_PENDING_SHELL_BYTES: usize = 128 * 1024;
 
 fn bounded_pending_shell_context(
-    candidates: &[crate::db::models::message_context_item::MessageContextItemRow],
+    candidates: &[crate::db::entity::message_context_item::Model],
 ) -> Result<Option<PendingShellContext>, String> {
     let mut item_ids = Vec::new();
     let mut rendered = Vec::new();
@@ -1776,12 +1776,12 @@ fn bounded_pending_shell_context(
             break;
         }
         let body = crate::workspace::reference::render_context_item(
-            crate::workspace::reference::MessageContextKind::parse(&item.kind)?,
+            item.kind,
             item.display_path.as_deref(),
             item.line_start,
             item.line_end,
             &item.content,
-            item.truncated != 0,
+            item.truncated.get(),
         );
         let message = provider::ChatMessage::user_provided_context(&body);
         let wire = provider::render_message(&message, provider::SenderRendering::Prefix)
@@ -1986,18 +1986,15 @@ impl Owed {
             crate::agent::queue::confirm_reported(services, report).await;
         }
         if let Some(shell) = self.shell {
-            let pool = services.db.clone();
             let count = shell.item_ids.len();
-            let settled = tokio::task::spawn_blocking(move || {
-                let mut conn = get_conn(&pool)?;
-                crate::db::ops::acp_context_delivery::mark_delivered(&mut conn, &shell.item_ids, now_ms())
-                    .map_err(|e| e.to_string())
-            })
-            .await;
-            match settled {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::warn!(error = %error, count, "could not settle ACP shell context"),
-                Err(error) => tracing::warn!(error = %error, count, "ACP shell-context settlement task failed"),
+            let settled = services
+                .sea
+                .write(async |tx| {
+                    crate::db::sea::ops::acp_context_delivery::mark_delivered(tx, &shell.item_ids, now_ms()).await
+                })
+                .await;
+            if let Err(error) = settled {
+                tracing::warn!(error = %error, count, "could not settle ACP shell context");
             }
         }
         if self.memory_lost
@@ -3365,50 +3362,50 @@ impl AcpSession {
     /// a pipe failure or a stop before first poll leaves them for the next
     /// prompt instead of spending them on nobody.
     async fn pending_shell_context(&self, services: &Services) -> Result<Option<PendingShellContext>, String> {
-        let pool = services.db.clone();
-        let conversation_id = self.conversation_id.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<PendingShellContext>, String> {
-            let mut conn = get_conn(&pool)?;
-            let conversation = crate::db::ops::conversation::get_conversation(&mut conn, &conversation_id)
-                .map_err(|e| e.to_string())?;
-            let history =
-                crate::db::ops::message::list_messages(&mut conn, &conversation_id).map_err(|e| e.to_string())?;
-            let context = crate::db::ops::message::active_context(&history, conversation.head_message_id.as_deref());
-            let message_ids = context.path.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-            let mut by_message = crate::db::ops::message_context_item::list_for_messages(&mut conn, &message_ids)
-                .map_err(|e| e.to_string())?;
+        use crate::db::sea::ops::{acp_context_delivery, conversation, message, message_context_item};
+        use crate::workspace::reference::MessageContextKind;
 
-            // Match native context construction: a denied sandbox attempt and
-            // its approved host retry are both retained for diagnosis, but only
-            // the final attempt is evidence for the next model turn.
-            let mut candidates = Vec::new();
-            for message in &context.path {
-                let Some(items) = by_message.remove(&message.id) else {
-                    continue;
-                };
-                for item in &items {
-                    crate::workspace::reference::MessageContextKind::parse(&item.kind)?;
-                }
-                if let Some(item) = items
-                    .into_iter()
-                    .filter(|item| item.kind == "shell_output")
-                    .max_by_key(|item| item.position)
-                {
-                    candidates.push(item);
-                }
-            }
-            let ids = candidates.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-            let delivered =
-                crate::db::ops::acp_context_delivery::delivered(&mut conn, &ids).map_err(|e| e.to_string())?;
-            candidates.retain(|item| !delivered.contains(&item.id));
-            if candidates.is_empty() {
-                return Ok(None);
-            }
+        // One snapshot: the branch, its items and the receipts describe one moment.
+        let candidates = services
+            .sea
+            .read(async |tx| {
+                let conversation = conversation::get_conversation(tx, &self.conversation_id)
+                    .await?
+                    .ok_or_else(|| {
+                        crate::db::sea::DbErr::RecordNotFound(format!("conversation {}", self.conversation_id))
+                    })?;
+                let history = message::list_messages(tx, &self.conversation_id).await?;
+                let context = message::active_context(&history, conversation.head_message_id.as_deref());
+                let message_ids = context.path.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+                let mut by_message = message_context_item::list_for_messages(tx, &message_ids).await?;
 
-            bounded_pending_shell_context(&candidates)
-        })
-        .await
-        .map_err(|error| format!("ACP shell-context load task failed: {error}"))?
+                // Match native context construction: a denied sandbox attempt and
+                // its approved host retry are both retained for diagnosis, but only
+                // the final attempt is evidence for the next model turn.
+                let mut candidates = Vec::new();
+                for message in &context.path {
+                    let Some(items) = by_message.remove(&message.id) else {
+                        continue;
+                    };
+                    if let Some(item) = items
+                        .into_iter()
+                        .filter(|item| item.kind == MessageContextKind::ShellOutput)
+                        .max_by_key(|item| item.position)
+                    {
+                        candidates.push(item);
+                    }
+                }
+                let ids = candidates.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+                let delivered = acp_context_delivery::delivered(tx, &ids).await?;
+                candidates.retain(|item| !delivered.contains(&item.id));
+                Ok::<_, crate::db::sea::DbErr>(candidates)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        bounded_pending_shell_context(&candidates)
     }
 
     /// Write the user's row and the turn record — and, when this prompt came
@@ -4476,11 +4473,11 @@ mod tests {
 
     #[test]
     fn pending_shell_context_batches_items_and_receipts_only_what_was_injected() {
-        let item = |id: &str, content: String| crate::db::models::message_context_item::MessageContextItemRow {
+        let item = |id: &str, content: String| crate::db::entity::message_context_item::Model {
             id: id.into(),
             message_id: format!("message-{id}"),
             position: 0,
-            kind: "shell_output".into(),
+            kind: crate::workspace::reference::MessageContextKind::ShellOutput,
             content,
             display_path: None,
             line_start: None,
@@ -4489,7 +4486,7 @@ mod tests {
             byte_count: 0,
             line_count: 1,
             token_count: 1,
-            truncated: 0,
+            truncated: crate::db::types::SqlBool::FALSE,
             metadata: None,
             created_at: 1,
         };

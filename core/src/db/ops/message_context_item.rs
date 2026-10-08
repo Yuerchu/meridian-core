@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
+use crate::db::entity::message_context_item;
 use crate::db::models::message_context_item::{MessageContextItemInsert, MessageContextItemRow};
 use crate::db::schema::message_context_items;
 
@@ -15,18 +16,31 @@ pub fn insert_many(conn: &mut SqliteConnection, items: &[MessageContextItemInser
         .execute(conn)
 }
 
-pub fn list_for_message(conn: &mut SqliteConnection, message_id: &str) -> QueryResult<Vec<MessageContextItemRow>> {
+/// A Diesel row as the entity model; an unknown kind or a flag outside 0/1
+/// fails the read.
+fn model(row: MessageContextItemRow) -> QueryResult<message_context_item::Model> {
+    message_context_item::Model::try_from(row)
+        .map_err(|message| diesel::result::Error::DeserializationError(message.into()))
+}
+
+pub fn list_for_message(
+    conn: &mut SqliteConnection,
+    message_id: &str,
+) -> QueryResult<Vec<message_context_item::Model>> {
     message_context_items::table
         .filter(message_context_items::message_id.eq(message_id))
         .order(message_context_items::position.asc())
         .select(MessageContextItemRow::as_select())
-        .load(conn)
+        .load::<MessageContextItemRow>(conn)?
+        .into_iter()
+        .map(model)
+        .collect()
 }
 
 pub fn list_for_messages(
     conn: &mut SqliteConnection,
     message_ids: &[String],
-) -> QueryResult<HashMap<String, Vec<MessageContextItemRow>>> {
+) -> QueryResult<HashMap<String, Vec<message_context_item::Model>>> {
     if message_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -38,9 +52,9 @@ pub fn list_for_messages(
         ))
         .select(MessageContextItemRow::as_select())
         .load::<MessageContextItemRow>(conn)?;
-    let mut by_message: HashMap<String, Vec<MessageContextItemRow>> = HashMap::new();
+    let mut by_message: HashMap<String, Vec<message_context_item::Model>> = HashMap::new();
     for row in rows {
-        by_message.entry(row.message_id.clone()).or_default().push(row);
+        by_message.entry(row.message_id.clone()).or_default().push(model(row)?);
     }
     Ok(by_message)
 }
