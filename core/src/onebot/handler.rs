@@ -672,7 +672,7 @@ pub(super) async fn run_agent_turn(
     // outside, so the duplicate case is unreachable here — but it is worth
     // hearing about if it ever stops being. Returning drops `running`, which
     // announces the end and hands both claims back.
-    if let Err(e) = running.open_record(&state.services.db, self_id).await {
+    if let Err(e) = running.open_record(&state.services.sea, self_id).await {
         tracing::error!(turn_id = %turn_id, error = %e, "OneBot turn id collided");
         return build_session_reply(session_key, "内部错误,请重试。", reply_to);
     }
@@ -790,7 +790,7 @@ pub(super) async fn run_agent_turn(
                     | crate::events::ChatStopReason::MaxTurnRequests
                     | crate::events::ChatStopReason::Refusal => (TurnStatus::Done, None),
                 };
-                crate::agent::turn_record::finish(&state.services.db, &turn_id, status, error).await;
+                crate::agent::turn_record::finish(&state.services.sea, &turn_id, status, error).await;
                 return actions;
             }
             Some(items) => {

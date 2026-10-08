@@ -196,7 +196,7 @@ pub(crate) async fn run(state: Arc<SharedState>, job: ReviewJob) -> Result<Revie
         (Ok(_), true) => (TurnStatus::Cancelled, None),
         (Ok(_), false) => (TurnStatus::Done, None),
     };
-    turn_record::finish(&state.services.db, &turn_id, status, error.as_deref()).await;
+    turn_record::finish(&state.services.sea, &turn_id, status, error.as_deref()).await;
     stopped(state, &conversation_id, &turn_id, &outcome);
     announce(state, &conversation_id);
 
@@ -694,7 +694,7 @@ async fn run_turn(
     };
 
     let services = engine::TurnServices {
-        pool: &state.services.db,
+        db: &state.services.sea,
         tools: &state.services.tools,
         mcp: &state.services.mcp,
         redaction: &state.services.redaction,

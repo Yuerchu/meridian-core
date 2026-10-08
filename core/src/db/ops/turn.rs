@@ -58,7 +58,7 @@ pub fn begin(
 
 /// [`begin`], for a turn that says what set it going. Everything a person
 /// started goes through `begin`, which is this with `TurnTrigger::User`.
-pub fn begin_triggered(
+fn begin_triggered(
     conn: &mut SqliteConnection,
     id: &str,
     conversation_id: &str,
@@ -184,98 +184,6 @@ fn running(
     turns::table
         .find(id)
         .filter(turns::status.eq(TurnStatus::Running.as_str()))
-}
-
-/// Turns of a conversation that may still owe the model an explanation, newest
-/// first, capped at `limit`.
-///
-/// `excluding` is the turn asking. By the time a turn wants to know how the
-/// previous ones ended it has already opened its own record, so without this it
-/// would find itself — running, held by the coordinator, and therefore
-/// perfectly fine.
-///
-/// "May" because `running` is only half an answer here: the coordinator decides
-/// whether such a row is a live turn or a dead one. The two statuses selected
-/// are the only ones that can be a dead turn at all; `done`, `cancelled` and
-/// `failed` each reached an ending and said so in the transcript.
-///
-/// Deliberately *not* "the most recent turn". The previous design read only the
-/// latest row and so treated any later turn as having consumed the notice,
-/// including one that failed before sending a single request. `reported_at` is
-/// the consumption record instead, and it is only written by a turn that got a
-/// reply back and read it to the end.
-pub fn unreported_for_conversation(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-    excluding: Option<&str>,
-    limit: i64,
-) -> QueryResult<Vec<InterruptedCandidate>> {
-    let mut out: Vec<InterruptedCandidate> = turns::table
-        .filter(turns::conversation_id.eq(conversation_id))
-        .filter(turns::id.ne(excluding.unwrap_or("")))
-        .filter(turns::reported_at.is_null())
-        .filter(turns::status.eq_any([TurnStatus::Running.as_str(), TurnStatus::Interrupted.as_str()]))
-        .order((turns::started_at.desc(), insertion_order().desc()))
-        .limit(limit)
-        .load::<TurnRow>(conn)?
-        .into_iter()
-        .map(model)
-        .collect::<QueryResult<Vec<_>>>()?
-        .into_iter()
-        .map(|turn| InterruptedCandidate {
-            turn,
-            ledger: Ledger::Own,
-            child_title: None,
-        })
-        .collect();
-
-    // What the conversation delegated. The parent has to hear about these
-    // itself: "a sub-agent was partway through `edit_file`" is the fact that
-    // matters, and it lives on a row in a conversation the parent's own history
-    // never mentions.
-    let children: Vec<(String, Option<String>)> = crate::db::schema::conversations::table
-        .filter(crate::db::schema::conversations::parent_conversation_id.eq(conversation_id))
-        .select((
-            crate::db::schema::conversations::id,
-            crate::db::schema::conversations::title,
-        ))
-        .load(conn)?;
-    if !children.is_empty() {
-        let ids: Vec<&str> = children.iter().map(|(id, _)| id.as_str()).collect();
-        let delegated = turns::table
-            .filter(turns::conversation_id.eq_any(&ids))
-            // Only the delegated run itself. A follow-up the user typed into the
-            // sub-agent's transcript is between them and that conversation — the
-            // parent never saw the question and would be left guessing what an
-            // interruption there was even about.
-            .filter(turns::origin.eq(TurnOrigin::SubAgent.as_str()))
-            .filter(turns::parent_reported_at.is_null())
-            .filter(turns::status.eq_any([TurnStatus::Running.as_str(), TurnStatus::Interrupted.as_str()]))
-            .order((turns::started_at.desc(), insertion_order().desc()))
-            .limit(limit)
-            .load::<TurnRow>(conn)?
-            .into_iter()
-            .map(model)
-            .collect::<QueryResult<Vec<_>>>()?;
-        out.extend(delegated.into_iter().map(|turn| {
-            let child_title = children
-                .iter()
-                .find(|(id, _)| *id == turn.conversation_id)
-                .and_then(|(_, title)| title.clone());
-            InterruptedCandidate {
-                turn,
-                ledger: Ledger::Parent,
-                child_title,
-            }
-        }));
-    }
-
-    // Both halves arrive newest first; merging keeps that. A stable sort settles
-    // a shared millisecond in favour of the conversation's own turn, which is
-    // the one the reader has actually seen.
-    out.sort_by_key(|x| std::cmp::Reverse(x.turn.started_at));
-    out.truncate(limit as usize);
-    Ok(out)
 }
 
 pub use crate::db::sea::ops::turn::{InterruptedCandidate, Ledger};
@@ -594,113 +502,6 @@ mod tests {
         assert_eq!(t.error.as_deref(), Some("API Key not set"));
     }
 
-    fn ids(candidates: Vec<InterruptedCandidate>) -> Vec<String> {
-        candidates.into_iter().map(|c| c.turn.id).collect()
-    }
-
-    #[test]
-    fn unreported_turns_come_back_newest_first_within_their_conversation() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        conv(&mut conn, "c2");
-        begin(&mut conn, "old", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        begin(&mut conn, "new", "c1", TurnOrigin::Desktop, None, 2000).unwrap();
-        begin(&mut conn, "other", "c2", TurnOrigin::Desktop, None, 3000).unwrap();
-
-        assert_eq!(
-            ids(unreported_for_conversation(&mut conn, "c1", None, 10).unwrap()),
-            ["new", "old"]
-        );
-        assert_eq!(
-            ids(unreported_for_conversation(&mut conn, "c2", None, 10).unwrap()),
-            ["other"]
-        );
-        assert!(
-            unreported_for_conversation(&mut conn, "nope", None, 10)
-                .unwrap()
-                .is_empty()
-        );
-        // The turn asking is never one of the answers.
-        assert_eq!(
-            ids(unreported_for_conversation(&mut conn, "c1", Some("new"), 10).unwrap()),
-            ["old"]
-        );
-        // And the limit keeps the newest, which is where the useful detail is.
-        assert_eq!(
-            ids(unreported_for_conversation(&mut conn, "c1", None, 1).unwrap()),
-            ["new"]
-        );
-
-        let all: Vec<String> = list_for_conversation(&mut conn, "c1")
-            .unwrap()
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
-        assert_eq!(all, vec!["old", "new"]);
-    }
-
-    /// Only a turn that never reached an ending can owe an explanation. The
-    /// other three said how they ended, in the transcript, where the model can
-    /// already see it.
-    #[test]
-    fn a_turn_that_reached_an_ending_owes_nothing() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        for (id, status) in [
-            ("done", TurnStatus::Done),
-            ("cancelled", TurnStatus::Cancelled),
-            ("failed", TurnStatus::Failed),
-        ] {
-            begin(&mut conn, id, "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-            finish(&mut conn, id, status, None, 1500).unwrap();
-        }
-        begin(&mut conn, "cut-off", "c1", TurnOrigin::Desktop, None, 2000).unwrap();
-        begin(&mut conn, "reconciled", "c1", TurnOrigin::Desktop, None, 3000).unwrap();
-        reconcile_interrupted(&mut conn, 3500).unwrap();
-
-        assert_eq!(
-            ids(unreported_for_conversation(&mut conn, "c1", None, 10).unwrap()),
-            ["reconciled", "cut-off"]
-        );
-    }
-
-    /// The record of having been told, which is what stops the same warning
-    /// from being repeated forever — and what stops it from being lost when the
-    /// turn that read it dies on the way to the provider.
-    #[test]
-    fn a_reported_turn_leaves_the_queue_and_keeps_its_first_telling() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        begin(&mut conn, "t2", "c1", TurnOrigin::Desktop, None, 2000).unwrap();
-
-        assert_eq!(
-            mark_reported(&mut conn, &["t1".to_string()], Ledger::Own, 5000).unwrap(),
-            1
-        );
-        assert_eq!(
-            ids(unreported_for_conversation(&mut conn, "c1", None, 10).unwrap()),
-            ["t2"]
-        );
-
-        // Told once. A second telling finds nothing to record, and the first
-        // timestamp stands.
-        assert_eq!(
-            mark_reported(&mut conn, &["t1".to_string()], Ledger::Own, 9000).unwrap(),
-            0
-        );
-        assert_eq!(get(&mut conn, "t1").reported_at, Some(5000));
-        assert_eq!(mark_reported(&mut conn, &[], Ledger::Own, 9000).unwrap(), 0);
-
-        // Reconciliation is about how a turn ended, and does not un-tell it.
-        reconcile_interrupted(&mut conn, 9500).unwrap();
-        assert_eq!(get(&mut conn, "t1").reported_at, Some(5000));
-        assert_eq!(get(&mut conn, "t1").status().unwrap(), TurnStatus::Interrupted);
-    }
-
     /// Turns belong to their conversation and go with it.
     #[test]
     fn deleting_a_conversation_takes_its_turns() {
@@ -782,33 +583,6 @@ mod tests {
         let t = get(&mut conn, "t1");
         assert_eq!(t.status().unwrap(), TurnStatus::Failed);
         assert_eq!(t.error.as_deref(), Some("loop_detected"));
-    }
-
-    /// A turn refused by its provider can start and finish inside the same
-    /// millisecond, so `started_at` alone does not say which of two turns came
-    /// last — and a uuid primary key cannot break the tie, because its order
-    /// has nothing to do with when it was written. Insertion order does.
-    #[test]
-    fn turns_from_the_same_millisecond_still_have_an_order() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        // Ids chosen so that ordering by `id` would put them the wrong way
-        // round: "aaa" sorts before "zzz" but was written second.
-        begin(&mut conn, "zzz-first", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        begin(&mut conn, "aaa-second", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-
-        assert_eq!(
-            ids(unreported_for_conversation(&mut conn, "c1", None, 10).unwrap()),
-            ["aaa-second", "zzz-first"],
-            "the latest turn is the one written last, not the one sorting last",
-        );
-        let all: Vec<String> = list_for_conversation(&mut conn, "c1")
-            .unwrap()
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
-        assert_eq!(all, vec!["zzz-first", "aaa-second"]);
     }
 
     /// The desktop's turn ids arrive from the front end, so a replayed one is

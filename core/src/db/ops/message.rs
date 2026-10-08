@@ -2,7 +2,7 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
 use crate::db::entity::message;
-use crate::db::models::message::{MessageInsert, MessageRow, MessageUsage};
+use crate::db::models::message::{MessageInsert, MessageRow};
 use crate::db::schema::{conversations, messages};
 
 // The tree is read the same way whichever ORM loaded it.
@@ -155,42 +155,12 @@ pub fn insert_message(conn: &mut SqliteConnection, new: &MessageInsert) -> Query
 // the lease that keeps a running turn from having the ground moved under it.
 
 /// One row by id. Selected by name, for the reason `list_messages` is.
-pub fn get_message(conn: &mut SqliteConnection, id: &str) -> QueryResult<message::Model> {
+fn get_message(conn: &mut SqliteConnection, id: &str) -> QueryResult<message::Model> {
     messages::table
         .find(id)
         .select(MessageRow::as_select())
         .first::<MessageRow>(conn)
         .and_then(model)
-}
-
-pub fn update_assistant_message(
-    conn: &mut SqliteConnection,
-    id: &str,
-    content: &str,
-    reasoning_content: Option<&str>,
-    tool_calls: Option<&str>,
-    provider_state: Option<&str>,
-    usage: &MessageUsage,
-    response_model_id: Option<&str>,
-) -> QueryResult<()> {
-    let affected = diesel::update(messages::table.find(id))
-        .set((
-            messages::content.eq(content),
-            messages::reasoning_content.eq(reasoning_content),
-            messages::tool_calls.eq(tool_calls),
-            messages::provider_state.eq(provider_state),
-            messages::input_tokens.eq(usage.input_tokens),
-            messages::output_tokens.eq(usage.output_tokens),
-            messages::cache_read_tokens.eq(usage.cache_read_tokens),
-            messages::cache_write_tokens.eq(usage.cache_write_tokens),
-            messages::server_tool_calls.eq(usage.server_tool_calls),
-            messages::response_model_id.eq(response_model_id),
-        ))
-        .execute(conn)?;
-    if affected != 1 {
-        return Err(diesel::result::Error::NotFound);
-    }
-    Ok(())
 }
 
 /// Fill in one tool call inside a row that has already been stored.

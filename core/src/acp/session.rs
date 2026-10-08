@@ -940,7 +940,7 @@ impl Shared {
     async fn write_row(&self, turn_id: &str, parent: &str, row: &OpenRow) -> String {
         let tool_calls_json = (!row.tool_calls.is_empty()).then(|| serialize_tool_calls_openai(&row.tool_calls));
         if let Err(e) = complete_assistant(
-            &self.services.db,
+            &self.services.sea,
             &row.message_id,
             &row.text,
             (!row.reasoning.is_empty()).then_some(row.reasoning.as_str()),
@@ -993,7 +993,7 @@ impl Shared {
         let mut last = row.message_id.clone();
         for (call_id, output, outcome) in &row.results {
             if let Some(id) = append_tool_result(
-                &self.services.db,
+                &self.services.sea,
                 &self.conversation_id,
                 turn_id,
                 call_id,
@@ -1024,7 +1024,7 @@ impl Shared {
             // reason: a user row, filed under the turn it was said *to* rather
             // than the one it causes, because that is where the agent read it.
             match write_steering(
-                &self.services.db,
+                &self.services.sea,
                 &self.conversation_id,
                 turn_id,
                 &item.text,
@@ -1095,7 +1095,7 @@ impl Shared {
         let last = self.write_interjections(&turn_id, &last, &interjected).await;
 
         match begin_assistant(
-            &self.services.db,
+            &self.services.sea,
             &self.conversation_id,
             &turn_id,
             (None, Some(PROVIDER_LABEL)),
@@ -1428,7 +1428,7 @@ impl Shared {
             TurnTrigger::AgentAutonomous
         };
         if let Err(error) = crate::agent::turn_record::begin_triggered(
-            &self.services.db,
+            &self.services.sea,
             &turn_id,
             &self.conversation_id,
             TurnOrigin::ClaudeCode,
@@ -1442,7 +1442,7 @@ impl Shared {
             return false;
         }
         let message_id = match begin_assistant(
-            &self.services.db,
+            &self.services.sea,
             &self.conversation_id,
             &turn_id,
             (None, Some(PROVIDER_LABEL)),
@@ -1454,7 +1454,7 @@ impl Shared {
             Ok(id) => id,
             Err(error) => {
                 tracing::error!(%error, conversation_id = %self.conversation_id, "could not open an unprompted turn's row");
-                crate::agent::turn_record::finish(&self.services.db, &turn_id, TurnStatus::Failed, Some(&error)).await;
+                crate::agent::turn_record::finish(&self.services.sea, &turn_id, TurnStatus::Failed, Some(&error)).await;
                 return false;
             }
         };
@@ -1565,7 +1565,7 @@ impl Shared {
             "an unprompted turn ended"
         );
 
-        crate::agent::turn_record::finish(&self.services.db, &turn_id, status, error.as_deref()).await;
+        crate::agent::turn_record::finish(&self.services.sea, &turn_id, status, error.as_deref()).await;
         self.emit(ChatStreamEvent::Stop {
             reason,
             message_id: Some(state.row.message_id),
@@ -1984,7 +1984,7 @@ impl Owed {
     /// Write the ledgers down, now that the agent has had them.
     async fn settle(self, services: &Services, shared: &Shared) {
         if let Some(report) = self.turns {
-            crate::agent::interrupted::confirm_delivered(&services.db, report).await;
+            crate::agent::interrupted::confirm_delivered(&services.sea, report).await;
         }
         if let Some(report) = self.queued {
             crate::agent::queue::confirm_reported(services, report).await;
@@ -3168,7 +3168,7 @@ impl AcpSession {
             .await?;
 
         let assistant_message_id = begin_assistant(
-            &services.db,
+            &services.sea,
             &self.conversation_id,
             &turn_id,
             (None, Some(PROVIDER_LABEL)),
@@ -3352,8 +3352,13 @@ impl AcpSession {
     /// whatever the tool did to the disk did not.
     async fn owed_explanations(&self, services: &Services, turn_id: &str) -> Result<Owed, String> {
         Ok(Owed {
-            turns: crate::agent::interrupted::load_block(&services.db, &services.turns, &self.conversation_id, turn_id)
-                .await?,
+            turns: crate::agent::interrupted::load_block(
+                &services.sea,
+                &services.turns,
+                &self.conversation_id,
+                turn_id,
+            )
+            .await?,
             queued: crate::agent::queue::owed(services, &self.conversation_id).await,
             shell: self.pending_shell_context(services).await?,
             // Read, not taken. A turn can assemble this and then die before a
@@ -3682,7 +3687,7 @@ impl AcpSession {
                 Err(error) => tracing::warn!(%error, turn_id, "settling ACP waiting review turn panicked"),
             }
         } else {
-            crate::agent::turn_record::finish(&services.db, turn_id, status, error.as_deref()).await;
+            crate::agent::turn_record::finish(&services.sea, turn_id, status, error.as_deref()).await;
         }
 
         self.shared.emit(ChatStreamEvent::Stop {
@@ -4136,25 +4141,32 @@ mod tests {
     /// explained goes in front of the message rather than beside it — and when
     /// there is nothing to explain, the message is passed through untouched
     /// rather than wrapped in an empty frame.
-    #[test]
-    fn what_is_owed_goes_in_front_of_the_message_and_nothing_else_does() {
+    #[tokio::test]
+    async fn what_is_owed_goes_in_front_of_the_message_and_nothing_else_does() {
         let plain = Owed::default();
         assert!(plain.is_empty());
         assert_eq!(plain.in_front_of("do the thing"), "do the thing");
 
-        let mut conn = crate::db::diesel_test_db().get().unwrap();
-        crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();
-        crate::db::ops::turn::begin(&mut conn, "dead", "c1", crate::turn::TurnOrigin::ClaudeCode, None, 1000).unwrap();
-        crate::db::ops::turn::set_phase(&mut conn, "dead", TurnPhase::RunningTool, Some("Bash"), 1001).unwrap();
+        let db = crate::db::sea::sea_test_db().await;
+        crate::db::sea::execute_for_tests(
+            &db,
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c1', 't', 0, 0)",
+        )
+        .await
+        .unwrap();
+        db.write(async |tx| {
+            use crate::db::sea::ops::turn;
+            turn::begin(tx, "dead", "c1", crate::turn::TurnOrigin::ClaudeCode, None, 1000).await?;
+            turn::set_phase(tx, "dead", TurnPhase::RunningTool, Some("Bash"), 1001).await
+        })
+        .await
+        .unwrap();
+        let coordinator = std::sync::Arc::new(crate::turn::TurnCoordinator::new());
 
         let owed = Owed {
-            turns: crate::agent::interrupted::block(
-                &mut conn,
-                &crate::turn::TurnCoordinator::new(),
-                "c1",
-                Some("asking"),
-            )
-            .unwrap(),
+            turns: crate::agent::interrupted::load_block(&db, &coordinator, "c1", "asking")
+                .await
+                .unwrap(),
             queued: None,
             shell: None,
             memory_lost: false,
@@ -4175,13 +4187,9 @@ mod tests {
         // this one says it is following none of it, which changes how the rest
         // should be read.
         let blind = Owed {
-            turns: crate::agent::interrupted::block(
-                &mut conn,
-                &crate::turn::TurnCoordinator::new(),
-                "c1",
-                Some("asking"),
-            )
-            .unwrap(),
+            turns: crate::agent::interrupted::load_block(&db, &coordinator, "c1", "asking")
+                .await
+                .unwrap(),
             queued: None,
             shell: None,
             memory_lost: true,
@@ -4759,7 +4767,7 @@ mod tests {
             crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).unwrap();
         }
         let first = begin_assistant(
-            &services.db,
+            &services.sea,
             "c1",
             "t1",
             (None, Some(PROVIDER_LABEL)),
@@ -5017,7 +5025,7 @@ mod unprompted {
             .expect("live_turn opens a turn")
             .row
             .message_id;
-        crate::agent::turn_record::finish(&shared.services.db, "t1", TurnStatus::Done, None).await;
+        crate::agent::turn_record::finish(&shared.services.sea, "t1", TurnStatus::Done, None).await;
         let recorder = Arc::new(Recorder::default());
         shared.services.events.register(recorder.clone(), false);
         (Arc::new(shared), recorder, head)

@@ -536,8 +536,8 @@ impl RunningTurn {
     /// rather than read from the config, because the config names the listener
     /// and the event names who answered — and those stop being the same thing
     /// the moment a second account connects to that listener.
-    pub async fn open_record(&self, pool: &crate::db::DbPool, self_id: Option<i64>) -> Result<(), String> {
-        crate::agent::turn_record::begin(pool, &self.turn_id, &self.conversation_id, TurnOrigin::OneBot, self_id).await
+    pub async fn open_record(&self, db: &crate::db::sea::cap::Db, self_id: Option<i64>) -> Result<(), String> {
+        crate::agent::turn_record::begin(db, &self.turn_id, &self.conversation_id, TurnOrigin::OneBot, self_id).await
     }
 
     /// Fold a finished round's numbers in. Follow-up rounds are the same turn,

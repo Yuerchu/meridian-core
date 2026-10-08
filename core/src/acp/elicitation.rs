@@ -644,9 +644,9 @@ pub async fn ask(
         return Ok(protocol::elicitation_declined());
     }
 
-    let pool = services.db.clone();
+    let db = services.sea.clone();
     let decision = engine::in_phase(
-        &pool,
+        &db,
         &turn.turn_id,
         TurnPhase::AwaitingApproval,
         Some(ASK_TOOL),

@@ -295,7 +295,7 @@ fn billing_mode_for(
 /// caller should let it fail a turn: a database that cannot take the audit copy
 /// is a problem to be shouted about, but refusing to answer the user because of
 /// it would turn a bookkeeping fault into an outage.
-pub fn record(conn: &mut SqliteConnection, msg: &message_entity::Model) -> QueryResult<()> {
+pub(super) fn record(conn: &mut SqliteConnection, msg: &message_entity::Model) -> QueryResult<()> {
     let snap = snapshot(conn, msg)?;
     let id = uuid::Uuid::new_v4().to_string();
     diesel::insert_into(audit_messages::table)

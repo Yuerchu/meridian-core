@@ -146,7 +146,7 @@ impl crate::agent::engine::Emit for BestEffortEmit {
 /// turn typing into authorisation to run a command.
 struct ChatApprovals<'a> {
     approval_fn: &'a ApprovalFn,
-    pool: DbPool,
+    db: crate::db::sea::cap::Db,
     turn_id: String,
 }
 
@@ -172,7 +172,7 @@ impl crate::agent::engine::Approvals for ChatApprovals<'_> {
         // minute, so this is a window the process can easily be killed in — and
         // dying here means nothing ran, which is worth being able to say.
         let said = engine::in_phase(
-            &self.pool,
+            &self.db,
             &self.turn_id,
             TurnPhase::AwaitingApproval,
             Some(&call.name),
@@ -905,7 +905,7 @@ async fn headless_chat_inner(
     // Emptied by the first reply read to the end, not by reading the record and
     // not by getting a request away.
     let interrupted = match coordinator {
-        Some(c) => crate::agent::interrupted::load_block(pool, c, conversation_id, turn_id).await?,
+        Some(c) => crate::agent::interrupted::load_block(sea, c, conversation_id, turn_id).await?,
         None => None,
     };
 
@@ -1098,7 +1098,7 @@ async fn headless_chat_inner(
     // things and only the caller knows which one is ending.
     let asker = ChatApprovals {
         approval_fn,
-        pool: pool.clone(),
+        db: sea.clone(),
         turn_id: turn_id.to_string(),
     };
     // `unattended`: a QQ approval is a message in a chat that nobody may be
@@ -1151,7 +1151,7 @@ async fn headless_chat_inner(
 
     let outcome = engine::run_turn(
         &engine::TurnServices {
-            pool,
+            db: sea,
             tools: tool_registry,
             mcp: mcp_registry,
             redaction: services.map(|s| &*s.redaction).unwrap_or(&DISABLED_REDACTION),
@@ -1416,26 +1416,38 @@ mod tests {
     mod approvals {
         use super::*;
         use crate::agent::engine::{ApprovalDecision, Approvals};
-        use crate::db::diesel_test_db;
         use crate::turn::TurnOrigin;
 
         /// `said` of `None` is nobody answering: the minute ran out, or the turn
         /// was swept out from under the question.
         fn asked(said: Option<&str>, tool: &str) -> Option<ApprovalDecision> {
             let said = said.map(str::to_string);
-            let pool = diesel_test_db();
-            {
-                let mut conn = pool.get().unwrap();
-                crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
-                crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::OneBot, None, 1000).unwrap();
-            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let db = runtime.block_on(async {
+                let db = crate::db::sea::sea_test_db().await;
+                crate::db::sea::execute_for_tests(
+                    &db,
+                    "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c1', 't', 1, 1)",
+                )
+                .await
+                .unwrap();
+                db.write(async |tx| {
+                    crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::OneBot, None, 1000).await
+                })
+                .await
+                .unwrap();
+                db
+            });
             let approval_fn: ApprovalFn = Box::new(move |_, _| {
                 let said = said.clone();
                 Box::pin(async move { Ok(said) })
             });
             let adapter = ChatApprovals {
                 approval_fn: &approval_fn,
-                pool: pool.clone(),
+                db,
                 turn_id: "t1".into(),
             };
             let call = ToolCall {
@@ -1443,12 +1455,7 @@ mod tests {
                 name: tool.into(),
                 arguments: "{}".into(),
             };
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(adapter.ask("m1", &call, None))
-                .unwrap()
+            runtime.block_on(adapter.ask("m1", &call, None)).unwrap()
         }
 
         /// **A QQ chat never answers "run it with nothing known about where".**
@@ -1459,7 +1466,11 @@ mod tests {
         #[test]
         fn unreadable_settings_are_refused_without_asking_the_chat() {
             let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let pool = diesel_test_db();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let db = runtime.block_on(crate::db::sea::sea_test_db());
             let counter = asked.clone();
             let approval_fn: ApprovalFn = Box::new(move |_, _| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1467,7 +1478,7 @@ mod tests {
             });
             let adapter = ChatApprovals {
                 approval_fn: &approval_fn,
-                pool,
+                db,
                 turn_id: "t1".into(),
             };
             let call = ToolCall {
@@ -1479,12 +1490,7 @@ mod tests {
                 kind: crate::events::ApprovalRetryKind::SettingsUnreadable,
                 reason: "database is locked",
             };
-            let decision = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(adapter.ask("m1", &call, Some(escalation)))
-                .unwrap();
+            let decision = runtime.block_on(adapter.ask("m1", &call, Some(escalation))).unwrap();
 
             match decision {
                 Some(ApprovalDecision::Denied(Some(reason))) => {
