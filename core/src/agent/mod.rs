@@ -51,8 +51,9 @@ pub use context::SenderNames;
 pub use context::build_messages;
 pub(crate) use context::sender_ref;
 pub use context::{
-    build_messages_with_context_items, build_messages_with_senders, load_sender_names, microcompact,
-    persisted_user_message, resolve_file_uris_in_messages, resolve_sticker_parts_in_messages, trim_to_context_limit,
+    build_messages_with_context_items, build_messages_with_senders, freeze_sticker_parts, load_sender_names,
+    microcompact, persisted_user_message, resolve_file_uris_in_messages, resolve_sticker_parts_in_messages,
+    trim_to_context_limit,
 };
 pub use file_access::{build_file_access, file_access_prompt};
 pub(crate) use inline_tag::{InlineHiddenTagParser, InlineTagSpec};

@@ -375,6 +375,19 @@ async fn handle_text_message(
         );
         serde_json::Value::Array(parts).to_string()
     };
+    // Before anything renders or stores it, and for the steered path as much as
+    // the first: `IncomingMessage` carries this string either way.
+    let user_content = if has_stickers {
+        match crate::agent::freeze_sticker_parts(&state.services.sea, &user_content).await {
+            Ok(frozen) => frozen,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not record what a message's stickers were; message not handled");
+                return vec![];
+            }
+        }
+    } else {
+        user_content
+    };
 
     run_agent_turn(
         state,

@@ -314,6 +314,9 @@ pub struct TurnSetup<'a> {
     pub withheld: WithheldWording,
     /// Where a steered message's `file://` parts resolve against.
     pub files_root: Option<std::path::PathBuf>,
+    /// What a steered message's sticker parts render against. `None` for a
+    /// runner whose messages never carry one.
+    pub stickers: Option<StickerRendering>,
     /// How earlier turns ended, for any that did not end cleanly. Retired by the
     /// first reply read all the way to the end — not by getting a request away,
     /// and not by reading the record.
@@ -326,6 +329,16 @@ pub struct TurnSetup<'a> {
     /// What set this turn going, announced with every round it opens so the
     /// transcript can tell a turn nobody asked for from the one before it.
     pub trigger: crate::turn::TurnTrigger,
+}
+
+/// Where sticker parts render from, and whether the model sees pictures: the
+/// arguments `resolve_sticker_parts_in_messages` takes for the turn's first
+/// request, held for the messages that arrive while it runs.
+#[derive(Clone)]
+pub struct StickerRendering {
+    pub db: crate::db::sea::cap::Db,
+    pub data_dir: std::path::PathBuf,
+    pub supports_images: bool,
 }
 
 /// What one reply reported, in the shape a row stores.
@@ -491,6 +504,7 @@ async fn run(
         approval_rule,
         withheld,
         files_root,
+        stickers,
         mut interrupted,
         compaction,
         pricing,
@@ -903,6 +917,7 @@ async fn run(
                 &mut parent_cursor,
                 &mut chat_messages,
                 files_root.as_deref(),
+                stickers.as_ref(),
             )
             .await?;
             narrow_offered(&mut offered, ports.steering);
@@ -1571,6 +1586,7 @@ async fn run(
                     &mut parent_cursor,
                     &mut chat_messages,
                     files_root.as_deref(),
+                    stickers.as_ref(),
                 )
                 .await?;
                 narrow_offered(&mut offered, ports.steering);
@@ -1655,6 +1671,7 @@ async fn inject_steering(
     parent_cursor: &mut Option<String>,
     chat_messages: &mut Vec<ChatMessage>,
     files_root: Option<&std::path::Path>,
+    stickers: Option<&StickerRendering>,
 ) -> Result<(), String> {
     for item in items {
         let sender = match &item.origin {
@@ -1699,6 +1716,15 @@ async fn inject_steering(
             }
             SteeredOrigin::System => ChatMessage::system_context(&item.text),
         }];
+        if let Some(s) = stickers {
+            crate::agent::resolve_sticker_parts_in_messages(
+                &mut injected,
+                Some(&s.db),
+                Some(&s.data_dir),
+                s.supports_images,
+            )
+            .await?;
+        }
         crate::agent::resolve_file_uris_in_messages(&mut injected, files_root)?;
         chat_messages.extend(injected);
     }
@@ -2195,6 +2221,7 @@ mod tests {
             approval_rule: ApprovalRule::ByReach { accept_edits: false },
             withheld: WithheldWording::Explained,
             files_root: None,
+            stickers: None,
             interrupted: None,
             compaction: CompactionPolicy::OneBot,
             pricing: None,
