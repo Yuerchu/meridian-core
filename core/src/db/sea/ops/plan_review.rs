@@ -69,6 +69,15 @@ async fn active_barrier_reviews_for_conversation(
     Ok(active)
 }
 
+/// Whether ordinary traffic in this conversation must stop at a plan-review
+/// boundary: a review is pending, or a settled one's continuation is still
+/// queued, on its way, held or in doubt.
+pub async fn has_conversation_barrier(db: &impl Snapshot, conversation_id: &str) -> Result<bool, DbErr> {
+    Ok(!active_barrier_reviews_for_conversation(db, conversation_id)
+        .await?
+        .is_empty())
+}
+
 /// Conversations whose currently blocked native continuation depends on
 /// something: `frozen_on` asks a review's frozen runtime, and `standing` asks
 /// the conversation itself, which is consulted only for an active legacy
@@ -295,5 +304,31 @@ mod tests {
         assert_eq!(model("p1", "m").await, ["frozen"]);
         assert!(model("p1", "other").await.is_empty(), "the model has to match too");
         assert!(model("p2", "m").await.is_empty(), "a settled review holds nothing");
+    }
+
+    /// A conversation's own barrier: a pending review, or a settled one whose
+    /// continuation is not yet acknowledged.
+    #[tokio::test]
+    async fn a_conversation_is_held_by_a_pending_review_or_an_undelivered_continuation() {
+        let db = sea_test_db().await;
+        review(&db, "pending", "pending", None, None).await;
+        review(&db, "queued", "approved", None, None).await;
+        delivery(&db, "queued", "held").await;
+        review(&db, "acked", "approved", None, None).await;
+        delivery(&db, "acked", "acknowledged").await;
+        execute_for_tests(
+            &db,
+            "INSERT INTO conversations (id, created_at, updated_at) VALUES ('quiet', 1, 1)",
+        )
+        .await
+        .unwrap();
+
+        for (conversation, held) in [("pending", true), ("queued", true), ("acked", false), ("quiet", false)] {
+            let answer = db
+                .read(async |tx| has_conversation_barrier(tx, conversation).await)
+                .await
+                .unwrap();
+            assert_eq!(answer, held, "{conversation}");
+        }
     }
 }

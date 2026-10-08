@@ -21,6 +21,7 @@ pub mod model_profile;
 pub mod notification;
 pub mod plan_review;
 pub mod preference;
+pub mod project;
 pub mod provider;
 pub mod redaction_rule;
 pub mod skill;

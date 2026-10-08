@@ -32,13 +32,3 @@ pub struct ProjectInsert<'a> {
     pub created_at: i64,
     pub updated_at: i64,
 }
-
-#[derive(Debug, Default, AsChangeset)]
-#[diesel(table_name = projects)]
-pub struct ProjectChangeset {
-    pub name: Option<String>,
-    pub path: Option<Option<String>>,
-    pub assistant_id: Option<Option<String>>,
-    pub description: Option<Option<String>>,
-    pub updated_at: Option<i64>,
-}

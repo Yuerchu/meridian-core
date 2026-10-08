@@ -1,10 +1,5 @@
 //! `projects`: a working directory, or the project a OneBot chat is filed
 //! under.
-//!
-//! The entity exists ahead of the project ops, which still run on Diesel
-//! inside the plan-review barrier transactions: the skill bindings reference
-//! this table, and the drift test checks a reference only when both ends have
-//! an entity.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -44,6 +39,17 @@ impl Related<super::assistant::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// A partial update: a field left `None` is not written. The nullable
+/// columns are `Option<Option<_>>`, so `Some(None)` clears one.
+#[derive(Debug, Default, DeriveIntoActiveModel)]
+pub struct ProjectChangeset {
+    pub name: Option<String>,
+    pub path: Option<Option<String>>,
+    pub assistant_id: Option<Option<String>>,
+    pub description: Option<Option<String>>,
+    pub updated_at: Option<EpochMs>,
+}
 
 /// Where a project came from. The column has no `CHECK`, so this type is what
 /// holds the list closed. Re-exported from `db::models::project` while the

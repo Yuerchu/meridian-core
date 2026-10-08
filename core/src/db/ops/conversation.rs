@@ -77,19 +77,6 @@ pub fn list_conversations_by_project(
         .load::<ConversationRow>(conn)
 }
 
-/// Every conversation whose runtime workspace is derived from this project.
-///
-/// Unlike the sidebar query above this includes archived and delegated rows:
-/// changing or deleting the project changes their next turn's working
-/// directory too, and an active turn/review on either kind must block it.
-pub fn ids_by_project(conn: &mut SqliteConnection, project_id: &str) -> QueryResult<Vec<String>> {
-    conversations::table
-        .filter(conversations::project_id.eq(project_id))
-        .select(conversations::id)
-        .order(conversations::id.asc())
-        .load(conn)
-}
-
 pub fn update_title(conn: &mut SqliteConnection, id: &str, title: &str, now: i64) -> QueryResult<()> {
     diesel::update(conversations::table.find(id))
         .set((conversations::title.eq(title), conversations::updated_at.eq(now)))
