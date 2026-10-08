@@ -428,6 +428,19 @@ pub async fn purge_expired_trash(tx: &WriteTx, now: EpochMs) -> Result<u64, DbEr
         .rows_affected)
 }
 
+/// Every memory filed under a deleted project. Hard delete, not soft: with the
+/// project gone a tombstone's scope_id points nowhere, so it could be neither
+/// restored nor shown in the trash. Memories carry no foreign key to the
+/// project (scope_id is polymorphic), so `project::delete_project` calls this.
+pub async fn delete_project_memories(tx: &WriteTx, project_id: &str) -> Result<u64, DbErr> {
+    Ok(memory::Entity::delete_many()
+        .filter(memory::Column::ScopeType.eq(MemoryScope::Project))
+        .filter(memory::Column::ScopeId.eq(project_id))
+        .exec(tx.conn()?)
+        .await?
+        .rows_affected)
+}
+
 /// Safety net for the case a future migration rebuilds `projects`: foreign keys
 /// are off during migrations, so even a real FK would not have cascaded.
 pub async fn purge_orphan_project_memories(tx: &WriteTx) -> Result<u64, DbErr> {

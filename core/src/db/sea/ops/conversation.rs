@@ -5,7 +5,7 @@
 //! it, and stays a dual implementation (`docs/dual-impl.md`) until the last
 //! Diesel caller has moved.
 
-use sea_orm::{DbErr, EntityTrait, QuerySelect};
+use sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 
 use crate::db::entity::conversation;
 use crate::db::sea::cap::Read;
@@ -15,6 +15,20 @@ pub async fn all_ids(db: &impl Read) -> Result<Vec<String>, DbErr> {
     conversation::Entity::find()
         .select_only()
         .column(conversation::Column::Id)
+        .into_tuple()
+        .all(db.conn()?)
+        .await
+}
+
+/// Every conversation whose working directory comes from this project, by
+/// id. Archived and delegated rows count: changing or deleting the project
+/// changes their next turn's directory too.
+pub async fn ids_by_project(db: &impl Read, project_id: &str) -> Result<Vec<String>, DbErr> {
+    conversation::Entity::find()
+        .filter(conversation::Column::ProjectId.eq(project_id))
+        .select_only()
+        .column(conversation::Column::Id)
+        .order_by_asc(conversation::Column::Id)
         .into_tuple()
         .all(db.conn()?)
         .await

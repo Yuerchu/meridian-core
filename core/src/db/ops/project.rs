@@ -1,15 +1,9 @@
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
-use crate::db::models::project::{ProjectChangeset, ProjectInsert, ProjectRow};
+use crate::db::models::project::{ProjectInsert, ProjectRow};
 #[allow(unused_imports)]
 use crate::db::schema::projects;
-
-pub fn list_projects(conn: &mut SqliteConnection) -> QueryResult<Vec<ProjectRow>> {
-    projects::table
-        .order(projects::updated_at.desc())
-        .load::<ProjectRow>(conn)
-}
 
 pub fn get_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<ProjectRow> {
     projects::table.find(id).first::<ProjectRow>(conn)
@@ -40,7 +34,11 @@ pub fn find_project_by_path(conn: &mut SqliteConnection, path: &str) -> QueryRes
     if wanted.is_empty() {
         return Ok(None);
     }
-    Ok(list_projects(conn)?
+    // Most recently touched first, so of two spellings of one directory the
+    // live project wins, as it did when this read the listing.
+    Ok(projects::table
+        .order(projects::updated_at.desc())
+        .load::<ProjectRow>(conn)?
         .into_iter()
         .find(|p| p.path.as_deref().map(normalize_path).as_deref() == Some(wanted.as_str())))
 }
@@ -71,22 +69,6 @@ pub(crate) fn normalize_path(path: &str) -> String {
 pub fn create_project(conn: &mut SqliteConnection, new: &ProjectInsert) -> QueryResult<ProjectRow> {
     diesel::insert_into(projects::table).values(new).execute(conn)?;
     projects::table.find(new.id).first::<ProjectRow>(conn)
-}
-
-pub fn update_project(conn: &mut SqliteConnection, id: &str, changeset: &ProjectChangeset) -> QueryResult<ProjectRow> {
-    diesel::update(projects::table.find(id)).set(changeset).execute(conn)?;
-    projects::table.find(id).first::<ProjectRow>(conn)
-}
-
-/// Memories are not reachable by foreign key any more (scope_id is polymorphic),
-/// so the cascade happens here — in ops rather than in the command layer, so
-/// every caller is covered.
-pub fn delete_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<()> {
-    conn.transaction(|conn| {
-        crate::db::ops::memory::delete_project_memories(conn, id)?;
-        diesel::delete(projects::table.find(id)).execute(conn)?;
-        Ok(())
-    })
 }
 
 #[cfg(test)]
