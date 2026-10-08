@@ -106,10 +106,10 @@ impl Tool for ReadBackgroundOutputTool {
         let (launcher, conversation) = launcher(context)?;
         let id = task_id(&args)?;
         let offset = args["offset"].as_u64().unwrap_or(0);
+        // domain-default: the schema documents an absent max_bytes as the most one read returns
         let max_bytes = args["max_bytes"]
             .as_u64()
-            .map(|n| n as usize)
-            .unwrap_or(crate::background::READ_MAX);
+            .map_or(crate::background::READ_MAX, |n| n as usize);
         let wait = Duration::from_millis(args["wait_ms"].as_u64().unwrap_or(0));
         let output = launcher.read(conversation, id, offset, max_bytes, wait).await?;
 
