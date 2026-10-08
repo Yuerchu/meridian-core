@@ -4,6 +4,9 @@
 //! such pair with its remaining Diesel callers, and the checker keeps the two
 //! in step.
 
+pub mod acp_context_delivery;
+pub mod acp_session;
+pub mod acp_session_notice;
 pub mod assistant;
 pub mod audit;
 pub mod background_task;
@@ -17,6 +20,7 @@ pub mod journal;
 pub mod mcp_server;
 pub mod memory;
 pub mod message;
+pub mod message_context_item;
 pub mod model_config;
 pub mod model_profile;
 pub mod notification;

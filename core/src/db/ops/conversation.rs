@@ -5,6 +5,8 @@ use crate::db::entity::{conversation, turn};
 use crate::db::models::conversation::{ConversationInsert, ConversationRow, SubAgentRun};
 use crate::db::models::turn::TurnRow;
 use crate::db::schema::conversations;
+// One transcript reading, whichever ORM ran the query.
+pub use crate::db::sea::ops::conversation::{TranscriptHit, searchable_text, snippet_around};
 
 /// A Diesel row as the entity model; a stored value this build cannot read
 /// fails the read, as it does on the SeaORM side.
@@ -202,18 +204,6 @@ pub fn sub_agent_conversation_ids(conn: &mut SqliteConnection, parent_id: &str) 
         .load::<String>(conn)
 }
 
-/// One conversation that says the query somewhere in its transcript, with a
-/// snippet around the newest mention.
-#[derive(Debug)]
-pub struct TranscriptHit {
-    pub conversation_id: String,
-    pub title: Option<String>,
-    /// Who said the matched line — `user` or `assistant`.
-    pub role: String,
-    pub snippet: String,
-    pub created_at: i64,
-}
-
 #[derive(diesel::QueryableByName)]
 struct RawTranscriptHitRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -332,73 +322,6 @@ pub fn search_transcripts(conn: &mut SqliteConnection, query: &str, limit: usize
             return Ok(hits);
         }
     }
-}
-
-/// What a row *reads as*. A block-array row stores JSON; the words are its
-/// `text` members and everything else — data URIs, type tags — is transport.
-///
-/// The leading test is byte-for-byte the SQL prefilter's `LIKE '[%'` branch,
-/// on purpose: a row this function decodes but the prefilter does not ship is
-/// a row that can never match. The `type` check keeps a *plain* message that
-/// happens to be a JSON array — someone pasting `[1, 2, 3]` — matchable as the
-/// text it is.
-fn searchable_text(content: &str) -> String {
-    if content.starts_with('[')
-        && let Ok(serde_json::Value::Array(parts)) = serde_json::from_str::<serde_json::Value>(content)
-        && parts.iter().all(|p| p.get("type").is_some())
-    {
-        return parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
-    content.to_string()
-}
-
-/// How much of the line travels with a match. Chars, not bytes: the transcript
-/// is largely CJK, where 30 bytes is ten characters.
-const SNIPPET_BEFORE: usize = 24;
-const SNIPPET_AFTER: usize = 56;
-
-/// A window of text around the first occurrence of `query`, or `None` when the
-/// readable text never says it.
-///
-/// ASCII case folding, deliberately the same fold SQLite's LIKE applies: plain
-/// rows only reach here through the LIKE prefilter, so a broader Unicode fold
-/// would accept matches ("Ä" for "ä") on exactly the rows the prefilter never
-/// ships — a promise the pipeline as a whole cannot keep. Folding ASCII is
-/// also byte-preserving, so the offset found in the folded copy needs no
-/// translation back.
-fn snippet_around(text: &str, query: &str) -> Option<String> {
-    let anchor = text.to_ascii_lowercase().find(&query.to_ascii_lowercase())?;
-
-    let start = text[..anchor]
-        .char_indices()
-        .rev()
-        .take(SNIPPET_BEFORE)
-        .last()
-        .map_or(anchor, |(i, _)| i);
-    let end = text[anchor..]
-        .char_indices()
-        .nth(query.chars().count() + SNIPPET_AFTER)
-        .map_or(text.len(), |(i, _)| anchor + i);
-
-    let mut snippet = String::new();
-    if start > 0 {
-        snippet.push('…');
-    }
-    // Newlines flatten to spaces: the snippet is one line under a title, and a
-    // line break inside it would push the match out of the row.
-    snippet.extend(
-        text[start..end]
-            .chars()
-            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c }),
-    );
-    if end < text.len() {
-        snippet.push('…');
-    }
-    Some(snippet)
 }
 
 #[cfg(test)]
