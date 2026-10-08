@@ -63,6 +63,12 @@ impl From<String> for PlanReviewStoreError {
     }
 }
 
+impl From<&str> for PlanReviewStoreError {
+    fn from(value: &str) -> Self {
+        Self::Contract(value.to_owned())
+    }
+}
+
 pub type PlanReviewStoreResult<T> = Result<T, PlanReviewStoreError>;
 
 pub fn markdown_sha256(content: &str) -> String {

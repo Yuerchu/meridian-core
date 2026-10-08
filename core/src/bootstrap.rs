@@ -88,7 +88,7 @@ pub async fn bootstrap_with_secrets(
     let sea = db::sea::open(&db_path)
         .await
         .map_err(|error| format!("could not open the database through SeaORM: {error}"))?;
-    startup_recovery(&pool, &sea, &plan_files).await;
+    startup_recovery(&sea, &plan_files).await;
     // The preference lives in the database, so the first few lines above
     // are recorded at the default level.
     crate::logging::apply_saved_level(&sea).await?;
@@ -437,17 +437,16 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
 /// A list, not a loop over anything, so a change of order or a dropped item
 /// shows up in review; `a_turn_killed_by_a_crash_holds_its_queue_at_the_next_start`
 /// fails if the interrupted-turn reconciliation stops running at startup.
-pub(crate) async fn startup_recovery(
-    pool: &db::DbPool,
-    sea: &db::sea::cap::Db,
-    plan_files: &crate::plan_files::PlanFileStore,
-) {
-    let mut conn = pool.get().expect("db connection");
+pub(crate) async fn startup_recovery(sea: &db::sea::cap::Db, plan_files: &crate::plan_files::PlanFileStore) {
+    use db::sea::ops::plan_review as plan_ops;
     let now = now_ms();
 
     // Memories no longer hang off projects by foreign key, and migrations run
     // with foreign keys off anyway, so a table rebuild can leave orphans behind.
-    match db::ops::plan_review::backfill_legacy_artifacts(&mut conn, now) {
+    match sea
+        .write(async |tx| plan_ops::backfill_legacy_artifacts(tx, now).await)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => tracing::info!(documents = n, "backfilled legacy plan artifacts"),
         // The old rows remain readable through their existing path, so this is
@@ -455,7 +454,10 @@ pub(crate) async fn startup_recovery(
         // unavailable. The next startup retries the idempotent backfill.
         Err(error) => tracing::error!(error = %error, "could not backfill legacy plan artifacts"),
     }
-    match db::ops::plan_review::reconcile_dispatched_deliveries(&mut conn, now) {
+    match sea
+        .write(async |tx| plan_ops::reconcile_dispatched_deliveries(tx, now).await)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => tracing::warn!(deliveries = n, "reconciled plan review deliveries after restart"),
         Err(error) => tracing::error!(error = %error, "could not reconcile plan review deliveries"),
@@ -518,7 +520,7 @@ pub(crate) async fn startup_recovery(
         Err(e) => tracing::error!(error = %e, "could not reconcile interrupted turns"),
     }
 
-    match plan_files.reconcile_all(&mut conn, now_ms()) {
+    match plan_files.reconcile_all(sea, now_ms()).await {
         Ok(reports) => {
             let conflicts = reports.iter().filter(|(_, report)| report.conflict.is_some()).count();
             if conflicts > 0 {
@@ -576,20 +578,14 @@ pub async fn reconnect_mcp(services: Services) {
 /// continuation turn, so leaving them behind would let a later direct prompt
 /// overtake the already queued follow-up.
 pub async fn resume_completed_plan_review_queues(services: Services) {
-    let pool = services.db.clone();
-    let resumes = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::plan_review::list_startup_queue_resumes(&mut conn).map_err(|error| error.to_string())
-    })
-    .await;
+    let resumes = services
+        .sea
+        .read(async |tx| crate::db::sea::ops::plan_review::list_startup_queue_resumes(tx).await)
+        .await;
     let resumes = match resumes {
-        Ok(Ok(resumes)) => resumes,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "could not read plan-review queue resumes at startup");
-            return;
-        }
+        Ok(resumes) => resumes,
         Err(error) => {
-            tracing::warn!(%error, "reading plan-review queue resumes panicked");
+            tracing::warn!(%error, "could not read plan-review queue resumes at startup");
             return;
         }
     };
@@ -613,14 +609,13 @@ pub async fn resume_completed_plan_review_queues(services: Services) {
             tracing::warn!(conversation_id, "plan-review queue resume made no durable progress");
             continue;
         }
-        let pool = services.db.clone();
-        let cleared = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|error| error.to_string())?;
-            crate::db::ops::plan_review::finish_startup_queue_resume(&mut conn, &delivery_id, now_ms())
-                .map_err(|error| error.to_string())
-        })
-        .await;
-        if !matches!(cleared, Ok(Ok(true))) {
+        let cleared = services
+            .sea
+            .write(async |tx| {
+                crate::db::sea::ops::plan_review::finish_startup_queue_resume(tx, &delivery_id, now_ms()).await
+            })
+            .await;
+        if !matches!(cleared, Ok(true)) {
             tracing::warn!(
                 conversation_id,
                 "could not clear a completed plan-review queue resume marker"

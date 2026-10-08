@@ -1134,7 +1134,5 @@ mod tests {
         let error = get_conversation(&mut conn, "c1").unwrap_err().to_string();
         assert!(error.contains("conversation c1 has an invalid is_pinned"), "{error}");
         assert!(list_conversations(&mut conn, false).is_err());
-        let error = crate::db::ops::turn::get(&mut conn, "t1").unwrap_err().to_string();
-        assert!(error.contains("unknown turn status 'from_the_future'"), "{error}");
     }
 }

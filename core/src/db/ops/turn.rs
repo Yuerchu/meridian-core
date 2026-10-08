@@ -236,20 +236,6 @@ pub fn list_for_conversation(conn: &mut SqliteConnection, conversation_id: &str)
         .collect()
 }
 
-/// One turn's record, for a caller that has the id and wants the verdict.
-///
-/// `None` for an id with no row, which is not an error: a turn can fail before
-/// it has written one, and the callers here treat "no record" and "did not
-/// reach an ending" the same way.
-pub(super) fn get(conn: &mut SqliteConnection, turn_id: &str) -> QueryResult<Option<turn::Model>> {
-    turns::table
-        .find(turn_id)
-        .first::<TurnRow>(conn)
-        .optional()?
-        .map(model)
-        .transpose()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
