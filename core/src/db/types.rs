@@ -46,6 +46,20 @@ impl From<bool> for SqlBool {
     }
 }
 
+/// A 0/1 flag carried as an integer outside the database (the prepared
+/// context items do); anything else is an error, as it is at the read.
+impl TryFrom<i32> for SqlBool {
+    type Error = String;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self(false)),
+            1 => Ok(Self(true)),
+            other => Err(format!("expected a 0/1 flag, found {other}")),
+        }
+    }
+}
+
 impl From<SqlBool> for bool {
     fn from(value: SqlBool) -> Self {
         value.0

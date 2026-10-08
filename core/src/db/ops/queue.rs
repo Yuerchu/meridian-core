@@ -51,7 +51,7 @@ pub fn enqueue(
     enqueue_with_context(conn, id, conversation_id, content, delivery, &[], now)
 }
 
-pub fn enqueue_with_context(
+pub(super) fn enqueue_with_context(
     conn: &mut SqliteConnection,
     id: &str,
     conversation_id: &str,

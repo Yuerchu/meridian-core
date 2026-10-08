@@ -40,6 +40,26 @@ impl Delivery {
 
 text_enum_column!(Delivery);
 
+/// Where one queued message has got to.
+///
+/// Derived from which timestamps are set rather than stored as a column,
+/// because the timestamps are what the writes actually produce — a status
+/// column beside them would be a second answer that could disagree after a
+/// partial write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueState {
+    /// Nothing has happened to it. Safe to deliver.
+    Queued,
+    /// Handed to a runner, and what became of it is not known. Never
+    /// re-delivered; reported to the agent instead. See the migration.
+    InDoubt,
+    /// It became a `messages` row.
+    Settled,
+    /// The turn before it did not finish, so it waits for a person.
+    Held,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "queued_prompts")]
 pub struct Model {
@@ -76,3 +96,19 @@ impl Related<super::conversation::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+impl Model {
+    /// Read from which timestamps are set: settled, then dispatched (in
+    /// doubt), then held, else still queued.
+    pub fn state(&self) -> QueueState {
+        if self.settled_at.is_some() {
+            QueueState::Settled
+        } else if self.dispatched_at.is_some() {
+            QueueState::InDoubt
+        } else if self.held_at.is_some() {
+            QueueState::Held
+        } else {
+            QueueState::Queued
+        }
+    }
+}

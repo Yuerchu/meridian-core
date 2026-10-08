@@ -3,27 +3,7 @@ use serde::Serialize;
 
 use crate::db::schema::queued_prompts;
 
-pub use crate::db::entity::queued_prompt::Delivery;
-
-/// Where one queued message has got to.
-///
-/// Derived from which timestamps are set rather than stored as a column,
-/// because the timestamps are what the writes actually produce — a status
-/// column beside them would be a second answer that could disagree after a
-/// partial write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueState {
-    /// Nothing has happened to it. Safe to deliver.
-    Queued,
-    /// Handed to a runner, and what became of it is not known. Never
-    /// re-delivered; reported to the agent instead. See the migration.
-    InDoubt,
-    /// It became a `messages` row.
-    Settled,
-    /// The turn before it did not finish, so it waits for a person.
-    Held,
-}
+pub use crate::db::entity::queued_prompt::{Delivery, QueueState};
 
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable, Serialize)]
 #[diesel(table_name = queued_prompts)]

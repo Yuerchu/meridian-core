@@ -97,7 +97,7 @@ pub fn set_phase(
 /// review row contains everything needed to continue, and no task or lease is
 /// expected to remain alive. `ended_at` stays NULL because the tool call has
 /// not received its decision yet.
-pub fn wait_for_review(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<usize> {
+pub(super) fn wait_for_review(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<usize> {
     diesel::update(running(id))
         .set((
             turns::status.eq(TurnStatus::WaitingReview.as_str()),
@@ -260,24 +260,7 @@ pub fn unreported_for_conversation(
     Ok(out)
 }
 
-/// Which ledger records that a turn has been described.
-///
-/// A delegated run has two audiences — its own conversation, which the user can
-/// open and read, and the one that spawned it — and one column cannot serve
-/// both. With a single `reported_at`, opening the sub-agent and typing one
-/// message would consume the notice, and the parent would never hear that a tool
-/// had been left half-run.
-///
-/// Two columns rather than a `(turn, recipient)` table because depth is one by
-/// construction: a sub-agent is handed no way to delegate, so a turn has at most
-/// two audiences. Lift that and this has to become the table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ledger {
-    /// `turns.reported_at`: the conversation the turn ran in has been told.
-    Own,
-    /// `turns.parent_reported_at`: the conversation that delegated it has.
-    Parent,
-}
+pub use crate::db::sea::ops::turn::Ledger;
 
 /// A turn that may still owe an explanation, and who it owes it to.
 pub struct InterruptedCandidate {

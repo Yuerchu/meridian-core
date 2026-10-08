@@ -4,7 +4,7 @@ use diesel::sqlite::SqliteConnection;
 use crate::db::models::queued_prompt_context_item::{QueuedPromptContextItemInsert, QueuedPromptContextItemRow};
 use crate::db::schema::queued_prompt_context_items;
 
-pub fn insert_prepared(
+pub(super) fn insert_prepared(
     conn: &mut SqliteConnection,
     queue_id: &str,
     items: &[crate::workspace::reference::PreparedContextItem],
