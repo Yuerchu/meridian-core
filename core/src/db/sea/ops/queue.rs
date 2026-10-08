@@ -315,6 +315,30 @@ pub async fn mark_dispatched(
         .rows_affected)
 }
 
+/// Spend a queued item on the turn of its own that `message_id` opens: claim
+/// it, settle it onto that row and drop its frozen context, in the caller's
+/// write — the one that wrote the row. A claim refused (somebody else took
+/// it, or it was held or dragged out of first place since it was read) is an
+/// error, so the row goes back with it rather than a second copy landing.
+/// `None` for the mode: with nothing running, every mode is deliverable.
+pub async fn spend(
+    tx: &WriteTx,
+    conversation_id: &str,
+    id: &str,
+    turn_id: &str,
+    message_id: &str,
+    now: EpochMs,
+) -> Result<(), DbErr> {
+    if mark_dispatched(tx, conversation_id, id, None, turn_id, now).await? == 0 {
+        return Err(DbErr::Custom(format!(
+            "queued message '{id}' is no longer the one to deliver"
+        )));
+    }
+    mark_settled(tx, id, Some(message_id), now).await?;
+    queued_prompt_context_item::delete_for_queue(tx, id).await?;
+    Ok(())
+}
+
 /// The send came back, so the doubt is resolved. `None` for the message means
 /// "not yet": writing NULL over an id `attach_message` already filled in is
 /// how a concurrent finish erases the link, so it is left alone.
@@ -1033,6 +1057,44 @@ mod tests {
     }
 
     /// A settled row keeps its place in the list but is never re-taken.
+    #[tokio::test]
+    async fn a_refused_spend_takes_the_row_written_beside_it_back() {
+        let db = with_conversations(&["c1"]).await;
+        db.write(async |tx| {
+            enqueue(tx, "q1", "c1", "first", Delivery::FollowUp, 1).await?;
+            enqueue(tx, "q2", "c1", "second", Delivery::FollowUp, 2).await
+        })
+        .await
+        .unwrap();
+        let row = |id: &str| crate::db::sea::ops::message::new_row(id, "c1", "user", "x", 3);
+
+        // q2 is not the front: the claim is refused and the row goes with it.
+        let refused = db
+            .write(async |tx| {
+                crate::db::sea::ops::message::append_message(tx, row("m2"), None).await?;
+                spend(tx, "c1", "q2", "t1", "m2", 3).await
+            })
+            .await;
+        assert!(refused.is_err());
+        assert!(
+            crate::db::sea::ops::message::list_messages(&db, "c1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(get(&db, "q2").await.unwrap().unwrap().state(), QueueState::Queued);
+
+        db.write(async |tx| {
+            crate::db::sea::ops::message::append_message(tx, row("m1"), None).await?;
+            spend(tx, "c1", "q1", "t1", "m1", 4).await
+        })
+        .await
+        .unwrap();
+        let spent = get(&db, "q1").await.unwrap().unwrap();
+        assert_eq!(spent.state(), QueueState::Settled);
+        assert_eq!(spent.settled_message_id.as_deref(), Some("m1"));
+    }
+
     #[tokio::test]
     async fn settled_items_are_stepped_over() {
         let db = with_conversations(&["c1"]).await;

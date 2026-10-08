@@ -6,7 +6,7 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
 use crate::db::entity::queued_prompt;
-use crate::db::models::queue::{Delivery, QueueState, QueuedPromptInsert, QueuedPromptRow};
+use crate::db::models::queue::{Delivery, QueuedPromptInsert, QueuedPromptRow};
 use crate::db::schema::queued_prompts;
 
 /// A Diesel row as the entity model; a stored delivery mode this build cannot
@@ -24,6 +24,7 @@ fn contract_error(message: String) -> diesel::result::Error {
 /// Includes settled rows: the front end draws them as they leave, and dropping
 /// them here would make an item vanish a beat before its message appears.
 /// Callers that only want work use `next_pending`.
+#[cfg(test)]
 pub(super) fn list(conn: &mut SqliteConnection, conversation_id: &str) -> QueryResult<Vec<queued_prompt::Model>> {
     queued_prompts::table
         .filter(queued_prompts::conversation_id.eq(conversation_id))
@@ -118,101 +119,6 @@ pub fn enqueue_with_context_in_transaction(
         .select(QueuedPromptRow::as_select())
         .first::<QueuedPromptRow>(conn)
         .and_then(model)
-}
-
-/// Mark an item as handed over without a message row of our own.
-///
-/// The hosted case: `_session/steering` puts the text into the agent's own
-/// conversation, and the row this app writes is a copy for the transcript
-/// rather than the thing the agent reads. So the two cannot be made atomic with
-/// respect to *the agent*, and this records the attempt before it is made —
-/// which is what turns a kill in the gap into a reportable doubt instead of a
-/// silent loss.
-///
-/// **It is a claim on the deliverable front, not on an id.** Everything a
-/// runner checked before it got here — that the item is not held, that it is
-/// still first, that it is still the mode that was read — can change in the
-/// gap, which for a hosted steer spans a round trip to a child process. Only
-/// `dispatched_at` was being re-checked, so a queue held by a person between
-/// the read and the claim was delivered anyway, and so was an item somebody had
-/// just dragged out of first place.
-///
-/// `expect` is the mode the caller intends to deliver *in*: `Some(Interject)`
-/// for a steer, which is void if the user switched the row to `follow_up`, and
-/// `None` for a turn of its own, where any mode is deliverable because there is
-/// nothing to wait for.
-///
-/// Assumes the caller is inside a transaction — two of the three are, writing
-/// the message row in the same one. [`super::super::agent::queue`]'s steer path
-/// opens its own, because there the claim stands alone.
-pub fn mark_dispatched(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-    id: &str,
-    expect: Option<Delivery>,
-    turn_id: &str,
-    now: i64,
-) -> QueryResult<usize> {
-    // The front is the first row that is not settled — which is exactly what
-    // `next_pending` walks to, since a settled row is stepped over and a held
-    // or in-doubt one stops it. So being the front and being deliverable are
-    // one question asked of one row.
-    let Some(front) = list(conn, conversation_id)?
-        .into_iter()
-        .find(|item| item.state() != QueueState::Settled)
-    else {
-        return Ok(0);
-    };
-    let delivery = front.delivery;
-    if front.id != id || front.state() != QueueState::Queued || expect.is_some_and(|mode| delivery != mode) {
-        return Ok(0);
-    }
-
-    diesel::update(
-        queued_prompts::table
-            .find(id)
-            .filter(queued_prompts::conversation_id.eq(conversation_id))
-            .filter(queued_prompts::dispatched_at.is_null()),
-    )
-    .set((
-        queued_prompts::dispatched_at.eq(Some(now)),
-        queued_prompts::dispatched_turn_id.eq(Some(turn_id)),
-    ))
-    .execute(conn)
-}
-
-/// And the other half: the send came back, so the doubt is resolved.
-///
-/// `None` for the row means "not yet" — a steered message is settled the
-/// moment the agent takes it, and the transcript row arrives at the next
-/// round boundary. Writing NULL over an id that `attach_message` already
-/// filled in is how a concurrent `session/prompt` finish erases the link.
-pub fn mark_settled(conn: &mut SqliteConnection, id: &str, message_id: Option<&str>, now: i64) -> QueryResult<usize> {
-    match message_id {
-        Some(message_id) => diesel::update(queued_prompts::table.find(id))
-            .set((
-                queued_prompts::settled_at.eq(Some(now)),
-                queued_prompts::settled_message_id.eq(Some(message_id)),
-            ))
-            .execute(conn),
-        None => diesel::update(queued_prompts::table.find(id))
-            .set(queued_prompts::settled_at.eq(Some(now)))
-            .execute(conn),
-    }
-}
-
-/// Name the transcript row a settled item became, once it has one.
-///
-/// Split from [`mark_settled`] because for a steered message the two facts
-/// arrive apart. The agent's `injected` is what resolves the doubt and it comes
-/// back in milliseconds; the row is written at the next round boundary, which
-/// is however long the tool call in flight takes. Waiting for the row to settle
-/// the item would leave the queue stopped behind it for that whole time, on a
-/// message that has demonstrably arrived.
-pub fn attach_message(conn: &mut SqliteConnection, id: &str, message_id: &str) -> QueryResult<usize> {
-    diesel::update(queued_prompts::table.find(id))
-        .set(queued_prompts::settled_message_id.eq(Some(message_id)))
-        .execute(conn)
 }
 
 /// Whether a queued message carries anything besides text.

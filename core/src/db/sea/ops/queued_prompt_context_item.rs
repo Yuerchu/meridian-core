@@ -76,3 +76,80 @@ pub async fn delete_for_queue(tx: &WriteTx, queue_id: &str) -> Result<u64, DbErr
         .await?
         .rows_affected)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::entity::queued_prompt::Delivery;
+    use crate::db::sea::ops::queue;
+    use crate::db::sea::{execute_for_tests, sea_test_db};
+    use crate::workspace::reference::MessageContextKind;
+
+    fn prepared(id: &str, content: &str) -> PreparedContextItem {
+        PreparedContextItem {
+            id: id.into(),
+            kind: MessageContextKind::ProjectFile,
+            content: content.into(),
+            display_path: Some("src/lib.rs".into()),
+            line_start: None,
+            line_end: None,
+            content_hash: "hash".into(),
+            byte_count: 9,
+            line_count: 1,
+            token_count: 2,
+            truncated: 0,
+            metadata: None,
+        }
+    }
+
+    /// The prompt and its frozen snapshot are written together and read back
+    /// as they were frozen; spending the item drops the snapshot, and so does
+    /// deleting the prompt.
+    #[tokio::test]
+    async fn a_prompt_and_its_frozen_snapshot_live_and_die_together() {
+        let db = sea_test_db().await;
+        execute_for_tests(
+            &db,
+            "INSERT INTO conversations (id, created_at, updated_at) VALUES ('c1', 1, 1)",
+        )
+        .await
+        .unwrap();
+        let context = [prepared("x1", "old bytes"), prepared("x2", "more bytes")];
+        db.write(async |tx| {
+            queue::enqueue_with_context(tx, "q1", "c1", "read @src/lib.rs", Delivery::FollowUp, &context, 2).await?;
+            queue::enqueue_with_context(tx, "q2", "c1", "and again", Delivery::FollowUp, &context[..1], 3)
+                .await
+                .map(|_| ())
+        })
+        .await
+        .expect_err("a context id is frozen once");
+        assert!(
+            list_prepared(&db, "q1").await.unwrap().is_empty(),
+            "the failed write took q1 with it"
+        );
+
+        db.write(async |tx| {
+            queue::enqueue_with_context(tx, "q1", "c1", "read @src/lib.rs", Delivery::FollowUp, &context, 2).await
+        })
+        .await
+        .unwrap();
+        let got = list_prepared(&db, "q1").await.unwrap();
+        assert_eq!(got, context);
+
+        assert_eq!(db.write(async |tx| delete_for_queue(tx, "q1").await).await.unwrap(), 2);
+        assert!(list_prepared(&db, "q1").await.unwrap().is_empty());
+
+        db.write(async |tx| {
+            queue::enqueue_with_context(tx, "q2", "c1", "again", Delivery::FollowUp, &[prepared("x3", "b")], 3).await
+        })
+        .await
+        .unwrap();
+        execute_for_tests(&db, "DELETE FROM queued_prompts WHERE id = 'q2'")
+            .await
+            .unwrap();
+        assert!(
+            list_prepared(&db, "q2").await.unwrap().is_empty(),
+            "the snapshot goes with its prompt"
+        );
+    }
+}

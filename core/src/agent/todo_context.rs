@@ -22,8 +22,9 @@
 
 use diesel::sqlite::SqliteConnection;
 
-use crate::db::DbPool;
 use crate::db::entity::message as message_entity;
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::Db;
 
 const SOURCE_TAG: &str = "todo";
 
@@ -97,11 +98,24 @@ pub fn plan_todo_injection(
     conversation_id: &str,
     live: &[message_entity::Model],
 ) -> Result<Option<TodoInjection>, String> {
-    let rendered = match crate::db::ops::todo::get_active_view(conn, conversation_id) {
-        Ok(view) => view
-            .as_ref()
-            .and_then(crate::db::ops::todo::format_todo_block)
-            .map(|block| block.trim_start().to_string()),
+    let rendered = crate::db::ops::todo::get_active_view(conn, conversation_id)
+        .map(|view| {
+            view.as_ref()
+                .and_then(crate::db::ops::todo::format_todo_block)
+                .map(|block| block.trim_start().to_string())
+        })
+        .map_err(|e| e.to_string());
+    decide(conversation_id, live, rendered)
+}
+
+/// What to freeze, given the live path and the checklist as it renders now.
+fn decide(
+    conversation_id: &str,
+    live: &[message_entity::Model],
+    rendered: Result<Option<String>, String>,
+) -> Result<Option<TodoInjection>, String> {
+    let rendered = match rendered {
+        Ok(rendered) => rendered,
         // Not "empty": an empty answer would write the cleared marker and tell
         // the model the checklist is gone when only the read failed.
         Err(e) => {
@@ -130,26 +144,30 @@ pub fn plan_todo_injection(
     })
 }
 
-/// Async wrapper for the call sites that hold a pool rather than a connection.
+/// [`plan_todo_injection`] on SeaORM, for the turns: the list and its items
+/// are read in one snapshot.
 pub async fn plan_todo_injection_async(
-    pool: &DbPool,
-    conversation_id: String,
-    live: Vec<message_entity::Model>,
+    db: &Db,
+    conversation_id: &str,
+    live: &[message_entity::Model],
 ) -> Result<Option<TodoInjection>, String> {
-    let pool = pool.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|e| e.to_string())?;
-        plan_todo_injection(&mut conn, &conversation_id, &live)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let rendered = db
+        .read(async |tx| crate::db::sea::ops::todo::get_active_view(tx, conversation_id).await)
+        .await
+        .map(|view| {
+            view.as_ref()
+                .and_then(crate::db::sea::ops::todo::format_todo_block)
+                .map(|block| block.trim_start().to_string())
+        })
+        .map_err(|e: DbErr| e.to_string());
+    decide(conversation_id, live, rendered)
 }
 
 /// Freeze this turn's checklist block into the history, after the memory row and
 /// ahead of the user message, and answer with the row the next write should
 /// hang off. Same writer, same failure policy as the memory row.
 pub async fn persist_todo_injection(
-    pool: &DbPool,
+    db: &Db,
     injection: &TodoInjection,
     conversation_id: &str,
     turn_id: &str,
@@ -157,7 +175,7 @@ pub async fn persist_todo_injection(
     now: i64,
 ) -> Option<String> {
     super::memory_context::persist_context_row(
-        pool,
+        db,
         injection.text.clone(),
         injection.source(),
         "checklist",
@@ -176,7 +194,7 @@ mod tests {
     use crate::db::models::todo::ItemStatus;
     use crate::db::ops::todo::{TodoItemSpec, replace_active_list};
 
-    fn seed(pool: &DbPool) {
+    fn seed(pool: &crate::db::DbPool) {
         let mut conn = pool.get().unwrap();
         crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
         crate::db::ops::turn::begin(&mut conn, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).unwrap();
@@ -281,86 +299,64 @@ mod tests {
     /// off it; and once it is on the path, the next turn has nothing to add.
     #[tokio::test]
     async fn a_changed_checklist_writes_exactly_one_row_before_the_message() {
-        let pool = diesel_test_db();
-        seed(&pool);
-        let live = |pool: &DbPool| {
-            let mut conn = pool.get().unwrap();
-            let conv = crate::db::ops::conversation::get_conversation(&mut conn, "c1").unwrap();
-            let history = crate::db::ops::message::list_messages(&mut conn, "c1").unwrap();
-            crate::db::ops::message::active_context(&history, conv.head_message_id.as_deref())
+        use crate::db::sea::ops::{conversation as conversation_ops, message as message_ops, todo as todo_ops};
+
+        let db = crate::db::sea::sea_test_db().await;
+        db.write(async |tx| {
+            conversation_ops::create_conversation(tx, "c1", Some("t"), None, None, 1).await?;
+            crate::db::sea::ops::turn::begin(tx, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).await
+        })
+        .await
+        .unwrap();
+        async fn live(db: &Db) -> Vec<message_entity::Model> {
+            let conv = conversation_ops::get_conversation(db, "c1").await.unwrap().unwrap();
+            let history = message_ops::list_messages(db, "c1").await.unwrap();
+            message_ops::active_context(&history, conv.head_message_id.as_deref())
                 .live()
                 .to_vec()
-        };
-        let user_row = |pool: &DbPool, id: &str, parent: Option<&str>, now: i64| {
-            let mut conn = pool.get().unwrap();
-            crate::db::ops::message::append_message(
-                &mut conn,
-                &crate::db::models::message::MessageInsert {
-                    id,
-                    conversation_id: "c1",
-                    role: "user",
-                    content: "go on",
-                    provider_id: None,
-                    model_id: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    sort_order: 0,
-                    created_at: now,
-                    reasoning_content: None,
-                    rating: None,
-                    schema_version: 2,
-                    is_compact_summary: 0,
-                    sender_id: None,
-                    parent_id: None,
-                    compact_anchor_id: None,
-                    source: None,
-                    turn_id: Some("t1"),
-                    tool_outcome: None,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
-                    server_tool_calls: None,
-                    provider_name: None,
-                    response_model_id: None,
-                },
-                parent,
-            )
-            .unwrap();
-        };
-
-        {
-            let mut conn = pool.get().unwrap();
-            replace_active_list(&mut conn, "c1", "Ship it", &[step("step", ItemStatus::Pending)], 10).unwrap();
         }
-        let first = {
-            let path = live(&pool);
-            let mut conn = pool.get().unwrap();
-            plan_todo_injection(&mut conn, "c1", &path).unwrap().unwrap()
-        };
-        let first_row = persist_todo_injection(&pool, &first, "c1", "t1", None, 100)
+        async fn user_row(db: &Db, id: &str, parent: Option<&str>, now: i64) {
+            let row = message_entity::Model {
+                turn_id: Some("t1".into()),
+                ..message_ops::new_row(id, "c1", "user", "go on", now)
+            };
+            db.write(async |tx| message_ops::append_message(tx, row, parent).await)
+                .await
+                .unwrap();
+        }
+        async fn tick(db: &Db, status: ItemStatus, now: i64) {
+            let items = [todo_ops::TodoItemSpec {
+                content: "step".into(),
+                active_form: "stepping".into(),
+                status,
+            }];
+            db.write(async |tx| todo_ops::replace_active_list(tx, "c1", "Ship it", &items, now).await)
+                .await
+                .unwrap();
+        }
+
+        tick(&db, ItemStatus::Pending, 10).await;
+        let first = plan_todo_injection_async(&db, "c1", &live(&db).await)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_row = persist_todo_injection(&db, &first, "c1", "t1", None, 100)
             .await
             .expect("the row is written and its id handed back");
-        user_row(&pool, "u1", Some(&first_row), 101);
+        user_row(&db, "u1", Some(&first_row), 101).await;
 
-        {
-            let mut conn = pool.get().unwrap();
-            replace_active_list(&mut conn, "c1", "Ship it", &[step("step", ItemStatus::InProgress)], 200).unwrap();
-        }
-        let second = {
-            let path = live(&pool);
-            let mut conn = pool.get().unwrap();
-            plan_todo_injection(&mut conn, "c1", &path)
-                .unwrap()
-                .expect("a ticked step is a changed list")
-        };
+        tick(&db, ItemStatus::InProgress, 200).await;
+        let second = plan_todo_injection_async(&db, "c1", &live(&db).await)
+            .await
+            .unwrap()
+            .expect("a ticked step is a changed list");
         assert_ne!(second.text, first.text);
-        let second_row = persist_todo_injection(&pool, &second, "c1", "t1", Some("u1".into()), 300)
+        let second_row = persist_todo_injection(&db, &second, "c1", "t1", Some("u1".into()), 300)
             .await
             .unwrap();
-        user_row(&pool, "u2", Some(&second_row), 301);
+        user_row(&db, "u2", Some(&second_row), 301).await;
 
-        let path = live(&pool);
+        let path = live(&db).await;
         let todo_rows: Vec<&message_entity::Model> = path
             .iter()
             .filter(|r| r.role == "context" && r.source.as_deref().is_some_and(|s| s.starts_with("todo|")))
@@ -374,8 +370,7 @@ mod tests {
             "the message hangs off the new row"
         );
 
-        let mut conn = pool.get().unwrap();
-        assert_eq!(plan_todo_injection(&mut conn, "c1", &path).unwrap(), None);
+        assert_eq!(plan_todo_injection_async(&db, "c1", &path).await.unwrap(), None);
     }
 
     /// Finishing the last step archives the list. The model's newest frozen row

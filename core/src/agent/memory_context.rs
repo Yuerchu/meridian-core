@@ -4,7 +4,6 @@
 //! (desktop chat, its token-counting mirror, and OneBot) cannot drift apart on
 //! privacy rules the way three hand-copied loaders would.
 
-use crate::db::DbPool;
 use crate::db::entity::memory;
 use crate::db::entity::memory::{GLOBAL_SCOPE_ID, MemoryScope, Visibility, onebot_user_scope_id};
 use crate::db::entity::message as message_entity;
@@ -1125,7 +1124,7 @@ async fn forgotten_section(
 /// `Full` to scan back to and send everything again. Degrading into a re-send is
 /// the right direction for this to fail in.
 pub async fn persist_injection(
-    pool: &DbPool,
+    db: &Db,
     injection: &Injection,
     conversation_id: &str,
     turn_id: &str,
@@ -1136,7 +1135,7 @@ pub async fn persist_injection(
         return parent;
     };
     persist_context_row(
-        pool,
+        db,
         text.trim_start().to_string(),
         injection.source(),
         "memory",
@@ -1158,7 +1157,7 @@ pub async fn persist_injection(
 /// failed turn (see `persist_injection`); `label` names the block in the warning.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_context_row(
-    pool: &DbPool,
+    db: &Db,
     text: String,
     source: String,
     label: &'static str,
@@ -1168,63 +1167,26 @@ pub(crate) async fn persist_context_row(
     now: i64,
 ) -> Option<String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let (pool2, conv, turn, hang_on) = (
-        pool.clone(),
-        conversation_id.to_string(),
-        turn_id.to_string(),
-        parent.clone(),
-    );
-    let written = tokio::task::spawn_blocking(move || {
-        let mut conn = pool2.get().map_err(|e| e.to_string())?;
-        crate::db::ops::message::append_message(
-            &mut conn,
-            &crate::db::models::message::MessageInsert {
-                id: &id,
-                conversation_id: &conv,
-                role: "context",
-                content: &text,
-                provider_id: None,
-                model_id: None,
-                input_tokens: None,
-                output_tokens: None,
-                tool_calls: None,
-                tool_call_id: None,
-                sort_order: 0,
-                created_at: now,
-                reasoning_content: None,
-                rating: None,
-                schema_version: 2,
-                is_compact_summary: 0,
-                sender_id: None,
-                parent_id: None,
-                compact_anchor_id: None,
-                source: Some(&source),
-                turn_id: Some(&turn),
-                tool_outcome: None,
-                // Nobody was billed for remembering something.
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                server_tool_calls: None,
-                provider_name: None,
-                response_model_id: None,
-            },
-            hang_on.as_deref(),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok::<_, String>(id)
-    })
-    .await;
-    let reason = match written {
-        Ok(Ok(id)) => return Some(id),
-        Ok(Err(e)) => e,
-        Err(e) => e.to_string(),
+    let row = crate::db::sea::ops::message::ContextRowInsert {
+        id: &id,
+        conversation_id,
+        content: &text,
+        source: &source,
+        turn_id: Some(turn_id),
+        created_at: now,
     };
-    tracing::warn!(
-        conversation_id = %conversation_id,
-        block = label,
-        error = %reason,
-        "the {label} block could not be recorded; the next turn will send it again",
-    );
+    let written = db
+        .write(async |tx| crate::db::sea::ops::message::append_context(tx, &row, parent.as_deref()).await)
+        .await;
+    match written {
+        Ok(()) => return Some(id),
+        Err(e) => tracing::warn!(
+            conversation_id = %conversation_id,
+            block = label,
+            error = %e,
+            "the {label} block could not be recorded; the next turn will send it again",
+        ),
+    }
     parent
 }
 

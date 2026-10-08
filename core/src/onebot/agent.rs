@@ -9,7 +9,6 @@ use crate::agent::{
     TokenBudget, build_messages_with_senders, microcompact, resolve_provider_config, trim_to_context_limit,
 };
 use crate::db::DbPool;
-use crate::db::models::message::MessageInsert;
 use crate::db::models::turn::TurnPhase;
 use crate::mcp::McpRegistry;
 use crate::provider::{self, ChatMessage, ToolCall};
@@ -872,7 +871,7 @@ async fn headless_chat_inner(
     let injection = crate::agent::plan_injection_async(sea, memory_request, ctx.live().to_vec(), t0).await?;
     // The checklist, frozen the same way and placed right after memory. A QQ
     // group never has one and this is a no-op there; a private admin chat can.
-    let todo = crate::agent::plan_todo_injection_async(pool, conversation_id.to_string(), ctx.live().to_vec()).await?;
+    let todo = crate::agent::plan_todo_injection_async(sea, conversation_id, ctx.live()).await?;
     let keep_recent = assistant.as_ref().map(|a| a.compact_keep_recent as usize).unwrap_or(10);
 
     let budget = TokenBudget::new(
@@ -886,6 +885,7 @@ async fn headless_chat_inner(
     // Nicknames are not on the message row (they change), so history is
     // re-attributed from the subject table.
     // Cosmetic: a failed read renders speakers by number for one turn.
+    // pool-read-before-write: display names for rendering; the row writes below do not depend on them.
     let sender_names = crate::db::sea::ops::memory::list_subjects(sea)
         .await
         .map(|subjects| {
@@ -996,66 +996,34 @@ async fn headless_chat_inner(
     // turn has to find it.
     if let Some(ref injection) = injection {
         parent_cursor =
-            crate::agent::persist_injection(pool, injection, conversation_id, turn_id, parent_cursor, now).await;
+            crate::agent::persist_injection(sea, injection, conversation_id, turn_id, parent_cursor, now).await;
     }
     // After memory, before the messages: the order `trailing` sent them in.
     if let Some(ref todo) = todo {
         parent_cursor =
-            crate::agent::persist_todo_injection(pool, todo, conversation_id, turn_id, parent_cursor, now).await;
+            crate::agent::persist_todo_injection(sea, todo, conversation_id, turn_id, parent_cursor, now).await;
     }
     {
-        let pool = pool.clone();
-        let conv_id = conversation_id.to_string();
         let mut parent = parent_cursor.clone();
         parent_cursor = rows.last().map(|r| r.id.clone()).or(parent_cursor);
-        let turn = turn_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
+        // One write for the lot: a group turn opening with three messages
+        // either has all three on the path or none of them.
+        sea.write(async |tx| {
             for row in &rows {
-                crate::db::ops::message::append_message(
-                    &mut conn,
-                    &MessageInsert {
-                        id: &row.id,
-                        conversation_id: &conv_id,
-                        role: "user",
-                        content: &row.text,
-                        provider_id: None,
-                        model_id: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        sort_order: 0,
-                        created_at: row.created_at,
-                        reasoning_content: None,
-                        rating: None,
-                        schema_version: 2,
-                        is_compact_summary: 0,
-                        sender_id: row.sender_id,
-                        parent_id: None,
-                        compact_anchor_id: None,
-                        source: None,
-                        turn_id: Some(&turn),
-                        tool_outcome: None,
-                        // What someone said cost no tokens and came from no upstream.
-                        cache_read_tokens: None,
-                        cache_write_tokens: None,
-                        server_tool_calls: None,
-                        provider_name: None,
-                        response_model_id: None,
-                    },
-                    parent.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
-                crate::db::ops::emoji::link_stickers_in_content(&mut conn, &row.id, &row.text)
-                    .map_err(|e| e.to_string())?;
+                let model = crate::db::entity::message::Model {
+                    sender_id: row.sender_id,
+                    turn_id: Some(turn_id.to_string()),
+                    ..crate::db::sea::ops::message::new_row(&row.id, conversation_id, "user", &row.text, row.created_at)
+                };
+                crate::db::sea::ops::message::append_message(tx, model, parent.as_deref()).await?;
+                crate::db::sea::ops::emoji::link_stickers_in_content(tx, &row.id, &row.text).await?;
                 // Queued messages chain to each other, not all to the same parent.
                 parent = Some(row.id.clone());
             }
-            Ok::<_, String>(())
+            Ok::<_, crate::db::sea::DbErr>(())
         })
         .await
-        .map_err(|e| e.to_string())??;
+        .map_err(|e| e.to_string())?;
     }
 
     // Build tool context. The command settings and the sandbox policy were

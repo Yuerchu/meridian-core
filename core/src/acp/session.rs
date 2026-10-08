@@ -1035,15 +1035,11 @@ impl Shared {
             .await
             {
                 Ok(id) => {
-                    let pool = self.services.db.clone();
-                    let queue_id = item.queue_id.clone();
-                    let message_id = id.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let mut conn = get_conn(&pool)?;
-                        crate::db::ops::queue::attach_message(&mut conn, &queue_id, &message_id)
-                            .map_err(|e| e.to_string())
-                    })
-                    .await;
+                    let _ = self
+                        .services
+                        .sea
+                        .write(async |tx| crate::db::sea::ops::queue::attach_message(tx, &item.queue_id, &id).await)
+                        .await;
                     self.emit(ChatStreamEvent::UserMessage {
                         message_id: id.clone(),
                         content: item.text.clone(),
@@ -3064,14 +3060,9 @@ impl AcpSession {
     /// failed. Marking it in doubt instead would warn the next agent about a
     /// message sitting in plain sight a few rows above.
     pub async fn deliver_queued(&self, services: &Services, item: &queued_prompt::Model) -> Result<(), String> {
-        let pool = services.db.clone();
-        let queue_id = item.id.clone();
-        let context = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::queued_prompt_context_item::list_prepared(&mut conn, &queue_id).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let context = crate::db::sea::ops::queued_prompt_context_item::list_prepared(&services.sea, &item.id)
+            .await
+            .map_err(|e| e.to_string())?;
         // Checked before the turn as well as inside it, for what a refusal
         // does here. A direct send hands the refusal to the person who pressed
         // send; a queued item has nobody waiting on it, and returned as an
@@ -3435,112 +3426,41 @@ impl AcpSession {
         queued: Option<&str>,
         context: &[crate::workspace::reference::PreparedContextItem],
     ) -> Result<String, String> {
-        use crate::db::models::message::MessageInsert;
-        use diesel::Connection;
-
-        let pool = services.db.clone();
-        let conversation_id = self.conversation_id.clone();
-        let turn_id = turn_id.to_string();
+        let conversation_id = self.conversation_id.as_str();
         let message_id = uuid::Uuid::new_v4().to_string();
-        let returned = message_id.clone();
-        let content = text.to_string();
-        let queued = queued.map(str::to_string);
-        let context = context.to_vec();
+        let now = now_ms();
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let now = now_ms();
-            conn.transaction::<_, diesel::result::Error, _>(|conn| {
-                let head = crate::db::ops::conversation::get_conversation(conn, &conversation_id)
-                    .ok()
+        services
+            .sea
+            .write(async |tx| {
+                let head = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+                    .await?
                     .and_then(|c| c.head_message_id);
+                let row = crate::db::entity::message::Model {
+                    turn_id: Some(turn_id.to_string()),
+                    ..crate::db::sea::ops::message::new_row(&message_id, conversation_id, "user", text, now)
+                };
+                crate::db::sea::ops::message::append_message(tx, row, head.as_deref()).await?;
+                crate::db::sea::ops::message_context_item::insert_prepared(tx, &message_id, context, now).await?;
 
-                crate::db::ops::message::append_message(
-                    conn,
-                    &MessageInsert {
-                        id: &message_id,
-                        conversation_id: &conversation_id,
-                        role: "user",
-                        content: &content,
-                        provider_id: None,
-                        model_id: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        sort_order: 0,
-                        created_at: now,
-                        reasoning_content: None,
-                        rating: None,
-                        schema_version: 2,
-                        is_compact_summary: 0,
-                        sender_id: None,
-                        parent_id: head.as_deref(),
-                        compact_anchor_id: None,
-                        source: None,
-                        turn_id: Some(&turn_id),
-                        tool_outcome: None,
-                        cache_read_tokens: None,
-                        cache_write_tokens: None,
-                        server_tool_calls: None,
-                        provider_name: None,
-                        response_model_id: None,
-                    },
-                    head.as_deref(),
-                )?;
-
-                let context_rows = context
-                    .iter()
-                    .enumerate()
-                    .map(
-                        |(position, item)| crate::db::models::message_context_item::MessageContextItemInsert {
-                            id: &item.id,
-                            message_id: &message_id,
-                            position: position as i32,
-                            kind: item.kind.as_str(),
-                            content: &item.content,
-                            display_path: item.display_path.as_deref(),
-                            line_start: item.line_start,
-                            line_end: item.line_end,
-                            content_hash: &item.content_hash,
-                            byte_count: item.byte_count,
-                            line_count: item.line_count,
-                            token_count: item.token_count,
-                            truncated: item.truncated,
-                            metadata: item.metadata.as_deref(),
-                            created_at: now,
-                        },
-                    )
-                    .collect::<Vec<_>>();
-                crate::db::ops::message_context_item::insert_many(conn, &context_rows)?;
-
-                crate::db::ops::turn::begin(conn, &turn_id, &conversation_id, TurnOrigin::ClaudeCode, None, now)?;
-                if let Some(queued) = &queued {
+                crate::db::sea::ops::turn::begin(tx, turn_id, conversation_id, TurnOrigin::ClaudeCode, None, now)
+                    .await?;
+                if let Some(queued) = queued {
                     // Refuses an item somebody has already taken, and rolls the
                     // whole thing back rather than writing a second row for it.
                     // The turn lease makes that all but impossible — two pumps
                     // cannot both hold the conversation — and "all but" is the
                     // wrong guarantee for a message that says "delete the old
-                    // migration".
-                    // `None`: this is a turn of its own, and with nothing
-                    // running every mode is deliverable — an `interject` left
-                    // over from a turn that has ended is still the next thing
-                    // the user meant to happen.
-                    if crate::db::ops::queue::mark_dispatched(conn, &conversation_id, queued, None, &turn_id, now)? == 0
-                    {
-                        return Err(diesel::result::Error::RollbackTransaction);
-                    }
-                    crate::db::ops::queue::mark_settled(conn, queued, Some(&message_id), now)?;
-                    crate::db::ops::queued_prompt_context_item::delete_for_queue(conn, queued)?;
+                    // migration". An `interject` left over from a turn that has
+                    // ended is still the next thing the user meant to happen.
+                    crate::db::sea::ops::queue::spend(tx, conversation_id, queued, turn_id, &message_id, now).await?;
                 }
                 Ok(())
             })
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+            .await
+            .map_err(|e: crate::db::sea::DbErr| e.to_string())?;
 
-        Ok(returned)
+        Ok(message_id)
     }
 
     /// Land the transcript and report how the turn ended.

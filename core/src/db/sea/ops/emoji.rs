@@ -212,6 +212,34 @@ pub async fn attach_captured_media(
     .await
 }
 
+/// Record which stickers a message shows, in order, from its parts. Content
+/// that is not a parts array has none; a link already there is left alone.
+pub async fn link_stickers_in_content(tx: &WriteTx, message_id: &str, content: &str) -> Result<(), DbErr> {
+    let Ok(parts) = serde_json::from_str::<Vec<serde_json::Value>>(content) else {
+        return Ok(());
+    };
+    for (position, sticker_id) in parts
+        .iter()
+        .filter(|part| part.get("type").and_then(|v| v.as_str()) == Some("sticker"))
+        .filter_map(|part| part.get("sticker_id").and_then(|v| v.as_str()))
+        .enumerate()
+    {
+        let link = crate::db::entity::message_sticker::ActiveModel {
+            message_id: sea_orm::ActiveValue::Set(message_id.to_owned()),
+            sticker_id: sea_orm::ActiveValue::Set(sticker_id.to_owned()),
+            position: sea_orm::ActiveValue::Set(position as i32),
+        };
+        crate::db::entity::message_sticker::Entity::insert(link)
+            .on_conflict_do_nothing_on([
+                crate::db::entity::message_sticker::Column::MessageId,
+                crate::db::entity::message_sticker::Column::Position,
+            ])
+            .exec_without_returning(tx.conn()?)
+            .await?;
+    }
+    Ok(())
+}
+
 pub async fn count_by_pack(db: &impl Read, pack_id: &str) -> Result<u64, DbErr> {
     emoji::Entity::find()
         .filter(emoji::Column::PackId.eq(pack_id))
@@ -383,5 +411,42 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(get_emoji(&db, "s1").await.is_err());
+    }
+
+    /// A message's sticker parts become links in the order they appear;
+    /// linking again changes nothing, and text that is not a parts array has
+    /// none.
+    #[tokio::test]
+    async fn a_message_links_the_stickers_it_shows_in_order() {
+        let db = with_pack().await;
+        insert(&db, sticker("s1", "p", EmojiSemanticStatus::Confirmed)).await;
+        insert(&db, sticker("s2", "p", EmojiSemanticStatus::Confirmed)).await;
+        crate::db::sea::execute_for_tests(
+            &db,
+            "INSERT INTO conversations (id, created_at, updated_at) VALUES ('c1', 1, 1);
+             INSERT INTO messages (id, conversation_id, role, content, created_at)
+                 VALUES ('m1', 'c1', 'user', 'a', 1), ('m2', 'c1', 'user', 'b', 2)",
+        )
+        .await
+        .unwrap();
+        let content = r#"[{"type":"sticker","sticker_id":"s2"},{"type":"text","text":"and"},{"type":"sticker","sticker_id":"s1"}]"#;
+        for _ in 0..2 {
+            db.write(async |tx| link_stickers_in_content(tx, "m1", content).await)
+                .await
+                .unwrap();
+        }
+        db.write(async |tx| link_stickers_in_content(tx, "m2", "plain words").await)
+            .await
+            .unwrap();
+
+        let links: Vec<_> = crate::db::entity::message_sticker::Entity::find()
+            .order_by_asc(crate::db::entity::message_sticker::Column::Position)
+            .all(db.conn().unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.message_id, l.sticker_id, l.position))
+            .collect();
+        assert_eq!(links, [("m1".into(), "s2".into(), 0), ("m1".into(), "s1".into(), 1)]);
     }
 }

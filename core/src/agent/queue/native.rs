@@ -15,7 +15,6 @@ use crate::db::models::queue::Delivery;
 use crate::db::sea::DbErr;
 use crate::db::sea::cap::Db;
 use crate::db::sea::ops::{conversation as conversation_ops, queue as queue_ops};
-use crate::db::types::SqlBool;
 use crate::events::EventBus;
 use crate::services::Services;
 use crate::util::now_ms;
@@ -190,39 +189,11 @@ async fn take_one(db: &Db, conversation_id: &str, turn_id: &str, now: i64) -> Re
         let message_id = uuid::Uuid::new_v4().to_string();
 
         let row = message::Model {
-            id: message_id.clone(),
-            conversation_id: conversation_id.to_owned(),
-            role: "user".to_owned(),
-            content: item.content.clone(),
-            provider_id: None,
-            model_id: None,
-            input_tokens: None,
-            output_tokens: None,
-            tool_calls: None,
-            tool_call_id: None,
-            sort_order: 0,
-            created_at: now,
-            reasoning_content: None,
-            rating: None,
-            schema_version: 2,
-            is_compact_summary: SqlBool::FALSE,
-            sender_id: None,
-            parent_id: None,
-            compact_anchor_id: None,
-            source: None,
             // The turn it interrupted, not a turn of its own. That is where the
             // model reads it, so a reader who found it filed elsewhere would be
             // looking at a different conversation than the model was.
             turn_id: Some(turn_id.to_owned()),
-            tool_outcome: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            provider_name: None,
-            provider_state: None,
-            auto_review: None,
-            server_tool_calls: None,
-            tool_diffs: None,
-            response_model_id: None,
+            ..crate::db::sea::ops::message::new_row(&message_id, conversation_id, "user", &item.content, now)
         };
 
         let taken = queue_ops::take_next(

@@ -37,10 +37,24 @@ pub struct ContextRowInsert<'a> {
 /// in the caller's transaction.
 pub async fn append_context(tx: &WriteTx, row: &ContextRowInsert<'_>, parent: Option<&str>) -> Result<(), DbErr> {
     let model = message::Model {
-        id: row.id.to_string(),
-        conversation_id: row.conversation_id.to_string(),
-        role: "context".to_string(),
-        content: row.content.to_string(),
+        source: Some(row.source.to_string()),
+        turn_id: row.turn_id.map(str::to_string),
+        ..new_row(row.id, row.conversation_id, "context", row.content, row.created_at)
+    };
+    link(tx, model, parent).await.map(|_| ())
+}
+
+/// A row of `role` with everything an append fills in left blank — the
+/// parent is the append's to set and `sort_order` the trigger's — and
+/// nothing billed: what somebody typed and what was injected cost no tokens
+/// and came from no upstream. Callers add what their row carries beyond that
+/// (a turn, a source, a sender).
+pub fn new_row(id: &str, conversation_id: &str, role: &str, content: &str, created_at: EpochMs) -> message::Model {
+    message::Model {
+        id: id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        role: role.to_owned(),
+        content: content.to_owned(),
         provider_id: None,
         model_id: None,
         input_tokens: None,
@@ -48,7 +62,7 @@ pub async fn append_context(tx: &WriteTx, row: &ContextRowInsert<'_>, parent: Op
         tool_calls: None,
         tool_call_id: None,
         sort_order: 0,
-        created_at: row.created_at,
+        created_at,
         reasoning_content: None,
         rating: None,
         schema_version: 2,
@@ -56,8 +70,8 @@ pub async fn append_context(tx: &WriteTx, row: &ContextRowInsert<'_>, parent: Op
         sender_id: None,
         parent_id: None,
         compact_anchor_id: None,
-        source: Some(row.source.to_string()),
-        turn_id: row.turn_id.map(str::to_string),
+        source: None,
+        turn_id: None,
         tool_outcome: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
@@ -67,8 +81,7 @@ pub async fn append_context(tx: &WriteTx, row: &ContextRowInsert<'_>, parent: Op
         server_tool_calls: None,
         tool_diffs: None,
         response_model_id: None,
-    };
-    link(tx, model, parent).await.map(|_| ())
+    }
 }
 
 /// Insert `new` under `parent` and move the conversation's head onto it.
