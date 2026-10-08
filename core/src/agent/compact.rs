@@ -8,8 +8,8 @@ use super::provider_config::{
 };
 use super::stream::is_context_window_error;
 use super::tokenizer::TokenBudget;
+use crate::db::entity::assistant;
 use crate::db::entity::message_context_item;
-use crate::db::models::assistant::AssistantRow;
 use crate::db::models::message::MessageInsert;
 use crate::db::{self, DbPool};
 use crate::provider::{self, ChatMessage, ChatProvider};
@@ -220,7 +220,7 @@ pub async fn do_compact(
     pool: &DbPool,
     secrets: &Arc<SecretsManager>,
     conversation_id: &str,
-    assistant: Option<&AssistantRow>,
+    assistant: Option<&assistant::Model>,
     keep_recent: usize,
     custom_instructions: Option<&str>,
 ) -> Result<String, String> {

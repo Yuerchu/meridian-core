@@ -19,8 +19,7 @@ pub fn insert_many(conn: &mut SqliteConnection, items: &[MessageContextItemInser
 /// A Diesel row as the entity model; an unknown kind or a flag outside 0/1
 /// fails the read.
 fn model(row: MessageContextItemRow) -> QueryResult<message_context_item::Model> {
-    message_context_item::Model::try_from(row)
-        .map_err(|message| diesel::result::Error::DeserializationError(message.into()))
+    message_context_item::Model::try_from(row).map_err(super::contract_violation)
 }
 
 pub fn list_for_message(

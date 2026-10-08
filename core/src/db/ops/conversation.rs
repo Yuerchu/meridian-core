@@ -717,7 +717,7 @@ mod tests {
             .execute(&mut conn)
             .unwrap();
 
-        let big = crate::db::models::assistant::AssistantRow {
+        let big = crate::db::entity::assistant::Model {
             provider_id: Some("anthropic".into()),
             model_id: Some("mythos".into()),
             context_limit: 200_000,
@@ -742,8 +742,8 @@ mod tests {
         assert_eq!(pinned.context_limit, 0, "the window comes from the model now");
     }
 
-    fn assistant() -> crate::db::models::assistant::AssistantRow {
-        crate::db::models::assistant::AssistantRow {
+    fn assistant() -> crate::db::entity::assistant::Model {
+        crate::db::entity::assistant::Model {
             id: "a1".into(),
             name: "A".into(),
             description: None,
@@ -754,17 +754,17 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
-            is_default: 0,
+            is_default: crate::db::types::SqlBool::FALSE,
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
             context_limit: 0,
             compact_keep_recent: 10,
             enabled_tools: None,
-            thinking_enabled: 0,
+            thinking_enabled: crate::db::types::SqlBool::FALSE,
             thinking_budget: None,
             tool_preset_id: None,
-            auto_compact_enabled: 0,
+            auto_compact_enabled: crate::db::types::SqlBool::FALSE,
         }
     }
 

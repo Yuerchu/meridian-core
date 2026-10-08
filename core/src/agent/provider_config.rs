@@ -1,5 +1,5 @@
 use crate::agent::model_config::EffectiveModelConfig;
-use crate::db::models::assistant::AssistantRow;
+use crate::db::entity::assistant;
 use crate::db::{self, DbPool};
 use crate::provider::{self, ChatParams, ProviderCapabilities, ServerToolKind};
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
@@ -52,7 +52,7 @@ pub fn build_tool_secrets(secrets: &SecretsManager, pool: &DbPool) -> std::colle
 pub fn resolve_provider_config(
     secrets: &SecretsManager,
     pool: &DbPool,
-    assistant: Option<&AssistantRow>,
+    assistant: Option<&assistant::Model>,
 ) -> Result<ResolvedProvider, String> {
     if let Some(provider_id) = assistant.and_then(|a| a.provider_id.as_deref()) {
         let mut conn = get_conn(pool)?;
@@ -242,7 +242,7 @@ fn resolve_credential(
 pub fn resolve_with_overrides(
     secrets: &SecretsManager,
     pool: &DbPool,
-    assistant: Option<&AssistantRow>,
+    assistant: Option<&assistant::Model>,
     model_override: Option<String>,
     provider_override: Option<&str>,
 ) -> Result<ResolvedProvider, String> {
@@ -329,7 +329,7 @@ pub(crate) fn without_thinking(params: ChatParams) -> ChatParams {
 }
 
 /// Everything a request needs beyond the messages: the wire parameters plus the
-/// limits the token budget is derived from. AssistantRow settings, the per-model
+/// limits the token budget is derived from. Assistant settings, the per-model
 /// config row and the catalog are layered here once, so no call site invents a
 /// value of its own — a summarisation request is filtered against the same
 /// capabilities as the turn it summarises.
@@ -349,7 +349,7 @@ pub struct TurnParams {
 }
 
 pub struct TurnParamsResolveRequest<'a> {
-    pub assistant: Option<&'a AssistantRow>,
+    pub assistant: Option<&'a assistant::Model>,
     /// The provider actually used this turn, which a per-request override may
     /// have moved away from the assistant's own.
     pub provider_id: Option<&'a str>,
@@ -483,7 +483,7 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
     let server_tools = enabled_server_tools(model_config.as_ref(), &caps)?;
 
     let (thinking_enabled, thinking_budget, thinking_effort) = provider::capabilities::resolve_thinking(
-        assistant.map(|a| a.thinking_enabled != 0).unwrap_or(false),
+        assistant.map(|a| a.thinking_enabled.get()).unwrap_or(false),
         assistant.and_then(|a| a.thinking_budget),
         thinking_level,
     )?;
@@ -556,8 +556,8 @@ mod tests {
         assert_eq!(provider_secret_name("my-provider-1"), "PROVIDER_MY_PROVIDER_1_KEY");
     }
 
-    fn assistant_with(temperature: Option<f32>) -> AssistantRow {
-        AssistantRow {
+    fn assistant_with(temperature: Option<f32>) -> assistant::Model {
+        assistant::Model {
             id: "a1".into(),
             name: "A".into(),
             description: None,
@@ -568,21 +568,21 @@ mod tests {
             temperature,
             top_p: None,
             max_tokens: None,
-            is_default: 0,
+            is_default: crate::db::types::SqlBool::FALSE,
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
             context_limit: 0,
             compact_keep_recent: 10,
             enabled_tools: None,
-            thinking_enabled: 1,
+            thinking_enabled: crate::db::types::SqlBool::TRUE,
             thinking_budget: Some(4096),
             tool_preset_id: None,
-            auto_compact_enabled: 1,
+            auto_compact_enabled: crate::db::types::SqlBool::TRUE,
         }
     }
 
-    fn resolve_for(pool: &DbPool, model: &str, assistant: &AssistantRow) -> TurnParams {
+    fn resolve_for(pool: &DbPool, model: &str, assistant: &assistant::Model) -> TurnParams {
         resolve_turn_params(
             pool,
             TurnParamsResolveRequest {

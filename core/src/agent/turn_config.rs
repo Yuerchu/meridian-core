@@ -15,7 +15,7 @@ use std::collections::HashSet;
 
 use diesel::sqlite::SqliteConnection;
 
-use crate::db::models::assistant::AssistantRow;
+use crate::db::entity::assistant;
 use crate::provider::{ServerToolKind, ToolDefinition};
 use crate::tools::ToolRegistry;
 
@@ -47,7 +47,7 @@ impl ToolExposure {
 }
 
 pub struct TurnConfigResolveRequest {
-    pub assistant: Option<AssistantRow>,
+    pub assistant: Option<assistant::Model>,
     pub conversation_id: String,
     pub project_id: Option<String>,
     /// Where the conversation is, and whether this runner can move it. The
@@ -288,7 +288,10 @@ pub fn resolve(
 /// A missing preset row or malformed JSON is a broken stored contract, not an
 /// empty allow-list. Returning an error keeps the failure visible at every
 /// runner instead of quietly changing what an assistant may do.
-fn enabled_tools(conn: &mut SqliteConnection, assistant: Option<&AssistantRow>) -> Result<Option<Vec<String>>, String> {
+fn enabled_tools(
+    conn: &mut SqliteConnection,
+    assistant: Option<&assistant::Model>,
+) -> Result<Option<Vec<String>>, String> {
     let Some(assistant) = assistant else {
         return Ok(None);
     };
@@ -303,11 +306,8 @@ fn enabled_tools(conn: &mut SqliteConnection, assistant: Option<&AssistantRow>) 
             .map_err(|error| format!("tool preset {preset_id} has invalid tool_names JSON: {error}"))?;
         return Ok(Some(names));
     }
-    assistant.enabled_tools.as_ref().map_or(Ok(None), |json| {
-        serde_json::from_str::<Vec<String>>(json)
-            .map(Some)
-            .map_err(|error| format!("assistant {} has invalid enabled_tools JSON: {error}", assistant.id))
-    })
+    // Decoded at the read: a list that is not a JSON array of names failed it.
+    Ok(assistant.enabled_tools.as_ref().map(|tools| tools.0.clone()))
 }
 
 #[cfg(test)]
@@ -337,8 +337,8 @@ mod tests {
             .unwrap();
     }
 
-    fn assistant_with(preset: Option<&str>, enabled: Option<&str>) -> AssistantRow {
-        AssistantRow {
+    fn assistant_with(preset: Option<&str>, enabled: Option<&str>) -> assistant::Model {
+        assistant::Model {
             id: "a1".into(),
             name: "A".into(),
             description: None,
@@ -349,17 +349,17 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
-            is_default: 0,
+            is_default: crate::db::types::SqlBool::FALSE,
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
             context_limit: 128000,
             compact_keep_recent: 10,
-            enabled_tools: enabled.map(str::to_string),
-            thinking_enabled: 0,
+            enabled_tools: enabled.map(|json| crate::db::types::Json::decode(json).unwrap()),
+            thinking_enabled: crate::db::types::SqlBool::FALSE,
             thinking_budget: None,
             tool_preset_id: preset.map(str::to_string),
-            auto_compact_enabled: 0,
+            auto_compact_enabled: crate::db::types::SqlBool::FALSE,
         }
     }
 
@@ -387,7 +387,7 @@ mod tests {
         Modes::Switchable(super::super::modes::resolve(id).unwrap())
     }
 
-    fn input(mode: Modes, assistant: Option<AssistantRow>) -> TurnConfigResolveRequest {
+    fn input(mode: Modes, assistant: Option<assistant::Model>) -> TurnConfigResolveRequest {
         TurnConfigResolveRequest {
             assistant,
             conversation_id: "c1".into(),
@@ -474,18 +474,6 @@ mod tests {
             .expect("malformed preset JSON must fail");
 
         assert!(error.contains("invalid tool_names JSON"), "{error}");
-    }
-
-    #[test]
-    fn malformed_enabled_tools_is_an_error() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        let assistant = assistant_with(None, Some("not json"));
-        let error = resolve(&mut conn, &reg, input(switchable(None), Some(assistant)))
-            .err()
-            .expect("malformed assistant JSON must fail");
-
-        assert!(error.contains("invalid enabled_tools JSON"), "{error}");
     }
 
     #[test]

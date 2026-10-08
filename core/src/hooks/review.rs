@@ -25,7 +25,7 @@ use crate::agent::engine::{self, ApprovalDecision, Approvals};
 use crate::agent::turn_record;
 use crate::db;
 use crate::db::DbPool;
-use crate::db::models::assistant::AssistantRow;
+use crate::db::entity::assistant;
 use crate::db::models::conversation::ConversationInsert;
 use crate::db::models::message::MessageInsert;
 use crate::db::models::turn::TurnStatus;
@@ -249,7 +249,7 @@ async fn effective_assistant(
     model: &str,
     cwd: &str,
     job: &ReviewJob,
-) -> Result<AssistantRow, Refused> {
+) -> Result<assistant::Model, Refused> {
     let (provider_id, model_id) = model.split_once(':').ok_or_else(|| {
         refuse(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -259,7 +259,7 @@ async fn effective_assistant(
 
     let pool = state.services.db.clone();
     let wanted = state.config.assistant_id.clone();
-    let base = tokio::task::spawn_blocking(move || -> Result<AssistantRow, String> {
+    let base = tokio::task::spawn_blocking(move || -> Result<assistant::Model, String> {
         let mut conn = get_conn(&pool)?;
         match wanted {
             Some(id) => db::ops::assistant::get_assistant(&mut conn, &id).map_err(|e| e.to_string()),
@@ -282,19 +282,24 @@ async fn effective_assistant(
         Kind::Plan => verdict::prompt(cwd, round, max_rounds, job.stagnant, &tools),
         Kind::Implementation => verdict::implementation_prompt(cwd, round, max_rounds, job.stagnant, &tools),
     };
-    Ok(AssistantRow {
+    Ok(assistant::Model {
         provider_id: Some(provider_id.to_string()),
         model_id: Some(model_id.to_string()),
         context_limit: 0,
         max_tokens: None,
         tool_preset_id: None,
-        enabled_tools: serde_json::to_string(&tools).ok(),
+        enabled_tools: Some(crate::db::types::Json(
+            tools.iter().map(|name| name.to_string()).collect(),
+        )),
         system_prompt,
         ..base
     })
 }
 
-async fn resolve_params(state: &SharedState, assistant: &AssistantRow) -> Result<crate::agent::TurnParams, Refused> {
+async fn resolve_params(
+    state: &SharedState,
+    assistant: &assistant::Model,
+) -> Result<crate::agent::TurnParams, Refused> {
     let pool = state.services.db.clone();
     let secrets = state.services.secrets.clone();
     let a = assistant.clone();
@@ -414,7 +419,7 @@ async fn write_round(
     conversation_id: &str,
     turn_id: &str,
     job: &ReviewJob,
-    assistant: &AssistantRow,
+    assistant: &assistant::Model,
     is_new: bool,
 ) -> Result<String, String> {
     let pool = state.services.db.clone();
@@ -582,7 +587,7 @@ fn round_prompt(job: &ReviewJob) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn run_turn(
     state: &SharedState,
-    assistant: &AssistantRow,
+    assistant: &assistant::Model,
     params: &crate::agent::TurnParams,
     conversation_id: &str,
     turn_id: &str,
@@ -740,7 +745,7 @@ async fn load_history(state: &SharedState, conversation_id: &str) -> db::ops::me
 
 async fn build_config(
     state: &SharedState,
-    assistant: &AssistantRow,
+    assistant: &assistant::Model,
     conversation_id: &str,
     params: &crate::agent::TurnParams,
 ) -> Result<crate::agent::turn_config::TurnConfig, String> {
@@ -775,7 +780,7 @@ async fn build_config(
 
 async fn build_provider(
     state: &SharedState,
-    assistant: &AssistantRow,
+    assistant: &assistant::Model,
 ) -> Result<(Box<dyn crate::provider::ChatProvider>, crate::agent::ResolvedProvider), String> {
     let pool = state.services.db.clone();
     let secrets = state.services.secrets.clone();

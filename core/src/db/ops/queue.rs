@@ -12,11 +12,7 @@ use crate::db::schema::queued_prompts;
 /// A Diesel row as the entity model; a stored delivery mode this build cannot
 /// read fails the read, as it does on the SeaORM side.
 fn model(row: QueuedPromptRow) -> QueryResult<queued_prompt::Model> {
-    queued_prompt::Model::try_from(row).map_err(contract_error)
-}
-
-fn contract_error(message: String) -> diesel::result::Error {
-    diesel::result::Error::QueryBuilderError(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, message)))
+    queued_prompt::Model::try_from(row).map_err(super::contract_violation)
 }
 
 /// Everything queued for a conversation, in the order it will be delivered.
@@ -92,7 +88,7 @@ pub fn enqueue_with_context_in_transaction(
     // row is written so it holds for every caller rather than for the one
     // command that happens to check first.
     if delivery == Delivery::Interject && carries_attachments(content)? {
-        return Err(contract_error(
+        return Err(super::contract_violation(
             "attachments can only be queued as follow-up messages".into(),
         ));
     }
@@ -127,7 +123,7 @@ pub fn enqueue_with_context_in_transaction(
 /// session, a steered message on a native one — and neither has anywhere to
 /// put an image or a file. Damaged parts are an error, never "no attachments".
 pub(super) fn carries_attachments(content: &str) -> QueryResult<bool> {
-    let parts = crate::provider::decode_message_parts(content).map_err(contract_error)?;
+    let parts = crate::provider::decode_message_parts(content).map_err(super::contract_violation)?;
     Ok(parts.is_some_and(|parts| {
         parts
             .iter()

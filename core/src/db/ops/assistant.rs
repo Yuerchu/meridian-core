@@ -1,34 +1,45 @@
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
+use crate::db::entity::assistant;
 use crate::db::models::assistant::{AssistantChangeset, AssistantInsert, AssistantRow};
 use crate::db::schema::assistants;
 
-pub fn get_assistant(conn: &mut SqliteConnection, id: &str) -> QueryResult<AssistantRow> {
-    assistants::table.find(id).first::<AssistantRow>(conn)
+/// A Diesel row as the entity model; a bad flag or tool list fails the read.
+fn model(row: AssistantRow) -> QueryResult<assistant::Model> {
+    assistant::Model::try_from(row).map_err(super::contract_violation)
 }
 
-pub fn get_default_assistant(conn: &mut SqliteConnection) -> QueryResult<Option<AssistantRow>> {
+pub fn get_assistant(conn: &mut SqliteConnection, id: &str) -> QueryResult<assistant::Model> {
+    assistants::table.find(id).first::<AssistantRow>(conn).and_then(model)
+}
+
+pub fn get_default_assistant(conn: &mut SqliteConnection) -> QueryResult<Option<assistant::Model>> {
     assistants::table
         .filter(assistants::is_default.eq(1))
         .first::<AssistantRow>(conn)
-        .optional()
+        .optional()?
+        .map(model)
+        .transpose()
 }
 
-pub fn create_assistant(conn: &mut SqliteConnection, new: &AssistantInsert) -> QueryResult<AssistantRow> {
+pub fn create_assistant(conn: &mut SqliteConnection, new: &AssistantInsert) -> QueryResult<assistant::Model> {
     diesel::insert_into(assistants::table).values(new).execute(conn)?;
-    assistants::table.find(new.id).first::<AssistantRow>(conn)
+    assistants::table
+        .find(new.id)
+        .first::<AssistantRow>(conn)
+        .and_then(model)
 }
 
 pub fn update_assistant(
     conn: &mut SqliteConnection,
     id: &str,
     changeset: &AssistantChangeset,
-) -> QueryResult<AssistantRow> {
+) -> QueryResult<assistant::Model> {
     diesel::update(assistants::table.find(id))
         .set(changeset)
         .execute(conn)?;
-    assistants::table.find(id).first::<AssistantRow>(conn)
+    assistants::table.find(id).first::<AssistantRow>(conn).and_then(model)
 }
 
 #[cfg(test)]

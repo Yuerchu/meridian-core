@@ -73,8 +73,8 @@ impl crate::db::entity::conversation::Model {
     /// here would make the swap look done while changing nothing that matters.
     pub fn pin_model(
         &self,
-        assistant: Option<crate::db::models::assistant::AssistantRow>,
-    ) -> Option<crate::db::models::assistant::AssistantRow> {
+        assistant: Option<crate::db::entity::assistant::Model>,
+    ) -> Option<crate::db::entity::assistant::Model> {
         let (provider, model) = match (&self.agent_provider_id, &self.agent_model_id) {
             (Some(p), Some(m)) if !p.trim().is_empty() && !m.trim().is_empty() => (p, m),
             _ => return assistant,
