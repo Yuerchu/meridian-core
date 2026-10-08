@@ -350,6 +350,12 @@ pub async fn list(db: &Db, conversation_id: &str) -> Result<Vec<background_task:
         .map_err(|e| e.to_string())
 }
 
+/// How many commands each conversation has running, for the conversations
+/// that have any — what the sidebar marks.
+pub async fn running_counts(db: &Db) -> Result<Vec<(String, i64)>, String> {
+    ops::running_by_conversation(db).await.map_err(|e| e.to_string())
+}
+
 /// Read a task's log. See [`Launcher::read`].
 pub async fn read(
     services: &Services,

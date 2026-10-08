@@ -91,6 +91,21 @@ pub async fn count_running(db: &impl Read, conversation_id: &str) -> Result<u64,
         .await
 }
 
+/// How many tasks each conversation has running, for the conversations that
+/// have any. One grouped read rather than one per sidebar row.
+pub async fn running_by_conversation(db: &impl Read) -> Result<Vec<(String, i64)>, DbErr> {
+    use sea_orm::QuerySelect;
+    background_task::Entity::find()
+        .select_only()
+        .column(background_task::Column::ConversationId)
+        .column_as(background_task::Column::Id.count(), "running")
+        .filter(background_task::Column::State.eq(BackgroundState::Running))
+        .group_by(background_task::Column::ConversationId)
+        .into_tuple()
+        .all(db.conn()?)
+        .await
+}
+
 /// Write how a task ended — once. A task that is no longer `running` has
 /// already been given an ending (a stop, or the reconcile at startup) and this
 /// answers 0 rather than overwriting it.
@@ -303,5 +318,10 @@ mod tests {
         assert_eq!((first, second), (1, 0), "claimed once");
         assert!(unnotified(&db, "c1", true).await.unwrap().is_empty());
         assert_eq!(count_running(&db, "c1").await.unwrap(), 1);
+        assert_eq!(
+            running_by_conversation(&db).await.unwrap(),
+            vec![("c1".to_string(), 1)],
+            "only the one still running, under its conversation"
+        );
     }
 }
