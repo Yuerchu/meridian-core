@@ -16,6 +16,8 @@ pub mod journal;
 pub mod mcp_server;
 pub mod memory;
 pub mod message;
+pub mod model_config;
+pub mod model_profile;
 pub mod notification;
 pub mod plan_review;
 pub mod preference;
