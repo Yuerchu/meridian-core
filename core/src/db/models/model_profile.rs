@@ -90,3 +90,25 @@ pub struct ModelProfileChangeset<'a> {
     pub capability_overrides: Option<&'a str>,
     pub updated_at: i64,
 }
+
+/// For the readers still on Diesel; see the same conversion on
+/// `ModelConfigRow`.
+impl From<ModelProfileRow> for crate::db::entity::model_profile::Model {
+    fn from(row: ModelProfileRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            context_window: row.context_window,
+            compact_threshold: row.compact_threshold,
+            max_output_tokens: row.max_output_tokens,
+            input_price: row.input_price,
+            output_price: row.output_price,
+            cache_read_price: row.cache_read_price,
+            cache_write_price: row.cache_write_price,
+            pricing_tiers: row.pricing_tiers,
+            capability_overrides: row.capability_overrides,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}

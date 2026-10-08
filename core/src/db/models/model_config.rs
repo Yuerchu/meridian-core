@@ -67,3 +67,26 @@ pub struct ModelConfigInsert<'a> {
     pub created_at: i64,
     pub updated_at: i64,
 }
+
+/// For the readers still on Diesel, which hand their rows to
+/// `agent::model_config::effective`; goes with them.
+impl From<ModelConfigRow> for crate::db::entity::model_config::Model {
+    fn from(row: ModelConfigRow) -> Self {
+        Self {
+            id: row.id,
+            provider_id: row.provider_id,
+            model_id: row.model_id,
+            profile_id: row.profile_id,
+            overrides_pricing: row.overrides_pricing.into(),
+            input_price: row.input_price,
+            output_price: row.output_price,
+            cache_read_price: row.cache_read_price,
+            cache_write_price: row.cache_write_price,
+            pricing_tiers: row.pricing_tiers,
+            server_tools: row.server_tools,
+            server_tool_price: row.server_tool_price,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}

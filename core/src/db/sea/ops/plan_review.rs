@@ -128,6 +128,22 @@ pub async fn barrier_conversations_for_assistant(db: &impl Snapshot, assistant_i
     .await
 }
 
+/// Conversations whose currently blocked native continuation was resolved
+/// against this exact provider and model. A legacy review with no frozen
+/// runtime blocks no model: the conversation never recorded one.
+pub async fn barrier_conversations_for_model(
+    db: &impl Snapshot,
+    provider_id: &str,
+    model: &str,
+) -> Result<Vec<String>, DbErr> {
+    barrier_conversations(
+        db,
+        |runtime| runtime.provider_id == provider_id && runtime.model == model,
+        |_| false,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +273,27 @@ mod tests {
             assistant("a2").await.is_empty(),
             "a frozen runtime outranks the conversation's own"
         );
+    }
+
+    /// The model barrier matches the frozen provider and model together, and
+    /// has no legacy fallback.
+    #[tokio::test]
+    async fn the_model_barrier_needs_the_frozen_provider_and_model() {
+        let db = sea_test_db().await;
+        review(&db, "frozen", "pending", Some("p1"), None).await;
+        review(&db, "legacy", "pending", None, Some("p1")).await;
+        review(&db, "settled", "approved", Some("p2"), None).await;
+
+        let model = |provider: &'static str, model: &'static str| {
+            let db = db.clone();
+            async move {
+                db.read(async |tx| barrier_conversations_for_model(tx, provider, model).await)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(model("p1", "m").await, ["frozen"]);
+        assert!(model("p1", "other").await.is_empty(), "the model has to match too");
+        assert!(model("p2", "m").await.is_empty(), "a settled review holds nothing");
     }
 }

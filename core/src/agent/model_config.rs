@@ -14,6 +14,7 @@
 
 use diesel::prelude::*;
 
+use crate::db::entity::{model_config as config_entity, model_profile};
 use crate::db::models::model_config::ModelConfigRow;
 use crate::db::models::model_profile::ModelProfileRow;
 use crate::db::ops::model_config;
@@ -57,24 +58,25 @@ pub struct EffectiveModelConfig {
 /// `server_tools` and `server_tool_price` are never the profile's: whether this
 /// upstream runs a search on its own side, and what it charges per call for it,
 /// is a fact about the upstream.
-pub fn effective(config: &ModelConfigRow, profile: &ModelProfileRow) -> EffectiveModelConfig {
-    let (input_price, output_price, cache_read_price, cache_write_price, pricing_tiers) = if config.overrides_pricing {
-        (
-            config.input_price.clone(),
-            config.output_price.clone(),
-            config.cache_read_price.clone(),
-            config.cache_write_price.clone(),
-            config.pricing_tiers.clone(),
-        )
-    } else {
-        (
-            profile.input_price.clone(),
-            profile.output_price.clone(),
-            profile.cache_read_price.clone(),
-            profile.cache_write_price.clone(),
-            profile.pricing_tiers.clone(),
-        )
-    };
+pub fn effective(config: &config_entity::Model, profile: &model_profile::Model) -> EffectiveModelConfig {
+    let (input_price, output_price, cache_read_price, cache_write_price, pricing_tiers) =
+        if config.overrides_pricing.get() {
+            (
+                config.input_price.clone(),
+                config.output_price.clone(),
+                config.cache_read_price.clone(),
+                config.cache_write_price.clone(),
+                config.pricing_tiers.clone(),
+            )
+        } else {
+            (
+                profile.input_price.clone(),
+                profile.output_price.clone(),
+                profile.cache_read_price.clone(),
+                profile.cache_write_price.clone(),
+                profile.pricing_tiers.clone(),
+            )
+        };
 
     EffectiveModelConfig {
         config_id: config.id.clone(),
@@ -103,7 +105,7 @@ pub fn load(
     model_id: &str,
 ) -> QueryResult<Option<EffectiveModelConfig>> {
     Ok(model_config::get_with_profile(conn, provider_id, model_id)?
-        .map(|(config, profile)| effective(&config, &profile)))
+        .map(|(config, profile)| effective(&config.into(), &profile.into())))
 }
 
 /// Every configured model on this machine, for readers that price many rows at
@@ -114,19 +116,20 @@ pub fn load_all(conn: &mut SqliteConnection) -> QueryResult<Vec<EffectiveModelCo
         .inner_join(model_profiles::table)
         .select((ModelConfigRow::as_select(), ModelProfileRow::as_select()))
         .load(conn)?;
-    Ok(rows.iter().map(|(c, p)| effective(c, p)).collect())
+    Ok(rows.into_iter().map(|(c, p)| effective(&c.into(), &p.into())).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::types::SqlBool;
 
     fn decimal(raw: &str) -> Decimal {
         raw.parse().unwrap()
     }
 
-    fn profile() -> ModelProfileRow {
-        ModelProfileRow {
+    fn profile() -> model_profile::Model {
+        model_profile::Model {
             id: "prof".into(),
             name: "Claude Sonnet 5".into(),
             context_window: 200_000,
@@ -143,13 +146,13 @@ mod tests {
         }
     }
 
-    fn config() -> ModelConfigRow {
-        ModelConfigRow {
+    fn config() -> config_entity::Model {
+        config_entity::Model {
             id: "mc".into(),
             provider_id: "vertex".into(),
             model_id: "claude-sonnet-5@20260514".into(),
             profile_id: "prof".into(),
-            overrides_pricing: false,
+            overrides_pricing: SqlBool::FALSE,
             input_price: Some(decimal("4")),
             output_price: Some(decimal("20")),
             cache_read_price: None,
@@ -198,8 +201,8 @@ mod tests {
     #[test]
     fn an_overriding_row_replaces_the_rates_whole() {
         let resolved = effective(
-            &ModelConfigRow {
-                overrides_pricing: true,
+            &config_entity::Model {
+                overrides_pricing: SqlBool::TRUE,
                 ..config()
             },
             &profile(),
@@ -216,8 +219,8 @@ mod tests {
     fn the_provider_keeps_its_own_tools_and_their_rate() {
         for overriding in [false, true] {
             let resolved = effective(
-                &ModelConfigRow {
-                    overrides_pricing: overriding,
+                &config_entity::Model {
+                    overrides_pricing: SqlBool::from(overriding),
                     ..config()
                 },
                 &profile(),

@@ -27,6 +27,8 @@ pub mod memory_proposal;
 pub mod memory_subject;
 pub mod message;
 pub mod message_sticker;
+pub mod model_config;
+pub mod model_profile;
 pub mod notification_alert_state;
 pub mod notification_webhook;
 pub mod plan_comment;
@@ -65,8 +67,6 @@ pub const PENDING_TABLES: &[&str] = &[
     "audit_messages",
     "message_context_items",
     "mode_artifacts",
-    "model_configs",
-    "model_profiles",
     "queued_prompt_context_items",
     "queued_prompts",
     "todo_items",
@@ -131,6 +131,8 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<memory_subject::Entity>(),
         shape_of::<message::Entity>(),
         shape_of::<message_sticker::Entity>(),
+        shape_of::<model_config::Entity>(),
+        shape_of::<model_profile::Entity>(),
         shape_of::<notification_alert_state::Entity>(),
         shape_of::<notification_webhook::Entity>(),
         shape_of::<plan_comment::Entity>(),

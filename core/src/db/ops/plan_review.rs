@@ -714,58 +714,6 @@ pub fn has_conversation_barrier(conn: &mut SqliteConnection, conversation_id: &s
         .is_some())
 }
 
-fn review_has_delivery_barrier(conn: &mut SqliteConnection, review_id: &str) -> PlanReviewStoreResult<bool> {
-    Ok(plan_review_deliveries::table
-        .filter(plan_review_deliveries::review_id.eq(review_id))
-        .filter(plan_review_deliveries::state.eq_any([
-            PlanDeliveryState::Queued.as_str(),
-            PlanDeliveryState::Dispatched.as_str(),
-            PlanDeliveryState::Held.as_str(),
-            PlanDeliveryState::InDoubt.as_str(),
-        ]))
-        .select(plan_review_deliveries::id)
-        .first::<String>(conn)
-        .optional()?
-        .is_some())
-}
-
-fn active_barrier_reviews_for_conversation(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-) -> PlanReviewStoreResult<Vec<PlanReviewSessionRow>> {
-    let mut active = Vec::new();
-    for review in list_reviews_for_conversation(conn, conversation_id)? {
-        if review.state()? == PlanReviewState::Pending || review_has_delivery_barrier(conn, &review.id)? {
-            active.push(review);
-        }
-    }
-    Ok(active)
-}
-
-/// Conversations whose blocked native continuation was resolved against this
-/// exact provider/model capability record.
-pub fn barrier_conversations_for_model(
-    conn: &mut SqliteConnection,
-    provider_id: &str,
-    model: &str,
-) -> PlanReviewStoreResult<Vec<String>> {
-    let mut blocked = Vec::new();
-    for conversation_id in crate::db::ops::conversation::all_ids(conn)? {
-        for review in active_barrier_reviews_for_conversation(conn, &conversation_id)? {
-            if review
-                .native_runtime_config()?
-                .is_some_and(|runtime| runtime.provider_id == provider_id && runtime.model == model)
-            {
-                blocked.push(conversation_id.clone());
-                break;
-            }
-        }
-    }
-    blocked.sort();
-    blocked.dedup();
-    Ok(blocked)
-}
-
 pub fn list_reviews(
     conn: &mut SqliteConnection,
     document_id: &str,
@@ -2683,9 +2631,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_mutation_guards_ignore_settled_historical_reviews() {
-        let pool = crate::db::diesel_test_db();
+    /// Built through the real review flow on a file both pools open; the
+    /// barrier itself is read through SeaORM.
+    #[tokio::test]
+    async fn runtime_mutation_guards_ignore_settled_historical_reviews() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, sea) = crate::db::sea::shared_test_db(dir.path()).await;
         let mut conn = pool.get().unwrap();
         let first = append_first(&mut conn, "c1", "# First plan\n");
         mark_applied(&mut conn, &first);
@@ -2768,15 +2719,19 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            barrier_conversations_for_model(&mut conn, "provider-a", "model-a")
+        drop(conn);
+        let blocked = |provider: &'static str, model: &'static str| {
+            let sea = sea.clone();
+            async move {
+                sea.read(async |tx| {
+                    crate::db::sea::ops::plan_review::barrier_conversations_for_model(tx, provider, model).await
+                })
+                .await
                 .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            barrier_conversations_for_model(&mut conn, "provider-b", "model-b").unwrap(),
-            ["c1"]
-        );
+            }
+        };
+        assert!(blocked("provider-a", "model-a").await.is_empty());
+        assert_eq!(blocked("provider-b", "model-b").await, ["c1"]);
     }
 
     #[test]

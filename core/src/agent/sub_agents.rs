@@ -146,8 +146,8 @@ pub fn catalog(conn: &mut SqliteConnection) -> Result<SubAgentCatalog, String> {
         let configs: Vec<crate::agent::model_config::EffectiveModelConfig> =
             crate::db::ops::model_config::list_by_provider_with_profiles(conn, &p.id)
                 .map_err(|error| error.to_string())?
-                .iter()
-                .map(|(config, profile)| crate::agent::model_config::effective(config, profile))
+                .into_iter()
+                .map(|(config, profile)| crate::agent::model_config::effective(&config.into(), &profile.into()))
                 .collect();
 
         for c in cached {
