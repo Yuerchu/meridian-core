@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::db::models::message::MessageRow;
+use crate::db::entity::message as message_entity;
 use crate::db::models::message_context_item::MessageContextItemRow;
 use crate::db::ops::message::ActiveContext;
 use crate::provider::{self, ChatMessage, SenderRef};
@@ -48,7 +48,7 @@ pub fn build_messages_with_senders(
 }
 
 /// Build provider history while replaying the frozen context items attached to
-/// each user row. Keeping the map separate from `MessageRow` means raw snapshots
+/// each user row. Keeping the map separate from `message_entity::Model` means raw snapshots
 /// never cross the transcript DTO or audit boundary.
 pub fn build_messages_with_context_items(
     system_prompt: &str,
@@ -174,7 +174,7 @@ pub fn persisted_user_message(
 
 fn push_history_message(
     msgs: &mut Vec<ChatMessage>,
-    m: &MessageRow,
+    m: &message_entity::Model,
     names: &SenderNames,
     context_items: Option<&[MessageContextItemRow]>,
 ) -> Result<(), String> {
@@ -744,8 +744,8 @@ mod tests {
     use super::*;
     use provider::ToolCall;
 
-    fn msg(id: &str, role: &str, content: &str) -> MessageRow {
-        MessageRow {
+    fn msg(id: &str, role: &str, content: &str) -> message_entity::Model {
+        message_entity::Model {
             id: id.into(),
             conversation_id: "c".into(),
             role: role.into(),
@@ -761,7 +761,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -794,9 +794,13 @@ mod tests {
     }
 
     /// A linear conversation with nothing compacted — what these tests are about.
-    fn ctx(history: &[MessageRow]) -> ActiveContext {
+    fn ctx(history: &[message_entity::Model]) -> ActiveContext {
         ActiveContext {
-            path: history.iter().filter(|m| m.is_compact_summary == 0).cloned().collect(),
+            path: history
+                .iter()
+                .filter(|m| !m.is_compact_summary.get())
+                .cloned()
+                .collect(),
             summary: None,
             anchor_index: None,
             head_id: history.last().map(|m| m.id.clone()),
@@ -1316,8 +1320,8 @@ mod injected_context_tests {
     }
 
     /// A stored row carrying an injection frozen by an earlier turn.
-    fn frozen_row(content: &str, source: &str) -> MessageRow {
-        MessageRow {
+    fn frozen_row(content: &str, source: &str) -> message_entity::Model {
+        message_entity::Model {
             id: "m1".into(),
             conversation_id: "c".into(),
             role: "context".into(),
@@ -1333,7 +1337,7 @@ mod injected_context_tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -1597,7 +1601,7 @@ mod injected_context_tests {
     /// accumulate one copy per compaction.
     #[test]
     fn compaction_summaries_are_not_treated_as_injected() {
-        let history = [crate::db::models::message::MessageRow {
+        let history = [crate::db::entity::message::Model {
             id: "s".into(),
             conversation_id: "c".into(),
             role: "user".into(),
@@ -1613,7 +1617,7 @@ mod injected_context_tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 1,
+            is_compact_summary: crate::db::types::SqlBool::TRUE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,

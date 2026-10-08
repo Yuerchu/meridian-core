@@ -156,7 +156,7 @@ fn user_section_prefix(sent_at: i64, sender: Option<&provider::SenderRef>) -> Re
 }
 
 fn prepare_compact_input(
-    messages: &[&crate::db::models::message::MessageRow],
+    messages: &[&crate::db::entity::message::Model],
     context_items: &HashMap<String, Vec<MessageContextItemRow>>,
     sender_names: &crate::agent::SenderNames,
 ) -> Result<Vec<CompactSection>, String> {
@@ -255,8 +255,7 @@ pub async fn do_compact(
     // only labels user/assistant/tool and would skip these anyway, but that is a
     // property of a match arm rather than a decision, and `<owner_notes>` going
     // through a summariser is not something to leave resting on one.
-    let active_messages: Vec<&db::models::message::MessageRow> =
-        ctx.path.iter().filter(|m| m.role != "context").collect();
+    let active_messages: Vec<&db::entity::message::Model> = ctx.path.iter().filter(|m| m.role != "context").collect();
 
     let min_messages = keep_recent * 2 + 2;
     if active_messages.len() < min_messages {
@@ -785,9 +784,7 @@ fn extract_recent_files_from_chat(messages: &[ChatMessage]) -> String {
     out
 }
 
-fn extract_recent_files_from_db_messages(
-    messages: &[&crate::db::models::message::MessageRow],
-) -> Result<String, String> {
+fn extract_recent_files_from_db_messages(messages: &[&crate::db::entity::message::Model]) -> Result<String, String> {
     let mut files: Vec<(String, &str)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -1190,7 +1187,7 @@ mod tests {
 
     #[test]
     fn test_prepare_compact_input_truncates_large_tool() {
-        let msg = crate::db::models::message::MessageRow {
+        let msg = crate::db::entity::message::Model {
             id: "1".into(),
             conversation_id: "c".into(),
             role: "tool".into(),
@@ -1206,7 +1203,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -1230,7 +1227,7 @@ mod tests {
 
     #[test]
     fn compact_input_keeps_frozen_user_context_with_its_message() {
-        let row = crate::db::models::message::MessageRow {
+        let row = crate::db::entity::message::Model {
             id: "m1".into(),
             conversation_id: "c".into(),
             role: "user".into(),
@@ -1246,7 +1243,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -1337,7 +1334,7 @@ mod tests {
     fn compact_input_stamps_user_sections_with_time_and_speaker() {
         const T: i64 = 1_600_000_000_000;
         let names: crate::agent::SenderNames = [(1, "张三".to_string())].into_iter().collect();
-        let row = crate::db::models::message::MessageRow {
+        let row = crate::db::entity::message::Model {
             id: "u1".into(),
             conversation_id: "c".into(),
             role: "user".into(),
@@ -1353,7 +1350,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: Some(1),
             parent_id: None,
             compact_anchor_id: None,
@@ -1429,7 +1426,7 @@ mod tests {
     /// the summariser would ignore the row even if one got through.
     #[test]
     fn a_frozen_memory_row_never_reaches_the_summariser() {
-        let mut row = crate::db::models::message::MessageRow {
+        let mut row = crate::db::entity::message::Model {
             id: "1".into(),
             conversation_id: "c".into(),
             role: "context".into(),
@@ -1445,7 +1442,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,

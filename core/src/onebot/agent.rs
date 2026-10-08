@@ -1291,7 +1291,7 @@ mod tests {
         );
 
         for row in &rows {
-            let stored = crate::db::models::message::MessageRow {
+            let stored = crate::db::entity::message::Model {
                 id: row.id.clone(),
                 conversation_id: "c".into(),
                 role: "user".into(),
@@ -1307,7 +1307,7 @@ mod tests {
                 reasoning_content: None,
                 rating: None,
                 schema_version: 2,
-                is_compact_summary: 0,
+                is_compact_summary: crate::db::types::SqlBool::FALSE,
                 sender_id: row.sender_id,
                 parent_id: None,
                 compact_anchor_id: None,

@@ -23,7 +23,7 @@
 use diesel::sqlite::SqliteConnection;
 
 use crate::db::DbPool;
-use crate::db::models::message::MessageRow;
+use crate::db::entity::message as message_entity;
 
 const SOURCE_TAG: &str = "todo";
 
@@ -73,7 +73,7 @@ fn parse_source(source: &str) -> Result<Option<TodoKind>, String> {
 }
 
 /// The most recent frozen checklist on the live path, if there is one.
-fn prior(live: &[MessageRow]) -> Result<Option<(TodoKind, &str)>, String> {
+fn prior(live: &[message_entity::Model]) -> Result<Option<(TodoKind, &str)>, String> {
     for row in live.iter().rev() {
         if row.role != "context" {
             continue;
@@ -95,7 +95,7 @@ fn prior(live: &[MessageRow]) -> Result<Option<(TodoKind, &str)>, String> {
 pub fn plan_todo_injection(
     conn: &mut SqliteConnection,
     conversation_id: &str,
-    live: &[MessageRow],
+    live: &[message_entity::Model],
 ) -> Result<Option<TodoInjection>, String> {
     let rendered = match crate::db::ops::todo::get_active_view(conn, conversation_id) {
         Ok(view) => view
@@ -134,7 +134,7 @@ pub fn plan_todo_injection(
 pub async fn plan_todo_injection_async(
     pool: &DbPool,
     conversation_id: String,
-    live: Vec<MessageRow>,
+    live: Vec<message_entity::Model>,
 ) -> Result<Option<TodoInjection>, String> {
     let pool = pool.clone();
     tokio::task::spawn_blocking(move || {
@@ -191,8 +191,8 @@ mod tests {
     }
 
     /// A frozen checklist row, as `persist_todo_injection` would have left it.
-    fn frozen(injection: &TodoInjection) -> MessageRow {
-        MessageRow {
+    fn frozen(injection: &TodoInjection) -> message_entity::Model {
+        message_entity::Model {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: "c1".into(),
             role: "context".into(),
@@ -208,7 +208,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -228,7 +228,7 @@ mod tests {
 
     /// Run a turn start the way a surface would: plan against the rows frozen
     /// so far, then append this turn's row to them.
-    fn round(conn: &mut SqliteConnection, history: &mut Vec<MessageRow>) -> Option<TodoInjection> {
+    fn round(conn: &mut SqliteConnection, history: &mut Vec<message_entity::Model>) -> Option<TodoInjection> {
         let injection = plan_todo_injection(conn, "c1", history).unwrap();
         if let Some(injection) = &injection {
             history.push(frozen(injection));
@@ -361,7 +361,7 @@ mod tests {
         user_row(&pool, "u2", Some(&second_row), 301);
 
         let path = live(&pool);
-        let todo_rows: Vec<&MessageRow> = path
+        let todo_rows: Vec<&message_entity::Model> = path
             .iter()
             .filter(|r| r.role == "context" && r.source.as_deref().is_some_and(|s| s.starts_with("todo|")))
             .collect();

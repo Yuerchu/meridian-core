@@ -175,3 +175,47 @@ pub struct MessageInsert<'a> {
     pub provider_name: Option<&'a str>,
     pub response_model_id: Option<&'a str>,
 }
+
+/// The Diesel reads hand out the entity model, so everything above the ops
+/// works with one row type whichever ORM read it; goes with the Diesel reads.
+/// The flag is held to 0/1 here, as the SeaORM read holds it.
+impl TryFrom<MessageRow> for crate::db::entity::message::Model {
+    type Error = String;
+
+    fn try_from(row: MessageRow) -> Result<Self, String> {
+        let is_compact_summary = crate::db::types::SqlBool::try_from(row.is_compact_summary)
+            .map_err(|error| format!("message {} has an invalid is_compact_summary: {error}", row.id))?;
+        Ok(Self {
+            id: row.id,
+            conversation_id: row.conversation_id,
+            role: row.role,
+            content: row.content,
+            provider_id: row.provider_id,
+            model_id: row.model_id,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            tool_calls: row.tool_calls,
+            tool_call_id: row.tool_call_id,
+            sort_order: row.sort_order,
+            created_at: row.created_at,
+            reasoning_content: row.reasoning_content,
+            rating: row.rating,
+            schema_version: row.schema_version,
+            is_compact_summary,
+            sender_id: row.sender_id,
+            parent_id: row.parent_id,
+            compact_anchor_id: row.compact_anchor_id,
+            source: row.source,
+            turn_id: row.turn_id,
+            tool_outcome: row.tool_outcome,
+            cache_read_tokens: row.cache_read_tokens,
+            cache_write_tokens: row.cache_write_tokens,
+            provider_name: row.provider_name,
+            provider_state: row.provider_state,
+            auto_review: row.auto_review,
+            server_tool_calls: row.server_tool_calls,
+            tool_diffs: row.tool_diffs,
+            response_model_id: row.response_model_id,
+        })
+    }
+}

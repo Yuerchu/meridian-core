@@ -5094,7 +5094,7 @@ mod unprompted {
             .collect()
     }
 
-    fn rows(shared: &Shared, turn_id: &str) -> Vec<crate::db::models::message::MessageRow> {
+    fn rows(shared: &Shared, turn_id: &str) -> Vec<crate::db::entity::message::Model> {
         let mut conn = shared.services.db.get().unwrap();
         crate::db::ops::message::list_messages(&mut conn, "c1")
             .unwrap()

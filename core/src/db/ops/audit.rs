@@ -2,8 +2,8 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
 use crate::agent::pricing::BillingMode;
+use crate::db::entity::message as message_entity;
 use crate::db::models::audit::AuditMessageInsert;
-use crate::db::models::message::MessageRow;
 use crate::db::schema::{audit_messages, conversations, memory_subjects, projects, providers, turns};
 use crate::decimal::Decimal;
 use crate::util::now_ms;
@@ -149,7 +149,7 @@ fn prices_for(
 
 /// The four lookups, from the identifiers rather than from a row.
 ///
-/// Takes the pieces rather than a `MessageRow` because the review rows have no
+/// Takes the pieces rather than a `message_entity::Model` because the review rows have no
 /// `messages` row of their own — they describe spend against a message that
 /// somebody else wrote.
 struct Subject<'a> {
@@ -163,7 +163,7 @@ struct Subject<'a> {
     prompt_tokens: Option<i32>,
 }
 
-fn snapshot(conn: &mut SqliteConnection, msg: &MessageRow) -> QueryResult<Snapshot> {
+fn snapshot(conn: &mut SqliteConnection, msg: &message_entity::Model) -> QueryResult<Snapshot> {
     snapshot_of(
         conn,
         Subject {
@@ -295,7 +295,7 @@ fn billing_mode_for(
 /// caller should let it fail a turn: a database that cannot take the audit copy
 /// is a problem to be shouted about, but refusing to answer the user because of
 /// it would turn a bookkeeping fault into an outage.
-pub fn record(conn: &mut SqliteConnection, msg: &MessageRow) -> QueryResult<()> {
+pub fn record(conn: &mut SqliteConnection, msg: &message_entity::Model) -> QueryResult<()> {
     let snap = snapshot(conn, msg)?;
     let id = uuid::Uuid::new_v4().to_string();
     diesel::insert_into(audit_messages::table)

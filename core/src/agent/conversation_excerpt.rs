@@ -21,7 +21,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::agent::truncate::{approx_token_count, truncate_middle_with_token_budget};
-use crate::db::models::message::{MessageRole, MessageRow};
+use crate::db::entity::message as message_entity;
+use crate::db::models::message::MessageRole;
 use crate::workspace::reference::{MessageContextKind, PreparedContextItem};
 
 /// Per-entry ceilings, the same shape as the reviewer's: generous for a
@@ -43,15 +44,15 @@ fn cap(text: &str, tokens: usize) -> String {
 }
 
 /// One transcript line, or nothing when the row carries nothing worth a line.
-fn line(msg: &MessageRow) -> Result<Option<String>, String> {
+fn line(msg: &message_entity::Model) -> Result<Option<String>, String> {
     let role = MessageRole::parse(&msg.role).map_err(|error| format!("message {}: {error}", msg.id))?;
     // The frozen memory block. It is background this app injected, not part of
     // the conversation being excerpted, and it may carry memories from scopes
     // wider than this thread.
-    if role == MessageRole::Context && msg.is_compact_summary == 0 {
+    if role == MessageRole::Context && !msg.is_compact_summary.get() {
         return Ok(None);
     }
-    if msg.is_compact_summary != 0 {
+    if msg.is_compact_summary.get() {
         return Ok(Some(
             json!({ "summary_of_earlier_messages": cap(&msg.content, MAX_MESSAGE_TOKENS) }).to_string(),
         ));
@@ -104,7 +105,7 @@ fn line(msg: &MessageRow) -> Result<Option<String>, String> {
 /// `history` is the referenced conversation's active path — the caller reads
 /// it with `active_context(...).live()`, so branches not on the head and
 /// anything a compaction already replaced stay out.
-pub fn render_excerpt(history: &[MessageRow], budget_tokens: usize) -> Result<(String, bool), String> {
+pub fn render_excerpt(history: &[message_entity::Model], budget_tokens: usize) -> Result<(String, bool), String> {
     let mut kept: Vec<String> = Vec::new();
     let mut spent = 0usize;
     let mut truncated = false;
@@ -220,8 +221,8 @@ pub fn freeze_conversation_refs(
 mod tests {
     use super::*;
 
-    fn row(id: &str, role: &str, content: &str) -> MessageRow {
-        MessageRow {
+    fn row(id: &str, role: &str, content: &str) -> message_entity::Model {
+        message_entity::Model {
             id: id.into(),
             conversation_id: "c-src".into(),
             role: role.into(),
@@ -237,7 +238,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -392,7 +393,7 @@ mod tests {
     fn memory_context_rows_stay_out_and_summaries_stay_in() {
         let memory = row("m1", "context", "injected memory block");
         let mut summary = row("m2", "context", "earlier talk, summarised");
-        summary.is_compact_summary = 1;
+        summary.is_compact_summary = crate::db::types::SqlBool::TRUE;
         let (out, _) = render_excerpt(&[memory, summary], 1_000).unwrap();
         assert!(!out.contains("injected memory block"));
         assert!(out.contains("summary_of_earlier_messages"));

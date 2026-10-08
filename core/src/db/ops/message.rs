@@ -3,8 +3,20 @@ use std::collections::HashMap;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
+use crate::db::entity::message;
 use crate::db::models::message::{MessageInsert, MessageRow, MessageUsage};
 use crate::db::schema::{conversations, messages};
+
+/// A Diesel row as the entity model; a flag that is not 0/1 fails the read,
+/// as it does on the SeaORM side.
+fn model(row: MessageRow) -> QueryResult<message::Model> {
+    message::Model::try_from(row).map_err(|error| {
+        diesel::result::Error::DeserializationError(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error,
+        )))
+    })
+}
 
 /// Append a message to the end of a conversation's active path.
 ///
@@ -26,8 +38,8 @@ pub fn append_message(
     conn: &mut SqliteConnection,
     new: &MessageInsert,
     parent: Option<&str>,
-) -> QueryResult<MessageRow> {
-    let row = conn.transaction(|conn| {
+) -> QueryResult<message::Model> {
+    let row = conn.transaction(|conn| -> QueryResult<message::Model> {
         let row = insert_message(
             conn,
             &MessageInsert {
@@ -38,7 +50,7 @@ pub fn append_message(
         diesel::update(conversations::table.find(new.conversation_id))
             .set(conversations::head_message_id.eq(Some(&row.id)))
             .execute(conn)?;
-        Ok::<_, diesel::result::Error>(row)
+        Ok(row)
     })?;
     audit_copy(conn, &row);
     Ok(row)
@@ -58,11 +70,11 @@ pub fn append_message(
 /// altogether: they are our own text, and their arguments carry file contents and
 /// command output this table has no business holding a second copy of. A
 /// compaction summary is not something anyone said.
-fn audit_copy(conn: &mut SqliteConnection, row: &MessageRow) {
+fn audit_copy(conn: &mut SqliteConnection, row: &message::Model) {
     // A `shell` row is a local execution record, not training/audit text. Its
     // command routinely contains tokens and passwords, while the paired output
     // already lives in the deliberately private context-item table.
-    if row.role != "user" || row.is_compact_summary != 0 || row.source.as_deref() == Some("shell") {
+    if row.role != "user" || row.is_compact_summary.get() || row.source.as_deref() == Some("shell") {
         return;
     }
     if let Err(e) = crate::db::ops::audit::record(conn, row) {
@@ -84,15 +96,15 @@ fn audit_copy(conn: &mut SqliteConnection, row: &MessageRow) {
 ///
 /// `history` is the caller's already-loaded message list for the conversation,
 /// ordered by `sort_order`.
-pub fn resolve_head(stored_head: Option<&str>, history: &[MessageRow]) -> Option<String> {
+pub fn resolve_head(stored_head: Option<&str>, history: &[message::Model]) -> Option<String> {
     if let Some(head) = stored_head
-        && history.iter().any(|m| m.id == head && m.is_compact_summary == 0)
+        && history.iter().any(|m| m.id == head && !m.is_compact_summary.get())
     {
         return Some(head.to_string());
     }
     history
         .iter()
-        .rfind(|m| m.is_compact_summary == 0)
+        .rfind(|m| !m.is_compact_summary.get())
         .map(|m| m.id.clone())
 }
 
@@ -105,9 +117,9 @@ pub fn resolve_head(stored_head: Option<&str>, history: &[MessageRow]) -> Option
 /// without recomputing it from sort_order.
 pub struct ActiveContext {
     /// Root to head, in order. Excludes summaries and inactive branches.
-    pub path: Vec<MessageRow>,
+    pub path: Vec<message::Model>,
     /// The summary standing in front of `path`, when one applies.
-    pub summary: Option<MessageRow>,
+    pub summary: Option<message::Model>,
     /// Where `summary` takes over: everything before this index is represented
     /// by it. `None` when no summary applies.
     pub anchor_index: Option<usize>,
@@ -117,7 +129,7 @@ pub struct ActiveContext {
 impl ActiveContext {
     /// The messages a request actually carries: the tail from the anchor on,
     /// since anything before it is covered by the summary.
-    pub fn live(&self) -> &[MessageRow] {
+    pub fn live(&self) -> &[message::Model] {
         match self.anchor_index {
             Some(i) => &self.path[i..],
             None => &self.path,
@@ -132,10 +144,10 @@ impl ActiveContext {
 /// `QueryableByName` impl and hand-writing every column's type, which is pure
 /// upkeep. The visited set guards against a cycle, which no writer can produce
 /// but corrupted data could.
-fn path_to_head(history: &[MessageRow], head: &str) -> Vec<MessageRow> {
-    let by_id: std::collections::HashMap<&str, &MessageRow> = history
+fn path_to_head(history: &[message::Model], head: &str) -> Vec<message::Model> {
+    let by_id: std::collections::HashMap<&str, &message::Model> = history
         .iter()
-        .filter(|m| m.is_compact_summary == 0)
+        .filter(|m| !m.is_compact_summary.get())
         .map(|m| (m.id.as_str(), m))
         .collect();
 
@@ -158,7 +170,7 @@ fn path_to_head(history: &[MessageRow], head: &str) -> Vec<MessageRow> {
 /// Load the active path plus whichever summary applies to it.
 ///
 /// `history` is the full conversation, ordered by `sort_order`.
-pub fn active_context(history: &[MessageRow], stored_head: Option<&str>) -> ActiveContext {
+pub fn active_context(history: &[message::Model], stored_head: Option<&str>) -> ActiveContext {
     let head_id = resolve_head(stored_head, history);
     // No sort_order fallback for an unlinked history. The backfill runs inside
     // the migration transaction and a failure there aborts startup, so a
@@ -174,8 +186,8 @@ pub fn active_context(history: &[MessageRow], stored_head: Option<&str>) -> Acti
     // A summary applies only if its anchor is on this path — that is what stops
     // one branch from being handed another branch's summary. With several, the
     // deepest anchor wins, being the most recent compaction of this path.
-    let mut best: Option<(usize, &MessageRow)> = None;
-    for s in history.iter().filter(|m| m.is_compact_summary == 1) {
+    let mut best: Option<(usize, &message::Model)> = None;
+    for s in history.iter().filter(|m| m.is_compact_summary.get()) {
         let Some(anchor) = s.compact_anchor_id.as_deref() else {
             continue;
         };
@@ -238,17 +250,20 @@ fn copy_of<'a>(n: &MessageInsert<'a>) -> MessageInsert<'a> {
 /// in either `schema.rs` or the struct would compile, pass every test, and
 /// quietly report each cache write as a read for the rest of the table's life.
 /// `as_select()` makes that a compile error instead.
-pub fn list_messages(conn: &mut SqliteConnection, conversation_id: &str) -> QueryResult<Vec<MessageRow>> {
+pub fn list_messages(conn: &mut SqliteConnection, conversation_id: &str) -> QueryResult<Vec<message::Model>> {
     messages::table
         .filter(messages::conversation_id.eq(conversation_id))
         .order(messages::sort_order.asc())
         .select(MessageRow::as_select())
-        .load(conn)
+        .load::<MessageRow>(conn)?
+        .into_iter()
+        .map(model)
+        .collect()
 }
 
-pub fn insert_message(conn: &mut SqliteConnection, new: &MessageInsert) -> QueryResult<MessageRow> {
+pub fn insert_message(conn: &mut SqliteConnection, new: &MessageInsert) -> QueryResult<message::Model> {
     diesel::insert_into(messages::table).values(new).execute(conn)?;
-    messages::table.find(new.id).first::<MessageRow>(conn)
+    get_message(conn, new.id)
 }
 
 // `update_content` was here, and went with the `update_message_content`
@@ -257,8 +272,12 @@ pub fn insert_message(conn: &mut SqliteConnection, new: &MessageInsert) -> Query
 // the lease that keeps a running turn from having the ground moved under it.
 
 /// One row by id. Selected by name, for the reason `list_messages` is.
-pub fn get_message(conn: &mut SqliteConnection, id: &str) -> QueryResult<MessageRow> {
-    messages::table.find(id).select(MessageRow::as_select()).first(conn)
+pub fn get_message(conn: &mut SqliteConnection, id: &str) -> QueryResult<message::Model> {
+    messages::table
+        .find(id)
+        .select(MessageRow::as_select())
+        .first::<MessageRow>(conn)
+        .and_then(model)
 }
 
 pub fn update_assistant_message(
@@ -567,7 +586,11 @@ pub fn delete_subtree(
         let history = messages::table
             .filter(messages::conversation_id.eq(conversation_id))
             .order(messages::sort_order.asc())
-            .load::<MessageRow>(conn)?;
+            .select(MessageRow::as_select())
+            .load::<MessageRow>(conn)?
+            .into_iter()
+            .map(model)
+            .collect::<QueryResult<Vec<_>>>()?;
         let new_head = parent
             .filter(|p| history.iter().any(|m| &m.id == p))
             .map(|p| deepest_descendant(&history, &p))
@@ -608,7 +631,7 @@ pub struct BranchPoint {
 /// hanging off the context row while the old one hangs off its parent, the two
 /// stop being siblings, and the version pager silently disappears from a
 /// message that certainly has more than one version.
-fn effective_parent(by_id: &HashMap<&str, &MessageRow>, m: &MessageRow) -> Option<String> {
+fn effective_parent(by_id: &HashMap<&str, &message::Model>, m: &message::Model) -> Option<String> {
     let mut cursor = m.parent_id.clone();
     while let Some(id) = cursor {
         // A parent that is not in `history` is as far as this can go.
@@ -632,15 +655,15 @@ fn effective_parent(by_id: &HashMap<&str, &MessageRow>, m: &MessageRow) -> Optio
 /// 622 rows, 10s at 2000, on every mount of the transcript and up to four times
 /// per snapshot attempt. Importing a terminal session is what made a
 /// conversation that size reachable in one click.
-pub fn branch_points(history: &[MessageRow], path: &[MessageRow]) -> Vec<BranchPoint> {
-    let by_id: HashMap<&str, &MessageRow> = history.iter().map(|m| (m.id.as_str(), m)).collect();
+pub fn branch_points(history: &[message::Model], path: &[message::Model]) -> Vec<BranchPoint> {
+    let by_id: HashMap<&str, &message::Model> = history.iter().map(|m| (m.id.as_str(), m)).collect();
 
     // Keyed on the effective parent, `None` for the roots — editing the opening
     // message produces a second one, which is a version of the same step.
-    let mut families: HashMap<Option<String>, Vec<&MessageRow>> = HashMap::new();
+    let mut families: HashMap<Option<String>, Vec<&message::Model>> = HashMap::new();
     for m in history
         .iter()
-        .filter(|s| s.is_compact_summary == 0 && s.role != "context")
+        .filter(|s| !s.is_compact_summary.get() && s.role != "context")
     {
         families.entry(effective_parent(&by_id, m)).or_default().push(m);
     }
@@ -684,8 +707,15 @@ pub fn switch_branch(
         let history = messages::table
             .filter(messages::conversation_id.eq(conversation_id))
             .order(messages::sort_order.asc())
-            .load::<MessageRow>(conn)?;
-        if !history.iter().any(|m| m.id == message_id && m.is_compact_summary == 0) {
+            .select(MessageRow::as_select())
+            .load::<MessageRow>(conn)?
+            .into_iter()
+            .map(model)
+            .collect::<QueryResult<Vec<_>>>()?;
+        if !history
+            .iter()
+            .any(|m| m.id == message_id && !m.is_compact_summary.get())
+        {
             return Err(diesel::result::Error::NotFound);
         }
         let head = deepest_descendant(&history, message_id);
@@ -699,12 +729,12 @@ pub fn switch_branch(
 /// Follow the newest child at each step. Used when the head has to move onto a
 /// branch: "where that branch was last written" is the position a reader expects
 /// to land on.
-pub fn deepest_descendant(history: &[MessageRow], from: &str) -> String {
+pub fn deepest_descendant(history: &[message::Model], from: &str) -> String {
     let mut current = from.to_string();
     loop {
         let next = history
             .iter()
-            .filter(|m| m.is_compact_summary == 0)
+            .filter(|m| !m.is_compact_summary.get())
             .filter(|m| m.parent_id.as_deref() == Some(current.as_str()))
             .max_by_key(|m| m.sort_order);
         match next {
@@ -1055,7 +1085,7 @@ mod tests {
             .find(|m| m.id == "m1")
             .expect("the row that was just written");
 
-        let MessageRow {
+        let message::Model {
             id,
             conversation_id,
             role,
@@ -1112,7 +1142,7 @@ mod tests {
         assert_eq!(reasoning_content.as_deref(), Some("thinking"));
         assert_eq!(rating, Some(1));
         assert_eq!(schema_version, 2);
-        assert_eq!(is_compact_summary, 0);
+        assert!(!is_compact_summary.get());
         assert_eq!(sender_id, Some(99));
         assert_eq!(parent_id.as_deref(), Some("root"), "the one field the copy overrides");
         assert_eq!(compact_anchor_id.as_deref(), Some("root"));
@@ -1575,5 +1605,26 @@ mod tests {
         let history = list_messages(&mut conn, "c1").unwrap();
 
         assert_eq!(ids(&active_context(&history, Some("a2"))), ["q", "a2"]);
+    }
+
+    /// The flag has no CHECK in the schema, so the read holds it to 0/1: a
+    /// stored 2 is a broken row, not a summary.
+    #[tokio::test]
+    async fn a_compact_flag_that_is_not_zero_or_one_fails_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, sea) = crate::db::sea::shared_test_db(dir.path()).await;
+        let mut conn = pool.get().unwrap();
+        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
+        insert_message(&mut conn, &row("m1", "c1", "assistant")).unwrap();
+        crate::db::sea::execute_for_tests(&sea, "UPDATE messages SET is_compact_summary = 2 WHERE id = 'm1'")
+            .await
+            .unwrap();
+
+        let error = list_messages(&mut conn, "c1").unwrap_err().to_string();
+        assert!(
+            error.contains("message m1 has an invalid is_compact_summary"),
+            "{error}"
+        );
+        assert!(get_message(&mut conn, "m1").is_err());
     }
 }

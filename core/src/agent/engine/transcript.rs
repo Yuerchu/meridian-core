@@ -461,7 +461,7 @@ mod tests {
         crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
     }
 
-    fn rows(pool: &DbPool) -> Vec<crate::db::models::message::MessageRow> {
+    fn rows(pool: &DbPool) -> Vec<crate::db::entity::message::Model> {
         let mut conn = pool.get().unwrap();
         crate::db::ops::message::list_messages(&mut conn, "c1").unwrap()
     }
