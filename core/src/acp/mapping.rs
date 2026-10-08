@@ -196,21 +196,39 @@ pub fn notice_of(record: &SessionFailureRecord) -> Option<SessionNoticeRecord> {
 /// alone, the arguments stored for the call stopped at the frame before, with
 /// `old_string` and no `new_string`. So that frame is a revision and then a
 /// diff, in that order.
+///
+/// **And an update is every one of the things it carries, too.** From 0.82 an
+/// AIR client is sent no `rawInput` while the input streams; it comes once,
+/// complete, on a `tool_call_update` that also carries the diff. Read as one
+/// effect it was only the diff, so `file_path` never reached the call and
+/// every hosted edit showed a change with no file named. That was the third
+/// time one AIR frame carried two facts and one was dropped — the tool name
+/// and the first announcement's diff were the others — so this reads each part
+/// of an update rather than choosing one: the revision, then the diff, then
+/// the result, which is the order they have to land in. See
+/// `tests::no_part_of_a_tool_call_update_is_dropped` for the gate.
 pub fn effects_of(update: SessionUpdate) -> Vec<Effect> {
-    let revised = match &update {
-        SessionUpdate::ToolCallUpdate(call)
-            if call.raw_input.is_some()
-                && !matches!(call.status.as_deref(), Some("completed" | "failed"))
-                && call.content.iter().any(|b| b.kind == "diff") =>
-        {
-            Some(Effect::ToolCallRevised {
+    if let SessionUpdate::ToolCallUpdate(call) = &update {
+        let mut effects = Vec::new();
+        if revises(call) {
+            effects.push(Effect::ToolCallRevised {
                 call_id: call.tool_call_id.clone(),
                 tool_name: explicit_tool_name(call).unwrap_or_default().to_string(),
                 arguments: arguments_of(call),
-            })
+            });
         }
-        _ => None,
-    };
+        if has_diff(call) {
+            effects.push(Effect::ToolCallDiff {
+                call_id: call.tool_call_id.clone(),
+                diffs: diffs_of(call),
+            });
+        }
+        effects.extend(result_of(call));
+        if effects.is_empty() {
+            effects.push(Effect::Ignored);
+        }
+        return effects;
+    }
     let (diffs, finished) = match &update {
         SessionUpdate::ToolCall(call) => {
             let diffs = diffs_of(call);
@@ -222,11 +240,31 @@ pub fn effects_of(update: SessionUpdate) -> Vec<Effect> {
         }
         _ => (None, None),
     };
-    let mut effects: Vec<Effect> = revised.into_iter().collect();
-    effects.push(effect_of(update));
+    let mut effects = vec![effect_of(update)];
     effects.extend(diffs);
     effects.extend(finished);
     effects
+}
+
+/// Whether an update says something new about the call itself: input that is
+/// more than `{}`, or — on a frame that is nothing else — the call's name.
+///
+/// Not every `_meta` is a revision. The adapter repeats the tool name on
+/// most frames, the finishing one included, and a "revision" of `{}` there
+/// is not harmless downstream of `revise`: anything reading the last revision
+/// as the call's arguments reads it as the call having had none.
+fn revises(call: &ToolCall) -> bool {
+    let input = call
+        .raw_input
+        .as_ref()
+        .is_some_and(|v| !(v.is_null() || v.as_object().is_some_and(|o| o.is_empty())));
+    let renamed = explicit_tool_name(call).is_some_and(|n| !n.is_empty());
+    input || (renamed && !has_diff(call) && result_of(call).is_none())
+}
+
+/// Whether an update carries what an Edit or Write changed.
+fn has_diff(call: &ToolCall) -> bool {
+    call.content.iter().any(|b| b.kind == "diff")
 }
 
 /// The result a call's status reports, if it reports one.
@@ -288,7 +326,7 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
             // before the revision arm below, because this frame carries
             // `_meta` too and read as a revision it is one with `{}` for
             // arguments — which `revise` then ignores, and the diff with it.
-            _ if call.content.iter().any(|b| b.kind == "diff") => Effect::ToolCallDiff {
+            _ if has_diff(&call) => Effect::ToolCallDiff {
                 call_id: call.tool_call_id.clone(),
                 diffs: diffs_of(&call),
             },
@@ -296,7 +334,7 @@ pub fn effect_of(update: SessionUpdate) -> Effect {
             // how a call announced before its arguments were known gets them,
             // and how the adapter's second source revises one it did not emit.
             // An update carrying neither is the ordinary "still going" beat.
-            _ if call.raw_input.is_some() || call.meta.is_some() || call.title.is_some() => Effect::ToolCallRevised {
+            _ if revises(&call) => Effect::ToolCallRevised {
                 call_id: call.tool_call_id.clone(),
                 // Empty is "unchanged", which is what `revise` reads it as.
                 tool_name: explicit_tool_name(&call).unwrap_or_default().to_string(),
@@ -588,6 +626,80 @@ mod tests {
                 arguments: r#"{"command":"git status"}"#.into(),
             }
         );
+    }
+
+    /// The refinement 0.84.0 sends an AIR client once an Edit's input is
+    /// complete: the input (text fields left out, `file_path` kept) *and* the
+    /// diff, on one update. Both have to land — the path is the only place the
+    /// card learns which file it is changing.
+    #[test]
+    fn an_edit_refinement_names_the_file_as_well_as_the_change() {
+        let refinement = update(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"toolu_E",
+                "_meta":{"claudeCode":{"toolName":"Edit"}},
+                "rawInput":{"file_path":"C:\\repo\\src\\lib.rs","replace_all":false},
+                "title":"Edit lib.rs","kind":"edit",
+                "content":[{"type":"diff","path":"C:\\repo\\src\\lib.rs","oldText":"a","newText":"b"}]}"#,
+        );
+        let effects = effects_of(refinement);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::ToolCallRevised { arguments, .. }, Effect::ToolCallDiff { .. }]
+                    if arguments.contains("file_path")
+            ),
+            "the input, then the diff: {effects:?}"
+        );
+    }
+
+    /// **The gate for the class, not the instance.** Every combination of the
+    /// three things a `tool_call_update` can carry — input, a diff, a
+    /// terminal status — has to come out as every one of them, in the order
+    /// they land. Three bugs shipped from a frame that carried two of these and
+    /// was read as one.
+    #[test]
+    fn no_part_of_a_tool_call_update_is_dropped() {
+        for input in [false, true] {
+            for diff in [false, true] {
+                for done in [false, true] {
+                    let mut frame = serde_json::json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t" });
+                    if input {
+                        frame["rawInput"] = serde_json::json!({ "file_path": "/repo/a.rs" });
+                    }
+                    if diff {
+                        frame["content"] = serde_json::json!([{ "type": "diff", "path": "/repo/a.rs", "oldText": "a", "newText": "b" }]);
+                    }
+                    if done {
+                        frame["status"] = serde_json::json!("completed");
+                    }
+                    let effects = effects_of(update(&frame.to_string()));
+                    let kinds: Vec<&str> = effects
+                        .iter()
+                        .map(|e| match e {
+                            Effect::ToolCallRevised { .. } => "revised",
+                            Effect::ToolCallDiff { .. } => "diff",
+                            Effect::ToolResult { .. } => "result",
+                            Effect::Ignored => "ignored",
+                            _ => "other",
+                        })
+                        .collect();
+                    let mut expected: Vec<&str> = Vec::new();
+                    if input {
+                        expected.push("revised");
+                    }
+                    if diff {
+                        expected.push("diff");
+                    }
+                    if done {
+                        expected.push("result");
+                    }
+                    if expected.is_empty() {
+                        expected.push("ignored");
+                    }
+                    assert_eq!(kinds, expected, "input={input} diff={diff} done={done}");
+                }
+            }
+        }
     }
 
     /// A beat that carries nothing new is still just a beat. Treated as a
