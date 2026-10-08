@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 
-use diesel::sqlite::SqliteConnection;
+use crate::db::sea::cap::Snapshot;
 
 use crate::db::entity::assistant;
 use crate::provider::{ServerToolKind, ToolDefinition};
@@ -107,8 +107,10 @@ pub struct TurnConfig {
     pub offered: HashSet<String>,
 }
 
-pub fn resolve(
-    conn: &mut SqliteConnection,
+/// One snapshot: the assistant's preset, its sticker roster, the bound
+/// skills and the approved plan describe the same moment.
+pub async fn resolve(
+    db: &impl Snapshot,
     registry: &ToolRegistry,
     input: TurnConfigResolveRequest,
 ) -> Result<TurnConfig, String> {
@@ -128,15 +130,18 @@ pub fn resolve(
     } = input;
 
     let tool_defs = if exposure != ToolExposure::None {
-        let enabled = enabled_tools(conn, assistant.as_ref())?;
+        let enabled = enabled_tools(db, assistant.as_ref()).await?;
         let mut defs = super::tool_defs::collect(registry, mcp_defs, enabled.as_deref());
         // Sticker availability is data, not an assistant preset. Keep the two
         // fixed-schema tools present whenever this assistant has a confirmed
         // roster, even if an older preset predates the feature.
         if let Some(assistant_id) = assistant.as_ref().map(|value| value.id.as_str()) {
-            let has_stickers = crate::db::ops::emoji_pack::list_assigned_pack_ids(conn, assistant_id)
-                .and_then(|packs| crate::db::ops::emoji::list_confirmed_for_packs(conn, &packs))
-                .is_ok_and(|stickers| !stickers.is_empty());
+            let has_stickers = match crate::db::sea::ops::emoji_pack::list_assigned_pack_ids(db, assistant_id).await {
+                Ok(packs) => crate::db::sea::ops::emoji::list_confirmed_for_packs(db, &packs)
+                    .await
+                    .is_ok_and(|stickers| !stickers.is_empty()),
+                Err(_) => false,
+            };
             if has_stickers {
                 for name in ["list_stickers", "send_sticker"] {
                     if defs.iter().any(|definition| definition.name == name) {
@@ -153,11 +158,12 @@ pub fn resolve(
             }
         }
         super::tool_defs::apply_mode(&mut defs, mode, registry);
-        let available = crate::db::ops::skill_binding::resolve_available(
-            conn,
+        let available = crate::db::sea::ops::skill_binding::resolve_available(
+            db,
             project_id.as_deref(),
             assistant.as_ref().map(|a| a.id.as_str()),
         )
+        .await
         .unwrap_or_else(|e| {
             // An empty list makes `apply_skill_catalog` remove `load_skill`
             // entirely, so a failed query and "no skills bound" look the same:
@@ -239,9 +245,9 @@ pub fn resolve(
     // a plan it agreed to — read as "it went off the rails again" rather than as
     // an error. `Ok(None)` is the ordinary case and stays quiet.
     let has_versioned_plan =
-        match crate::db::ops::plan_review::get_approved_revision_for_conversation(conn, &conversation_id) {
+        match crate::db::sea::ops::plan_review::get_approved_revision_for_conversation(db, &conversation_id).await {
             Ok(Some(revision)) => {
-                if let Some(block) = crate::db::ops::plan_review::format_approved_plan_block(&revision) {
+                if let Some(block) = crate::db::sea::ops::plan_review::format_approved_plan_block(&revision) {
                     prompt.push_str(&block);
                 }
                 true
@@ -256,9 +262,9 @@ pub fn resolve(
             }
         };
     if !has_versioned_plan {
-        match crate::db::ops::plan::get_active(conn, &conversation_id) {
+        match crate::db::sea::ops::plan::get_active(db, &conversation_id).await {
             Ok(Some(plan)) => {
-                if let Some(block) = crate::db::ops::plan::format_plan_block(&plan) {
+                if let Some(block) = crate::db::sea::ops::plan::format_plan_block(&plan) {
                     prompt.push_str(&block);
                 }
             }
@@ -282,29 +288,48 @@ pub fn resolve(
     })
 }
 
+/// [`resolve`] in a read snapshot of its own, for a caller that holds the
+/// handle rather than a transaction.
+pub async fn resolve_on(
+    db: &crate::db::sea::cap::Db,
+    registry: &ToolRegistry,
+    input: TurnConfigResolveRequest,
+) -> Result<TurnConfig, String> {
+    db.read(async |tx| Ok::<_, crate::db::sea::DbErr>(resolve(tx, registry, input).await))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 /// Tool filtering as configured on the assistant: preset wins over an explicit
 /// list, and neither means every tool is allowed.
 ///
 /// A missing preset row or malformed JSON is a broken stored contract, not an
 /// empty allow-list. Returning an error keeps the failure visible at every
 /// runner instead of quietly changing what an assistant may do.
-fn enabled_tools(
-    conn: &mut SqliteConnection,
+async fn enabled_tools(
+    db: &impl crate::db::sea::cap::Read,
     assistant: Option<&assistant::Model>,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(assistant) = assistant else {
         return Ok(None);
     };
     if let Some(preset_id) = assistant.tool_preset_id.as_ref() {
-        let preset = crate::db::ops::tool_preset::get_preset(conn, preset_id).map_err(|error| {
-            format!(
-                "assistant {} references unreadable tool preset {preset_id}: {error}",
-                assistant.id
-            )
-        })?;
-        let names = serde_json::from_str::<Vec<String>>(&preset.tool_names)
-            .map_err(|error| format!("tool preset {preset_id} has invalid tool_names JSON: {error}"))?;
-        return Ok(Some(names));
+        let preset = crate::db::sea::ops::tool_preset::get_preset(db, preset_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "assistant {} references unreadable tool preset {preset_id}: {error}",
+                    assistant.id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "assistant {} references unreadable tool preset {preset_id}: it no longer exists",
+                    assistant.id
+                )
+            })?;
+        // Decoded at the read: a list that is not a JSON array of names failed it.
+        return Ok(Some(preset.tool_names.0));
     }
     // Decoded at the read: a list that is not a JSON array of names failed it.
     Ok(assistant.enabled_tools.as_ref().map(|tools| tools.0.clone()))
@@ -313,9 +338,8 @@ fn enabled_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::tool_preset::ToolPresetInsert;
-    use crate::db::{DbPool, diesel_test_db};
-    use diesel::prelude::*;
+    use crate::db::sea::cap::Db;
+    use crate::db::sea::{execute_for_tests, sea_test_db};
 
     fn registry() -> ToolRegistry {
         ToolRegistry::new(
@@ -325,16 +349,8 @@ mod tests {
         )
     }
 
-    fn seed_conversation(conn: &mut SqliteConnection, id: &str) {
-        use crate::db::schema::conversations;
-        diesel::insert_into(conversations::table)
-            .values((
-                conversations::id.eq(id),
-                conversations::created_at.eq(1),
-                conversations::updated_at.eq(1),
-            ))
-            .execute(conn)
-            .unwrap();
+    async fn sql(db: &Db, statement: &str) {
+        execute_for_tests(db, statement).await.unwrap();
     }
 
     fn assistant_with(preset: Option<&str>, enabled: Option<&str>) -> assistant::Model {
@@ -363,22 +379,14 @@ mod tests {
         }
     }
 
-    fn seed_preset(conn: &mut SqliteConnection, id: &str, tools: &str) {
-        crate::db::ops::tool_preset::create_preset(
-            conn,
-            &ToolPresetInsert {
-                id,
-                name: id,
-                description: None,
-                icon: None,
-                tool_names: tools,
-                is_builtin: 0,
-                sort_order: 0,
-                created_at: 1,
-                updated_at: 1,
-            },
+    async fn seed_preset(db: &Db, id: &str, tools: &str) {
+        sql(
+            db,
+            &format!(
+                "INSERT INTO tool_presets (id, name, tool_names, created_at, updated_at) VALUES ('{id}', '{id}', '{tools}', 1, 1)"
+            ),
         )
-        .unwrap();
+        .await;
     }
 
     /// A desktop-shaped runner: it has a transitions port, so it is offered the
@@ -404,24 +412,32 @@ mod tests {
         }
     }
 
-    fn setup() -> (DbPool, ToolRegistry) {
-        let pool = diesel_test_db();
-        {
-            let mut conn = pool.get().unwrap();
-            seed_conversation(&mut conn, "c1");
-        }
-        (pool, registry())
+    async fn setup() -> (Db, ToolRegistry) {
+        let db = sea_test_db().await;
+        sql(
+            &db,
+            "INSERT INTO conversations (id, created_at, updated_at) VALUES ('c1', 1, 1)",
+        )
+        .await;
+        (db, registry())
     }
 
-    fn resolve_ok(conn: &mut SqliteConnection, registry: &ToolRegistry, input: TurnConfigResolveRequest) -> TurnConfig {
-        resolve(conn, registry, input).unwrap()
+    async fn resolve_on_db(
+        db: &Db,
+        registry: &ToolRegistry,
+        input: TurnConfigResolveRequest,
+    ) -> Result<TurnConfig, String> {
+        resolve_on(db, registry, input).await
     }
 
-    #[test]
-    fn no_assistant_means_every_tool() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(None), None));
+    async fn resolve_ok(db: &Db, registry: &ToolRegistry, input: TurnConfigResolveRequest) -> TurnConfig {
+        resolve_on_db(db, registry, input).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_assistant_means_every_tool() {
+        let (db, reg) = setup().await;
+        let cfg = resolve_ok(&db, &reg, input(switchable(None), None)).await;
 
         assert!(cfg.offered.contains("read_file"));
         assert!(cfg.offered.contains("write_file"));
@@ -431,14 +447,13 @@ mod tests {
     /// The bug this refactor exists to kill: the OneBot loop only ever read
     /// `enabled_tools`, so an assistant configured with a preset got a
     /// different tool set there than on the desktop. One resolver, one answer.
-    #[test]
-    fn a_preset_beats_the_explicit_list_for_every_caller() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        seed_preset(&mut conn, "p1", r#"["read_file","glob"]"#);
+    #[tokio::test]
+    async fn a_preset_beats_the_explicit_list_for_every_caller() {
+        let (db, reg) = setup().await;
+        seed_preset(&db, "p1", r#"["read_file","glob"]"#).await;
 
         let assistant = assistant_with(Some("p1"), Some(r#"["write_file","run_command"]"#));
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(None), Some(assistant)));
+        let cfg = resolve_ok(&db, &reg, input(switchable(None), Some(assistant))).await;
 
         assert!(cfg.offered.contains("read_file"));
         assert!(cfg.offered.contains("glob"));
@@ -451,37 +466,38 @@ mod tests {
 
     /// A dangling preset id is persisted corruption. It must stop the turn, not
     /// impersonate either "all tools" or an intentionally empty preset.
-    #[test]
-    fn a_missing_preset_is_an_error() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn a_missing_preset_is_an_error() {
+        let (db, reg) = setup().await;
         let assistant = assistant_with(Some("gone"), None);
-        let error = resolve(&mut conn, &reg, input(switchable(None), Some(assistant)))
+        let error = resolve_on_db(&db, &reg, input(switchable(None), Some(assistant)))
+            .await
             .err()
             .expect("dangling preset must fail");
 
         assert!(error.contains("unreadable tool preset"), "{error}");
     }
 
-    #[test]
-    fn a_corrupt_preset_payload_is_an_error() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        seed_preset(&mut conn, "broken", "not json at all");
+    #[tokio::test]
+    async fn a_corrupt_preset_payload_is_an_error() {
+        let (db, reg) = setup().await;
+        seed_preset(&db, "broken", "not json at all").await;
         let assistant = assistant_with(Some("broken"), None);
-        let error = resolve(&mut conn, &reg, input(switchable(None), Some(assistant)))
+        let error = resolve_on_db(&db, &reg, input(switchable(None), Some(assistant)))
+            .await
             .err()
             .expect("malformed preset JSON must fail");
 
-        assert!(error.contains("invalid tool_names JSON"), "{error}");
+        // Decoded at the read now: the preset row itself fails, and says so.
+        assert!(error.contains("unreadable tool preset broken"), "{error}");
+        assert!(error.contains("malformed"), "{error}");
     }
 
-    #[test]
-    fn the_explicit_list_applies_when_there_is_no_preset() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn the_explicit_list_applies_when_there_is_no_preset() {
+        let (db, reg) = setup().await;
         let assistant = assistant_with(None, Some(r#"["read_file"]"#));
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(None), Some(assistant)));
+        let cfg = resolve_ok(&db, &reg, input(switchable(None), Some(assistant))).await;
 
         assert!(cfg.offered.contains("read_file"));
         assert!(!cfg.offered.contains("write_file"));
@@ -490,12 +506,11 @@ mod tests {
         assert!(!cfg.offered.contains("enter_plan"));
     }
 
-    #[test]
-    fn an_assistant_that_can_edit_is_offered_the_way_into_plan() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn an_assistant_that_can_edit_is_offered_the_way_into_plan() {
+        let (db, reg) = setup().await;
         let assistant = assistant_with(None, Some(r#"["read_file","write_file"]"#));
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(None), Some(assistant)));
+        let cfg = resolve_ok(&db, &reg, input(switchable(None), Some(assistant))).await;
 
         assert!(cfg.offered.contains("enter_plan"));
     }
@@ -503,21 +518,19 @@ mod tests {
     /// `offered` is what the dispatch loop authorises against, so a model that
     /// invents `exit_plan` during ordinary work is refused before it can reach
     /// the branch that would switch modes.
-    #[test]
-    fn work_mode_never_authorises_the_exit_tool() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(None), None));
+    #[tokio::test]
+    async fn work_mode_never_authorises_the_exit_tool() {
+        let (db, reg) = setup().await;
+        let cfg = resolve_ok(&db, &reg, input(switchable(None), None)).await;
 
         assert!(!cfg.offered.contains("exit_plan"));
         assert!(!cfg.tool_defs.iter().any(|d| d.name == "exit_plan"), "not even visible");
     }
 
-    #[test]
-    fn plan_mode_narrows_and_adds_its_exit_tool() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(Some("plan")), None));
+    #[tokio::test]
+    async fn plan_mode_narrows_and_adds_its_exit_tool() {
+        let (db, reg) = setup().await;
+        let cfg = resolve_ok(&db, &reg, input(switchable(Some("plan")), None)).await;
 
         assert!(cfg.offered.contains("read_file"));
         assert!(cfg.offered.contains("exit_plan"));
@@ -530,13 +543,12 @@ mod tests {
     /// included. Asserted rather than left to the short-circuit above it,
     /// because that is one restructuring away from letting the mode add
     /// `enter_plan` back to an otherwise empty set.
-    #[test]
-    fn a_turn_with_no_tools_is_not_offered_a_way_into_plan() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn a_turn_with_no_tools_is_not_offered_a_way_into_plan() {
+        let (db, reg) = setup().await;
         let mut i = input(switchable(None), None);
         i.exposure = ToolExposure::None;
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
 
         assert!(cfg.offered.is_empty(), "got: {:?}", cfg.offered);
         assert!(cfg.tool_defs.is_empty());
@@ -544,23 +556,21 @@ mod tests {
 
     /// The headless side, end to end. It has every write tool an admin session
     /// gets, which is exactly the condition that used to earn it `enter_plan`.
-    #[test]
-    fn a_headless_turn_is_not_offered_the_way_into_plan() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        let cfg = resolve_ok(&mut conn, &reg, input(Modes::Fixed, None));
+    #[tokio::test]
+    async fn a_headless_turn_is_not_offered_the_way_into_plan() {
+        let (db, reg) = setup().await;
+        let cfg = resolve_ok(&db, &reg, input(Modes::Fixed, None)).await;
 
         assert!(cfg.offered.contains("write_file"), "it still gets its tools");
         assert!(!cfg.offered.contains("enter_plan"));
         assert!(!cfg.tool_defs.iter().any(|d| d.name == "enter_plan"));
     }
 
-    #[test]
-    fn a_mode_cannot_hand_back_what_the_assistant_withheld() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn a_mode_cannot_hand_back_what_the_assistant_withheld() {
+        let (db, reg) = setup().await;
         let assistant = assistant_with(None, Some(r#"["read_file"]"#));
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(Some("plan")), Some(assistant)));
+        let cfg = resolve_ok(&db, &reg, input(switchable(Some("plan")), Some(assistant))).await;
 
         assert!(cfg.offered.contains("read_file"));
         assert!(cfg.offered.contains("exit_plan"), "the exit tool is the one exception");
@@ -573,13 +583,12 @@ mod tests {
     /// A QQ group: no registry, no MCP, but the one tool whose definition says
     /// nothing about this machine. It used to be excluded by being filed with
     /// the rest, so a group could not search the web at all.
-    #[test]
-    fn a_narrowed_session_keeps_the_tools_that_reveal_nothing() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn a_narrowed_session_keeps_the_tools_that_reveal_nothing() {
+        let (db, reg) = setup().await;
         let mut i = input(Modes::Fixed, None);
         i.exposure = ToolExposure::Only(&["web_search"]);
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
 
         assert!(cfg.offered.contains("web_search"));
         assert!(!cfg.offered.contains("read_file"), "nothing that names a path");
@@ -589,14 +598,13 @@ mod tests {
 
     /// `Only` filters what the assistant allowed rather than replacing it, so
     /// naming a tool here cannot hand back one the user switched off.
-    #[test]
-    fn narrowing_cannot_widen() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn narrowing_cannot_widen() {
+        let (db, reg) = setup().await;
         let assistant = assistant_with(None, Some(r#"["read_file"]"#));
         let mut i = input(Modes::Fixed, Some(assistant));
         i.exposure = ToolExposure::Only(&["web_search"]);
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
 
         assert!(
             cfg.offered.is_empty(),
@@ -610,17 +618,16 @@ mod tests {
     /// Two ways to search is worse than either alone: the local one stops for
     /// approval and needs a Tavily key, so a model that picked it would ask
     /// permission and then fail, having had the better option taken from it.
-    #[test]
-    fn a_provider_side_search_takes_the_local_one_out_of_the_set() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn a_provider_side_search_takes_the_local_one_out_of_the_set() {
+        let (db, reg) = setup().await;
 
-        let with_local = resolve_ok(&mut conn, &reg, input(switchable(None), None));
+        let with_local = resolve_ok(&db, &reg, input(switchable(None), None)).await;
         assert!(with_local.offered.contains("web_search"), "the baseline");
 
         let mut i = input(switchable(None), None);
         i.server_tools = vec![ServerToolKind::WebSearch];
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
 
         assert!(!cfg.offered.contains("web_search"));
         assert!(
@@ -634,53 +641,58 @@ mod tests {
     /// is deliberately partial: `x_search` and `code_execution` have no
     /// equivalent here, and a blanket "drop anything with a similar name" would
     /// quietly take away tools nobody replaced.
-    #[test]
-    fn a_server_tool_with_no_local_twin_removes_nothing() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn a_server_tool_with_no_local_twin_removes_nothing() {
+        let (db, reg) = setup().await;
         let mut i = input(switchable(None), None);
         i.server_tools = vec![ServerToolKind::XSearch, ServerToolKind::CodeExecution];
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
 
         assert!(cfg.offered.contains("web_search"));
         assert!(cfg.offered.contains("read_file"));
     }
 
-    #[test]
-    fn a_session_without_tools_still_gets_a_prompt() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn a_session_without_tools_still_gets_a_prompt() {
+        let (db, reg) = setup().await;
         let mut i = input(switchable(None), None);
         i.exposure = ToolExposure::None;
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
 
         assert!(cfg.tool_defs.is_empty());
         assert!(cfg.offered.is_empty());
         assert!(cfg.system_prompt.contains("You are a test."));
     }
 
-    #[test]
-    fn state_blocks_come_last_and_in_a_fixed_order() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::todo::replace_active_list(
-            &mut conn,
-            "c1",
-            "Ship it",
-            &[crate::db::ops::todo::TodoItemSpec {
-                content: "step".into(),
-                active_form: "stepping".into(),
-                status: crate::db::models::todo::ItemStatus::InProgress,
-            }],
-            10,
-        )
+    #[tokio::test]
+    async fn state_blocks_come_last_and_in_a_fixed_order() {
+        let (db, reg) = setup().await;
+        db.write(async |tx| {
+            crate::db::sea::ops::todo::replace_active_list(
+                tx,
+                "c1",
+                "Ship it",
+                &[crate::db::sea::ops::todo::TodoItemSpec {
+                    content: "step".into(),
+                    active_form: "stepping".into(),
+                    status: crate::db::models::todo::ItemStatus::InProgress,
+                }],
+                10,
+            )
+            .await
+        })
+        .await
         .unwrap();
-        let plan = crate::db::ops::plan::record_plan(&mut conn, "c1", "the plan", 10).unwrap();
-        crate::db::ops::plan::approve(&mut conn, &plan.id, 20).unwrap();
+        sql(
+            &db,
+            "INSERT INTO mode_artifacts (id, conversation_id, kind, content, status, created_at, updated_at)
+             VALUES ('plan-1', 'c1', 'plan', 'the plan', 'approved', 10, 20)",
+        )
+        .await;
 
         let mut i = input(switchable(None), None);
         i.context_blocks = vec!["\n\n# Project instructions\nBe brief.".into()];
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
 
         let persona = cfg.system_prompt.find("You are a test.").unwrap();
         let instructions = cfg.system_prompt.find("# Project instructions").unwrap();
@@ -696,92 +708,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_versioned_approval_wins_over_the_legacy_plan_fallback() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        let legacy = crate::db::ops::plan::record_plan(&mut conn, "c1", "legacy plan", 10).unwrap();
-        crate::db::ops::plan::approve(&mut conn, &legacy.id, 11).unwrap();
+    #[tokio::test]
+    async fn a_versioned_approval_wins_over_the_legacy_plan_fallback() {
+        let (db, reg) = setup().await;
+        sql(
+            &db,
+            "INSERT INTO mode_artifacts (id, conversation_id, kind, content, status, created_at, updated_at)
+             VALUES ('legacy-1', 'c1', 'plan', 'legacy plan', 'approved', 10, 11)",
+        )
+        .await;
+        db.write(async |tx| {
+            use crate::db::sea::ops::plan_review as plan_ops;
+            let document = plan_ops::create_or_resume_document(tx, "c1", 12).await?;
+            let appended = plan_ops::append_assistant_revision(
+                tx,
+                &plan_ops::PlanRevisionAppend {
+                    document_id: &document.id,
+                    expected_generation: 0,
+                    expected_head_sha256: None,
+                    content_markdown: "versioned plan",
+                    patch: "*** Add File: plan.md",
+                    source_message_id: None,
+                    source_call_id: None,
+                    responding_to_suggestion_revision_id: None,
+                    now: 13,
+                },
+            )
+            .await?;
+            plan_ops::mark_materialization_applied(tx, &appended.materialization.id, 14).await?;
+            let review = plan_ops::submit_native_head_for_review(
+                tx,
+                &plan_ops::PlanReviewSubmit {
+                    document_id: &document.id,
+                    expected_generation: 1,
+                    expected_head_sha256: &appended.revision.content_sha256,
+                    turn_id: None,
+                    assistant_message_id: None,
+                    provider_call_id: None,
+                    provider_kind: crate::db::models::plan_review::PlanReviewProviderKind::Native,
+                    now: 15,
+                },
+                &crate::db::models::plan_review::NativePlanReviewRuntimeConfig::fixture(),
+            )
+            .await?;
+            plan_ops::decide_review(
+                tx,
+                &plan_ops::PlanReviewDecision {
+                    review_id: &review.review.id,
+                    decision_id: "approve-versioned",
+                    expected_lock_version: 0,
+                    expected_draft_generation: 0,
+                    expected_draft_sha256: &review.draft.draft_sha256,
+                    action: plan_ops::PlanReviewDecisionAction::Approve,
+                    decision_summary: None,
+                    delivery_target: None,
+                    target_session_id: None,
+                    target_turn_id: None,
+                    now: 16,
+                },
+            )
+            .await
+        })
+        .await
+        .unwrap();
 
-        let document = crate::db::ops::plan_review::create_or_resume_document(&mut conn, "c1", 12).unwrap();
-        let appended = crate::db::ops::plan_review::append_assistant_revision(
-            &mut conn,
-            &crate::db::ops::plan_review::PlanRevisionAppend {
-                document_id: &document.id,
-                expected_generation: 0,
-                expected_head_sha256: None,
-                content_markdown: "versioned plan",
-                patch: "*** Add File: plan.md",
-                source_message_id: None,
-                source_call_id: None,
-                responding_to_suggestion_revision_id: None,
-                now: 13,
-            },
-        )
-        .unwrap();
-        crate::db::ops::plan_review::mark_materialization_applied(&mut conn, &appended.materialization.id, 14).unwrap();
-        let review = crate::db::ops::plan_review::submit_native_head_for_review(
-            &mut conn,
-            &crate::db::ops::plan_review::PlanReviewSubmit {
-                document_id: &document.id,
-                expected_generation: 1,
-                expected_head_sha256: &appended.revision.content_sha256,
-                turn_id: None,
-                assistant_message_id: None,
-                provider_call_id: None,
-                provider_kind: crate::db::models::plan_review::PlanReviewProviderKind::Native,
-                now: 15,
-            },
-            &crate::db::models::plan_review::NativePlanReviewRuntimeConfig::fixture(),
-        )
-        .unwrap();
-        crate::db::ops::plan_review::decide_review(
-            &mut conn,
-            &crate::db::ops::plan_review::PlanReviewDecision {
-                review_id: &review.review.id,
-                decision_id: "approve-versioned",
-                expected_lock_version: 0,
-                expected_draft_generation: 0,
-                expected_draft_sha256: &review.draft.draft_sha256,
-                action: crate::db::ops::plan_review::PlanReviewDecisionAction::Approve,
-                decision_summary: None,
-                delivery_target: None,
-                target_session_id: None,
-                target_turn_id: None,
-                now: 16,
-            },
-        )
-        .unwrap();
-
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(None), None));
+        let cfg = resolve_ok(&db, &reg, input(switchable(None), None)).await;
         assert!(cfg.system_prompt.contains("versioned plan"));
         assert!(!cfg.system_prompt.contains("legacy plan"));
     }
 
-    #[test]
-    fn the_estimator_and_the_chat_loop_see_the_same_prompt() {
+    #[tokio::test]
+    async fn the_estimator_and_the_chat_loop_see_the_same_prompt() {
         // Previously the estimator built its own prompt and left the checklist
         // out, so its token count ran low exactly when the context was tightest.
         // The checklist is a frozen row now and both sides plan it through
         // `todo_context`; what this still pins is that two resolutions of the
         // same state are the same bytes, and that neither smuggles the list back.
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::todo::replace_active_list(
-            &mut conn,
-            "c1",
-            "Ship it",
-            &[crate::db::ops::todo::TodoItemSpec {
-                content: "step".into(),
-                active_form: "stepping".into(),
-                status: crate::db::models::todo::ItemStatus::Pending,
-            }],
-            10,
-        )
+        let (db, reg) = setup().await;
+        db.write(async |tx| {
+            crate::db::sea::ops::todo::replace_active_list(
+                tx,
+                "c1",
+                "Ship it",
+                &[crate::db::sea::ops::todo::TodoItemSpec {
+                    content: "step".into(),
+                    active_form: "stepping".into(),
+                    status: crate::db::models::todo::ItemStatus::Pending,
+                }],
+                10,
+            )
+            .await
+        })
+        .await
         .unwrap();
 
-        let a = resolve_ok(&mut conn, &reg, input(switchable(None), None));
-        let b = resolve_ok(&mut conn, &reg, input(switchable(None), None));
+        let a = resolve_ok(&db, &reg, input(switchable(None), None)).await;
+        let b = resolve_ok(&db, &reg, input(switchable(None), None)).await;
         assert_eq!(a.system_prompt, b.system_prompt);
         assert!(!a.system_prompt.contains("<todo_list>\nTitle:"));
     }
@@ -789,10 +811,9 @@ mod tests {
     /// The runner's tools replace the registry's of the same name *inside* the
     /// resolver, so the base prompt is built against what the model will see.
     /// Spliced in afterwards, the sticker section never fired on QQ.
-    #[test]
-    fn session_tools_replace_the_registry_pair_before_the_prompt_is_built() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn session_tools_replace_the_registry_pair_before_the_prompt_is_built() {
+        let (db, reg) = setup().await;
         let mut i = input(switchable(None), None);
         i.session_tools = Some(SessionTools {
             owned: ["list_stickers", "send_sticker"]
@@ -805,7 +826,7 @@ mod tests {
                 parameters: serde_json::json!({}),
             }],
         });
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
 
         let senders: Vec<&ToolDefinition> = cfg.tool_defs.iter().filter(|d| d.name == "send_sticker").collect();
         assert_eq!(senders.len(), 1, "one definition per name, the runner's");
@@ -821,88 +842,40 @@ mod tests {
     /// A confirmed sticker roster puts the pair into the set even when the
     /// assistant's own list predates stickers, and the prompt gains the one
     /// sentence the definitions do not carry. Without a roster, neither.
-    #[test]
-    fn a_confirmed_roster_adds_the_sticker_guidance() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
-        {
-            use crate::db::schema::assistants;
-            diesel::insert_into(assistants::table)
-                .values((
-                    assistants::id.eq("a1"),
-                    assistants::name.eq("A"),
-                    assistants::system_prompt.eq(""),
-                    assistants::is_default.eq(0),
-                    assistants::sort_order.eq(0),
-                    assistants::created_at.eq(1),
-                    assistants::updated_at.eq(1),
-                    assistants::context_limit.eq(128000),
-                    assistants::compact_keep_recent.eq(10),
-                    assistants::enabled_tools.eq(r#"["read_file"]"#),
-                    assistants::thinking_enabled.eq(0),
-                    assistants::auto_compact_enabled.eq(0),
-                ))
-                .execute(&mut conn)
-                .unwrap();
-        }
+    #[tokio::test]
+    async fn a_confirmed_roster_adds_the_sticker_guidance() {
+        let (db, reg) = setup().await;
+        sql(
+            &db,
+            "INSERT INTO assistants (id, name, system_prompt, created_at, updated_at, enabled_tools)
+             VALUES ('a1', 'A', '', 1, 1, '[\"read_file\"]')",
+        )
+        .await;
         let assistant = || assistant_with(None, Some(r#"["read_file"]"#));
 
-        let before = resolve_ok(&mut conn, &reg, input(switchable(None), Some(assistant())));
+        let before = resolve_ok(&db, &reg, input(switchable(None), Some(assistant()))).await;
         assert!(!before.offered.contains("send_sticker"));
         assert!(!before.system_prompt.contains("# Stickers"));
 
-        crate::db::ops::emoji_pack::create_pack(
-            &mut conn,
-            &crate::db::models::emoji_pack::EmojiPackInsert {
-                id: "p1",
-                name: "pack",
-                description: None,
-                cover_image: None,
-                is_builtin: 0,
-                sort_order: 0,
-                created_at: 1,
-                updated_at: 1,
-                kind: "manual",
-                source_account_id: None,
-            },
+        sql(
+            &db,
+            "INSERT INTO emoji_packs (id, name, created_at, updated_at) VALUES ('p1', 'pack', 1, 1);
+             INSERT INTO emojis (id, pack_id, name, file_name, file_format, created_at, semantic_status, last_seen_at)
+                 VALUES ('e1', 'p1', 'wave', 'wave.png', 'png', 1, 'confirmed', 1);
+             INSERT INTO assistant_emoji_packs (assistant_id, pack_id, created_at) VALUES ('a1', 'p1', 1)",
         )
-        .unwrap();
-        crate::db::ops::emoji::create_emoji(
-            &mut conn,
-            &crate::db::models::emoji::EmojiInsert {
-                id: "e1",
-                pack_id: "p1",
-                name: "wave",
-                tags: None,
-                file_name: "wave.png",
-                file_format: "png",
-                sort_order: 0,
-                created_at: 1,
-                source: "local",
-                source_key: None,
-                native_payload: None,
-                semantic_status: "confirmed",
-                suggested_name: None,
-                suggested_tags: None,
-                file_size: 0,
-                seen_count: 1,
-                last_seen_at: Some(1),
-            },
-        )
-        .unwrap();
-        crate::db::ops::emoji_pack::assign_pack(&mut conn, "a1", "p1", 1).unwrap();
+        .await;
 
-        let after = resolve_ok(&mut conn, &reg, input(switchable(None), Some(assistant())));
+        let after = resolve_ok(&db, &reg, input(switchable(None), Some(assistant()))).await;
         assert!(after.offered.contains("send_sticker"));
         assert!(after.system_prompt.contains("# Stickers"), "{}", after.system_prompt);
     }
 
     /// Session tools are not narrowed by exposure: a group that sees only
     /// `web_search` from the registry still sees the QQ tools it was handed.
-    #[test]
-    fn session_tools_survive_a_narrowed_exposure() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn session_tools_survive_a_narrowed_exposure() {
+        let (db, reg) = setup().await;
         let mut i = input(switchable(None), None);
         i.exposure = ToolExposure::Only(&["web_search"]);
         i.session_tools = Some(SessionTools {
@@ -913,48 +886,46 @@ mod tests {
                 parameters: serde_json::json!({}),
             }],
         });
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
         let names: HashSet<&str> = cfg.tool_defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, HashSet::from(["web_search", "qq_get_chat_history"]));
     }
 
     /// The shell line comes from the request, and only when there is a
     /// `run_command` for it to describe.
-    #[test]
-    fn the_shell_line_follows_the_request() {
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn the_shell_line_follows_the_request() {
+        let (db, reg) = setup().await;
 
         let mut i = input(switchable(None), None);
         i.command_shell = Some(crate::tools::command_shell::CommandShell::ContainerSh);
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
         assert!(cfg.offered.contains("run_command"));
         assert!(cfg.system_prompt.contains("# Shell"), "{}", cfg.system_prompt);
         assert!(cfg.system_prompt.contains("container"), "{}", cfg.system_prompt);
 
-        let cfg = resolve_ok(&mut conn, &reg, input(switchable(None), None));
+        let cfg = resolve_ok(&db, &reg, input(switchable(None), None)).await;
         assert!(!cfg.system_prompt.contains("# Shell"), "no shell decided, no line");
 
         // The reviewer's shape: a shell decided but no `run_command` to describe.
         let mut i = input(switchable(None), Some(assistant_with(None, Some(r#"["read_file"]"#))));
         i.command_shell = Some(crate::tools::command_shell::CommandShell::ContainerSh);
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
         assert!(!cfg.offered.contains("run_command"));
         assert!(!cfg.system_prompt.contains("# Shell"), "{}", cfg.system_prompt);
     }
 
-    #[test]
-    fn the_voice_block_reaches_the_prompt_like_any_context_block() {
+    #[tokio::test]
+    async fn the_voice_block_reaches_the_prompt_like_any_context_block() {
         // chat.rs and the estimator both derive this block from
         // voice::prompt::voice_context_block over the same active path; here we
         // pin that whatever that function emits actually lands in the prompt.
-        let (pool, reg) = setup();
-        let mut conn = pool.get().unwrap();
+        let (db, reg) = setup().await;
 
         let block = crate::voice::prompt::voice_context_block(&[], true).unwrap();
         let mut i = input(switchable(None), None);
         i.context_blocks = vec![block];
-        let cfg = resolve_ok(&mut conn, &reg, i);
+        let cfg = resolve_ok(&db, &reg, i).await;
         assert!(cfg.system_prompt.contains("<voice_input>"));
 
         // And a typed-only conversation adds nothing.

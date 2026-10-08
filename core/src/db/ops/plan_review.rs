@@ -249,32 +249,6 @@ fn get_revision(conn: &mut SqliteConnection, id: &str) -> PlanReviewStoreResult<
         .ok_or(PlanReviewStoreError::NotFound("plan revision"))
 }
 
-pub fn get_approved_revision_for_conversation(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-) -> PlanReviewStoreResult<Option<PlanRevisionRow>> {
-    let document = plan_documents::table
-        .filter(plan_documents::conversation_id.eq(conversation_id))
-        .filter(plan_documents::state.ne(PlanDocumentState::Done.as_str()))
-        .filter(plan_documents::approved_revision_id.is_not_null())
-        .order(plan_documents::updated_at.desc())
-        .first::<PlanDocumentRow>(conn)
-        .optional()?;
-    document
-        .and_then(|row| row.approved_revision_id)
-        .as_deref()
-        .map(|id| get_revision(conn, id))
-        .transpose()
-}
-
-pub fn format_approved_plan_block(revision: &PlanRevisionRow) -> Option<String> {
-    let content = revision.content_markdown.trim();
-    if content.is_empty() {
-        return None;
-    }
-    Some(format!("\n\n<approved_plan>\n{content}\n</approved_plan>"))
-}
-
 fn next_revision_no(conn: &mut SqliteConnection, document_id: &str) -> QueryResult<i64> {
     plan_revisions::table
         .filter(plan_revisions::document_id.eq(document_id))

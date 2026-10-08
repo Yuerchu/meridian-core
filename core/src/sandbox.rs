@@ -288,6 +288,45 @@ impl CommandSettings {
         })
     }
 
+    /// [`read_on`](Self::read_on) through SeaORM, both preferences in one
+    /// snapshot: a failed read is `Unreadable`, an unknown value an error.
+    pub async fn read_in(db: &impl crate::db::sea::cap::Snapshot) -> Result<Self, String> {
+        let read = async |key: &str| {
+            crate::db::sea::ops::preference::get_preference(db, key)
+                .await
+                .map_err(|error| format!("could not read the `{key}` preference: {error}"))
+        };
+        let shell = match read("shell").await {
+            Ok(value) => value,
+            Err(error) => return Ok(Self::Unreadable(error)),
+        };
+        let mode = match read("sandbox.enabled").await {
+            Ok(value) => value,
+            Err(error) => return Ok(Self::Unreadable(error)),
+        };
+        Ok(Self::Read {
+            shell: shell
+                .map(|value| crate::tools::ShellType::parse(&value))
+                .transpose()?
+                .unwrap_or_else(crate::tools::ShellType::default_for_platform),
+            mode: ExecutionMode::parse(mode.as_deref())?,
+        })
+    }
+
+    /// [`read_in`](Self::read_in) in a read of its own, counting a database
+    /// that cannot open one as a failed read.
+    pub async fn load(db: &crate::db::sea::cap::Db) -> Result<Self, String> {
+        match db
+            .read(async |tx| Ok::<_, crate::db::sea::DbErr>(Self::read_in(tx).await))
+            .await
+        {
+            Ok(settings) => settings,
+            Err(error) => Ok(Self::Unreadable(format!(
+                "could not open the database to read the shell and sandbox preferences: {error}"
+            ))),
+        }
+    }
+
     /// Reads both preferences, counting a pool that cannot hand out a
     /// connection as a failed read. Blocking.
     pub fn read(pool: &crate::db::DbPool) -> Result<Self, String> {

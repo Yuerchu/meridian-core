@@ -768,14 +768,7 @@ async fn build_config(
         // No shell either — see `hook-gates.md`.
         command_shell: None,
     };
-    let pool = state.services.db.clone();
-    let tools = state.services.tools.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        crate::agent::turn_config::resolve(&mut conn, &tools, input)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    crate::agent::turn_config::resolve_on(&state.services.sea, &state.services.tools, input).await
 }
 
 async fn build_provider(

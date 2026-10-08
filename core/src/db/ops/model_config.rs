@@ -9,23 +9,6 @@ use crate::db::models::model_config::ModelConfigRow;
 use crate::db::models::model_profile::ModelProfileRow;
 use crate::db::schema::{model_configs, model_profiles};
 
-/// A provider's models with the profile each one describes.
-///
-/// Everything that wants a row wants the profile too — there is no context
-/// window, no capability patch and usually no price without it — so the join is
-/// the ordinary read and the bare `list_by_provider` above is the exception.
-pub fn list_by_provider_with_profiles(
-    conn: &mut SqliteConnection,
-    provider_id: &str,
-) -> QueryResult<Vec<(ModelConfigRow, ModelProfileRow)>> {
-    model_configs::table
-        .inner_join(model_profiles::table)
-        .filter(model_configs::provider_id.eq(provider_id))
-        .order(model_configs::model_id.asc())
-        .select((ModelConfigRow::as_select(), ModelProfileRow::as_select()))
-        .load(conn)
-}
-
 pub fn get_with_profile(
     conn: &mut SqliteConnection,
     provider_id: &str,
@@ -123,67 +106,4 @@ pub fn seed_flat(conn: &mut SqliteConnection, flat: &FlatModelConfig) -> QueryRe
         .filter(model_configs::provider_id.eq(flat.provider_id))
         .filter(model_configs::model_id.eq(flat.model_id))
         .first(conn)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::diesel_test_db;
-    use crate::db::models::provider::ProviderInsert;
-
-    fn seed_provider(conn: &mut SqliteConnection) {
-        diesel::insert_into(crate::db::schema::providers::table)
-            .values(&ProviderInsert {
-                id: "p1",
-                name: "Acme",
-                provider_type: "xai",
-                base_url: "https://example.invalid",
-                is_enabled: 1,
-                sort_order: 0,
-                created_at: 0,
-                updated_at: 0,
-                api_format: "responses",
-                catalog_id: None,
-                credential_kind: "api_key",
-                transport_profile: "standard",
-                icon: None,
-                codex_request_shape: 0,
-            })
-            .execute(conn)
-            .unwrap();
-    }
-
-    /// The join the Diesel readers still want; and seeding the same model
-    /// again moves its price on the one row rather than adding a second.
-    #[test]
-    fn a_model_reads_back_beside_the_profile_that_describes_it() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        seed_provider(&mut conn);
-        let flat = FlatModelConfig {
-            provider_id: "p1",
-            model_id: "grok-4.6",
-            ..FlatModelConfig::default()
-        };
-        seed_flat(&mut conn, &flat).unwrap();
-        seed_flat(
-            &mut conn,
-            &FlatModelConfig {
-                input_price: Some("3".parse().unwrap()),
-                server_tools: Some(r#"["web_search"]"#),
-                updated_at: 5,
-                ..flat
-            },
-        )
-        .unwrap();
-
-        let (config, profile) = get_with_profile(&mut conn, "p1", "grok-4.6").unwrap().unwrap();
-        assert_eq!(config.id, "mc1");
-        assert_eq!(config.server_tools.as_deref(), Some(r#"["web_search"]"#));
-        assert_eq!(
-            (profile.context_window, profile.input_price),
-            (128_000, Some("3".parse().unwrap()))
-        );
-        assert_eq!(list_by_provider_with_profiles(&mut conn, "p1").unwrap().len(), 1);
-    }
 }

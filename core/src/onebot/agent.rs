@@ -762,12 +762,7 @@ async fn headless_chat_inner(
     // QQ by `ChatApprovals`, because nobody there may answer it. Read here,
     // ahead of the turn config, because the prompt says which shell commands
     // run under — the same decision `run_command` executes.
-    let command_settings = {
-        let pool2 = pool.clone();
-        tokio::task::spawn_blocking(move || crate::sandbox::CommandSettings::read(&pool2))
-            .await
-            .map_err(|e| e.to_string())??
-    };
+    let command_settings = crate::sandbox::CommandSettings::load(sea).await?;
     // Headless sessions have no project directory. A requested container is
     // therefore refused explicitly instead of being downgraded to the platform
     // default; there is no honest answer to what the container should mount.
@@ -788,8 +783,6 @@ async fn headless_chat_inner(
     let command_shell = None;
 
     let turn = {
-        let pool2 = pool.clone();
-        let registry = tool_registry.clone();
         let input = crate::agent::turn_config::TurnConfigResolveRequest {
             server_tools: turn_params.params.server_tools.clone(),
             assistant: assistant.clone(),
@@ -833,12 +826,7 @@ async fn headless_chat_inner(
             session_tools: qq_tools.filter(|_| supports_tools).map(|q| q.session_tools()),
             command_shell,
         };
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool2.get().map_err(|e| e.to_string())?;
-            crate::agent::turn_config::resolve(&mut conn, &registry, input)
-        })
-        .await
-        .map_err(|e| e.to_string())??
+        crate::agent::turn_config::resolve_on(sea, tool_registry, input).await?
     };
     let tool_defs = turn.tool_defs;
     let system_prompt = turn.system_prompt;

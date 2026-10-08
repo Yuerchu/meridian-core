@@ -4,8 +4,6 @@
 //! everything about *which* agent and *what it costs* lives here, so that
 //! neither the engine nor the runner has to carry it.
 
-use diesel::sqlite::SqliteConnection;
-
 use crate::decimal::Decimal;
 use crate::provider::capabilities;
 
@@ -135,27 +133,33 @@ impl SubAgentCatalog {
 /// picker, the per-model rows behind the pricing settings, and the capability
 /// table. Models that cannot call tools are left out — a sub-agent without
 /// tools is a single completion, which is a different feature.
-pub fn catalog(conn: &mut SqliteConnection) -> Result<SubAgentCatalog, String> {
-    let providers = crate::db::ops::provider::list_providers(conn).map_err(|error| error.to_string())?;
+/// In one snapshot, so a provider and the models filed under it agree.
+pub async fn catalog(db: &impl crate::db::sea::cap::Snapshot) -> Result<SubAgentCatalog, String> {
+    let providers = crate::db::sea::ops::provider::list_providers(db)
+        .await
+        .map_err(|error| error.to_string())?;
     let mut models: Vec<AgentModel> = Vec::new();
 
-    for p in providers.into_iter().filter(|p| p.is_enabled != 0) {
-        let cached = crate::db::ops::cached_model::list_by_provider(conn, &p.id).map_err(|error| error.to_string())?;
+    for p in providers.into_iter().filter(|p| p.is_enabled.get()) {
+        let cached = crate::db::sea::ops::cached_model::list_by_provider(db, &p.id)
+            .await
+            .map_err(|error| error.to_string())?;
         // With the profiles joined on: a model's window, capability patch and
         // — unless this provider overrides them — its prices are the profile's.
         let configs: Vec<crate::agent::model_config::EffectiveModelConfig> =
-            crate::db::ops::model_config::list_by_provider_with_profiles(conn, &p.id)
+            crate::db::sea::ops::model_config::list_by_provider_with_profiles(db, &p.id)
+                .await
                 .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|(config, profile)| crate::agent::model_config::effective(&config.into(), &profile.into()))
+                .iter()
+                .map(|(config, profile)| crate::agent::model_config::effective(config, profile))
                 .collect();
 
         for c in cached {
             let cfg = configs.iter().find(|m| m.model_id == c.model_id);
             let mut caps = crate::provider::registry::get_capabilities(
-                &p.provider_type,
-                &p.api_format,
-                &p.transport_profile,
+                p.provider_type.as_str(),
+                p.api_format.as_str(),
+                p.transport_profile.as_str(),
                 &c.model_id,
             )?;
             capabilities::apply_overrides(&mut caps, cfg.and_then(|m| m.capability_overrides.as_deref()))?;
