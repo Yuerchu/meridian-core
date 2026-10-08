@@ -742,41 +742,6 @@ fn active_barrier_reviews_for_conversation(
     Ok(active)
 }
 
-/// Conversations whose currently blocked native continuation depends on this
-/// assistant. Historical settled reviews are deliberately ignored: an old
-/// review using assistant A must not freeze A while an unrelated active review
-/// uses assistant B.
-pub fn barrier_conversations_for_assistant(
-    conn: &mut SqliteConnection,
-    assistant_id: &str,
-) -> PlanReviewStoreResult<Vec<String>> {
-    let mut blocked = Vec::new();
-    for conversation_id in crate::db::ops::conversation::all_ids(conn)? {
-        let active_reviews = active_barrier_reviews_for_conversation(conn, &conversation_id)?;
-        if active_reviews.is_empty() {
-            continue;
-        }
-        let conversation = crate::db::ops::conversation::get_conversation(conn, &conversation_id)?;
-        let mut missing_runtime = false;
-        let mut frozen = false;
-        for review in active_reviews {
-            match review.native_runtime_config()? {
-                Some(runtime) => {
-                    frozen |= runtime.assistant_id.as_deref() == Some(assistant_id);
-                }
-                None => missing_runtime = true,
-            }
-        }
-        let standing_fallback = missing_runtime && conversation.assistant_id.as_deref() == Some(assistant_id);
-        if frozen || standing_fallback {
-            blocked.push(conversation_id);
-        }
-    }
-    blocked.sort();
-    blocked.dedup();
-    Ok(blocked)
-}
-
 /// Conversations whose blocked native continuation was resolved against this
 /// exact provider/model capability record.
 pub fn barrier_conversations_for_model(
@@ -2803,15 +2768,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            barrier_conversations_for_assistant(&mut conn, "assistant-a")
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            barrier_conversations_for_assistant(&mut conn, "assistant-b").unwrap(),
-            ["c1"]
-        );
         assert!(
             barrier_conversations_for_model(&mut conn, "provider-a", "model-a")
                 .unwrap()

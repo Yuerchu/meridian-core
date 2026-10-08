@@ -4,12 +4,6 @@ use diesel::sqlite::SqliteConnection;
 use crate::db::models::assistant::{AssistantChangeset, AssistantInsert, AssistantRow};
 use crate::db::schema::assistants;
 
-pub fn list_assistants(conn: &mut SqliteConnection) -> QueryResult<Vec<AssistantRow>> {
-    assistants::table
-        .order(assistants::sort_order.asc())
-        .load::<AssistantRow>(conn)
-}
-
 pub fn get_assistant(conn: &mut SqliteConnection, id: &str) -> QueryResult<AssistantRow> {
     assistants::table.find(id).first::<AssistantRow>(conn)
 }
@@ -35,11 +29,6 @@ pub fn update_assistant(
         .set(changeset)
         .execute(conn)?;
     assistants::table.find(id).first::<AssistantRow>(conn)
-}
-
-pub fn delete_assistant(conn: &mut SqliteConnection, id: &str) -> QueryResult<()> {
-    diesel::delete(assistants::table.find(id)).execute(conn)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -87,21 +76,6 @@ mod tests {
     }
 
     #[test]
-    fn test_list_ordered() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_assistant(&mut conn, &make_new_assistant("a2", "Second", 2)).unwrap();
-        create_assistant(&mut conn, &make_new_assistant("a1", "First", 1)).unwrap();
-        create_assistant(&mut conn, &make_new_assistant("a3", "Third", 3)).unwrap();
-
-        let list = list_assistants(&mut conn).unwrap();
-        assert_eq!(list.len(), 3);
-        assert_eq!(list[0].name, "First");
-        assert_eq!(list[1].name, "Second");
-        assert_eq!(list[2].name, "Third");
-    }
-
-    #[test]
     fn test_get_default() {
         let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
@@ -135,14 +109,5 @@ mod tests {
         let updated = update_assistant(&mut conn, "a1", &changeset).unwrap();
         assert_eq!(updated.name, "New Name");
         assert_eq!(updated.system_prompt, "Updated prompt");
-    }
-
-    #[test]
-    fn test_delete() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_assistant(&mut conn, &make_new_assistant("a1", "To Delete", 0)).unwrap();
-        delete_assistant(&mut conn, "a1").unwrap();
-        assert!(get_assistant(&mut conn, "a1").is_err());
     }
 }

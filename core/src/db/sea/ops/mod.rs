@@ -4,6 +4,7 @@
 //! such pair with its remaining Diesel callers, and the checker keeps the two
 //! in step.
 
+pub mod assistant;
 pub mod cached_model;
 pub mod composer_draft;
 pub mod conversation;

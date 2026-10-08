@@ -12,8 +12,10 @@
 use sea_orm::{ColumnTrait, DbErr, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait};
 
 use crate::db::entity::plan_review_delivery::PlanDeliveryState;
-use crate::db::entity::plan_review_session::PlanReviewState;
-use crate::db::entity::{plan_document, plan_review_delivery, plan_review_session};
+use crate::db::entity::plan_review_session::{NativePlanReviewRuntimeConfig, PlanReviewState};
+use crate::db::entity::{
+    conversation as conversation_entity, plan_document, plan_review_delivery, plan_review_session,
+};
 use crate::db::sea::cap::Snapshot;
 use crate::db::sea::ops::conversation;
 
@@ -67,11 +69,17 @@ async fn active_barrier_reviews_for_conversation(
     Ok(active)
 }
 
-/// Conversations whose currently blocked native continuation depends on this
-/// provider. Frozen runtime identity is authoritative; the conversation value
-/// is consulted only for an active legacy row with no frozen snapshot.
-/// Sorted, without duplicates.
-pub async fn barrier_conversations_for_provider(db: &impl Snapshot, provider_id: &str) -> Result<Vec<String>, DbErr> {
+/// Conversations whose currently blocked native continuation depends on
+/// something: `frozen_on` asks a review's frozen runtime, and `standing` asks
+/// the conversation itself, which is consulted only for an active legacy
+/// review with no frozen snapshot. Historical settled reviews are ignored: an
+/// old review using A must not freeze A while an unrelated active review uses
+/// B. Sorted, without duplicates.
+async fn barrier_conversations(
+    db: &impl Snapshot,
+    frozen_on: impl Fn(&NativePlanReviewRuntimeConfig) -> bool,
+    standing: impl Fn(&conversation_entity::Model) -> bool,
+) -> Result<Vec<String>, DbErr> {
     let mut blocked = Vec::new();
     for conversation_id in conversation::all_ids(db).await? {
         let active_reviews = active_barrier_reviews_for_conversation(db, &conversation_id).await?;
@@ -85,18 +93,39 @@ pub async fn barrier_conversations_for_provider(db: &impl Snapshot, provider_id:
         let mut frozen = false;
         for review in active_reviews {
             match review.native_runtime_config_json {
-                Some(runtime) => frozen |= runtime.provider_id == provider_id,
+                Some(runtime) => frozen |= frozen_on(&runtime),
                 None => missing_runtime = true,
             }
         }
-        let standing_fallback = missing_runtime && conversation.agent_provider_id.as_deref() == Some(provider_id);
-        if frozen || standing_fallback {
+        if frozen || (missing_runtime && standing(&conversation)) {
             blocked.push(conversation_id);
         }
     }
     blocked.sort();
     blocked.dedup();
     Ok(blocked)
+}
+
+/// Conversations whose currently blocked native continuation depends on this
+/// provider.
+pub async fn barrier_conversations_for_provider(db: &impl Snapshot, provider_id: &str) -> Result<Vec<String>, DbErr> {
+    barrier_conversations(
+        db,
+        |runtime| runtime.provider_id == provider_id,
+        |conversation| conversation.agent_provider_id.as_deref() == Some(provider_id),
+    )
+    .await
+}
+
+/// Conversations whose currently blocked native continuation depends on this
+/// assistant.
+pub async fn barrier_conversations_for_assistant(db: &impl Snapshot, assistant_id: &str) -> Result<Vec<String>, DbErr> {
+    barrier_conversations(
+        db,
+        |runtime| runtime.assistant_id.as_deref() == Some(assistant_id),
+        |conversation| conversation.assistant_id.as_deref() == Some(assistant_id),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -110,17 +139,45 @@ mod tests {
     /// A conversation with one document, one revision and one review in
     /// `state`, frozen on `provider` (or on nothing, as a legacy row).
     async fn review(db: &Db, conversation: &str, state: &str, provider: Option<&str>, agent_provider: Option<&str>) {
-        let agent = agent_provider.map_or("NULL".to_owned(), |p| format!("'{p}'"));
-        let config = provider.map_or("NULL".to_owned(), |p| {
+        frozen(
+            db,
+            conversation,
+            state,
+            provider.map(|p| (p, None)),
+            agent_provider,
+            None,
+        )
+        .await;
+    }
+
+    fn sql_text(value: Option<&str>) -> String {
+        value.map_or("NULL".to_owned(), |v| format!("'{v}'"))
+    }
+
+    /// The same, with the frozen runtime's assistant and the conversation's
+    /// own assistant given too.
+    async fn frozen(
+        db: &Db,
+        conversation: &str,
+        state: &str,
+        runtime: Option<(&str, Option<&str>)>,
+        agent_provider: Option<&str>,
+        assistant: Option<&str>,
+    ) {
+        let agent = sql_text(agent_provider);
+        let standing_assistant = sql_text(assistant);
+        let config = runtime.map_or("NULL".to_owned(), |(p, a)| {
+            let a = a.map_or("null".to_owned(), |a| format!("\"{a}\""));
             format!(
-                r#"'{{"provider_id":"{p}","model":"m","assistant_id":null,"thinking_level":null,"fast":false,"project_id":null,"project_path":null,"accept_edits":false}}'"#
+                r#"'{{"provider_id":"{p}","model":"m","assistant_id":{a},"thinking_level":null,"fast":false,"project_id":null,"project_path":null,"accept_edits":false}}'"#
             )
         });
         let document_state = if state == "pending" { "reviewing" } else { "approved" };
         execute_for_tests(
             db,
             &format!(
-                "INSERT INTO conversations (id, agent_provider_id, created_at, updated_at) VALUES ('{conversation}', {agent}, 1, 1);
+                "INSERT INTO conversations (id, agent_provider_id, assistant_id, created_at, updated_at)
+                     VALUES ('{conversation}', {agent}, {standing_assistant}, 1, 1);
                  INSERT INTO plan_documents (id, conversation_id, state, file_rel_path, created_at, updated_at)
                      VALUES ('d-{conversation}', '{conversation}', '{document_state}', 'plan.md', 1, 1);
                  INSERT INTO plan_revisions (id, document_id, revision_no, author_kind, content_markdown, content_sha256, created_at)
@@ -170,5 +227,35 @@ mod tests {
         assert_eq!(blocked(&db, "p1").await, ["legacy", "pending", "queued"]);
         assert_eq!(blocked(&db, "p2").await, ["elsewhere"]);
         assert!(blocked(&db, "p3").await.is_empty());
+    }
+
+    /// The same rules on the assistant: the frozen runtime's assistant, and
+    /// the conversation's own assistant for a legacy review.
+    #[tokio::test]
+    async fn the_assistant_barrier_follows_the_frozen_runtime_and_the_legacy_fallback() {
+        let db = sea_test_db().await;
+        execute_for_tests(
+            &db,
+            "INSERT INTO assistants (id, name, created_at, updated_at) VALUES ('a1', 'A', 1, 1), ('a2', 'B', 1, 1)",
+        )
+        .await
+        .unwrap();
+        frozen(&db, "frozen", "pending", Some(("p", Some("a1"))), None, Some("a2")).await;
+        frozen(&db, "legacy", "pending", None, None, Some("a1")).await;
+        frozen(&db, "settled", "approved", Some(("p", Some("a1"))), None, None).await;
+
+        let assistant = |id: &'static str| {
+            let db = db.clone();
+            async move {
+                db.read(async |tx| barrier_conversations_for_assistant(tx, id).await)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(assistant("a1").await, ["frozen", "legacy"]);
+        assert!(
+            assistant("a2").await.is_empty(),
+            "a frozen runtime outranks the conversation's own"
+        );
     }
 }
