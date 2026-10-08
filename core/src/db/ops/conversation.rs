@@ -84,21 +84,6 @@ pub fn update_title(conn: &mut SqliteConnection, id: &str, title: &str, now: i64
     Ok(())
 }
 
-pub fn update_assistant(
-    conn: &mut SqliteConnection,
-    id: &str,
-    assistant_id: Option<&str>,
-    now: i64,
-) -> QueryResult<()> {
-    diesel::update(conversations::table.find(id))
-        .set((
-            conversations::assistant_id.eq(assistant_id),
-            conversations::updated_at.eq(now),
-        ))
-        .execute(conn)?;
-    Ok(())
-}
-
 /// Flip the pin and hand back the row as it is after the flip.
 ///
 /// `immediate_transaction`, because a read followed by a write on autocommit
@@ -144,31 +129,13 @@ pub fn toggle_archive(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryR
     })
 }
 
-/// Persist the per-conversation reasoning preferences. `thinking_level` of
-/// `None` means "inherit the assistant default".
-pub fn update_reasoning_prefs(
-    conn: &mut SqliteConnection,
-    id: &str,
-    thinking_level: Option<&str>,
-    fast_mode: bool,
-    now: i64,
-) -> QueryResult<()> {
-    diesel::update(conversations::table.find(id))
-        .set((
-            conversations::thinking_level.eq(thinking_level),
-            conversations::fast_mode.eq(i32::from(fast_mode)),
-            conversations::updated_at.eq(now),
-        ))
-        .execute(conn)?;
-    Ok(())
-}
-
 /// Persist the collaboration mode. `None` means the default (work) mode.
 ///
 /// Deliberately its own setter rather than another parameter on
-/// `update_reasoning_prefs`: that one already writes two fields at once, which
-/// forces every caller to pass the current value of the other. A third field
-/// would make all three callers depend on each other.
+/// `update_reasoning_prefs` (`db::sea::ops::conversation`): that one already
+/// writes two fields at once, which forces every caller to pass the current
+/// value of the other. A third field would make all three callers depend on
+/// each other.
 pub fn update_mode(conn: &mut SqliteConnection, id: &str, mode: Option<&str>, now: i64) -> QueryResult<()> {
     diesel::update(conversations::table.find(id))
         .set((conversations::mode.eq(mode), conversations::updated_at.eq(now)))
@@ -186,20 +153,6 @@ pub fn update_project(conn: &mut SqliteConnection, id: &str, project_id: Option<
     diesel::update(conversations::table.find(id))
         .set((
             conversations::project_id.eq(project_id),
-            conversations::updated_at.eq(now),
-        ))
-        .execute(conn)?;
-    Ok(())
-}
-
-/// Its own setter for the same reason as `update_mode`, and kept apart from it
-/// for a second one: a mode narrows what the assistant can do, this widens what
-/// it can do without asking. Writing both through one call would suggest they
-/// are two settings of the same kind.
-pub fn update_accept_edits(conn: &mut SqliteConnection, id: &str, accept_edits: bool, now: i64) -> QueryResult<()> {
-    diesel::update(conversations::table.find(id))
-        .set((
-            conversations::accept_edits.eq(i32::from(accept_edits)),
             conversations::updated_at.eq(now),
         ))
         .execute(conn)?;
@@ -809,26 +762,15 @@ mod tests {
     use super::*;
     use crate::db::diesel_test_db;
 
-    /// Migrations are plain SQL and Diesel does not check them at compile time,
-    /// so this is the only place a broken ALTER TABLE surfaces before runtime.
+    /// A new conversation inherits the assistant's reasoning preferences.
+    /// Setting and clearing them is `db::sea::ops::conversation`'s test.
     #[test]
-    fn migrations_apply_and_reasoning_prefs_round_trip() {
+    fn a_new_conversation_inherits_its_reasoning_prefs() {
         let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();
 
         let conv = create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
         assert_eq!(conv.thinking_level, None, "defaults to inheriting the assistant");
-        assert_eq!(conv.fast_mode, 0);
-
-        update_reasoning_prefs(&mut conn, "c1", Some("xhigh"), true, 2).unwrap();
-        let conv = get_conversation(&mut conn, "c1").unwrap();
-        assert_eq!(conv.thinking_level.as_deref(), Some("xhigh"));
-        assert_eq!(conv.fast_mode, 1);
-
-        // Clearing back to the assistant default must be expressible.
-        update_reasoning_prefs(&mut conn, "c1", None, false, 3).unwrap();
-        let conv = get_conversation(&mut conn, "c1").unwrap();
-        assert_eq!(conv.thinking_level, None);
         assert_eq!(conv.fast_mode, 0);
     }
 
