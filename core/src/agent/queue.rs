@@ -169,7 +169,7 @@ pub async fn after_recorded_turn(services: &Services, conversation_id: &str, tur
     let status = tokio::task::spawn_blocking(move || -> Result<Option<TurnStatus>, String> {
         let mut conn = get_conn(&pool)?;
         let turn = crate::db::ops::turn::get(&mut conn, &id).map_err(|error| error.to_string())?;
-        turn.map(|row| row.status()).transpose()
+        Ok(turn.map(|row| row.status))
     })
     .await
     .map_err(|error| error.to_string())??;

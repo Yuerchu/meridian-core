@@ -5085,7 +5085,7 @@ mod unprompted {
         })
     }
 
-    fn turns(shared: &Shared) -> Vec<crate::db::models::turn::TurnRow> {
+    fn turns(shared: &Shared) -> Vec<crate::db::entity::turn::Model> {
         let mut conn = shared.services.db.get().unwrap();
         crate::db::ops::turn::list_for_conversation(&mut conn, "c1")
             .unwrap()
@@ -5136,15 +5136,16 @@ mod unprompted {
         let turns = turns(&shared);
         assert_eq!(turns.len(), 1, "one turn for the whole cycle");
         let turn = &turns[0];
-        assert_eq!(turn.trigger, "task_completion");
+        assert_eq!(turn.trigger.as_str(), "task_completion");
         assert_eq!(
             turn.trigger_ref.as_deref(),
             Some("bg273fiw8"),
             "and it names what woke it"
         );
-        assert_eq!(turn.status, "done");
+        assert_eq!(turn.status.as_str(), "done");
         assert_eq!(
-            turn.origin, "claude_code",
+            turn.origin.as_str(),
+            "claude_code",
             "still Claude Code's turn, for billing and blame"
         );
 
@@ -5225,14 +5226,14 @@ mod unprompted {
             "the card belongs to that turn"
         );
         assert_eq!(
-            turns(&shared)[0].trigger,
+            turns(&shared)[0].trigger.as_str(),
             "agent_autonomous",
             "nothing said what woke it"
         );
 
         shared.close_unprompted(Ending::Stopped, None).await;
         asking.await.unwrap().unwrap();
-        assert_eq!(turns(&shared)[0].status, "cancelled");
+        assert_eq!(turns(&shared)[0].status.as_str(), "cancelled");
     }
 
     /// A prompted turn's own `idle` comes after its reply, while `finish` is
@@ -5292,7 +5293,7 @@ mod unprompted {
         state(&shared, "idle").await;
         let turns = turns(&shared);
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].trigger, "agent_autonomous");
+        assert_eq!(turns[0].trigger.as_str(), "agent_autonomous");
         assert_eq!(turns[0].trigger_ref, None);
     }
 

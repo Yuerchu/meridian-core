@@ -56,7 +56,7 @@ pub struct ConversationRow {
     pub agent_model_id: Option<String>,
 }
 
-impl ConversationRow {
+impl crate::db::entity::conversation::Model {
     /// The assistant this conversation actually runs on.
     ///
     /// An ordinary conversation runs on whatever the assistant says; its model
@@ -108,7 +108,7 @@ pub struct SubAgentRun {
     /// asked, not how many tools it called.
     pub steps: i64,
     /// The row named by `spawned_turn_id`, if it is still there.
-    pub turn: Option<crate::db::models::turn::TurnRow>,
+    pub turn: Option<crate::db::entity::turn::Model>,
 }
 
 #[derive(Debug, Default, Insertable)]
@@ -129,4 +129,40 @@ pub struct ConversationInsert<'a> {
     pub agent_kind: Option<&'a str>,
     pub agent_provider_id: Option<&'a str>,
     pub agent_model_id: Option<&'a str>,
+}
+
+/// The Diesel reads hand out the entity model; a flag that is not 0/1 fails
+/// the read, as it does on the SeaORM side. Goes with them.
+impl TryFrom<ConversationRow> for crate::db::entity::conversation::Model {
+    type Error = String;
+
+    fn try_from(row: ConversationRow) -> Result<Self, String> {
+        let flag = |name: &str, value: i32| {
+            crate::db::types::SqlBool::try_from(value)
+                .map_err(|error| format!("conversation {} has an invalid {name}: {error}", row.id))
+        };
+        Ok(Self {
+            is_pinned: flag("is_pinned", row.is_pinned)?,
+            is_archived: flag("is_archived", row.is_archived)?,
+            fast_mode: flag("fast_mode", row.fast_mode)?,
+            accept_edits: flag("accept_edits", row.accept_edits)?,
+            id: row.id,
+            title: row.title,
+            assistant_id: row.assistant_id,
+            message_count: row.message_count,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            project_id: row.project_id,
+            thinking_level: row.thinking_level,
+            mode: row.mode,
+            head_message_id: row.head_message_id,
+            parent_conversation_id: row.parent_conversation_id,
+            spawned_by_message_id: row.spawned_by_message_id,
+            spawned_by_call_id: row.spawned_by_call_id,
+            spawned_turn_id: row.spawned_turn_id,
+            agent_kind: row.agent_kind,
+            agent_provider_id: row.agent_provider_id,
+            agent_model_id: row.agent_model_id,
+        })
+    }
 }

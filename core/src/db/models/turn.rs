@@ -84,3 +84,29 @@ pub struct TurnInsert<'a> {
     pub trigger: &'a str,
     pub trigger_ref: Option<&'a str>,
 }
+
+/// The Diesel reads hand out the entity model; a stored word this build does
+/// not know fails the read, as it does on the SeaORM side. Goes with them.
+impl TryFrom<TurnRow> for crate::db::entity::turn::Model {
+    type Error = String;
+
+    fn try_from(row: TurnRow) -> Result<Self, String> {
+        Ok(Self {
+            origin: crate::turn::TurnOrigin::parse(&row.origin)?,
+            status: TurnStatus::parse(&row.status)?,
+            phase: row.phase.as_deref().map(TurnPhase::parse).transpose()?,
+            trigger: crate::turn::TurnTrigger::parse(&row.trigger)?,
+            id: row.id,
+            conversation_id: row.conversation_id,
+            phase_tool: row.phase_tool,
+            error: row.error,
+            started_at: row.started_at,
+            updated_at: row.updated_at,
+            ended_at: row.ended_at,
+            reported_at: row.reported_at,
+            parent_reported_at: row.parent_reported_at,
+            self_id: row.self_id,
+            trigger_ref: row.trigger_ref,
+        })
+    }
+}

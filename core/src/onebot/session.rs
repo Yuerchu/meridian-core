@@ -295,10 +295,11 @@ mod tests {
             crate::db::ops::conversation::get_conversation(&mut conn, id)
                 .unwrap()
                 .is_archived
+                .get()
         };
         assert_ne!(fresh, current, "the session moved to a new conversation");
-        assert_eq!(archived(&current), 1, "the session's own conversation is archived");
-        assert_eq!(archived(theirs), 0, "one the command never claimed is left alone");
-        assert_eq!(archived(&fresh), 0);
+        assert!(archived(&current), "the session's own conversation is archived");
+        assert!(!archived(theirs), "one the command never claimed is left alone");
+        assert!(!archived(&fresh));
     }
 }

@@ -1425,8 +1425,7 @@ pub fn reconcile_dispatched_deliveries(conn: &mut SqliteConnection, now: i64) ->
                     .map(|turn_id| crate::db::ops::turn::get(conn, turn_id))
                     .transpose()?
                     .flatten()
-                    .map(|turn| turn.status())
-                    .transpose()?
+                    .map(|turn| turn.status)
                     == Some(crate::db::models::turn::TurnStatus::Done);
             let (state, error) = if completed_native_turn {
                 (PlanDeliveryState::Acknowledged, Some(STARTUP_QUEUE_RESUME_PENDING))
@@ -2124,12 +2123,10 @@ mod tests {
         let turn = crate::db::ops::turn::list_for_conversation(&mut conn, "c1")
             .unwrap()
             .remove(0);
-        assert_eq!(turn.status().unwrap(), TurnStatus::WaitingReview);
+        assert_eq!(turn.status, TurnStatus::WaitingReview);
         assert_eq!(crate::db::ops::turn::reconcile_interrupted(&mut conn, 10).unwrap(), 0);
         assert_eq!(
-            crate::db::ops::turn::list_for_conversation(&mut conn, "c1").unwrap()[0]
-                .status()
-                .unwrap(),
+            crate::db::ops::turn::list_for_conversation(&mut conn, "c1").unwrap()[0].status,
             TurnStatus::WaitingReview
         );
     }

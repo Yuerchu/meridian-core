@@ -14,9 +14,21 @@
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
+use crate::db::entity::turn;
 use crate::db::models::turn::{TurnInsert, TurnPhase, TurnRow, TurnStatus};
 use crate::db::schema::turns;
 use crate::turn::{TurnOrigin, TurnTrigger};
+
+/// A Diesel row as the entity model; a stored value this build cannot read
+/// fails the read, as it does on the SeaORM side.
+pub(super) fn model(row: TurnRow) -> QueryResult<turn::Model> {
+    turn::Model::try_from(row).map_err(|error| {
+        diesel::result::Error::DeserializationError(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error,
+        )))
+    })
+}
 
 /// Record a turn that is starting. Called once the conversation has actually
 /// been taken, so a refused turn leaves nothing behind.
@@ -207,6 +219,9 @@ pub fn unreported_for_conversation(
         .limit(limit)
         .load::<TurnRow>(conn)?
         .into_iter()
+        .map(model)
+        .collect::<QueryResult<Vec<_>>>()?
+        .into_iter()
         .map(|turn| InterruptedCandidate {
             turn,
             ledger: Ledger::Own,
@@ -238,7 +253,10 @@ pub fn unreported_for_conversation(
             .filter(turns::status.eq_any([TurnStatus::Running.as_str(), TurnStatus::Interrupted.as_str()]))
             .order((turns::started_at.desc(), insertion_order().desc()))
             .limit(limit)
-            .load::<TurnRow>(conn)?;
+            .load::<TurnRow>(conn)?
+            .into_iter()
+            .map(model)
+            .collect::<QueryResult<Vec<_>>>()?;
         out.extend(delegated.into_iter().map(|turn| {
             let child_title = children
                 .iter()
@@ -260,18 +278,7 @@ pub fn unreported_for_conversation(
     Ok(out)
 }
 
-pub use crate::db::sea::ops::turn::Ledger;
-
-/// A turn that may still owe an explanation, and who it owes it to.
-pub struct InterruptedCandidate {
-    pub turn: TurnRow,
-    pub ledger: Ledger,
-    /// The sub-agent's title — the description the parent gave when it
-    /// delegated. Joined here rather than looked up while wording the report:
-    /// that side has no connection, and asking it to grow one to fetch a string
-    /// it was handed would be a query per line.
-    pub child_title: Option<String>,
-}
+pub use crate::db::sea::ops::turn::{InterruptedCandidate, Ledger};
 
 /// Record that these turns have now been described to the model.
 ///
@@ -311,11 +318,14 @@ fn insertion_order() -> diesel::expression::SqlLiteral<diesel::sql_types::BigInt
 
 /// Every turn of a conversation, oldest first. For the transcript snapshot,
 /// which is what lets the UI say which turn was cut off rather than guessing.
-pub fn list_for_conversation(conn: &mut SqliteConnection, conversation_id: &str) -> QueryResult<Vec<TurnRow>> {
+pub fn list_for_conversation(conn: &mut SqliteConnection, conversation_id: &str) -> QueryResult<Vec<turn::Model>> {
     turns::table
         .filter(turns::conversation_id.eq(conversation_id))
         .order((turns::started_at.asc(), insertion_order().asc()))
-        .load::<TurnRow>(conn)
+        .load::<TurnRow>(conn)?
+        .into_iter()
+        .map(model)
+        .collect()
 }
 
 /// One turn's record, for a caller that has the id and wants the verdict.
@@ -323,8 +333,13 @@ pub fn list_for_conversation(conn: &mut SqliteConnection, conversation_id: &str)
 /// `None` for an id with no row, which is not an error: a turn can fail before
 /// it has written one, and the callers here treat "no record" and "did not
 /// reach an ending" the same way.
-pub fn get(conn: &mut SqliteConnection, turn_id: &str) -> QueryResult<Option<TurnRow>> {
-    turns::table.find(turn_id).first::<TurnRow>(conn).optional()
+pub fn get(conn: &mut SqliteConnection, turn_id: &str) -> QueryResult<Option<turn::Model>> {
+    turns::table
+        .find(turn_id)
+        .first::<TurnRow>(conn)
+        .optional()?
+        .map(model)
+        .transpose()
 }
 
 /// Mark every turn still recorded as running as interrupted, and report how

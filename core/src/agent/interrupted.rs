@@ -18,7 +18,8 @@
 
 use diesel::sqlite::SqliteConnection;
 
-use crate::db::models::turn::{TurnPhase, TurnRow, TurnStatus};
+use crate::db::entity::turn;
+use crate::db::models::turn::{TurnPhase, TurnStatus};
 use crate::db::ops::turn::{InterruptedCandidate, Ledger};
 use crate::turn::{TurnCoordinator, TurnOrigin};
 
@@ -40,8 +41,8 @@ use crate::turn::{TurnCoordinator, TurnOrigin};
 /// `held` is the turn the coordinator has on this conversation, read once for
 /// however many rows are being judged. Asking it per row would let a list be
 /// answered against two different moments.
-pub fn was_cut_off(turn: &TurnRow, held: Option<&str>) -> Result<bool, String> {
-    Ok(match turn.status()? {
+pub fn was_cut_off(turn: &turn::Model, held: Option<&str>) -> Result<bool, String> {
+    Ok(match turn.status {
         TurnStatus::Interrupted => true,
         TurnStatus::Running => held != Some(turn.id.as_str()),
         TurnStatus::WaitingReview | TurnStatus::Done | TurnStatus::Cancelled | TurnStatus::Failed => false,
@@ -150,7 +151,7 @@ pub(crate) fn block(
 fn choose<'a>(cut_off: &[&'a InterruptedCandidate]) -> Result<Vec<&'a InterruptedCandidate>, String> {
     let mut chosen = Vec::new();
     for (index, candidate) in cut_off.iter().enumerate() {
-        if candidate.turn.phase()? == Some(TurnPhase::RunningTool) {
+        if candidate.turn.phase == Some(TurnPhase::RunningTool) {
             chosen.push(index);
             if chosen.len() == AT_MOST {
                 break;
@@ -267,7 +268,7 @@ fn what_happened(candidate: &InterruptedCandidate) -> Result<String, String> {
         Some(s) => (s, "its own"),
         None => ("It".to_string(), "this conversation's"),
     };
-    Ok(match turn.phase()? {
+    Ok(match turn.phase {
         // The dangerous one: the call had started, so whatever it does may
         // already be done. Saying "it failed" would be as wrong as saying it
         // succeeded, and either would have the model act on a guess.
@@ -300,7 +301,7 @@ fn what_happened(candidate: &InterruptedCandidate) -> Result<String, String> {
 /// Keyed off `origin` rather than off which ledger it came back in: the column
 /// is on the row, and it stays right if a candidate is ever reached another way.
 fn subject(candidate: &InterruptedCandidate) -> Option<String> {
-    if TurnOrigin::parse(&candidate.turn.origin) != Ok(TurnOrigin::SubAgent) {
+    if candidate.turn.origin != TurnOrigin::SubAgent {
         return None;
     }
     // The title is the description the parent wrote when it delegated, so it is

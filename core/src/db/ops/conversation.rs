@@ -1,9 +1,21 @@
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
+use crate::db::entity::{conversation, turn};
 use crate::db::models::conversation::{ConversationInsert, ConversationRow, SubAgentRun};
 use crate::db::models::turn::TurnRow;
 use crate::db::schema::conversations;
+
+/// A Diesel row as the entity model; a stored value this build cannot read
+/// fails the read, as it does on the SeaORM side.
+fn model(row: ConversationRow) -> QueryResult<conversation::Model> {
+    conversation::Model::try_from(row).map_err(|error| {
+        diesel::result::Error::DeserializationError(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error,
+        )))
+    })
+}
 
 /// The user's own conversations, newest first.
 ///
@@ -19,17 +31,23 @@ pub fn all_ids(conn: &mut SqliteConnection) -> QueryResult<Vec<String>> {
     conversations::table.select(conversations::id).load(conn)
 }
 
-pub fn list_conversations(conn: &mut SqliteConnection, archived: bool) -> QueryResult<Vec<ConversationRow>> {
+pub fn list_conversations(conn: &mut SqliteConnection, archived: bool) -> QueryResult<Vec<conversation::Model>> {
     let archived_val = if archived { 1 } else { 0 };
     conversations::table
         .filter(conversations::is_archived.eq(archived_val))
         .filter(conversations::parent_conversation_id.is_null())
         .order((conversations::is_pinned.desc(), conversations::updated_at.desc()))
-        .load::<ConversationRow>(conn)
+        .load::<ConversationRow>(conn)?
+        .into_iter()
+        .map(model)
+        .collect()
 }
 
-pub fn get_conversation(conn: &mut SqliteConnection, id: &str) -> QueryResult<ConversationRow> {
-    conversations::table.find(id).first::<ConversationRow>(conn)
+pub fn get_conversation(conn: &mut SqliteConnection, id: &str) -> QueryResult<conversation::Model> {
+    conversations::table
+        .find(id)
+        .first::<ConversationRow>(conn)
+        .and_then(model)
 }
 
 pub fn create_conversation(
@@ -39,7 +57,7 @@ pub fn create_conversation(
     assistant_id: Option<&str>,
     project_id: Option<&str>,
     now: i64,
-) -> QueryResult<ConversationRow> {
+) -> QueryResult<conversation::Model> {
     let new = ConversationInsert {
         id,
         title,
@@ -57,24 +75,30 @@ pub fn create_conversation(
 /// Insert a prepared row. Split out so a sub-agent can fill the spawned-by
 /// columns without `create_conversation` growing seven more parameters that
 /// every ordinary caller would pass `None` to.
-pub fn insert(conn: &mut SqliteConnection, new: ConversationInsert<'_>) -> QueryResult<ConversationRow> {
+pub fn insert(conn: &mut SqliteConnection, new: ConversationInsert<'_>) -> QueryResult<conversation::Model> {
     let id = new.id.to_string();
     diesel::insert_into(conversations::table).values(&new).execute(conn)?;
-    conversations::table.find(&id).first::<ConversationRow>(conn)
+    conversations::table
+        .find(&id)
+        .first::<ConversationRow>(conn)
+        .and_then(model)
 }
 
 pub fn list_conversations_by_project(
     conn: &mut SqliteConnection,
     project_id: &str,
     archived: bool,
-) -> QueryResult<Vec<ConversationRow>> {
+) -> QueryResult<Vec<conversation::Model>> {
     let archived_val = if archived { 1 } else { 0 };
     conversations::table
         .filter(conversations::project_id.eq(project_id))
         .filter(conversations::is_archived.eq(archived_val))
         .filter(conversations::parent_conversation_id.is_null())
         .order((conversations::is_pinned.desc(), conversations::updated_at.desc()))
-        .load::<ConversationRow>(conn)
+        .load::<ConversationRow>(conn)?
+        .into_iter()
+        .map(model)
+        .collect()
 }
 
 pub fn update_title(conn: &mut SqliteConnection, id: &str, title: &str, now: i64) -> QueryResult<()> {
@@ -93,7 +117,7 @@ pub fn update_title(conn: &mut SqliteConnection, id: &str, title: &str, now: i64
 /// same lock is what makes the row read back at the end this call's own
 /// outcome rather than whatever a later caller has since written.
 /// `concurrent_toggles_are_each_applied` is the test that goes red without it.
-pub fn toggle_pin(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<ConversationRow> {
+pub fn toggle_pin(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<conversation::Model> {
     conn.immediate_transaction(|conn| {
         let conv = conversations::table.find(id).first::<ConversationRow>(conn)?;
         let new_pinned = if conv.is_pinned == 0 { 1 } else { 0 };
@@ -103,7 +127,10 @@ pub fn toggle_pin(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResul
                 conversations::updated_at.eq(now),
             ))
             .execute(conn)?;
-        conversations::table.find(id).first::<ConversationRow>(conn)
+        conversations::table
+            .find(id)
+            .first::<ConversationRow>(conn)
+            .and_then(model)
     })
 }
 
@@ -115,7 +142,7 @@ pub fn archive_conversation(conn: &mut SqliteConnection, id: &str, now: i64) -> 
 }
 
 /// The archive flag's `toggle_pin`, under the same lock for the same reason.
-pub fn toggle_archive(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<ConversationRow> {
+pub fn toggle_archive(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<conversation::Model> {
     conn.immediate_transaction(|conn| {
         let conv = conversations::table.find(id).first::<ConversationRow>(conn)?;
         let new_archived = if conv.is_archived == 0 { 1 } else { 0 };
@@ -125,7 +152,10 @@ pub fn toggle_archive(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryR
                 conversations::updated_at.eq(now),
             ))
             .execute(conn)?;
-        conversations::table.find(id).first::<ConversationRow>(conn)
+        conversations::table
+            .find(id)
+            .first::<ConversationRow>(conn)
+            .and_then(model)
     })
 }
 
@@ -678,10 +708,13 @@ pub fn sub_agent_runs(conn: &mut SqliteConnection, parent_id: &str) -> QueryResu
         .select((messages::turn_id, diesel::dsl::count_star()))
         .load(conn)?;
 
-    let turns: Vec<TurnRow> = turns::table
+    let turns: Vec<turn::Model> = turns::table
         .filter(turns::id.eq_any(&turn_ids))
         .select(TurnRow::as_select())
-        .load(conn)?;
+        .load::<TurnRow>(conn)?
+        .into_iter()
+        .map(super::turn::model)
+        .collect::<QueryResult<_>>()?;
 
     Ok(rows
         .into_iter()
@@ -771,7 +804,7 @@ mod tests {
 
         let conv = create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
         assert_eq!(conv.thinking_level, None, "defaults to inheriting the assistant");
-        assert_eq!(conv.fast_mode, 0);
+        assert!(!conv.fast_mode.get());
     }
 
     /// Everything a delegated run needs in the database, written the way
@@ -935,7 +968,10 @@ mod tests {
 
         let runs = sub_agent_runs(&mut conn, "parent").unwrap();
         assert_eq!(runs[0].spawned_turn_id.as_deref(), Some("t-run"));
-        assert_eq!(runs[0].turn.as_ref().unwrap().status, "done");
+        assert_eq!(
+            runs[0].turn.as_ref().unwrap().status,
+            crate::db::models::turn::TurnStatus::Done
+        );
     }
 
     /// Steps are assistant iterations: how many times the model was asked. Tool
@@ -977,7 +1013,7 @@ mod tests {
         /// whole five seconds on a slow CI runner — measured there, not here.
         /// Availability under that load is not what this test is about; a
         /// toggle that was refused changed nothing and is simply asked again.
-        fn until_applied(mut op: impl FnMut() -> QueryResult<ConversationRow>) {
+        fn until_applied(mut op: impl FnMut() -> QueryResult<conversation::Model>) {
             loop {
                 match op() {
                     Ok(_) => return,
@@ -1012,8 +1048,8 @@ mod tests {
         // are back where they started — unless a press was lost.
         let conv = get_conversation(&mut pool.get().unwrap(), "c1").unwrap();
         assert_eq!(
-            (conv.is_archived, conv.is_pinned),
-            (0, 0),
+            (conv.is_archived.get(), conv.is_pinned.get()),
+            (false, false),
             "an even number of toggles lands back where it started"
         );
     }
@@ -1152,5 +1188,30 @@ mod tests {
             .execute(&mut conn)
             .unwrap();
         assert_eq!(descendants(&mut conn, "parent").unwrap(), ["child", "grandchild"]);
+    }
+
+    /// The Diesel reads hand out the entity model and hold it to the same
+    /// rules as the SeaORM read: a flag that is not 0/1, or a turn status this
+    /// build does not know, fails the read rather than reaching a response.
+    #[tokio::test]
+    async fn a_stored_value_the_model_cannot_hold_fails_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, sea) = crate::db::sea::shared_test_db(dir.path()).await;
+        let mut conn = pool.get().unwrap();
+        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
+        crate::db::ops::turn::begin(&mut conn, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1).unwrap();
+        crate::db::sea::execute_for_tests(
+            &sea,
+            "UPDATE conversations SET is_pinned = 2 WHERE id = 'c1';
+             UPDATE turns SET status = 'from_the_future' WHERE id = 't1'",
+        )
+        .await
+        .unwrap();
+
+        let error = get_conversation(&mut conn, "c1").unwrap_err().to_string();
+        assert!(error.contains("conversation c1 has an invalid is_pinned"), "{error}");
+        assert!(list_conversations(&mut conn, false).is_err());
+        let error = crate::db::ops::turn::get(&mut conn, "t1").unwrap_err().to_string();
+        assert!(error.contains("unknown turn status 'from_the_future'"), "{error}");
     }
 }
