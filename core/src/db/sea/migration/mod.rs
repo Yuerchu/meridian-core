@@ -17,6 +17,7 @@
 pub mod m0001_baseline;
 pub mod m0002_skill_keys;
 pub mod m0003_background_tasks;
+pub mod m0004_frozen_stickers;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -34,6 +35,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0001Baseline),
             Box::new(M0002SkillKeys),
             Box::new(M0003BackgroundTasks),
+            Box::new(M0004FrozenStickers),
         ]
     }
 }
@@ -85,6 +87,7 @@ pub fn sqlite_statements() -> Vec<String> {
     let mut all = m0001_baseline::sqlite_statements();
     all.extend(m0002_skill_keys::sqlite_statements());
     all.extend(m0003_background_tasks::sqlite_statements());
+    all.extend(m0004_frozen_stickers::sqlite_statements());
     all
 }
 
@@ -183,6 +186,35 @@ impl MigrationTrait for M0003BackgroundTasks {
             ));
         }
         for statement in m0003_background_tasks::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0004FrozenStickers;
+
+impl MigrationName for M0004FrozenStickers {
+    fn name(&self) -> &str {
+        "m0004_frozen_stickers"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0004FrozenStickers {
+    /// The rewrite and the ledger row commit together.
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "m0004_frozen_stickers uses SQLite's JSON functions; other backends are not shipped yet".into(),
+            ));
+        }
+        for statement in m0004_frozen_stickers::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;
         }
         Ok(())

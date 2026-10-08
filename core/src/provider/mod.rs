@@ -484,7 +484,25 @@ pub(crate) enum MessageContentPart {
         sticker_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// What the sticker was known as when the message was sent. Written by
+        /// `agent::freeze_sticker_parts` at the point the message enters the
+        /// backend, never by a client, and read on every replay: a later label
+        /// must not change what an earlier request said. `None` only on the
+        /// way in; a stored message that still lacks it is refused when it is
+        /// rendered.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seen_as: Option<StickerSeenAs>,
     },
+}
+
+/// The frozen half of a sticker part: see `MessageContentPart::Sticker`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum StickerSeenAs {
+    /// A confirmed sticker, as the exact text the model is given for it.
+    Described { text: String },
+    /// Nobody had said what it shows; the model is shown the picture instead.
+    Unlabelled,
 }
 
 /// Decode the storage envelope used for multimodal user messages.

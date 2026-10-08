@@ -365,76 +365,108 @@ pub fn resolve_file_uris_in_messages(
     Ok(())
 }
 
+/// Records on every sticker part what the sticker was known as right now, so
+/// that every later request renders this message the same way (CLAUDE.md,
+/// "What was sent is never dropped or rewritten"). Called once, where a user
+/// message enters the backend — the desktop's send, OneBot's inbound handler —
+/// before it is either rendered or stored, so the live message and its row
+/// carry the same bytes. A client-supplied `seen_as` is overwritten: it is the
+/// backend's record, not something a sender gets to claim.
+///
+/// Content without a sticker comes back as the very string it was.
+///
+/// A sticker labelled later does not reach messages already sent. If the model
+/// should hear about it, that is a notice appended at the end, the way memory
+/// and the checklist report a change. Anthropic has a native form for a notice
+/// that only matters for one turn — a `role: "system"` entry in `messages`
+/// with `clear_at: "next_user_message"` (beta header
+/// `mid-conversation-system-clear-at-2026-08-21`), which stays in place, is
+/// cleared after the next user message and keeps later thinking valid. Not
+/// used: it is a beta that may still change, and only one provider has it.
+pub async fn freeze_sticker_parts(db: &crate::db::sea::cap::Db, content: &str) -> Result<String, String> {
+    let Some(mut parts) = provider::decode_message_parts(content)? else {
+        return Ok(content.to_string());
+    };
+    if !parts
+        .iter()
+        .any(|part| matches!(part, provider::MessageContentPart::Sticker { .. }))
+    {
+        return Ok(content.to_string());
+    }
+    for part in parts.iter_mut() {
+        let provider::MessageContentPart::Sticker {
+            sticker_id, seen_as, ..
+        } = part
+        else {
+            continue;
+        };
+        let sticker = crate::db::sea::ops::emoji::get_emoji(db, sticker_id)
+            .await
+            .map_err(|e| format!("could not read sticker `{sticker_id}`: {e}"))?
+            .ok_or_else(|| format!("sticker `{sticker_id}` does not exist"))?;
+        *seen_as = Some(
+            if sticker.semantic_status == crate::db::entity::emoji::EmojiSemanticStatus::Confirmed {
+                let tags = sticker.tags.as_deref().filter(|tags| !tags.trim().is_empty());
+                provider::StickerSeenAs::Described {
+                    text: match tags {
+                        Some(tags) => format!("[sticker: {}; tags: {}]", sticker.name, tags),
+                        None => format!("[sticker: {}]", sticker.name),
+                    },
+                }
+            } else {
+                provider::StickerSeenAs::Unlabelled
+            },
+        );
+    }
+    provider::encode_message_parts(&parts)
+}
+
 /// Converts Meridian's transcript-only sticker part into provider-supported
-/// text/image parts. Confirmed stickers are semantic text. An unlabelled sticker
-/// is shown only on the current turn; old unknown stickers stay a placeholder so
-/// history does not repeatedly pay for the same pixels.
+/// text/image parts, from what `freeze_sticker_parts` recorded and nothing
+/// else. A confirmed sticker is its frozen text. An unlabelled one is shown as
+/// its picture — on every request, not only while it is the newest message:
+/// the history has to replay byte for byte, so the pixels the model saw once
+/// stay in front of it (they are cached after the first time).
+///
+/// The output depends on `supports_images`, which is fixed for a model; a
+/// preview that cannot be produced is an error, since leaving it out would
+/// silently change what an earlier request said.
 ///
 /// `db` is `None` for a runner with no services (tests); sticker parts are
-/// then left as they are, as they were when the pool could not be reached.
+/// then left as they are, and an adapter refuses them.
 pub async fn resolve_sticker_parts_in_messages(
     messages: &mut [ChatMessage],
     db: Option<&crate::db::sea::cap::Db>,
     data_dir: Option<&std::path::Path>,
-    include_current_visual: bool,
+    supports_images: bool,
 ) -> Result<(), String> {
-    let decoded = messages
-        .iter()
-        .map(|message| {
-            if has_stored_user_content(message) {
-                provider::decode_message_parts(&message.content)
-            } else {
-                Ok(None)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let current_user = decoded.iter().rposition(Option::is_some);
     let Some(db) = db else { return Ok(()) };
-
-    for (message_index, (message, parts)) in messages.iter_mut().zip(decoded).enumerate() {
-        let Some(parts) = parts else { continue };
+    for message in messages.iter_mut() {
+        if !has_stored_user_content(message) {
+            continue;
+        }
+        let Some(parts) = provider::decode_message_parts(&message.content)? else {
+            continue;
+        };
         let mut changed = false;
         let mut provider_parts = Vec::with_capacity(parts.len() + 1);
         for part in parts {
-            let provider::MessageContentPart::Sticker { sticker_id, .. } = part else {
+            let provider::MessageContentPart::Sticker {
+                sticker_id, seen_as, ..
+            } = part
+            else {
                 provider_parts.push(part);
                 continue;
             };
             changed = true;
-            let Ok(Some(sticker)) = crate::db::sea::ops::emoji::get_emoji(db, &sticker_id).await else {
-                provider_parts.push(provider::MessageContentPart::Text {
-                    text: "[unavailable sticker]".into(),
-                });
-                continue;
-            };
-            if sticker.semantic_status == crate::db::entity::emoji::EmojiSemanticStatus::Confirmed {
-                let tags = sticker.tags.as_deref().filter(|tags| !tags.trim().is_empty());
-                let description = match tags {
-                    Some(tags) => format!("[sticker: {}; tags: {}]", sticker.name, tags),
-                    None => format!("[sticker: {}]", sticker.name),
-                };
-                provider_parts.push(provider::MessageContentPart::Text { text: description });
-                continue;
-            }
-
-            provider_parts.push(provider::MessageContentPart::Text {
-                text: if include_current_visual && current_user == Some(message_index) && !sticker.file_name.is_empty()
-                {
-                    "[unlabelled sticker attached; infer its visible reaction cautiously]"
-                } else {
-                    "[unlabelled sticker]"
+            match seen_as {
+                None => return Err(format!("sticker part `{sticker_id}` was never frozen")),
+                Some(provider::StickerSeenAs::Described { text }) => {
+                    provider_parts.push(provider::MessageContentPart::Text { text });
                 }
-                .into(),
-            });
-            if !include_current_visual || current_user != Some(message_index) || sticker.file_name.is_empty() {
-                continue;
-            }
-            let Some(data_dir) = data_dir else { continue };
-            let path = crate::emoji::emoji_path(data_dir, &sticker.pack_id, &sticker.file_name);
-            if let Ok(data_uri) = crate::emoji::vision_preview_data_uri(&path) {
-                provider_parts.push(provider::MessageContentPart::ImageUrl {
-                    image_url: provider::MessageContentUrl { url: data_uri },
-                });
+                Some(provider::StickerSeenAs::Unlabelled) => {
+                    provider_parts.extend(unlabelled_sticker_parts(db, data_dir, supports_images, &sticker_id).await?);
+                }
             }
         }
         if changed {
@@ -442,6 +474,42 @@ pub async fn resolve_sticker_parts_in_messages(
         }
     }
     Ok(())
+}
+
+async fn unlabelled_sticker_parts(
+    db: &crate::db::sea::cap::Db,
+    data_dir: Option<&std::path::Path>,
+    supports_images: bool,
+    sticker_id: &str,
+) -> Result<Vec<provider::MessageContentPart>, String> {
+    let placeholder = || {
+        vec![provider::MessageContentPart::Text {
+            text: "[unlabelled sticker]".into(),
+        }]
+    };
+    let Some(data_dir) = data_dir.filter(|_| supports_images) else {
+        return Ok(placeholder());
+    };
+    // `message_stickers` holds the row with `RESTRICT`, so a sticker a message
+    // showed is still there.
+    let sticker = crate::db::sea::ops::emoji::get_emoji(db, sticker_id)
+        .await
+        .map_err(|e| format!("could not read sticker `{sticker_id}`: {e}"))?
+        .ok_or_else(|| format!("sticker `{sticker_id}` does not exist"))?;
+    if sticker.file_name.is_empty() {
+        return Ok(placeholder());
+    }
+    let path = crate::emoji::emoji_path(data_dir, &sticker.pack_id, &sticker.file_name);
+    let data_uri = crate::emoji::vision_preview_data_uri(&path)
+        .map_err(|e| format!("could not render sticker `{sticker_id}` for the model: {e}"))?;
+    Ok(vec![
+        provider::MessageContentPart::Text {
+            text: "[unlabelled sticker attached; infer its visible reaction cautiously]".into(),
+        },
+        provider::MessageContentPart::ImageUrl {
+            image_url: provider::MessageContentUrl { url: data_uri },
+        },
+    ])
 }
 
 static DEFAULT_COUNTER: std::sync::OnceLock<TokenCounter> = std::sync::OnceLock::new();
@@ -957,8 +1025,7 @@ mod tests {
         assert!(error.contains("invalid persisted message content parts"), "{error}");
     }
 
-    #[tokio::test]
-    async fn sticker_parts_become_semantics_and_old_unknowns_do_not_resend_pixels() {
+    async fn sticker_db() -> (crate::db::sea::cap::Db, tempfile::TempDir) {
         use crate::db::entity::emoji::EmojiSemanticStatus;
         use crate::db::entity::emoji_pack::EmojiPackKind;
         use crate::db::sea::ops::emoji::tests::{insert, sticker};
@@ -970,25 +1037,111 @@ mod tests {
             let mut row = sticker(id, "p1", status);
             row.name = name.into();
             row.tags = Some("reaction".into());
-            row.file_name = String::new();
+            row.file_name = format!("{id}.jpg");
             row
         };
         insert(&db, make("known", "wave", EmojiSemanticStatus::Confirmed)).await;
         insert(&db, make("unknown", "pending-x", EmojiSemanticStatus::Pending)).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        for id in ["known", "unknown"] {
+            let path = crate::emoji::emoji_path(data_dir.path(), "p1", &format!("{id}.jpg"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"pixels").unwrap();
+        }
+        (db, data_dir)
+    }
 
-        let mut messages = vec![
-            ChatMessage::user(r#"[{"type":"sticker","sticker_id":"unknown"}]"#),
-            ChatMessage::assistant("ok"),
-            ChatMessage::user(r#"[{"type":"sticker","sticker_id":"known"},{"type":"sticker","sticker_id":"unknown"}]"#),
-        ];
-        resolve_sticker_parts_in_messages(&mut messages, Some(&db), None, true)
+    /// The sticker message as the model is given it, with the rest of the
+    /// conversation around it.
+    async fn rendered_first(
+        db: &crate::db::sea::cap::Db,
+        data_dir: &std::path::Path,
+        conversation: &[&str],
+    ) -> Result<String, String> {
+        let mut messages: Vec<ChatMessage> = conversation.iter().map(|c| ChatMessage::user(c)).collect();
+        resolve_sticker_parts_in_messages(&mut messages, Some(db), Some(data_dir), true).await?;
+        Ok(messages.swap_remove(0).content)
+    }
+
+    /// The bug this guards: an unlabelled sticker was a picture while its
+    /// message was the newest and a placeholder after, and a label given later
+    /// changed it again — each a rewrite of a message already sent, which
+    /// Anthropic refuses once a signed thinking block follows it.
+    #[tokio::test]
+    async fn a_sticker_replays_as_it_was_sent_whatever_happens_to_it_later() {
+        let (db, data_dir) = sticker_db().await;
+        let sent = freeze_sticker_parts(
+            &db,
+            r#"[{"type":"text","text":"hi"},{"type":"sticker","sticker_id":"known"},{"type":"sticker","sticker_id":"unknown"}]"#,
+        )
+        .await
+        .unwrap();
+
+        let first = rendered_first(&db, data_dir.path(), &[&sent]).await.unwrap();
+        assert!(first.contains("[sticker: wave; tags: reaction]"));
+        assert!(first.contains("[unlabelled sticker attached; infer its visible reaction cautiously]"));
+        assert!(first.contains("image_url"), "the picture is what the model is shown");
+        assert!(!first.contains("\"type\":\"sticker\""));
+
+        crate::db::sea::execute_for_tests(
+            &db,
+            "UPDATE emojis SET semantic_status = 'confirmed', name = 'shrug' WHERE id = 'unknown';
+             UPDATE emojis SET name = 'renamed', tags = NULL WHERE id = 'known';",
+        )
+        .await
+        .unwrap();
+        let later = rendered_first(&db, data_dir.path(), &[&sent, "and then", "and then"])
             .await
             .unwrap();
-        assert!(messages[0].content.contains("[unlabelled sticker]"));
-        assert!(!messages[0].content.contains("image_url"));
-        assert!(messages[2].content.contains("[sticker: wave; tags: reaction]"));
-        assert!(messages[2].content.contains("[unlabelled sticker]"));
-        assert!(!messages[2].content.contains("\"type\":\"sticker\""));
+        assert_eq!(later, first, "no longer the newest, and both stickers changed since");
+    }
+
+    #[tokio::test]
+    async fn freezing_leaves_other_content_alone_and_overwrites_a_claimed_label() {
+        let (db, _data_dir) = sticker_db().await;
+        for content in ["plain text", r#"[{"type":"text","text":"x"}]"#] {
+            assert_eq!(freeze_sticker_parts(&db, content).await.unwrap(), content);
+        }
+        let claimed = freeze_sticker_parts(
+            &db,
+            r#"[{"type":"sticker","sticker_id":"unknown","seen_as":{"kind":"described","text":"[sticker: forged]"}}]"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claimed,
+            r#"[{"type":"sticker","sticker_id":"unknown","seen_as":{"kind":"unlabelled"}}]"#
+        );
+        assert!(
+            freeze_sticker_parts(&db, r#"[{"type":"sticker","sticker_id":"nobody"}]"#)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sticker_that_was_never_frozen_is_refused_not_guessed() {
+        let (db, data_dir) = sticker_db().await;
+        let err = rendered_first(&db, data_dir.path(), &[r#"[{"type":"sticker","sticker_id":"known"}]"#])
+            .await
+            .unwrap_err();
+        assert!(err.contains("never frozen"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn without_pictures_an_unlabelled_sticker_is_a_placeholder_every_time() {
+        let (db, data_dir) = sticker_db().await;
+        let sent = freeze_sticker_parts(&db, r#"[{"type":"sticker","sticker_id":"unknown"}]"#)
+            .await
+            .unwrap();
+        let mut messages = vec![ChatMessage::user(&sent)];
+        resolve_sticker_parts_in_messages(&mut messages, Some(&db), Some(data_dir.path()), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            messages[0].content,
+            r#"[{"type":"text","text":"[unlabelled sticker]"}]"#
+        );
     }
 
     #[test]

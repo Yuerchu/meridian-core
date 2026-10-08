@@ -669,6 +669,7 @@ async fn run_turn(
         approval_rule: engine::ApprovalRule::ByReach { accept_edits: false },
         withheld: engine::WithheldWording::Explained,
         files_root: None,
+        stickers: None,
         interrupted: None,
         compaction: engine::CompactionPolicy::Desktop {
             enabled: true,

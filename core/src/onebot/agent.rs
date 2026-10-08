@@ -1196,6 +1196,11 @@ async fn headless_chat_inner(
             // Steering resolves image URIs against this, which is why it is here
             // rather than only in the setup above.
             files_root,
+            stickers: services.map(|s| engine::StickerRendering {
+                db: s.sea.clone(),
+                data_dir: s.paths.data_dir.clone(),
+                supports_images,
+            }),
             interrupted,
             compaction: engine::CompactionPolicy::OneBot,
             // A QQ turn accumulates tokens for the session summary and has
