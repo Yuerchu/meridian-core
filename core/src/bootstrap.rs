@@ -508,7 +508,10 @@ pub(crate) async fn startup_recovery(
     // still marked running was killed rather than finished. This is the only
     // moment that fact is knowable — after this the row would just look like a
     // turn that has been going for a very long time.
-    match db::ops::turn::reconcile_interrupted(&mut conn, now) {
+    match sea
+        .write(async |tx| db::sea::ops::turn::reconcile_interrupted(tx, now).await)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => tracing::info!(turns = n, "turns left running by the previous session"),
         // Not fatal: it costs the diagnosis, not the conversation.

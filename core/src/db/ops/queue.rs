@@ -135,38 +135,6 @@ pub(super) fn carries_attachments(content: &str) -> QueryResult<bool> {
     }))
 }
 
-/// Stop the queue, because the turn in front of it did not finish.
-///
-/// Everything still waiting, not just the head: the instructions were written
-/// as a sequence, and the ones after a failure rest on the same assumption the
-/// failed step broke. "Now rename that function" means nothing if the function
-/// was never created.
-///
-/// **Everything unsettled, including a row already claimed**, and that is the
-/// one filter it is tempting to add back. A claim is not a delivery: `steer`
-/// marks a row dispatched *before* asking the adapter, and the answer can be
-/// `promptRequired` — the agent saying it did not take the message — which
-/// [`undispatch`] puts back on the queue. Skipping claimed rows, a hold landing
-/// inside that window is missed by the only row it was about: the turn fails,
-/// `hold_all` steps over the claimed item, `undispatch` returns it as plainly
-/// `Queued`, and the instruction runs on a premise that died — with no
-/// `queue_release` from anybody.
-///
-/// Marking it costs nothing while it is claimed, because [`QueueState`] reads
-/// `dispatched_at` first and an in-doubt row is already a barrier. The flag only
-/// starts meaning something at the moment `undispatch` clears the dispatch,
-/// which is exactly when it should.
-pub(super) fn hold_all(conn: &mut SqliteConnection, conversation_id: &str, now: i64) -> QueryResult<usize> {
-    diesel::update(
-        queued_prompts::table
-            .filter(queued_prompts::conversation_id.eq(conversation_id))
-            .filter(queued_prompts::settled_at.is_null())
-            .filter(queued_prompts::held_at.is_null()),
-    )
-    .set(queued_prompts::held_at.eq(Some(now)))
-    .execute(conn)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

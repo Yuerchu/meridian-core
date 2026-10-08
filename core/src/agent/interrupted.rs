@@ -464,12 +464,15 @@ mod tests {
 
     #[tokio::test]
     async fn the_startup_verdict_is_believed_without_asking_again() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        turn::set_phase(&mut conn, "t1", TurnPhase::AwaitingApproval, Some("run_command"), 1001).unwrap();
-        turn::reconcile_interrupted(&mut conn, 2000).unwrap();
-        drop(conn);
+        let (_dir, _pool, db, c) = setup().await;
+        db.write(async |tx| {
+            use crate::db::sea::ops::turn as sea_turn;
+            sea_turn::begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await?;
+            sea_turn::set_phase(tx, "t1", TurnPhase::AwaitingApproval, Some("run_command"), 1001).await?;
+            sea_turn::reconcile_interrupted(tx, 2000).await
+        })
+        .await
+        .unwrap();
 
         let told = latest(&db, &c)
             .await

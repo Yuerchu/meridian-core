@@ -2124,11 +2124,6 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(turn.status, TurnStatus::WaitingReview);
-        assert_eq!(crate::db::ops::turn::reconcile_interrupted(&mut conn, 10).unwrap(), 0);
-        assert_eq!(
-            crate::db::ops::turn::list_for_conversation(&mut conn, "c1").unwrap()[0].status,
-            TurnStatus::WaitingReview
-        );
     }
 
     #[test]

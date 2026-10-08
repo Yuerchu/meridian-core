@@ -250,59 +250,6 @@ pub(super) fn get(conn: &mut SqliteConnection, turn_id: &str) -> QueryResult<Opt
         .transpose()
 }
 
-/// Mark every turn still recorded as running as interrupted, and report how
-/// many there were.
-///
-/// Sound because a turn only ever runs inside the process that wrote its row:
-/// there is no scheduler, no worker pool, nothing that could still be going.
-/// So a `running` row seen at startup is not a turn in progress, it is a turn
-/// that was killed — and `phase` is the last thing it admitted to doing.
-///
-/// The one case this does not cover is two copies of the app sharing a
-/// database, where one would declare the other's live turns dead. That is
-/// already impossible for other reasons (the OneBot listener binds a port, MCP
-/// servers are spawned as children) and is not designed for.
-/// **It also holds those conversations' queues**, and that is not a second
-/// concern bolted on — it is the same fact written in the other place it has to
-/// be. The queue's rule is that a turn which did not reach an ending holds
-/// everything behind it: "now rename that function" means nothing if the
-/// function was never created, and only a person can decide otherwise. A crash
-/// is the purest case of a turn that reached no ending, and without this the
-/// rule survives everything except the one event it was written for — the next
-/// enqueue would pump a follow-up whose premise died with the process.
-pub fn reconcile_interrupted(conn: &mut SqliteConnection, now: i64) -> QueryResult<usize> {
-    conn.transaction(|conn| {
-        // Read before the update, because after it there is nothing left to
-        // tell these conversations apart from any other.
-        let stranded: Vec<String> = turns::table
-            .filter(turns::status.eq(TurnStatus::Running.as_str()))
-            .select(turns::conversation_id)
-            .distinct()
-            .load(conn)?;
-
-        let interrupted = diesel::update(turns::table.filter(turns::status.eq(TurnStatus::Running.as_str())))
-            .set((
-                turns::status.eq(TurnStatus::Interrupted.as_str()),
-                turns::ended_at.eq(Some(now)),
-                turns::updated_at.eq(now),
-            ))
-            .execute(conn)?;
-
-        let mut held = 0;
-        for conversation_id in &stranded {
-            held += crate::db::ops::queue::hold_all(conn, conversation_id, now)?;
-        }
-        if held > 0 {
-            tracing::info!(
-                items = held,
-                conversations = stranded.len(),
-                "held queued prompts whose turn was cut off",
-            );
-        }
-        Ok(interrupted)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,93 +346,6 @@ mod tests {
             t.phase_tool.is_none(),
             "a phase that names no tool must not keep the last one"
         );
-    }
-
-    /// The whole point. A turn that was killed left its row at `running` with
-    /// the phase it died in; startup turns that into a diagnosis without losing
-    /// the phase.
-    #[test]
-    fn a_turn_left_running_is_interrupted_at_the_next_launch() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        set_phase(&mut conn, "t1", TurnPhase::RunningTool, Some("edit_file"), 1001).unwrap();
-
-        assert_eq!(reconcile_interrupted(&mut conn, 2000).unwrap(), 1);
-
-        let t = get(&mut conn, "t1");
-        assert_eq!(t.status().unwrap(), TurnStatus::Interrupted);
-        assert_eq!(t.ended_at, Some(2000));
-        assert_eq!(
-            t.phase().unwrap(),
-            Some(TurnPhase::RunningTool),
-            "the phase is the diagnosis; reconciliation must not erase it",
-        );
-        assert_eq!(t.phase_tool.as_deref(), Some("edit_file"));
-    }
-
-    /// **A killed turn holds whatever was queued behind it.**
-    ///
-    /// The queue's rule is that only a turn reaching an ending lets the next
-    /// item go — "now rename that function" means nothing if the function was
-    /// never created. A crash is the purest case of a turn that reached no
-    /// ending, and it is also the only one where nobody is there to see it, so
-    /// without this the rule survived every situation except the one it was
-    /// written for.
-    #[test]
-    fn a_killed_turn_holds_the_queue_that_was_waiting_on_it() {
-        use crate::db::models::queue::{Delivery, QueueState};
-        use crate::db::ops::queue;
-
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "crashed");
-        conv(&mut conn, "idle");
-        begin(&mut conn, "t1", "crashed", TurnOrigin::Desktop, None, 1000).unwrap();
-
-        queue::enqueue(&mut conn, "q1", "crashed", "now rename it", Delivery::FollowUp, 1).unwrap();
-        // A conversation nothing was running on has nothing to be in the dark
-        // about, and its queue must not be swept up along with the other's.
-        queue::enqueue(&mut conn, "q2", "idle", "unrelated", Delivery::FollowUp, 1).unwrap();
-
-        assert_eq!(reconcile_interrupted(&mut conn, 2000).unwrap(), 1);
-
-        assert_eq!(
-            queue::list(&mut conn, "crashed").unwrap()[0].state(),
-            QueueState::Held,
-            "and so it waits for a person rather than running on a dead premise",
-        );
-        assert_eq!(
-            queue::list(&mut conn, "idle").unwrap()[0].state(),
-            QueueState::Queued,
-            "an untouched conversation's queue is not collateral",
-        );
-    }
-
-    #[test]
-    fn reconciliation_leaves_finished_turns_alone() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        for (id, status) in [
-            ("done", TurnStatus::Done),
-            ("cancelled", TurnStatus::Cancelled),
-            ("failed", TurnStatus::Failed),
-        ] {
-            begin(&mut conn, id, "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-            finish(&mut conn, id, status, None, 1500).unwrap();
-        }
-        begin(&mut conn, "live", "c1", TurnOrigin::OneBot, None, 1000).unwrap();
-
-        assert_eq!(reconcile_interrupted(&mut conn, 2000).unwrap(), 1);
-
-        assert_eq!(get(&mut conn, "done").status().unwrap(), TurnStatus::Done);
-        assert_eq!(get(&mut conn, "cancelled").status().unwrap(), TurnStatus::Cancelled);
-        assert_eq!(get(&mut conn, "failed").status().unwrap(), TurnStatus::Failed);
-        assert_eq!(get(&mut conn, "live").status().unwrap(), TurnStatus::Interrupted);
-        // Nothing to do the second time.
-        assert_eq!(reconcile_interrupted(&mut conn, 2001).unwrap(), 0);
     }
 
     #[test]
@@ -635,8 +495,6 @@ mod tests {
 
         let t = get(&mut conn, "t1");
         assert_eq!(t.status(), Err("unknown turn status 'from_the_future'".into()));
-        // And it is not swept up as if it were running.
-        assert_eq!(reconcile_interrupted(&mut conn, 2000).unwrap(), 0);
     }
 
     #[test]
