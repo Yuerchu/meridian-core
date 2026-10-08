@@ -70,3 +70,27 @@ impl Related<super::tool_preset::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// A partial update: a field left `None` is not written. The nullable
+/// columns are `Option<Option<_>>`, so `Some(None)` clears one.
+#[derive(Debug, Default, DeriveIntoActiveModel)]
+pub struct AssistantChangeset {
+    pub name: Option<String>,
+    pub description: Option<Option<String>>,
+    pub avatar: Option<Option<String>>,
+    pub system_prompt: Option<String>,
+    pub provider_id: Option<Option<String>>,
+    pub model_id: Option<Option<String>>,
+    pub temperature: Option<Option<f32>>,
+    pub top_p: Option<Option<f32>>,
+    pub max_tokens: Option<Option<i32>>,
+    pub is_default: Option<SqlBool>,
+    pub context_limit: Option<i32>,
+    pub compact_keep_recent: Option<i32>,
+    pub enabled_tools: Option<Option<Json<Vec<String>>>>,
+    pub thinking_enabled: Option<SqlBool>,
+    pub thinking_budget: Option<Option<i32>>,
+    pub tool_preset_id: Option<Option<String>>,
+    pub auto_compact_enabled: Option<SqlBool>,
+    pub updated_at: Option<EpochMs>,
+}
