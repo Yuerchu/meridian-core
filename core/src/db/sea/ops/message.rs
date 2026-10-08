@@ -1142,6 +1142,22 @@ mod tests {
         assert!(ids(&db, "c1").await.is_empty());
     }
 
+    /// With no sibling to follow, the head falls back to the deleted branch's
+    /// parent rather than to nothing.
+    #[tokio::test]
+    async fn deleting_the_only_branch_moves_the_head_to_the_parent() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("q", None), ("a", Some("q"))]).await;
+        execute_for_tests(&db, "UPDATE conversations SET head_message_id = 'a' WHERE id = 'c1'")
+            .await
+            .unwrap();
+
+        let new_head = db.write(async |tx| delete_subtree(tx, "c1", "a").await).await.unwrap();
+        assert_eq!(new_head.as_deref(), Some("q"));
+        assert_eq!(head(&db, "c1").await.as_deref(), Some("q"));
+        assert_eq!(ids(&db, "c1").await, ["q"]);
+    }
+
     /// A 2000-deep chain deletes: the parent link carries no foreign key, and
     /// the subtree is collected in Rust rather than by recursion in SQL.
     #[tokio::test]

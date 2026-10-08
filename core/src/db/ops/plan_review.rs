@@ -622,61 +622,9 @@ pub fn get_pending_review_for_conversation(
         .optional()?)
 }
 
-/// Whether ordinary conversation traffic must stop at a durable plan-review
-/// boundary.  A settled decision keeps the barrier while its continuation is
-/// queued, being dispatched, held, or explicitly in doubt; otherwise a normal
-/// prompt can race the decision command and take the conversation before the
-/// approved/feedback continuation does.
-pub fn has_conversation_barrier(conn: &mut SqliteConnection, conversation_id: &str) -> PlanReviewStoreResult<bool> {
-    if get_pending_review_for_conversation(conn, conversation_id)?.is_some() {
-        return Ok(true);
-    }
-    let document_ids = plan_documents::table
-        .filter(plan_documents::conversation_id.eq(conversation_id))
-        .select(plan_documents::id)
-        .load::<String>(conn)?;
-    if document_ids.is_empty() {
-        return Ok(false);
-    }
-    let review_ids = plan_review_sessions::table
-        .filter(plan_review_sessions::document_id.eq_any(document_ids))
-        .select(plan_review_sessions::id)
-        .load::<String>(conn)?;
-    if review_ids.is_empty() {
-        return Ok(false);
-    }
-    Ok(plan_review_deliveries::table
-        .filter(plan_review_deliveries::review_id.eq_any(review_ids))
-        .filter(plan_review_deliveries::state.eq_any([
-            PlanDeliveryState::Queued.as_str(),
-            PlanDeliveryState::Dispatched.as_str(),
-            PlanDeliveryState::Held.as_str(),
-            PlanDeliveryState::InDoubt.as_str(),
-        ]))
-        .select(plan_review_deliveries::id)
-        .first::<String>(conn)
-        .optional()?
-        .is_some())
-}
-
 fn list_reviews(conn: &mut SqliteConnection, document_id: &str) -> PlanReviewStoreResult<Vec<PlanReviewSessionRow>> {
     Ok(plan_review_sessions::table
         .filter(plan_review_sessions::document_id.eq(document_id))
-        .order(plan_review_sessions::created_at.asc())
-        .load(conn)?)
-}
-
-/// Review cards for every planning episode in one conversation.  The message
-/// snapshot applies branch visibility; this query deliberately crosses active
-/// and done documents so settled cards remain reconstructable after restart.
-pub fn list_reviews_for_conversation(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-) -> PlanReviewStoreResult<Vec<PlanReviewSessionRow>> {
-    Ok(plan_review_sessions::table
-        .inner_join(plan_documents::table)
-        .filter(plan_documents::conversation_id.eq(conversation_id))
-        .select(PlanReviewSessionRow::as_select())
         .order(plan_review_sessions::created_at.asc())
         .load(conn)?)
 }

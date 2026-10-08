@@ -119,6 +119,24 @@ mod tests {
         db.write(async |tx| upsert_if_newer(tx, row).await).await.unwrap()
     }
 
+    /// A stored action list this build cannot read fails the read rather than
+    /// becoming an incident that recommends nothing.
+    #[tokio::test]
+    async fn an_unreadable_action_list_fails_the_read() {
+        // The table checks for a JSON array; what is in it is the read's to judge.
+        for actions in [r#"["teleport"]"#, "[1]"] {
+            let db = with_conversations(&["c1"]).await;
+            record(&db, notice("n1", "c1", "sess:notice:1:1", 1, "Retrying", 5)).await;
+            execute_for_tests(
+                &db,
+                &format!("UPDATE acp_session_notices SET actions = '{actions}' WHERE id = 'n1'"),
+            )
+            .await
+            .unwrap();
+            assert!(list_for_conversation(&db, "c1").await.is_err(), "{actions} read");
+        }
+    }
+
     /// A warning, then the same incident at a higher revision saying it became
     /// the failure: one row throughout, keeping its first id and first sighting.
     #[tokio::test]

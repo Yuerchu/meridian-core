@@ -549,6 +549,31 @@ impl TryFrom<crate::db::models::acp_session_notice::AcpSessionNoticeRow> for Acp
     }
 }
 
+impl TryFrom<crate::db::entity::acp_session_notice::Model> for AcpSessionNoticeEvent {
+    type Error = String;
+
+    /// The model is typed already (the action list decodes strictly at the
+    /// read); what is left is the revision's sign.
+    fn try_from(row: crate::db::entity::acp_session_notice::Model) -> Result<Self, String> {
+        Ok(Self {
+            revision: u32::try_from(row.revision)
+                .map_err(|_| "acp_session_notices.revision is negative".to_string())?,
+            id: row.id,
+            conversation_id: row.conversation_id,
+            turn_id: row.turn_id,
+            notice_id: row.notice_id,
+            category: row.category,
+            severity: row.severity,
+            title: row.title,
+            details: row.details,
+            reason: row.reason,
+            actions: row.actions.0,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
 /// One hunk of the diff a hosted agent reported for an Edit or Write.
 ///
 /// The same shape is persisted in `messages.tool_diffs` (a map from call id
