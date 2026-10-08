@@ -627,16 +627,10 @@ pub async fn resume_completed_plan_review_queues(services: Services) {
 }
 
 async fn next_pending_queue_id(services: &Services, conversation_id: &str) -> Result<Option<String>, String> {
-    let pool = services.db.clone();
-    let conversation_id = conversation_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::queue::next_pending(&mut conn, &conversation_id)
-            .map(|row| row.map(|row| row.id))
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    crate::db::sea::ops::queue::next_pending(&services.sea, conversation_id)
+        .await
+        .map(|row| row.map(|row| row.id))
+        .map_err(|error| error.to_string())
 }
 
 fn queue_resume_progressed(before: Option<&str>, after: Option<&str>) -> bool {
@@ -701,10 +695,13 @@ mod tests {
             .await
             .unwrap();
 
-        let mut conn = services.db.get().unwrap();
-        assert_eq!(queue::list(&mut conn, "c1").unwrap()[0].state(), QueueState::Held);
+        let queued = crate::db::sea::ops::queue::list(&services.sea, "c1").await.unwrap();
+        assert_eq!(queued[0].state(), QueueState::Held);
         assert!(
-            queue::next_pending(&mut conn, "c1").unwrap().is_none(),
+            crate::db::sea::ops::queue::next_pending(&services.sea, "c1")
+                .await
+                .unwrap()
+                .is_none(),
             "nothing is delivered on the premise of a turn that never finished",
         );
     }

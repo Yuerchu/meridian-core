@@ -31,11 +31,11 @@ mod schema_drift;
 use std::path::Path;
 use std::time::Duration;
 
+use sea_orm::SqlxSqliteConnector;
 /// The error every op answers with, re-exported so a caller that does not
 /// depend on sea-orm itself (the shell) can name it — as the return type of a
 /// function it runs inside `Db::read` or `Db::write`.
-pub use sea_orm::DbErr;
-use sea_orm::SqlxSqliteConnector;
+pub use sea_orm::{DbErr, SqlErr};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Connection};
 

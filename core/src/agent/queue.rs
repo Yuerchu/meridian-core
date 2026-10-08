@@ -1,6 +1,6 @@
 //! Delivering the prompt queue.
 //!
-//! `db::ops::queue` decides *what* may go next; this decides *when*, and hands
+//! `db::sea::ops::queue` decides *what* may go next; this decides *when*, and hands
 //! it to whichever runner owns the conversation. One function does the work
 //! ([`pump`]) and everything else here is about when it is allowed to run.
 //!
@@ -21,7 +21,7 @@
 //!
 //! That difference is the same one the ledger is built around. A native turn
 //! resends its whole history, so a row in the transcript is delivery — and
-//! [`db::ops::queue::take_next`](crate::db::ops::queue::take_next) makes the row
+//! [`db::sea::ops::queue::take_next`](crate::db::sea::ops::queue::take_next) makes the row
 //! and the item's removal one transaction, which leaves no in-doubt state to
 //! report. A hosted turn's history lives in the adapter, so a row here proves
 //! nothing and the doubt is real.
@@ -29,8 +29,10 @@
 use crate::db::entity::queued_prompt;
 use crate::db::models::queue::Delivery;
 use crate::db::models::turn::TurnStatus;
+use crate::db::sea::DbErr;
+use crate::db::sea::ops::queue as queue_ops;
 use crate::services::Services;
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 mod native;
 
@@ -82,48 +84,34 @@ pub async fn pump(services: &Services, conversation_id: &str) {
 /// accidentally checking only for a pending review and forgetting the
 /// unacknowledged delivery states.
 pub async fn has_plan_review_barrier(services: &Services, conversation_id: &str) -> Result<bool, String> {
-    let pool = services.db.clone();
-    let conversation_id = conversation_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        crate::db::ops::plan_review::has_conversation_barrier(&mut conn, &conversation_id)
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    services
+        .sea
+        .read(async |tx| crate::db::sea::ops::plan_review::has_conversation_barrier(tx, conversation_id).await)
+        .await
+        .map_err(|error: DbErr| error.to_string())
 }
 
 /// Whether this conversation belongs to a hosted agent, from the row rather
 /// than from the registry.
 #[cfg(not(target_os = "android"))]
 async fn is_hosted(services: &Services, conversation_id: &str) -> bool {
-    let pool = services.db.clone();
-    let id = conversation_id.to_string();
     // Every failure has to stay distinguishable from "this is not hosted", so
     // the errors are carried rather than flattened with `.ok()?`. Written the
     // short way, a busy pool or a transient query error read exactly like an
     // ordinary conversation — and the recovery from a transient error is a
     // Claude Code queue answered by the user's own provider.
-    let kind: Result<Result<Option<String>, String>, _> = tokio::task::spawn_blocking(move || {
-        let mut conn = crate::util::get_conn(&pool)?;
-        crate::db::ops::conversation::get_conversation(&mut conn, &id)
-            .map(|c| c.agent_kind)
-            .map_err(|e| e.to_string())
-    })
-    .await;
-
-    match kind {
-        Ok(Ok(kind)) => kind.as_deref() == Some(crate::acp::AGENT_KIND),
+    match crate::db::sea::ops::conversation::get_conversation(&services.sea, conversation_id).await {
+        Ok(Some(conversation)) => conversation.agent_kind.as_deref() == Some(crate::acp::AGENT_KIND),
         // Nothing was learned, and the two answers are not symmetrical:
         // `hosted::pump` with no session does nothing and the queue waits,
         // while `native::pump` starts a turn. So an unanswered question is
-        // answered "hosted".
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "could not tell which runner owns this queue; leaving it alone");
+        // answered "hosted". A conversation that is gone has nothing to pump.
+        Ok(None) => {
+            tracing::warn!(conversation_id, "the queue's conversation is gone; leaving it alone");
             true
         }
         Err(e) => {
-            tracing::warn!(error = %e, "the runner lookup panicked; leaving the queue alone");
+            tracing::warn!(error = %e, "could not tell which runner owns this queue; leaving it alone");
             true
         }
     }
@@ -165,15 +153,10 @@ pub async fn after_turn(services: &Services, conversation_id: &str, status: Opti
 /// back is cheaper than threading the answer out through every early return of
 /// a function that has a dozen.
 pub async fn after_recorded_turn(services: &Services, conversation_id: &str, turn_id: &str) -> Result<(), String> {
-    let pool = services.db.clone();
-    let id = turn_id.to_string();
-    let status = tokio::task::spawn_blocking(move || -> Result<Option<TurnStatus>, String> {
-        let mut conn = get_conn(&pool)?;
-        let turn = crate::db::ops::turn::get(&mut conn, &id).map_err(|error| error.to_string())?;
-        Ok(turn.map(|row| row.status))
-    })
-    .await
-    .map_err(|error| error.to_string())??;
+    let status = crate::db::sea::ops::turn::get(&services.sea, turn_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|row| row.status);
     after_turn(services, conversation_id, status).await;
     Ok(())
 }
@@ -184,17 +167,14 @@ pub async fn after_recorded_turn(services: &Services, conversation_id: &str, tur
 /// as a sequence and the ones after a failure rest on the same assumption the
 /// failed step broke.
 pub async fn hold(services: &Services, conversation_id: &str) {
-    let pool = services.db.clone();
-    let id = conversation_id.to_string();
-    let held = tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        crate::db::ops::queue::hold_all(&mut conn, &id, now_ms()).map_err(|e| e.to_string())
-    })
-    .await;
+    let held = services
+        .sea
+        .write(async |tx| queue_ops::hold_all(tx, conversation_id, now_ms()).await)
+        .await;
 
     match held {
-        Ok(Ok(0)) => {}
-        Ok(Ok(count)) => {
+        Ok(0) => {}
+        Ok(count) => {
             tracing::info!(
                 count,
                 conversation_id,
@@ -202,8 +182,7 @@ pub async fn hold(services: &Services, conversation_id: &str) {
             );
             announce(services, conversation_id);
         }
-        Ok(Err(e)) => tracing::warn!(error = %e, conversation_id, "could not hold the queue"),
-        Err(e) => tracing::warn!(error = %e, conversation_id, "could not hold the queue (the write panicked)"),
+        Err(e) => tracing::warn!(error = %e, conversation_id, "could not hold the queue"),
     }
 }
 
@@ -269,15 +248,9 @@ impl Doubtful {
 ///
 /// Reading this settles nothing — see [`confirm_reported`].
 pub async fn owed(services: &Services, conversation_id: &str) -> Option<Doubtful> {
-    let pool = services.db.clone();
-    let id = conversation_id.to_string();
-    let items = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().ok()?;
-        crate::db::ops::queue::unreported_in_doubt(&mut conn, &id).ok()
-    })
-    .await
-    .ok()
-    .flatten()?;
+    let items = queue_ops::unreported_in_doubt(&services.sea, conversation_id)
+        .await
+        .ok()?;
 
     let items: Vec<queued_prompt::Model> = items.into_iter().take(AT_MOST).collect();
     if items.is_empty() {
@@ -297,16 +270,12 @@ pub async fn owed(services: &Services, conversation_id: &str) -> Option<Doubtful
 /// of getting this wrong repeats the warning rather than losing it, including a
 /// failed write, and that is the direction to fail in.
 pub async fn confirm_reported(services: &Services, report: Doubtful) {
-    let pool = services.db.clone();
-    let written = tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        crate::db::ops::queue::mark_reported(&mut conn, &report.ids, now_ms()).map_err(|e| e.to_string())
-    })
-    .await;
-    match written {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "could not record that a queued message was reported"),
-        Err(e) => tracing::warn!(error = %e, "recording a reported queue item panicked"),
+    let written = services
+        .sea
+        .write(async |tx| queue_ops::mark_reported(tx, &report.ids, now_ms()).await)
+        .await;
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "could not record that a queued message was reported");
     }
 }
 
@@ -390,50 +359,19 @@ fn spoken(content: &str) -> String {
 /// whatever mode it is in, because with no turn to interrupt the distinction
 /// has nothing to refer to.
 async fn read(services: &Services, conversation_id: &str, steerable: bool) -> Option<queued_prompt::Model> {
-    let pool = services.db.clone();
-    let id = conversation_id.to_string();
-    let found = tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        if steerable {
-            crate::db::ops::queue::next_deliverable(&mut conn, &id, Delivery::Interject).map_err(|e| e.to_string())
-        } else {
-            crate::db::ops::queue::next_pending(&mut conn, &id).map_err(|e| e.to_string())
-        }
-    })
-    .await;
+    let found = if steerable {
+        queue_ops::next_deliverable(&services.sea, conversation_id, Delivery::Interject).await
+    } else {
+        queue_ops::next_pending(&services.sea, conversation_id).await
+    };
 
     match found {
-        Ok(Ok(item)) => item,
-        Ok(Err(e)) => {
+        Ok(item) => item,
+        Err(e) => {
             tracing::warn!(error = %e, conversation_id, "could not read the queue");
             None
         }
-        Err(e) => {
-            tracing::warn!(error = %e, conversation_id, "could not read the queue (it panicked)");
-            None
-        }
     }
-}
-
-/// One small write against the queue, off the async runtime.
-// Android has no runner to deliver to: a hosted session is a child process, and
-// the native path is not connected yet.
-#[cfg_attr(target_os = "android", allow(dead_code, reason = "nothing delivers there yet"))]
-async fn write<F, T>(services: &Services, id: String, f: F) -> Result<T, String>
-where
-    F: FnOnce(&mut diesel::SqliteConnection, String) -> diesel::QueryResult<T> + Send + 'static,
-    // Generic in the result so a caller can read the affected-row count back.
-    // Most of these writes are notes and `()` is all there is to say; a
-    // `mark_dispatched` is a claim, and the count is the claim's answer.
-    T: Send + 'static,
-{
-    let pool = services.db.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        f(&mut conn, id).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
@@ -590,8 +528,12 @@ mod tests {
                 &crate::db::models::plan_review::NativePlanReviewRuntimeConfig::fixture(),
             )
             .unwrap();
-            crate::db::ops::queue::enqueue(&mut conn, "q1", "c1", "bypass the review", Delivery::FollowUp, 7).unwrap();
         }
+        services
+            .sea
+            .write(async |tx| queue_ops::enqueue(tx, "q1", "c1", "bypass the review", Delivery::FollowUp, 7).await)
+            .await
+            .unwrap();
 
         assert!(
             has_plan_review_barrier(&services, "c1").await.unwrap(),
@@ -600,12 +542,12 @@ mod tests {
         pump(&services, "c1").await;
 
         assert_eq!(starter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let queued = crate::db::ops::queue::list(&mut services.db.get().unwrap(), "c1").unwrap();
+        let queued = queue_ops::list(&services.sea, "c1").await.unwrap();
         assert_eq!(queued[0].settled_at, None, "the prompt remains durable and undelivered");
         assert_eq!(queued[0].state(), crate::db::models::queue::QueueState::Queued);
 
         after_recorded_turn(&services, "c1", "t1").await.unwrap();
-        let queued = crate::db::ops::queue::list(&mut services.db.get().unwrap(), "c1").unwrap();
+        let queued = queue_ops::list(&services.sea, "c1").await.unwrap();
         assert_eq!(
             queued[0].state(),
             crate::db::models::queue::QueueState::Queued,
@@ -655,11 +597,15 @@ mod tests {
         {
             let mut conn = services.db.get().unwrap();
             crate::db::ops::conversation::create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-            crate::db::ops::queue::enqueue(&mut conn, "q1", "c1", "after review", Delivery::FollowUp, 2).unwrap();
         }
+        services
+            .sea
+            .write(async |tx| queue_ops::enqueue(tx, "q1", "c1", "after review", Delivery::FollowUp, 2).await)
+            .await
+            .unwrap();
 
         after_turn(&services, "c1", Some(TurnStatus::WaitingReview)).await;
-        let queued = crate::db::ops::queue::list(&mut services.db.get().unwrap(), "c1").unwrap();
+        let queued = queue_ops::list(&services.sea, "c1").await.unwrap();
         assert_eq!(queued[0].state(), crate::db::models::queue::QueueState::Queued);
     }
 
@@ -736,7 +682,7 @@ mod tests {
 mod hosted {
     use std::sync::Arc;
 
-    use super::{announce, read, write};
+    use super::{announce, queue_ops, read};
     use crate::acp::AcpSession;
     use crate::acp::protocol::SteerOutcome;
     use crate::db::entity::queued_prompt;
@@ -844,21 +790,20 @@ mod hosted {
         // In a transaction of its own because the read and the update have to
         // be one step, and unlike `write_prompt_row` and `run_turn` this claim
         // is not already inside one.
-        let turn = turn_id.to_string();
-        let conversation = session.conversation_id.clone();
-        let claimed = write(services, item.id.clone(), move |conn, id| {
-            conn.immediate_transaction(|conn| {
-                crate::db::ops::queue::mark_dispatched(
-                    conn,
-                    &conversation,
-                    &id,
+        let claimed = services
+            .sea
+            .write(async |tx| {
+                queue_ops::mark_dispatched(
+                    tx,
+                    &session.conversation_id,
+                    &item.id,
                     Some(Delivery::Interject),
-                    &turn,
+                    turn_id,
                     now_ms(),
                 )
+                .await
             })
-        })
-        .await;
+            .await;
         match claimed {
             Ok(1..) => {}
             // Somebody else has it. Not a failure and not in doubt: whoever
@@ -881,10 +826,10 @@ mod hosted {
             // The agent says it did not take the message — evidence about the
             // delivery rather than the absence of it — so the item goes back.
             Ok(SteerOutcome::PromptRequired) => {
-                let _ = write(services, item.id.clone(), |conn, id| {
-                    crate::db::ops::queue::undispatch(conn, &id).map(|_| ())
-                })
-                .await;
+                let _ = services
+                    .sea
+                    .write(async |tx| queue_ops::undispatch(tx, &item.id).await)
+                    .await;
                 Steered::NotTaken
             }
             Ok(outcome) => {
@@ -897,10 +842,10 @@ mod hosted {
                         "a steer started a detached turn; this app has no lease on it"
                     );
                 }
-                let _ = write(services, item.id.clone(), |conn, id| {
-                    crate::db::ops::queue::mark_settled(conn, &id, None, now_ms()).map(|_| ())
-                })
-                .await;
+                let _ = services
+                    .sea
+                    .write(async |tx| queue_ops::mark_settled(tx, &item.id, None, now_ms()).await)
+                    .await;
                 announce(services, &session.conversation_id);
                 Steered::Delivered
             }

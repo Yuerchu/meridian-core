@@ -105,7 +105,9 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].content, "old bytes");
 
-        crate::db::ops::queue::remove(&mut conn, "c1", "q1").unwrap();
+        diesel::delete(crate::db::schema::queued_prompts::table.find("q1"))
+            .execute(&mut conn)
+            .unwrap();
         assert!(list_prepared(&mut conn, "q1").unwrap().is_empty());
     }
 }

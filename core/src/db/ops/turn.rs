@@ -241,7 +241,7 @@ pub fn list_for_conversation(conn: &mut SqliteConnection, conversation_id: &str)
 /// `None` for an id with no row, which is not an error: a turn can fail before
 /// it has written one, and the callers here treat "no record" and "did not
 /// reach an ending" the same way.
-pub fn get(conn: &mut SqliteConnection, turn_id: &str) -> QueryResult<Option<turn::Model>> {
+pub(super) fn get(conn: &mut SqliteConnection, turn_id: &str) -> QueryResult<Option<turn::Model>> {
     turns::table
         .find(turn_id)
         .first::<TurnRow>(conn)
@@ -451,9 +451,9 @@ mod tests {
 
         assert_eq!(reconcile_interrupted(&mut conn, 2000).unwrap(), 1);
 
-        assert_eq!(queue::list(&mut conn, "crashed").unwrap()[0].state(), QueueState::Held);
-        assert!(
-            queue::next_pending(&mut conn, "crashed").unwrap().is_none(),
+        assert_eq!(
+            queue::list(&mut conn, "crashed").unwrap()[0].state(),
+            QueueState::Held,
             "and so it waits for a person rather than running on a dead premise",
         );
         assert_eq!(
