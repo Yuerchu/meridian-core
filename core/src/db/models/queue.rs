@@ -1,38 +1,9 @@
 use diesel::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::db::schema::queued_prompts;
 
-/// When a queued message is handed to the agent.
-///
-/// The two are not urgency levels; they are different points in the run.
-/// `FollowUp` waits for the turn to reach an ending and then starts a new one —
-/// "when you have finished all that, also do this". `Interject` goes in at the
-/// next point the agent accepts input, between rounds of the turn already
-/// going — "stop, do it this way instead".
-///
-/// Claude Code offers only the second. Having only that one means every thought
-/// you queue while something long runs interrupts it, which is the opposite of
-/// what queueing is usually for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, strum::IntoStaticStr, strum::EnumString)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum Delivery {
-    FollowUp,
-    Interject,
-}
-
-impl Delivery {
-    pub fn as_str(&self) -> &'static str {
-        self.into()
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        value
-            .parse()
-            .map_err(|_| format!("unknown queue delivery mode `{value}`"))
-    }
-}
+pub use crate::db::entity::queued_prompt::Delivery;
 
 /// Where one queued message has got to.
 ///

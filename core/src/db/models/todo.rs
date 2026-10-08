@@ -3,49 +3,8 @@ use serde::Serialize;
 
 use crate::db::schema::{todo_items, todo_lists};
 
-/// Lifecycle of a checklist. A conversation may hold many lists but only one
-/// `InProgress` at a time — enforced by a partial unique index, not by code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::IntoStaticStr, strum::EnumString)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum ListStatus {
-    InProgress,
-    Completed,
-}
-
-impl ListStatus {
-    pub fn as_str(&self) -> &'static str {
-        self.into()
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        value
-            .parse()
-            .map_err(|_| format!("unknown todo-list status `{value}`; expected in_progress or completed"))
-    }
-}
-
-/// Per-item state. `InProgress` marks the single step being worked on right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::IntoStaticStr, strum::EnumString)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum ItemStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-impl ItemStatus {
-    pub fn as_str(&self) -> &'static str {
-        self.into()
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        value
-            .parse()
-            .map_err(|_| format!("unknown todo status '{value}'; expected pending, in_progress or completed"))
-    }
-}
+pub use crate::db::entity::todo_item::ItemStatus;
+pub use crate::db::entity::todo_list::ListStatus;
 
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]
 #[diesel(table_name = todo_lists)]

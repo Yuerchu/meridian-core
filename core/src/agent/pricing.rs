@@ -84,6 +84,13 @@ impl BillingMode {
     }
 }
 
+impl BillingMode {
+    /// The stored spelling back to the mode; an unknown one is an error.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        value.parse().map_err(|error: PricingError| error.to_string())
+    }
+}
+
 impl std::str::FromStr for BillingMode {
     type Err = PricingError;
 

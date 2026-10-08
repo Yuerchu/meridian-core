@@ -3,48 +3,7 @@ use serde::Serialize;
 
 use crate::db::schema::turns;
 
-/// How a turn ended, or that it has not.
-///
-/// `Running` is only ever true of the process that wrote it — a turn lives on
-/// the stack of the task driving it and does not survive a restart. So a
-/// `Running` row read at startup is not a turn still going; it is a turn that
-/// never reached its own ending, and `reconcile_interrupted` says so. That is
-/// what lets nothing be written from a destructor: destructors do not run for a
-/// kill, and leaving the row alone is already the truthful record.
-///
-/// `Cancelled` is the user pressing Stop. `Interrupted` is a turn that never
-/// reached an ending. The transcript has always shown these as the same thing,
-/// and they are not: one is a decision, the other is an accident that may have
-/// left work half done.
-///
-/// Stored, `Interrupted` is only ever written by startup reconciliation, so it
-/// does mean the process died. Reported — `conversation_snapshot` substitutes
-/// it for a `running` row the coordinator is not holding — it means less than
-/// that: a task that panicked or was dropped while the application carried on
-/// looks identical. Nothing may read a cause into either.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::IntoStaticStr, strum::EnumString)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum TurnStatus {
-    Running,
-    /// The model submitted a durable plan review and no task remains alive.
-    /// Startup must preserve this status instead of diagnosing an interruption.
-    WaitingReview,
-    Done,
-    Cancelled,
-    Failed,
-    Interrupted,
-}
-
-impl TurnStatus {
-    pub fn as_str(&self) -> &'static str {
-        self.into()
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        value.parse().map_err(|_| format!("unknown turn status '{value}'"))
-    }
-}
+pub use crate::db::entity::turn::{TurnPhase, TurnStatus};
 
 /// A turn cut short because the model kept making the same call.
 ///
@@ -54,35 +13,6 @@ impl TurnStatus {
 /// have the row claim a clean ending for a turn whose own stop event says it
 /// was aborted.
 pub const ERROR_LOOP_DETECTED: &str = "loop_detected";
-
-/// What a turn was doing when it last said anything.
-///
-/// Written *before* the thing it names, which is the whole point: whatever is
-/// stored when the process dies is where it died. Meaningless once a turn has
-/// ended normally.
-///
-/// `RunningTool` is the one that matters. It means a tool had started — a file
-/// may already be written, a command may already have run — and nothing
-/// recorded how it went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::IntoStaticStr, strum::EnumString)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum TurnPhase {
-    Streaming,
-    AwaitingApproval,
-    RunningTool,
-    Compacting,
-}
-
-impl TurnPhase {
-    pub fn as_str(&self) -> &'static str {
-        self.into()
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        value.parse().map_err(|_| format!("unknown turn phase '{value}'"))
-    }
-}
 
 /// A turn as stored.
 #[derive(Debug, Clone, Queryable, Selectable, Serialize)]

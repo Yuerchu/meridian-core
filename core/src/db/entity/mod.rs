@@ -9,8 +9,12 @@
 //! rather than a runtime surprise. Diesel gave that check for free at compile
 //! time through `schema.rs`; this is where it lives now.
 
+pub mod acp_context_delivery;
+pub mod acp_session;
+pub mod acp_session_notice;
 pub mod assistant;
 pub mod assistant_emoji_pack;
+pub mod audit_message;
 pub mod background_task;
 pub mod cached_model;
 pub mod composer_draft;
@@ -26,7 +30,9 @@ pub mod memory;
 pub mod memory_proposal;
 pub mod memory_subject;
 pub mod message;
+pub mod message_context_item;
 pub mod message_sticker;
+pub mod mode_artifact;
 pub mod model_config;
 pub mod model_profile;
 pub mod notification_alert_state;
@@ -41,13 +47,18 @@ pub mod plan_revision;
 pub mod preference;
 pub mod project;
 pub mod provider;
+pub mod queued_prompt;
+pub mod queued_prompt_context_item;
 pub mod redaction_rule;
 pub mod skill;
 pub mod skill_binding_assistant;
 pub mod skill_binding_global;
 pub mod skill_binding_project;
+pub mod todo_item;
+pub mod todo_list;
 pub mod tool_category;
 pub mod tool_preset;
+pub mod turn;
 pub mod voice_blob;
 pub mod voice_clip;
 pub mod voice_sender_optout;
@@ -60,19 +71,7 @@ pub mod voice_sender_optout;
 /// not in it — a table created during the coexistence period comes with its
 /// entity, it does not join the backlog — and refuses a list that grew. Phase
 /// 5 needs it empty. Sorted and one per line, because the checker parses it.
-pub const PENDING_TABLES: &[&str] = &[
-    "acp_context_deliveries",
-    "acp_session_notices",
-    "acp_sessions",
-    "audit_messages",
-    "message_context_items",
-    "mode_artifacts",
-    "queued_prompt_context_items",
-    "queued_prompts",
-    "todo_items",
-    "todo_lists",
-    "turns",
-];
+pub const PENDING_TABLES: &[&str] = &[];
 
 /// What an entity claims about its table, in the vocabulary the schema reader
 /// (`sea::introspect`) speaks: affinities rather than Rust or sea-query types,
@@ -113,12 +112,16 @@ pub struct ForeignKeyShape {
 /// the union of both lists against the schema.
 pub fn registered() -> Vec<EntityShape> {
     vec![
+        shape_of::<acp_context_delivery::Entity>(),
+        shape_of::<acp_session::Entity>(),
+        shape_of::<acp_session_notice::Entity>(),
         shape_of::<assistant::Entity>(),
         shape_of::<assistant_emoji_pack::Entity>(),
+        shape_of::<audit_message::Entity>(),
         shape_of::<background_task::Entity>(),
         shape_of::<cached_model::Entity>(),
-        shape_of::<conversation::Entity>(),
         shape_of::<composer_draft::Entity>(),
+        shape_of::<conversation::Entity>(),
         shape_of::<custom_tool::Entity>(),
         shape_of::<emoji::Entity>(),
         shape_of::<emoji_pack::Entity>(),
@@ -130,7 +133,9 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<memory_proposal::Entity>(),
         shape_of::<memory_subject::Entity>(),
         shape_of::<message::Entity>(),
+        shape_of::<message_context_item::Entity>(),
         shape_of::<message_sticker::Entity>(),
+        shape_of::<mode_artifact::Entity>(),
         shape_of::<model_config::Entity>(),
         shape_of::<model_profile::Entity>(),
         shape_of::<notification_alert_state::Entity>(),
@@ -145,13 +150,18 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<preference::Entity>(),
         shape_of::<project::Entity>(),
         shape_of::<provider::Entity>(),
+        shape_of::<queued_prompt::Entity>(),
+        shape_of::<queued_prompt_context_item::Entity>(),
         shape_of::<redaction_rule::Entity>(),
         shape_of::<skill::Entity>(),
         shape_of::<skill_binding_assistant::Entity>(),
         shape_of::<skill_binding_global::Entity>(),
         shape_of::<skill_binding_project::Entity>(),
+        shape_of::<todo_item::Entity>(),
+        shape_of::<todo_list::Entity>(),
         shape_of::<tool_category::Entity>(),
         shape_of::<tool_preset::Entity>(),
+        shape_of::<turn::Entity>(),
         shape_of::<voice_blob::Entity>(),
         shape_of::<voice_clip::Entity>(),
         shape_of::<voice_sender_optout::Entity>(),
@@ -307,4 +317,82 @@ pub(crate) fn allowed_by_check(table: &str, column: &str) -> std::collections::B
         .split(',')
         .map(|name| name.trim().trim_matches('\'').to_owned())
         .collect()
+}
+
+/// The domain enums stored through `text_enum_column!` against the `CHECK`
+/// on their column: each listed variant writes a spelling the column allows
+/// and reads back as itself, and together they are the whole list (less any
+/// variant this table deliberately refuses).
+#[cfg(test)]
+mod stored_domain_enums {
+    use std::collections::BTreeSet;
+
+    use super::allowed_by_check;
+    use crate::agent::pricing::BillingMode;
+    use crate::events::{AcpNoticeCategory, AcpNoticeSeverity};
+    use crate::turn::TurnTrigger;
+    use crate::workspace::reference::MessageContextKind;
+
+    fn spellings<E: Copy + std::fmt::Debug + PartialEq>(
+        variants: &[E],
+        write: impl Fn(E) -> &'static str,
+        read: impl Fn(&str) -> Result<E, String>,
+    ) -> BTreeSet<String> {
+        variants
+            .iter()
+            .map(|&variant| {
+                let stored = write(variant);
+                assert_eq!(read(stored).unwrap(), variant, "{stored}");
+                stored.to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_checked_column_allows_exactly_its_enum() {
+        use TurnTrigger::*;
+        assert_eq!(
+            spellings(
+                &[User, PlanContinuation, TaskCompletion, AgentAutonomous],
+                |v| v.as_str(),
+                TurnTrigger::parse
+            ),
+            allowed_by_check("turns", "trigger")
+        );
+
+        use MessageContextKind::*;
+        let kinds = [ProjectFile, ProjectDirectory, ShellOutput, Conversation];
+        let all = spellings(&kinds, MessageContextKind::as_str, MessageContextKind::parse);
+        assert_eq!(all, allowed_by_check("message_context_items", "kind"));
+        // A queued prompt cannot carry a command's output: that is captured
+        // when the message is sent, not when it is queued.
+        let mut queued = all;
+        queued.remove("shell_output");
+        assert_eq!(queued, allowed_by_check("queued_prompt_context_items", "kind"));
+
+        use BillingMode::*;
+        assert_eq!(
+            spellings(
+                &[Metered, Subscription, External],
+                BillingMode::as_str,
+                BillingMode::parse
+            ),
+            allowed_by_check("audit_messages", "billing_mode")
+        );
+
+        use AcpNoticeCategory::*;
+        assert_eq!(
+            spellings(
+                &[Connection, Access, Limit, Request, Service, Unknown],
+                AcpNoticeCategory::as_str,
+                AcpNoticeCategory::parse
+            ),
+            allowed_by_check("acp_session_notices", "category")
+        );
+        use AcpNoticeSeverity::*;
+        assert_eq!(
+            spellings(&[Warning, Error], AcpNoticeSeverity::as_str, AcpNoticeSeverity::parse),
+            allowed_by_check("acp_session_notices", "severity")
+        );
+    }
 }
