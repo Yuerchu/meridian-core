@@ -5,6 +5,7 @@
 //! in step.
 
 pub mod assistant;
+pub mod audit;
 pub mod background_task;
 pub mod cached_model;
 pub mod composer_draft;

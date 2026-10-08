@@ -873,7 +873,7 @@ mod tests {
             notices[0].text
         );
 
-        let stored = crate::db::sea::ops::message::get(&services.sea, &notices[0].message_id)
+        let stored = crate::db::sea::ops::message::get_message(&services.sea, &notices[0].message_id)
             .await
             .unwrap()
             .expect("the notice row exists");

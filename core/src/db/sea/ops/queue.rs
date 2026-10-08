@@ -242,6 +242,43 @@ pub async fn next_deliverable(
         .filter(|item| item.delivery == delivery))
 }
 
+/// Take the next deliverable item off the queue *and* write the message it
+/// becomes, atomically: the reason the queue is a table rather than a channel.
+/// Killed before the commit, the item is still queued and no row exists;
+/// after it, the item is settled and the row is on the path. Nothing in
+/// between, and a failure partway (a duplicate message id) undoes both, in a
+/// savepoint of the caller's write.
+#[allow(clippy::too_many_arguments)]
+pub async fn take_next(
+    tx: &WriteTx,
+    conversation_id: &str,
+    delivery: Delivery,
+    turn_id: &str,
+    message: crate::db::entity::message::Model,
+    parent: Option<&str>,
+    now: EpochMs,
+) -> Result<Option<queued_prompt::Model>, DbErr> {
+    tx.nested(async |tx| {
+        let Some(item) = next_deliverable(tx, conversation_id, delivery).await? else {
+            return Ok(None);
+        };
+        let row = crate::db::sea::ops::message::append_message(tx, message, parent).await?;
+        queued_prompt::Entity::update_many()
+            .set(queued_prompt::ActiveModel {
+                dispatched_at: Set(Some(now)),
+                dispatched_turn_id: Set(Some(turn_id.to_owned())),
+                settled_at: Set(Some(now)),
+                settled_message_id: Set(Some(row.id)),
+                ..Default::default()
+            })
+            .filter(queued_prompt::Column::Id.eq(&item.id))
+            .exec(tx.conn()?)
+            .await?;
+        get(tx, &item.id).await
+    })
+    .await
+}
+
 /// Mark an item as handed over without a message row of our own (a hosted
 /// steer), recording the attempt before it is made. A claim on the
 /// deliverable front, not on an id: the row must still be first, still
@@ -886,5 +923,127 @@ mod tests {
         let mut positions: Vec<_> = list(&db, "c1").await.unwrap().into_iter().map(|i| i.position).collect();
         positions.sort();
         assert_eq!(positions, (0..8).collect::<Vec<_>>());
+    }
+
+    fn user_row(id: &str, conversation_id: &str, content: &str, turn_id: &str) -> crate::db::entity::message::Model {
+        crate::db::entity::message::Model {
+            id: id.into(),
+            conversation_id: conversation_id.into(),
+            role: "user".into(),
+            content: content.into(),
+            provider_id: None,
+            model_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls: None,
+            tool_call_id: None,
+            sort_order: 0,
+            created_at: 0,
+            reasoning_content: None,
+            rating: None,
+            schema_version: 2,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
+            sender_id: None,
+            parent_id: None,
+            compact_anchor_id: None,
+            source: None,
+            turn_id: Some(turn_id.into()),
+            tool_outcome: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            provider_name: None,
+            provider_state: None,
+            auto_review: None,
+            server_tool_calls: None,
+            tool_diffs: None,
+            response_model_id: None,
+        }
+    }
+
+    async fn take(db: &Db, message: crate::db::entity::message::Model) -> Result<Option<queued_prompt::Model>, DbErr> {
+        db.write(async |tx| take_next(tx, "c1", Delivery::FollowUp, "t1", message, None, 5).await)
+            .await
+    }
+
+    async fn messages(db: &Db) -> Vec<String> {
+        crate::db::sea::ops::message::list_messages(db, "c1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect()
+    }
+
+    /// Taking the item and writing the message it becomes cannot come apart:
+    /// the item is settled against the row, and the row is on the path.
+    #[tokio::test]
+    async fn taking_an_item_and_writing_its_message_cannot_come_apart() {
+        let db = with_conversations(&["c1"]).await;
+        add(&db, "c1", "do the thing", Delivery::FollowUp).await;
+
+        let taken = take(&db, user_row("m1", "c1", "do the thing", "t1"))
+            .await
+            .unwrap()
+            .expect("an item was waiting");
+        assert_eq!(taken.state(), QueueState::Settled);
+        assert_eq!(
+            (taken.settled_message_id.as_deref(), taken.dispatched_turn_id.as_deref()),
+            (Some("m1"), Some("t1"))
+        );
+        assert_eq!(messages(&db).await, ["do the thing"]);
+    }
+
+    /// A failed take leaves nothing — no message, and the item still
+    /// deliverable — even when the caller's write goes on: the take has its
+    /// own savepoint.
+    #[tokio::test]
+    async fn a_failed_take_leaves_the_item_deliverable_and_writes_no_row() {
+        let db = with_conversations(&["c1"]).await;
+        add(&db, "c1", "first", Delivery::FollowUp).await;
+        db.write(async |tx| {
+            crate::db::sea::ops::message::append_message(tx, user_row("dup", "c1", "in the way", "t0"), None).await
+        })
+        .await
+        .unwrap();
+
+        let outcome = db
+            .write(async |tx| {
+                let failed = take_next(
+                    tx,
+                    "c1",
+                    Delivery::FollowUp,
+                    "t1",
+                    user_row("dup", "c1", "first", "t1"),
+                    None,
+                    5,
+                )
+                .await;
+                // The caller carries on and commits its own write.
+                Ok::<_, DbErr>(failed.is_err())
+            })
+            .await
+            .unwrap();
+        assert!(outcome, "a duplicate message id must fail the whole take");
+        assert_eq!(
+            list(&db, "c1").await.unwrap()[0].state(),
+            QueueState::Queued,
+            "not consumed"
+        );
+        assert_eq!(messages(&db).await, ["in the way"], "and nothing new was written");
+    }
+
+    /// A settled row keeps its place in the list but is never re-taken.
+    #[tokio::test]
+    async fn settled_items_are_stepped_over() {
+        let db = with_conversations(&["c1"]).await;
+        add(&db, "c1", "first", Delivery::FollowUp).await;
+        add(&db, "c1", "second", Delivery::FollowUp).await;
+        take(&db, user_row("m1", "c1", "first", "t1")).await.unwrap().unwrap();
+
+        assert_eq!(list(&db, "c1").await.unwrap().len(), 2, "both rows are still listed");
+        assert_eq!(
+            deliverable(&db, "c1", Delivery::FollowUp).await.as_deref(),
+            Some("second")
+        );
     }
 }

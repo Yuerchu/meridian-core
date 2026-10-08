@@ -1,11 +1,14 @@
-use std::collections::HashMap;
-
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
 use crate::db::entity::message;
 use crate::db::models::message::{MessageInsert, MessageRow, MessageUsage};
 use crate::db::schema::{conversations, messages};
+
+// The tree is read the same way whichever ORM loaded it.
+pub use crate::db::sea::ops::message::{
+    ActiveContext, BranchPoint, active_context, branch_points, deepest_descendant, resolve_head,
+};
 
 /// A Diesel row as the entity model; a flag that is not 0/1 fails the read,
 /// as it does on the SeaORM side.
@@ -83,126 +86,6 @@ fn audit_copy(conn: &mut SqliteConnection, row: &message::Model) {
             message_id = %row.id,
             "the audit copy of a message could not be written",
         );
-    }
-}
-
-/// Where the active path currently ends.
-///
-/// Falls back to the highest `sort_order` row when the stored head is missing or
-/// dangling. That row is necessarily a leaf: any child of it would have been
-/// inserted afterwards and so carry a larger `sort_order`, contradicting it being
-/// the maximum. So the fallback always names a legitimate tip, which is what lets
-/// a dropped head write cost an alternative branch rather than the transcript.
-///
-/// `history` is the caller's already-loaded message list for the conversation,
-/// ordered by `sort_order`.
-pub fn resolve_head(stored_head: Option<&str>, history: &[message::Model]) -> Option<String> {
-    if let Some(head) = stored_head
-        && history.iter().any(|m| m.id == head && !m.is_compact_summary.get())
-    {
-        return Some(head.to_string());
-    }
-    history
-        .iter()
-        .rfind(|m| !m.is_compact_summary.get())
-        .map(|m| m.id.clone())
-}
-
-/// Everything a turn needs to rebuild its context, resolved once.
-///
-/// Existed as three separate lookups threaded through
-/// `build_messages_with_senders`, which meant four call sites each had to
-/// remember to pair a message list with the matching cursor. Bundling them makes
-/// the pairing impossible to get wrong, and gives the front end the split point
-/// without recomputing it from sort_order.
-pub struct ActiveContext {
-    /// Root to head, in order. Excludes summaries and inactive branches.
-    pub path: Vec<message::Model>,
-    /// The summary standing in front of `path`, when one applies.
-    pub summary: Option<message::Model>,
-    /// Where `summary` takes over: everything before this index is represented
-    /// by it. `None` when no summary applies.
-    pub anchor_index: Option<usize>,
-    pub head_id: Option<String>,
-}
-
-impl ActiveContext {
-    /// The messages a request actually carries: the tail from the anchor on,
-    /// since anything before it is covered by the summary.
-    pub fn live(&self) -> &[message::Model] {
-        match self.anchor_index {
-            Some(i) => &self.path[i..],
-            None => &self.path,
-        }
-    }
-}
-
-/// Walk the tree from `head` back to a root, then reverse.
-///
-/// Done in Rust rather than a recursive CTE because the whole conversation is
-/// already loaded: reading a path through SQL would mean giving `MessageRow` a
-/// `QueryableByName` impl and hand-writing every column's type, which is pure
-/// upkeep. The visited set guards against a cycle, which no writer can produce
-/// but corrupted data could.
-fn path_to_head(history: &[message::Model], head: &str) -> Vec<message::Model> {
-    let by_id: std::collections::HashMap<&str, &message::Model> = history
-        .iter()
-        .filter(|m| !m.is_compact_summary.get())
-        .map(|m| (m.id.as_str(), m))
-        .collect();
-
-    let mut seen = std::collections::HashSet::new();
-    let mut reversed = Vec::new();
-    let mut cursor = Some(head);
-    while let Some(id) = cursor {
-        if !seen.insert(id) {
-            tracing::error!("cycle in message tree at {id}; truncating the path here");
-            break;
-        }
-        let Some(m) = by_id.get(id) else { break };
-        reversed.push((*m).clone());
-        cursor = m.parent_id.as_deref();
-    }
-    reversed.reverse();
-    reversed
-}
-
-/// Load the active path plus whichever summary applies to it.
-///
-/// `history` is the full conversation, ordered by `sort_order`.
-pub fn active_context(history: &[message::Model], stored_head: Option<&str>) -> ActiveContext {
-    let head_id = resolve_head(stored_head, history);
-    // No sort_order fallback for an unlinked history. The backfill runs inside
-    // the migration transaction and a failure there aborts startup, so a
-    // conversation cannot quietly end up without parent links — while several
-    // parentless rows *are* expected once editing the opening message starts
-    // producing sibling roots, and flattening those would splice two versions of
-    // the conversation into one.
-    let path = match head_id.as_deref() {
-        Some(head) => path_to_head(history, head),
-        None => Vec::new(),
-    };
-
-    // A summary applies only if its anchor is on this path — that is what stops
-    // one branch from being handed another branch's summary. With several, the
-    // deepest anchor wins, being the most recent compaction of this path.
-    let mut best: Option<(usize, &message::Model)> = None;
-    for s in history.iter().filter(|m| m.is_compact_summary.get()) {
-        let Some(anchor) = s.compact_anchor_id.as_deref() else {
-            continue;
-        };
-        if let Some(idx) = path.iter().position(|m| m.id == anchor)
-            && best.is_none_or(|(prev, _)| idx > prev)
-        {
-            best = Some((idx, s));
-        }
-    }
-
-    ActiveContext {
-        path,
-        summary: best.map(|(_, s)| s.clone()),
-        anchor_index: best.map(|(i, _)| i),
-        head_id,
     }
 }
 
@@ -604,98 +487,6 @@ pub fn delete_subtree(
     })
 }
 
-/// A point on the active path where the conversation was answered more than once.
-#[derive(Debug, Clone)]
-pub struct BranchPoint {
-    /// The version of this step currently on the path.
-    pub message_id: String,
-    /// 0-based position of `message_id` among its siblings.
-    pub index: usize,
-    pub total: usize,
-    /// All versions, oldest first, so paging is stable across reloads.
-    pub sibling_ids: Vec<String>,
-}
-
-/// Where the active path passes through a step that has alternatives.
-///
-/// Only points with more than one version are reported, so a conversation that
-/// has never been regenerated yields an empty list and the front end renders no
-/// pagers at all.
-/// The parent a version comparison should be made against.
-///
-/// Injected background (`role = "context"`) is written into the path like any
-/// other row, but it is not a step anybody took — so a message written after one
-/// is still a version of whatever preceded it, not a child of somewhere else.
-/// Walking past those rows is what keeps that true: without it, editing a
-/// message on a turn that also froze a memory block leaves the new version
-/// hanging off the context row while the old one hangs off its parent, the two
-/// stop being siblings, and the version pager silently disappears from a
-/// message that certainly has more than one version.
-fn effective_parent(by_id: &HashMap<&str, &message::Model>, m: &message::Model) -> Option<String> {
-    let mut cursor = m.parent_id.clone();
-    while let Some(id) = cursor {
-        // A parent that is not in `history` is as far as this can go.
-        let Some(parent) = by_id.get(id.as_str()) else {
-            return Some(id);
-        };
-        if parent.role != "context" {
-            return Some(id);
-        }
-        cursor = parent.parent_id.clone();
-    }
-    None
-}
-
-/// Every step on the path that has more than one version, with its siblings.
-///
-/// **Grouped once rather than searched per row.** This used to be three nested
-/// linear scans — a row on the path, every row in the history, and a lookup by
-/// id inside `effective_parent` — which is n³ on a conversation with no
-/// branches at all, the exact shape an imported session has. Measured: 0.3s at
-/// 622 rows, 10s at 2000, on every mount of the transcript and up to four times
-/// per snapshot attempt. Importing a terminal session is what made a
-/// conversation that size reachable in one click.
-pub fn branch_points(history: &[message::Model], path: &[message::Model]) -> Vec<BranchPoint> {
-    let by_id: HashMap<&str, &message::Model> = history.iter().map(|m| (m.id.as_str(), m)).collect();
-
-    // Keyed on the effective parent, `None` for the roots — editing the opening
-    // message produces a second one, which is a version of the same step.
-    let mut families: HashMap<Option<String>, Vec<&message::Model>> = HashMap::new();
-    for m in history
-        .iter()
-        .filter(|s| !s.is_compact_summary.get() && s.role != "context")
-    {
-        families.entry(effective_parent(&by_id, m)).or_default().push(m);
-    }
-    for siblings in families.values_mut() {
-        siblings.sort_by_key(|s| s.sort_order);
-    }
-
-    let mut out = Vec::new();
-    for m in path {
-        // Injected background has no versions to page through.
-        if m.role == "context" {
-            continue;
-        }
-        let Some(siblings) = families.get(&effective_parent(&by_id, m)) else {
-            continue;
-        };
-        if siblings.len() < 2 {
-            continue;
-        }
-        let Some(index) = siblings.iter().position(|s| s.id == m.id) else {
-            continue;
-        };
-        out.push(BranchPoint {
-            message_id: m.id.clone(),
-            index,
-            total: siblings.len(),
-            sibling_ids: siblings.iter().map(|s| s.id.clone()).collect(),
-        });
-    }
-    out
-}
-
 /// Move the head onto `message_id`'s branch, at the point that branch was last
 /// written.
 pub fn switch_branch(
@@ -724,24 +515,6 @@ pub fn switch_branch(
             .execute(conn)?;
         Ok(Some(head))
     })
-}
-
-/// Follow the newest child at each step. Used when the head has to move onto a
-/// branch: "where that branch was last written" is the position a reader expects
-/// to land on.
-pub fn deepest_descendant(history: &[message::Model], from: &str) -> String {
-    let mut current = from.to_string();
-    loop {
-        let next = history
-            .iter()
-            .filter(|m| !m.is_compact_summary.get())
-            .filter(|m| m.parent_id.as_deref() == Some(current.as_str()))
-            .max_by_key(|m| m.sort_order);
-        match next {
-            Some(child) => current = child.id.clone(),
-            None => return current,
-        }
-    }
 }
 
 #[cfg(test)]
