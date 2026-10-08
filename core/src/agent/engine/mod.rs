@@ -32,8 +32,8 @@ pub use approval::ApprovalDecision;
 pub use compaction::CompactionPolicy;
 pub(crate) use ports::SteeredOrigin;
 pub use ports::{
-    Approvals, Commentary, Escalation, Steered, Steering, Stranded, SubAgentReport, SubAgentSpec, SubAgentStatus,
-    SubAgents, SurfaceTools, TurnPorts,
+    Approvals, Chain, Commentary, Escalation, Steered, Steering, Stranded, SubAgentReport, SubAgentSpec,
+    SubAgentStatus, SubAgents, SurfaceTools, TurnPorts,
 };
 pub(crate) use stream::consume_stream;
 pub use transcript::{SteeringRole, in_phase, write_steering};

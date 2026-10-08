@@ -2159,6 +2159,8 @@ mod tests {
             sea: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets: Default::default(),
             cancel: cancel.clone(),
             journal: None,

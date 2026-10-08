@@ -281,6 +281,33 @@ pub trait Steering: Send + Sync {
     }
 }
 
+/// Several steering sources behind the one port a turn has.
+///
+/// `TurnPorts::steering` takes one, and a desktop turn has two: the queue's
+/// interjections and the notices of background tasks that ended. Drained in
+/// order, so a message somebody typed lands before a notice drained in the
+/// same boundary. What may still run is the intersection, since each source
+/// can only ever take tools away.
+pub struct Chain<'a>(pub Vec<&'a dyn Steering>);
+
+#[async_trait::async_trait]
+impl Steering for Chain<'_> {
+    async fn drain(&self) -> Vec<Steered> {
+        let mut out = Vec::new();
+        for source in &self.0 {
+            out.extend(source.drain().await);
+        }
+        out
+    }
+
+    fn narrowed(&self) -> Option<std::collections::HashSet<String>> {
+        self.0
+            .iter()
+            .filter_map(|source| source.narrowed())
+            .reduce(|a, b| a.intersection(&b).cloned().collect())
+    }
+}
+
 /// Everything the loop is allowed to reach outside itself.
 ///
 /// Borrowed rather than owned so that a caller can keep using the same

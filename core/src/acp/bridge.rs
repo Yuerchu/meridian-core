@@ -571,6 +571,8 @@ impl Bridge {
             sea: Some(self.services.sea.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets,
             cancel: turn.cancel.clone(),
             journal: None,
@@ -960,6 +962,8 @@ mod tests {
             sea: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets: Default::default(),
             cancel: CancellationToken::new(),
             journal: None,

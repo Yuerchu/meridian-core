@@ -640,6 +640,8 @@ async fn run_turn(
         sea: Some(state.services.sea.clone()),
         #[cfg(not(target_os = "android"))]
         sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+        #[cfg(not(target_os = "android"))]
+        background: None,
         tool_secrets,
         cancel: cancel.clone(),
         journal: None,

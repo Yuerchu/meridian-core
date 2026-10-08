@@ -223,6 +223,8 @@ mod tests {
             db_pool: None,
             sea: None,
             sandbox_policy: crate::sandbox::CommandSandbox::Unreadable("database is locked".into()),
+            #[cfg(not(target_os = "android"))]
+            background: None,
             tool_secrets: Default::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
             journal: None,

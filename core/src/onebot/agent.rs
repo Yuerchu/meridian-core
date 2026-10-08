@@ -1079,6 +1079,8 @@ async fn headless_chat_inner(
         journal: None,
         #[cfg(not(target_os = "android"))]
         sandbox_policy,
+        #[cfg(not(target_os = "android"))]
+        background: None,
         tool_secrets: {
             let pool2 = pool.clone();
             let secrets2 = secrets.clone();

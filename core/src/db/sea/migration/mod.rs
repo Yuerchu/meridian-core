@@ -16,6 +16,7 @@
 
 pub mod m0001_baseline;
 pub mod m0002_skill_keys;
+pub mod m0003_background_tasks;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -29,7 +30,11 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(M0001Baseline), Box::new(M0002SkillKeys)]
+        vec![
+            Box::new(M0001Baseline),
+            Box::new(M0002SkillKeys),
+            Box::new(M0003BackgroundTasks),
+        ]
     }
 }
 
@@ -79,6 +84,7 @@ impl MigrationTrait for M0001Baseline {
 pub fn sqlite_statements() -> Vec<String> {
     let mut all = m0001_baseline::sqlite_statements();
     all.extend(m0002_skill_keys::sqlite_statements());
+    all.extend(m0003_background_tasks::sqlite_statements());
     all
 }
 
@@ -148,6 +154,36 @@ impl MigrationTrait for M0002SkillKeys {
                     "m0002_skill_keys left {onto_skills} reference(s) from {table} to a skill that is not there"
                 )));
             }
+        }
+        Ok(())
+    }
+}
+
+pub struct M0003BackgroundTasks;
+
+impl MigrationName for M0003BackgroundTasks {
+    fn name(&self) -> &str {
+        "m0003_background_tasks"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0003BackgroundTasks {
+    /// The table, its index and the ledger row commit together, as the
+    /// baseline's do.
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "m0003_background_tasks carries SQLite CHECK text; other backends are not shipped yet".into(),
+            ));
+        }
+        for statement in m0003_background_tasks::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
         }
         Ok(())
     }

@@ -9,6 +9,10 @@ pub mod agent;
 #[cfg(target_os = "android")]
 pub mod android_bridge;
 pub mod approval;
+/// Commands that outlive the turn that started them. Desktop only, like the
+/// sandbox they run through.
+#[cfg(not(target_os = "android"))]
+pub mod background;
 pub mod bootstrap;
 pub mod client;
 pub mod codex_auth;

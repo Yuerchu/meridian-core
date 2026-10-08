@@ -39,6 +39,17 @@ pub(super) async fn pump(services: &Services, conversation_id: &str) {
         // queued and still on screen.
         return;
     };
+    // A background task that ended goes first, and goes even with the queue
+    // held. It is not an instruction resting on a premise the last turn may
+    // have broken — it is something that happened, which the model is owed
+    // before anything typed after it is answered.
+    #[cfg(not(target_os = "android"))]
+    if crate::background::has_wake(&services.sea, conversation_id).await {
+        if let Err(e) = starter.start_unprompted(conversation_id).await {
+            tracing::warn!(error = %e, conversation_id, "a background task's turn failed");
+        }
+        return;
+    }
     let Some(next) = super::read(services, conversation_id, false).await else {
         return;
     };

@@ -5,6 +5,7 @@
 //! in step.
 
 pub mod assistant;
+pub mod background_task;
 pub mod cached_model;
 pub mod composer_draft;
 pub mod conversation;
@@ -14,6 +15,7 @@ pub mod emoji_pack;
 pub mod journal;
 pub mod mcp_server;
 pub mod memory;
+pub mod message;
 pub mod notification;
 pub mod plan_review;
 pub mod preference;

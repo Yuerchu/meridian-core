@@ -116,7 +116,7 @@ mod tests {
             "web_search",
         ]);
         #[cfg(not(target_os = "android"))]
-        plan.insert("run_command");
+        plan.extend(["run_command", "read_background_output", "list_background_tasks"]);
         assert_eq!(set(r.builtin_names_where(|s| s.plan_mode)), plan, "plan mode");
         assert_eq!(
             set(r.builtin_names_where(|s| s.explore)),
@@ -132,23 +132,23 @@ mod tests {
             ]),
             "the Explore sub-agent"
         );
-        assert_eq!(
-            set(r.builtin_names_where(|s| s.parallel)),
-            set([
-                "read_app_logs",
-                "glob",
-                "list_directory",
-                "recall_memory",
-                "list_memories",
-                "read_conversation",
-                "read_file",
-                "list_redaction_rules",
-                "search_files",
-                "load_skill",
-                "web_search",
-            ]),
-            "parallel-safe"
-        );
+        #[cfg_attr(target_os = "android", allow(unused_mut))]
+        let mut parallel = set([
+            "read_app_logs",
+            "glob",
+            "list_directory",
+            "recall_memory",
+            "list_memories",
+            "read_conversation",
+            "read_file",
+            "list_redaction_rules",
+            "search_files",
+            "load_skill",
+            "web_search",
+        ]);
+        #[cfg(not(target_os = "android"))]
+        parallel.extend(["read_background_output", "list_background_tasks"]);
+        assert_eq!(set(r.builtin_names_where(|s| s.parallel)), parallel, "parallel-safe");
         assert_eq!(
             set(r.builtin_names_where(|s| s.loop_handled)),
             set([
