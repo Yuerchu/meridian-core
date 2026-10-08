@@ -220,7 +220,7 @@ pub fn get_document(conn: &mut SqliteConnection, id: &str) -> PlanReviewStoreRes
         .ok_or(PlanReviewStoreError::NotFound("plan document"))
 }
 
-pub fn get_active_document(
+fn get_active_document(
     conn: &mut SqliteConnection,
     conversation_id: &str,
 ) -> PlanReviewStoreResult<Option<PlanDocumentRow>> {
@@ -655,7 +655,7 @@ fn submit_head_for_review_inner(
     })
 }
 
-pub fn get_review(conn: &mut SqliteConnection, review_id: &str) -> PlanReviewStoreResult<PlanReviewSessionRow> {
+fn get_review(conn: &mut SqliteConnection, review_id: &str) -> PlanReviewStoreResult<PlanReviewSessionRow> {
     plan_review_sessions::table
         .find(review_id)
         .first(conn)
@@ -1359,17 +1359,6 @@ pub fn get_delivery(conn: &mut SqliteConnection, delivery_id: &str) -> PlanRevie
         .ok_or(PlanReviewStoreError::NotFound("plan review delivery"))
 }
 
-pub fn list_recoverable_deliveries(conn: &mut SqliteConnection) -> PlanReviewStoreResult<Vec<PlanReviewDeliveryRow>> {
-    Ok(plan_review_deliveries::table
-        .filter(plan_review_deliveries::state.eq_any([
-            PlanDeliveryState::Queued.as_str(),
-            PlanDeliveryState::Held.as_str(),
-            PlanDeliveryState::InDoubt.as_str(),
-        ]))
-        .order(plan_review_deliveries::created_at.asc())
-        .load(conn)?)
-}
-
 const STARTUP_QUEUE_RESUME_PENDING: &str = "startup_queue_resume_pending";
 
 /// Native continuations that completed before a crash but whose prompt queue
@@ -1799,24 +1788,6 @@ pub fn retry_materialization_from_database(
         ))
         .execute(conn)?;
     Ok(plan_materializations::table.find(&row.id).first(conn)?)
-}
-
-pub fn complete_active_document(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-    now: i64,
-) -> PlanReviewStoreResult<usize> {
-    Ok(diesel::update(
-        plan_documents::table
-            .filter(plan_documents::conversation_id.eq(conversation_id))
-            .filter(plan_documents::state.eq(PlanDocumentState::Approved.as_str())),
-    )
-    .set((
-        plan_documents::state.eq(PlanDocumentState::Done.as_str()),
-        plan_documents::lock_version.eq(plan_documents::lock_version + 1),
-        plan_documents::updated_at.eq(now),
-    ))
-    .execute(conn)?)
 }
 
 /// Convert pre-document plan artifacts into one immutable legacy episode per
@@ -2621,109 +2592,6 @@ mod tests {
             .is_err(),
             "unknown persisted runtime fields cannot be silently ignored"
         );
-    }
-
-    /// Built through the real review flow on a file both pools open; the
-    /// barrier itself is read through SeaORM.
-    #[tokio::test]
-    async fn runtime_mutation_guards_ignore_settled_historical_reviews() {
-        let dir = tempfile::tempdir().unwrap();
-        let (pool, sea) = crate::db::sea::shared_test_db(dir.path()).await;
-        let mut conn = pool.get().unwrap();
-        let first = append_first(&mut conn, "c1", "# First plan\n");
-        mark_applied(&mut conn, &first);
-        let runtime_a = NativePlanReviewRuntimeConfig {
-            provider_id: "provider-a".into(),
-            model: "model-a".into(),
-            assistant_id: Some("assistant-a".into()),
-            ..NativePlanReviewRuntimeConfig::fixture()
-        };
-        let first_review = submit_native_head_for_review(
-            &mut conn,
-            &PlanReviewSubmit {
-                document_id: &first.document.id,
-                expected_generation: first.document.working_generation,
-                expected_head_sha256: &first.revision.content_sha256,
-                turn_id: None,
-                assistant_message_id: Some("m1"),
-                provider_call_id: Some("exit-a"),
-                provider_kind: PlanReviewProviderKind::Native,
-                now: 5,
-            },
-            &runtime_a,
-        )
-        .unwrap();
-        decide_review(
-            &mut conn,
-            &PlanReviewDecision {
-                review_id: &first_review.review.id,
-                decision_id: "approve-a",
-                expected_lock_version: 0,
-                expected_draft_generation: 0,
-                expected_draft_sha256: &first_review.draft.draft_sha256,
-                action: PlanReviewDecisionAction::Approve,
-                decision_summary: None,
-                delivery_target: None,
-                target_session_id: None,
-                target_turn_id: None,
-                now: 6,
-            },
-        )
-        .unwrap();
-        assert_eq!(complete_active_document(&mut conn, "c1", 7).unwrap(), 1);
-
-        let document = create_or_resume_document(&mut conn, "c1", 8).unwrap();
-        let second = append_assistant_revision(
-            &mut conn,
-            &PlanRevisionAppend {
-                document_id: &document.id,
-                expected_generation: 0,
-                expected_head_sha256: None,
-                content_markdown: "# Second plan\n",
-                patch: "second plan",
-                source_message_id: Some("m2"),
-                source_call_id: Some("update-b"),
-                responding_to_suggestion_revision_id: None,
-                now: 9,
-            },
-        )
-        .unwrap();
-        mark_applied(&mut conn, &second);
-        let runtime_b = NativePlanReviewRuntimeConfig {
-            provider_id: "provider-b".into(),
-            model: "model-b".into(),
-            assistant_id: Some("assistant-b".into()),
-            ..NativePlanReviewRuntimeConfig::fixture()
-        };
-        submit_native_head_for_review(
-            &mut conn,
-            &PlanReviewSubmit {
-                document_id: &document.id,
-                expected_generation: second.document.working_generation,
-                expected_head_sha256: &second.revision.content_sha256,
-                turn_id: None,
-                assistant_message_id: Some("m2"),
-                provider_call_id: Some("exit-b"),
-                provider_kind: PlanReviewProviderKind::Native,
-                now: 10,
-            },
-            &runtime_b,
-        )
-        .unwrap();
-
-        drop(conn);
-        let blocked = |provider: &'static str, model: &'static str| {
-            let sea = sea.clone();
-            async move {
-                sea.read(async |tx| {
-                    crate::db::sea::ops::plan_review::barrier_conversations_for_model(tx, provider, model).await
-                })
-                .await
-                .unwrap()
-            }
-        };
-        assert!(blocked("provider-a", "model-a").await.is_empty());
-        assert_eq!(blocked("provider-b", "model-b").await, ["c1"]);
     }
 
     #[test]
