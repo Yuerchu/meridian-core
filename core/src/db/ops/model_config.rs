@@ -51,50 +51,7 @@ pub fn get_with_profile(
 /// to a profile, the provider-side tools stay on the row, and nothing
 /// overrides. Tests about the split itself build the two rows explicitly.
 #[cfg(any(test, feature = "test-support"))]
-pub struct FlatModelConfig<'a> {
-    pub id: &'a str,
-    pub provider_id: &'a str,
-    pub model_id: &'a str,
-    pub display_name: Option<&'a str>,
-    pub context_window: i32,
-    pub compact_threshold: i32,
-    pub max_output_tokens: Option<i32>,
-    pub input_price: Option<crate::decimal::Decimal>,
-    pub output_price: Option<crate::decimal::Decimal>,
-    pub cache_read_price: Option<crate::decimal::Decimal>,
-    pub cache_write_price: Option<crate::decimal::Decimal>,
-    pub capability_overrides: Option<&'a str>,
-    pub pricing_tiers: Option<&'a str>,
-    pub server_tools: Option<&'a str>,
-    pub server_tool_price: Option<crate::decimal::Decimal>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl<'a> Default for FlatModelConfig<'a> {
-    fn default() -> Self {
-        Self {
-            id: "mc1",
-            provider_id: "p1",
-            model_id: "m1",
-            display_name: None,
-            context_window: 128_000,
-            compact_threshold: 100_000,
-            max_output_tokens: None,
-            input_price: None,
-            output_price: None,
-            cache_read_price: None,
-            cache_write_price: None,
-            capability_overrides: None,
-            pricing_tiers: None,
-            server_tools: None,
-            server_tool_price: None,
-            created_at: 0,
-            updated_at: 0,
-        }
-    }
-}
+pub use crate::db::sea::ops::model_config::FlatModelConfig;
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn seed_flat(conn: &mut SqliteConnection, flat: &FlatModelConfig) -> QueryResult<ModelConfigRow> {

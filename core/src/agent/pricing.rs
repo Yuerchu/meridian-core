@@ -16,7 +16,7 @@ pub enum PricingError {
 ///
 /// It lives here, beside `compute_cost`, because it is a pricing rule and not a
 /// reporting preference: it decides whether a rate is *owed*, which has to be
-/// settled before anything goes looking for one. `db::ops::usage::resolve` falls
+/// settled before anything goes looking for one. `db::sea::ops::usage::resolve` falls
 /// back to today's `model_configs` when a row carries no snapshotted rate, so a
 /// subscription request under a provider that happens to have a price on file
 /// would otherwise be billed at it — "no rate stored" and "no rate exists" are

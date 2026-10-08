@@ -62,6 +62,24 @@ pub async fn list_by_provider_with_profiles(
         .collect()
 }
 
+/// Every provider's models, each with the profile it points at.
+pub async fn list_with_profiles(db: &impl Snapshot) -> Result<Vec<(model_config::Model, model_profile::Model)>, DbErr> {
+    let configs = model_config::Entity::find().all(db.conn()?).await?;
+    let profiles: HashMap<String, model_profile::Model> = model_profile::Entity::find()
+        .all(db.conn()?)
+        .await?
+        .into_iter()
+        .map(|profile| (profile.id.clone(), profile))
+        .collect();
+    configs
+        .into_iter()
+        .map(|config| match profiles.get(&config.profile_id) {
+            Some(profile) => Ok((config, profile.clone())),
+            None => Err(missing_profile(&config)),
+        })
+        .collect()
+}
+
 /// One provider's door to one model, with its profile.
 pub async fn get_with_profile(
     db: &impl Snapshot,
@@ -138,6 +156,130 @@ pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
         .rows_affected;
     profile_ops::delete_if_unreferenced(tx, &existing.profile_id).await?;
     Ok(deleted)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct FlatModelConfig<'a> {
+    pub id: &'a str,
+    pub provider_id: &'a str,
+    pub model_id: &'a str,
+    pub display_name: Option<&'a str>,
+    pub context_window: i32,
+    pub compact_threshold: i32,
+    pub max_output_tokens: Option<i32>,
+    pub input_price: Option<crate::decimal::Decimal>,
+    pub output_price: Option<crate::decimal::Decimal>,
+    pub cache_read_price: Option<crate::decimal::Decimal>,
+    pub cache_write_price: Option<crate::decimal::Decimal>,
+    pub capability_overrides: Option<&'a str>,
+    pub pricing_tiers: Option<&'a str>,
+    pub server_tools: Option<&'a str>,
+    pub server_tool_price: Option<crate::decimal::Decimal>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<'a> Default for FlatModelConfig<'a> {
+    fn default() -> Self {
+        Self {
+            id: "mc1",
+            provider_id: "p1",
+            model_id: "m1",
+            display_name: None,
+            context_window: 128_000,
+            compact_threshold: 100_000,
+            max_output_tokens: None,
+            input_price: None,
+            output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
+            capability_overrides: None,
+            pricing_tiers: None,
+            server_tools: None,
+            server_tool_price: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+}
+
+/// The old flat shape as a profile and a non-overriding config, for tests:
+/// prices, window and capability patch on the profile, provider-side tools
+/// on the row. Seeding the same model twice is a price change, which several
+/// callers test, so both rows are upserted.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn seed_flat(tx: &WriteTx, flat: &FlatModelConfig<'_>) -> Result<model_config::Model, DbErr> {
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::sea_query::OnConflict;
+
+    let profile_id = format!("{}-profile", flat.id);
+    model_profile::Entity::insert(model_profile::ActiveModel {
+        id: Set(profile_id.clone()),
+        name: Set(flat.display_name.unwrap_or(flat.model_id).to_owned()),
+        context_window: Set(flat.context_window),
+        compact_threshold: Set(flat.compact_threshold),
+        max_output_tokens: Set(flat.max_output_tokens),
+        input_price: Set(flat.input_price.clone()),
+        output_price: Set(flat.output_price.clone()),
+        cache_read_price: Set(flat.cache_read_price.clone()),
+        cache_write_price: Set(flat.cache_write_price.clone()),
+        pricing_tiers: Set(flat.pricing_tiers.map(str::to_owned)),
+        capability_overrides: Set(flat.capability_overrides.map(str::to_owned)),
+        created_at: Set(flat.created_at),
+        updated_at: Set(flat.updated_at),
+    })
+    .on_conflict(
+        OnConflict::column(model_profile::Column::Id)
+            .update_columns([
+                model_profile::Column::Name,
+                model_profile::Column::ContextWindow,
+                model_profile::Column::CompactThreshold,
+                model_profile::Column::MaxOutputTokens,
+                model_profile::Column::InputPrice,
+                model_profile::Column::OutputPrice,
+                model_profile::Column::CacheReadPrice,
+                model_profile::Column::CacheWritePrice,
+                model_profile::Column::PricingTiers,
+                model_profile::Column::CapabilityOverrides,
+                model_profile::Column::UpdatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec_without_returning(tx.conn()?)
+    .await?;
+    model_config::Entity::insert(model_config::ActiveModel {
+        id: Set(flat.id.to_owned()),
+        provider_id: Set(flat.provider_id.to_owned()),
+        model_id: Set(flat.model_id.to_owned()),
+        profile_id: Set(profile_id),
+        overrides_pricing: Set(crate::db::types::SqlBool::FALSE),
+        input_price: Set(None),
+        output_price: Set(None),
+        cache_read_price: Set(None),
+        cache_write_price: Set(None),
+        pricing_tiers: Set(None),
+        server_tools: Set(flat.server_tools.map(str::to_owned)),
+        server_tool_price: Set(flat.server_tool_price.clone()),
+        created_at: Set(flat.created_at),
+        updated_at: Set(flat.updated_at),
+    })
+    .on_conflict(
+        OnConflict::columns([model_config::Column::ProviderId, model_config::Column::ModelId])
+            .update_columns([
+                model_config::Column::ProfileId,
+                model_config::Column::ServerTools,
+                model_config::Column::ServerToolPrice,
+                model_config::Column::UpdatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec_without_returning(tx.conn()?)
+    .await?;
+    get_with_profile(tx, flat.provider_id, flat.model_id)
+        .await?
+        .map(|(config, _)| config)
+        .ok_or_else(|| DbErr::RecordNotFound(format!("model config {}", flat.id)))
 }
 
 #[cfg(test)]

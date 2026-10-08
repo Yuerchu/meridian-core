@@ -1,7 +1,7 @@
 //! What one conversation has cost, for an agent that wants to know.
 //!
 //! **The conversation is a constructor parameter, not an argument**, which is
-//! the whole of this tool's security story. `db::ops::usage::report` reads the
+//! the whole of this tool's security story. `db::sea::ops::usage::report` reads the
 //! entire ledger — every conversation, every provider, back to the first row —
 //! and the only thing that narrows it is [`UsageFilter::conversation_id`].
 //! Taking that from the model would make the scope a suggestion: it could ask
@@ -26,7 +26,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Permission, Tool, ToolContext};
-use crate::db::ops::usage::{UsageBucket, UsageDimension, UsageFilter, report};
+use crate::db::sea::DbErr;
+use crate::db::sea::ops::usage::{UsageBucket, UsageDimension, UsageFilter, report};
 
 /// How far back a request may look, in days.
 ///
@@ -150,24 +151,18 @@ impl Tool for ConversationUsageTool {
         // and is not. The bridge builds this tool once per session, while the
         // context is rebuilt for each call out of whatever turn is running, so
         // reading the scope from there would make it depend on the moment the
-        // call happened to arrive. The context is consulted for the pool alone.
+        // call happened to arrive. The context is consulted for the handle alone.
         let filter = UsageFilter {
             since_ms: Some(crate::util::now_ms() - days * 86_400_000),
             conversation_id: Some(self.conversation_id.clone()),
             ..Default::default()
         };
 
-        let pool = context
-            .db_pool
-            .as_ref()
-            .ok_or("Usage is unavailable: no database handle")?
-            .clone();
-        let buckets = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            report(&mut conn, dimension, &filter).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let db = context.sea.as_ref().ok_or("Usage is unavailable: no database handle")?;
+        let buckets = db
+            .read(async |tx| report(tx, dimension, &filter).await)
+            .await
+            .map_err(|error: DbErr| error.to_string())?;
 
         Ok(render(&buckets, dimension, days))
     }

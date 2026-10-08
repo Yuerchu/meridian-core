@@ -10,7 +10,9 @@
 //! exactly — and money in this app is `Decimal` specifically so that no
 //! decision rests on a rounded value.
 
-use crate::db::ops::usage::{UsageBucket, UsageDimension, UsageFilter, report};
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::Snapshot;
+use crate::db::sea::ops::usage::{UsageBucket, UsageDimension, UsageFilter, report};
 use crate::decimal::Decimal;
 
 use super::alert::{Alert, AlertDetail, UsageAlert, UsageSlice};
@@ -181,15 +183,9 @@ pub fn baseline_window_count(window_hours: u32, baseline_days: u32) -> i64 {
     (i64::from(baseline_days) * 24) / i64::from(window_hours)
 }
 
-/// Read both windows out of the ledger and judge them.
-///
-/// Blocking: every call inside is a database read. Callers run it on a blocking
-/// thread.
-pub fn collect(
-    conn: &mut diesel::SqliteConnection,
-    thresholds: &SurgeThresholds,
-    now: i64,
-) -> Result<Option<Alert>, String> {
+/// Read both windows out of the ledger and judge them, in one snapshot so the
+/// two windows and the breakdown describe the same ledger.
+pub async fn collect(db: &impl Snapshot, thresholds: &SurgeThresholds, now: i64) -> Result<Option<Alert>, DbErr> {
     let window_ms = i64::from(thresholds.window_hours) * HOUR_MS;
     let baseline_ms = i64::from(thresholds.baseline_days) * DAY_MS;
     let window_start = now - window_ms;
@@ -209,10 +205,10 @@ pub fn collect(
         ..Default::default()
     };
 
-    let recent = WindowSample::from_total(report(conn, UsageDimension::Total, &recent_filter).map_err(err)?);
-    let baseline = WindowSample::from_total(report(conn, UsageDimension::Total, &baseline_filter).map_err(err)?);
+    let recent = WindowSample::from_total(report(db, UsageDimension::Total, &recent_filter).await?);
+    let baseline = WindowSample::from_total(report(db, UsageDimension::Total, &baseline_filter).await?);
 
-    let oldest = crate::db::ops::usage::oldest_audit_created_at(conn).map_err(err)?;
+    let oldest = crate::db::sea::ops::usage::oldest_audit_created_at(db).await?;
     let covers = oldest.is_some_and(|oldest| oldest <= baseline_start);
 
     let windows = baseline_window_count(thresholds.window_hours, thresholds.baseline_days);
@@ -224,8 +220,8 @@ pub fn collect(
         }
     };
 
-    let top_providers = slices(conn, UsageDimension::Provider, &recent_filter)?;
-    let top_conversations = slices(conn, UsageDimension::Conversation, &recent_filter)?;
+    let top_providers = slices(db, UsageDimension::Provider, &recent_filter).await?;
+    let top_conversations = slices(db, UsageDimension::Conversation, &recent_filter).await?;
 
     let detail = UsageAlert {
         window_hours: thresholds.window_hours,
@@ -249,14 +245,10 @@ pub fn collect(
     }))
 }
 
-fn slices(
-    conn: &mut diesel::SqliteConnection,
-    dimension: UsageDimension,
-    filter: &UsageFilter,
-) -> Result<Vec<UsageSlice>, String> {
+async fn slices(db: &impl Snapshot, dimension: UsageDimension, filter: &UsageFilter) -> Result<Vec<UsageSlice>, DbErr> {
     // `report` already sorts biggest-first for a non-series dimension.
-    Ok(report(conn, dimension, filter)
-        .map_err(err)?
+    Ok(report(db, dimension, filter)
+        .await?
         .into_iter()
         .take(TOP_SLICES)
         .map(|bucket| UsageSlice {
@@ -266,10 +258,6 @@ fn slices(
             messages: bucket.messages,
         })
         .collect())
-}
-
-fn err(error: diesel::result::Error) -> String {
-    format!("could not read the usage ledger: {error}")
 }
 
 /// The sentence a person reads.
@@ -308,10 +296,8 @@ mod ledger_tests {
     //! where the boundary between them is decided.
 
     use super::*;
-    use crate::db::diesel_test_db;
-    use crate::db::models::audit::AuditMessageInsert;
-    use crate::db::schema::audit_messages;
-    use diesel::RunQueryDsl;
+    use crate::db::sea::cap::Db;
+    use crate::db::sea::{execute_for_tests, sea_test_db};
 
     const HOUR: i64 = HOUR_MS;
     const NOW: i64 = 1_700_000_000_000;
@@ -327,52 +313,35 @@ mod ledger_tests {
 
     /// One priced reply, straight into the table: these tests need control over
     /// the timestamp, which a real turn does not offer.
-    fn reply(conn: &mut diesel::SqliteConnection, id: &str, created_at: i64, output_tokens: i32) {
-        diesel::insert_into(audit_messages::table)
-            .values(&AuditMessageInsert {
-                id,
-                recorded_at: created_at,
-                message_id: id,
-                conversation_id: "c1",
-                turn_id: None,
-                source_type: None,
-                source_id: None,
-                turn_origin: Some("desktop"),
-                role: "assistant",
-                content: "",
-                sender_id: None,
-                sender_name: None,
-                provider_id: Some("p1"),
-                provider_name: Some("Acme"),
-                model_id: Some("m1"),
-                input_tokens: Some(0),
-                output_tokens: Some(output_tokens),
-                cache_read_tokens: Some(0),
-                cache_write_tokens: Some(0),
-                created_at,
-                // A price on the row itself, so nothing falls back to today's
-                // configuration and the figures are exactly these tokens.
-                input_price: Some("0".parse().unwrap()),
-                output_price: Some("1".parse().unwrap()),
-                cache_read_price: Some("0".parse().unwrap()),
-                cache_write_price: Some("0".parse().unwrap()),
-                server_tool_calls: None,
-                server_tool_price: None,
-                billing_mode: "metered",
-                self_id: None,
-                response_model_id: None,
-            })
-            .execute(conn)
-            .unwrap();
+    async fn reply(db: &Db, id: &str, created_at: i64, output_tokens: i32) {
+        // A price on the row itself, so nothing falls back to today's
+        // configuration and the figures are exactly these tokens.
+        execute_for_tests(
+            db,
+            &format!(
+                "INSERT INTO audit_messages (id, recorded_at, message_id, conversation_id, turn_origin, role, content,
+                     provider_id, provider_name, model_id, input_tokens, output_tokens, cache_read_tokens,
+                     cache_write_tokens, created_at, input_price, output_price, cache_read_price,
+                     cache_write_price, billing_mode)
+                 VALUES ('{id}', {created_at}, '{id}', 'c1', 'desktop', 'assistant', '', 'p1', 'Acme',
+                     'm1', 0, {output_tokens}, 0, 0, {created_at}, '0', '1', '0', '0', 'metered')"
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn collected(db: &Db) -> Option<Alert> {
+        db.read(async |tx| collect(tx, &thresholds(), NOW).await).await.unwrap()
     }
 
     /// A thousand output tokens an hour, for as many hours back as asked.
     ///
     /// The rate above is per *million* tokens, so a quiet hour costs 0.001 and
     /// the 168-hour baseline comes to 0.168.
-    fn quiet_hours(conn: &mut diesel::SqliteConnection, hours: i64) {
+    async fn quiet_hours(db: &Db, hours: i64) {
         for hour in 1..=hours {
-            reply(conn, &format!("old-{hour}"), NOW - hour * HOUR, 1_000);
+            reply(db, &format!("old-{hour}"), NOW - hour * HOUR, 1_000).await;
         }
     }
 
@@ -381,14 +350,13 @@ mod ledger_tests {
     /// Overlapped — the baseline running to `now` rather than to the start of
     /// the window — the spike lands inside its own baseline, and does so worst
     /// exactly when the spike is largest.
-    #[test]
-    fn the_baseline_stops_where_the_measured_window_begins() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        quiet_hours(&mut conn, 200);
-        reply(&mut conn, "spike", NOW - HOUR / 2, 500_000);
+    #[tokio::test]
+    async fn the_baseline_stops_where_the_measured_window_begins() {
+        let db = sea_test_db().await;
+        quiet_hours(&db, 200).await;
+        reply(&db, "spike", NOW - HOUR / 2, 500_000).await;
 
-        let alert = collect(&mut conn, &thresholds(), NOW).unwrap().expect("a surge");
+        let alert = collected(&db).await.expect("a surge");
         let AlertDetail::Usage(detail) = &alert.detail else {
             panic!("a usage alert");
         };
@@ -406,35 +374,32 @@ mod ledger_tests {
     }
 
     /// The same ledger without the spike is ordinary spending and says nothing.
-    #[test]
-    fn a_steady_ledger_raises_nothing() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        quiet_hours(&mut conn, 200);
-        assert!(collect(&mut conn, &thresholds(), NOW).unwrap().is_none());
+    #[tokio::test]
+    async fn a_steady_ledger_raises_nothing() {
+        let db = sea_test_db().await;
+        quiet_hours(&db, 200).await;
+        assert!(collected(&db).await.is_none());
     }
 
     /// A ledger that does not reach back across the baseline span has no
     /// baseline, only an install date.
-    #[test]
-    fn a_young_ledger_raises_nothing_however_large_the_hour() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        quiet_hours(&mut conn, 10);
-        reply(&mut conn, "spike", NOW - HOUR / 2, 5_000_000);
-        assert!(collect(&mut conn, &thresholds(), NOW).unwrap().is_none());
+    #[tokio::test]
+    async fn a_young_ledger_raises_nothing_however_large_the_hour() {
+        let db = sea_test_db().await;
+        quiet_hours(&db, 10).await;
+        reply(&db, "spike", NOW - HOUR / 2, 5_000_000).await;
+        assert!(collected(&db).await.is_none());
     }
 
     /// The alert has to name something actionable: a runaway is usually one
     /// conversation, and a total with no breakdown is a number nobody can act on.
-    #[test]
-    fn the_alert_carries_a_breakdown_of_the_window() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        quiet_hours(&mut conn, 200);
-        reply(&mut conn, "spike", NOW - HOUR / 2, 500_000);
+    #[tokio::test]
+    async fn the_alert_carries_a_breakdown_of_the_window() {
+        let db = sea_test_db().await;
+        quiet_hours(&db, 200).await;
+        reply(&db, "spike", NOW - HOUR / 2, 500_000).await;
 
-        let alert = collect(&mut conn, &thresholds(), NOW).unwrap().expect("a surge");
+        let alert = collected(&db).await.expect("a surge");
         let AlertDetail::Usage(detail) = &alert.detail else {
             panic!("a usage alert");
         };

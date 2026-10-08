@@ -689,19 +689,16 @@ async fn check_balances(services: &Services, config: &NotifyConfig) {
 }
 
 async fn check_usage(services: &Services, config: &NotifyConfig) {
-    let pool = services.db.clone();
     let thresholds = config.usage_thresholds();
     let now = now_ms();
-    let found = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        usage::collect(&mut conn, &thresholds, now)
-    })
-    .await;
+    let found = services
+        .sea
+        .read(async |tx| usage::collect(tx, &thresholds, now).await)
+        .await;
     match found {
-        Ok(Ok(Some(alert))) => raise_and_dispatch(services, &alert, config.usage_cooldown_ms()).await,
-        Ok(Ok(None)) => clear(services, usage::USAGE_ALERT_KEY).await,
-        Ok(Err(error)) => tracing::warn!(%error, "the usage check could not read the ledger"),
-        Err(error) => tracing::warn!(%error, "the usage check panicked"),
+        Ok(Some(alert)) => raise_and_dispatch(services, &alert, config.usage_cooldown_ms()).await,
+        Ok(None) => clear(services, usage::USAGE_ALERT_KEY).await,
+        Err(error) => tracing::warn!(%error, "the usage check could not read the ledger"),
     }
 }
 

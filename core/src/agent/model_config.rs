@@ -119,6 +119,19 @@ pub fn load_all(conn: &mut SqliteConnection) -> QueryResult<Vec<EffectiveModelCo
     Ok(rows.into_iter().map(|(c, p)| effective(&c.into(), &p.into())).collect())
 }
 
+/// [`load_all`] on SeaORM: every configuration with its profile, in one
+/// snapshot so a profile edited between the two reads cannot price half the
+/// models at the old rates.
+pub async fn load_every(
+    db: &impl crate::db::sea::cap::Snapshot,
+) -> Result<Vec<EffectiveModelConfig>, crate::db::sea::DbErr> {
+    Ok(crate::db::sea::ops::model_config::list_with_profiles(db)
+        .await?
+        .iter()
+        .map(|(config, profile)| effective(config, profile))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
