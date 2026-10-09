@@ -337,25 +337,26 @@ pub(super) async fn oneshot_completion(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
-    let assistant = {
-        let pool = state.services.db.clone();
-        let conv_id = conversation_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let conv =
-                crate::db::ops::conversation::get_conversation(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-            Ok::<_, String>(
-                conv.assistant_id
-                    .and_then(|id| crate::db::ops::assistant::get_assistant(&mut conn, &id).ok()),
-            )
+    let sea = &state.services.sea;
+    let assistant = sea
+        .read(async |tx| {
+            let Some(conv) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? else {
+                return Ok(Err(format!("conversation {conversation_id} not found")));
+            };
+            // An assistant that cannot be read leaves the pass on the default
+            // provider, as before.
+            let assistant = match conv.assistant_id {
+                Some(id) => crate::db::sea::ops::assistant::get_assistant(tx, &id)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            Ok::<_, crate::db::sea::DbErr>(Ok(assistant))
         })
         .await
-        .map_err(|e| e.to_string())??
-    };
+        .map_err(|e| e.to_string())??;
 
-    // Both resolutions take a pooled connection, and the first also reads the OS
-    // credential store, so they run off the async thread.
-    //
     // The turn parameters are resolved like any other turn: an extraction
     // request that invents its own temperature is rejected by models the chat
     // path already talks to.
@@ -372,56 +373,50 @@ pub(super) async fn oneshot_completion(
         provider_name,
         model,
     ) = {
-        let pool2 = state.services.db.clone();
-        let secrets2 = state.services.secrets.clone();
-        let assistant2 = assistant.clone();
-        tokio::task::spawn_blocking(move || {
-            let crate::agent::ResolvedProvider {
-                provider_id,
-                provider_name,
-                provider_type,
-                base_url,
-                credential,
-                model,
-                api_format,
-                transport_profile,
-                codex_request_shape,
-                codex_client_version,
-            } = resolve_provider_config(&secrets2, &pool2, assistant2.as_ref())?;
-            let effective_model = assistant2.as_ref().and_then(|a| a.model_id.clone()).unwrap_or(model);
-            let turn = crate::agent::resolve_turn_params(
-                &pool2,
-                crate::agent::TurnParamsResolveRequest {
-                    assistant: assistant2.as_ref(),
-                    provider_id: assistant2.as_ref().and_then(|a| a.provider_id.as_deref()),
-                    provider_type: &provider_type,
-                    api_format: &api_format,
+        let crate::agent::ResolvedProvider {
+            provider_id,
+            provider_name,
+            provider_type,
+            base_url,
+            credential,
+            model,
+            api_format,
+            transport_profile,
+            codex_request_shape,
+            codex_client_version,
+        } = resolve_provider_config(&state.services.secrets, sea, assistant.as_ref()).await?;
+        let effective_model = assistant.as_ref().and_then(|a| a.model_id.clone()).unwrap_or(model);
+        let turn = crate::agent::resolve_turn_params(
+            sea,
+            crate::agent::TurnParamsResolveRequest {
+                assistant: assistant.as_ref(),
+                provider_id: assistant.as_ref().and_then(|a| a.provider_id.as_deref()),
+                provider_type: &provider_type,
+                api_format: &api_format,
 
-                    transport_profile: &transport_profile,
-                    codex_request_shape,
-                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
-                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
-                    model: &effective_model,
-                    thinking_level: None,
-                    fast: false,
-                },
-            )?;
-            Ok::<_, String>((
-                provider_type,
-                base_url,
-                credential,
-                api_format,
-                transport_profile,
+                transport_profile: &transport_profile,
                 codex_request_shape,
-                codex_client_version,
-                turn,
-                provider_id,
-                provider_name,
-                effective_model,
-            ))
-        })
-        .await
-        .map_err(|e| e.to_string())??
+                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
+                model: &effective_model,
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await?;
+        (
+            provider_type,
+            base_url,
+            credential,
+            api_format,
+            transport_profile,
+            codex_request_shape,
+            codex_client_version,
+            turn,
+            provider_id,
+            provider_name,
+            effective_model,
+        )
     };
     let provider = provider::registry::create_provider(provider::registry::ProviderWire {
         provider_type: &provider_type,
@@ -633,17 +628,7 @@ async fn headless_chat_inner(
         .map_err(|e| e.to_string())??
     };
 
-    // Resolve provider off the async thread: it takes a pooled connection and
-    // reads the OS credential store, either of which can block for as long as
-    // the pool's acquire timeout.
-    let resolved = {
-        let pool2 = pool.clone();
-        let secrets2 = secrets.clone();
-        let assistant2 = assistant.clone();
-        tokio::task::spawn_blocking(move || resolve_provider_config(&secrets2, &pool2, assistant2.as_ref()))
-            .await
-            .map_err(|e| e.to_string())??
-    };
+    let resolved = resolve_provider_config(secrets, sea, assistant.as_ref()).await?;
     let provider = provider::registry::create_provider(resolved.wire())?;
     let crate::agent::ResolvedProvider {
         provider_type,
@@ -698,49 +683,34 @@ async fn headless_chat_inner(
         .to_string();
     // Same resolution as the desktop chat command, so a per-model config the
     // user wrote applies here too. No per-request tier: OneBot turns run off
-    // the assistant's stored defaults. Off the async thread because it takes a
-    // pooled connection.
+    // the assistant's stored defaults.
     //
     // Ahead of the tool set because what the model can be sent at all — whether
     // it takes a tools field — decides what that set may contain.
-    let mut turn_params = {
-        let pool2 = pool.clone();
-        let assistant2 = assistant.clone();
-        let pt = provider_type.clone();
-        let af = api_format.clone();
-        let tp = transport_profile.clone();
-        let crs = codex_request_shape;
-        let em = effective_model.clone();
-        // The provider this turn actually resolved to, not the assistant's
-        // stored field. They differ whenever the assistant names none and the
-        // fallback picked the first enabled one — and with the assistant's
-        // empty field there is no `model_configs` row to find, so that turn
-        // silently loses its context window, its prices, its capability
-        // overrides and its provider-side tools. The desktop has always passed
-        // the resolved id.
-        let pid = provider_id.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::agent::resolve_turn_params(
-                &pool2,
-                crate::agent::TurnParamsResolveRequest {
-                    assistant: assistant2.as_ref(),
-                    provider_id: Some(pid.as_str()),
-                    provider_type: &pt,
-                    api_format: &af,
+    // The provider this turn actually resolved to, not the assistant's stored
+    // field. They differ whenever the assistant names none and the fallback
+    // picked the first enabled one — and with the assistant's empty field there
+    // is no `model_configs` row to find, so that turn silently loses its context
+    // window, its prices, its capability overrides and its provider-side tools.
+    // The desktop has always passed the resolved id.
+    let mut turn_params = crate::agent::resolve_turn_params(
+        sea,
+        crate::agent::TurnParamsResolveRequest {
+            assistant: assistant.as_ref(),
+            provider_id: Some(provider_id.as_str()),
+            provider_type: &provider_type,
+            api_format: &api_format,
 
-                    transport_profile: &tp,
-                    codex_request_shape: crs,
-                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
-                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
-                    model: &em,
-                    thinking_level: None,
-                    fast: false,
-                },
-            )
-        })
-        .await
-        .map_err(|e| e.to_string())??
-    };
+            transport_profile: &transport_profile,
+            codex_request_shape,
+            codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
+            codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
+            model: &effective_model,
+            thinking_level: None,
+            fast: false,
+        },
+    )
+    .await?;
     // The same reasoning as the desktop path: one room, one stable prefix, one
     // server holding it. Worth more here than there, since a group's prefix is
     // long and every message in it is another turn against the same one.
@@ -1037,13 +1007,7 @@ async fn headless_chat_inner(
         sandbox_policy,
         #[cfg(not(target_os = "android"))]
         background: None,
-        tool_secrets: {
-            let pool2 = pool.clone();
-            let secrets2 = secrets.clone();
-            tokio::task::spawn_blocking(move || crate::agent::build_tool_secrets(&secrets2, &pool2))
-                .await
-                .map_err(|e| e.to_string())?
-        },
+        tool_secrets: crate::agent::build_tool_secrets(secrets, sea).await,
         cancel: cancel.clone(),
     };
 

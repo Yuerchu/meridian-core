@@ -43,7 +43,7 @@ pub fn append_message(
     parent: Option<&str>,
 ) -> QueryResult<message::Model> {
     let row = conn.transaction(|conn| -> QueryResult<message::Model> {
-        let row = insert_message(
+        let row = insert_row(
             conn,
             &MessageInsert {
                 parent_id: parent,
@@ -144,15 +144,17 @@ pub fn list_messages(conn: &mut SqliteConnection, conversation_id: &str) -> Quer
         .collect()
 }
 
-pub fn insert_message(conn: &mut SqliteConnection, new: &MessageInsert) -> QueryResult<message::Model> {
-    diesel::insert_into(messages::table).values(new).execute(conn)?;
-    get_message(conn, new.id)
-}
-
 // `update_content` was here, and went with the `update_message_content`
 // command that was its only caller. Rewriting one row's text in place has no
 // safe entry point: it names a message, not a conversation, so it cannot take
 // the lease that keeps a running turn from having the ground moved under it.
+
+/// One row as given, with no tree link and no head move: `append_message`'s
+/// insert, and the tests' way of writing a row exactly as they built it.
+fn insert_row(conn: &mut SqliteConnection, new: &MessageInsert) -> QueryResult<message::Model> {
+    diesel::insert_into(messages::table).values(new).execute(conn)?;
+    get_message(conn, new.id)
+}
 
 /// One row by id. Selected by name, for the reason `list_messages` is.
 fn get_message(conn: &mut SqliteConnection, id: &str) -> QueryResult<message::Model> {
@@ -348,30 +350,6 @@ pub fn record_tool_diffs_for_call(
         return Ok(Some(id));
     }
     Ok(None)
-}
-
-/// Drop the summaries belonging to one path, leaving other branches' alone.
-///
-/// Compacting used to clear every summary in the conversation, which is right
-/// while a conversation is a single line and wrong the moment it is not: the
-/// branch being compacted would take the other branches' summaries with it, and
-/// switching back would re-summarise from scratch.
-pub fn delete_summaries_anchored_in(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-    path_ids: &[String],
-) -> QueryResult<()> {
-    if path_ids.is_empty() {
-        return Ok(());
-    }
-    diesel::delete(
-        messages::table
-            .filter(messages::conversation_id.eq(conversation_id))
-            .filter(messages::is_compact_summary.eq(1))
-            .filter(messages::compact_anchor_id.eq_any(path_ids)),
-    )
-    .execute(conn)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -861,7 +839,7 @@ mod tests {
         let mut summary = row("s", "c1", "user");
         summary.is_compact_summary = 1;
         summary.sort_order = -1;
-        insert_message(&mut conn, &summary).unwrap();
+        insert_row(&mut conn, &summary).unwrap();
 
         let history = list_messages(&mut conn, "c1").unwrap();
         assert_eq!(resolve_head(Some("s"), &history).as_deref(), Some("b"));
@@ -880,7 +858,7 @@ mod tests {
         for (id, parent) in edges {
             let mut n = row(id, "c1", "user");
             n.parent_id = *parent;
-            insert_message(conn, &n).unwrap();
+            insert_row(conn, &n).unwrap();
         }
     }
 
@@ -945,7 +923,7 @@ mod tests {
         s.is_compact_summary = 1;
         s.sort_order = -1;
         s.compact_anchor_id = Some("m2");
-        insert_message(&mut conn, &s).unwrap();
+        insert_row(&mut conn, &s).unwrap();
         let history = list_messages(&mut conn, "c1").unwrap();
 
         let ctx = active_context(&history, Some("m3"));
@@ -971,7 +949,7 @@ mod tests {
         s.is_compact_summary = 1;
         s.sort_order = -1;
         s.compact_anchor_id = Some("a1");
-        insert_message(&mut conn, &s).unwrap();
+        insert_row(&mut conn, &s).unwrap();
         let history = list_messages(&mut conn, "c1").unwrap();
 
         let ctx = active_context(&history, Some("a2"));
@@ -992,7 +970,7 @@ mod tests {
             s.is_compact_summary = 1;
             s.sort_order = -1;
             s.compact_anchor_id = Some(anchor);
-            insert_message(&mut conn, &s).unwrap();
+            insert_row(&mut conn, &s).unwrap();
         }
         let history = list_messages(&mut conn, "c1").unwrap();
 
@@ -1107,7 +1085,7 @@ mod tests {
         let (pool, sea) = crate::db::sea::shared_test_db(dir.path()).await;
         let mut conn = pool.get().unwrap();
         create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-        insert_message(&mut conn, &row("m1", "c1", "assistant")).unwrap();
+        insert_row(&mut conn, &row("m1", "c1", "assistant")).unwrap();
         crate::db::sea::execute_for_tests(&sea, "UPDATE messages SET is_compact_summary = 2 WHERE id = 'm1'")
             .await
             .unwrap();

@@ -103,26 +103,37 @@ impl CodexTurnMetadata {
     /// `None` when there is no installation id to be had, because
     /// `installation_id` is the one field Codex always sends and a metadata
     /// object without it describes no installation at all.
-    pub fn for_install(
-        conn: &mut diesel::sqlite::SqliteConnection,
+    pub async fn for_install(
+        db: &crate::db::sea::cap::Db,
         request_kind: CodexRequestKind,
         thread_source: CodexThreadSource,
     ) -> Option<Self> {
-        let installation_id = crate::agent::codex_install::installation_id(conn)?;
-        let mut read = |key: &str| crate::db::ops::preference::get_preference(conn, key).ok().flatten();
+        let installation_id = crate::agent::codex_install::installation_id(db).await?;
+        let read = async |key: &str| {
+            crate::db::sea::ops::preference::get_preference(db, key)
+                .await
+                .ok()
+                .flatten()
+        };
+        let sandbox = read("sandbox.enabled").await;
+        // The same conjunction `AutoReviewed::wrap` uses: the switch alone
+        // leaves an inert wrapper, so a turn with no model named is not
+        // reviewed and must not say it is.
+        let auto_review_enabled = read("autoreview.enabled")
+            .await
+            .is_some_and(|value| value == "1" || value == "true")
+            && read("autoreview.model")
+                .await
+                .is_some_and(|model| !model.trim().is_empty());
         Some(Self {
             installation_id,
             turn_id: None,
             request_kind,
             thread_source,
             turn_started_at_unix_ms: None,
-            sandbox: read("sandbox.enabled"),
+            sandbox,
             workspace_kind: None,
-            // The same conjunction `AutoReviewed::wrap` uses: the switch alone
-            // leaves an inert wrapper, so a turn with no model named is not
-            // reviewed and must not say it is.
-            auto_review_enabled: read("autoreview.enabled").is_some_and(|value| value == "1" || value == "true")
-                && read("autoreview.model").is_some_and(|model| !model.trim().is_empty()),
+            auto_review_enabled,
         })
     }
 
@@ -205,6 +216,49 @@ mod tests {
             workspace_kind: Some("project"),
             auto_review_enabled: true,
         }
+    }
+
+    /// What the install says about itself: the sandbox preference as stored,
+    /// and auto review only when both the switch and a model are set.
+    #[tokio::test]
+    async fn the_install_metadata_reads_the_preferences() {
+        let db = crate::db::sea::sea_test_db().await;
+        let set = async |pairs: &[(&str, &str)]| {
+            db.write(async |tx| {
+                for (key, value) in pairs {
+                    crate::db::sea::ops::preference::set_preference(tx, key, value, 1).await?;
+                }
+                Ok::<_, crate::db::sea::DbErr>(())
+            })
+            .await
+            .unwrap();
+        };
+        let read = async || {
+            CodexTurnMetadata::for_install(&db, CodexRequestKind::Turn, CodexThreadSource::User)
+                .await
+                .expect("an installation id is minted")
+        };
+
+        let fresh = read().await;
+        assert_eq!(fresh.sandbox, None);
+        assert!(!fresh.auto_review_enabled);
+
+        set(&[
+            ("sandbox.enabled", "container"),
+            ("autoreview.enabled", "1"),
+            ("autoreview.model", " "),
+        ])
+        .await;
+        let switched_on = read().await;
+        assert_eq!(switched_on.sandbox.as_deref(), Some("container"));
+        assert!(
+            !switched_on.auto_review_enabled,
+            "a switch with no model reviews nothing"
+        );
+        assert_eq!(switched_on.installation_id, fresh.installation_id);
+
+        set(&[("autoreview.model", "p1:m1")]).await;
+        assert!(read().await.auto_review_enabled);
     }
 
     #[test]

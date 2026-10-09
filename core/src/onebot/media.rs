@@ -199,43 +199,45 @@ async fn resolve_supports_images(
     conversation_id: &str,
     model_override: Option<&str>,
 ) -> bool {
-    let pool = state.services.db.clone();
-    let secrets = state.services.secrets.clone();
-    let conv_id = conversation_id.to_string();
-    let config_aid = state.config.assistant_id.clone();
-    let override_model = model_override.map(String::from);
-
-    tokio::task::spawn_blocking(move || {
-        let mut conn = crate::util::get_conn(&pool).ok()?;
-        let effective_aid = match config_aid {
-            Some(aid) => Some(aid),
-            None => {
-                crate::db::ops::conversation::get_conversation(&mut conn, &conv_id)
-                    .ok()?
-                    .assistant_id
-            }
-        };
-        let assistant = effective_aid.and_then(|aid| crate::db::ops::assistant::get_assistant(&mut conn, &aid).ok());
-        drop(conn);
-
-        let crate::agent::ResolvedProvider {
-            provider_type,
-            model: resolved_model,
-            api_format,
-            transport_profile,
-            ..
-        } = crate::agent::resolve_provider_config(&secrets, &pool, assistant.as_ref()).ok()?;
-        let model = override_model
-            .or_else(|| assistant.as_ref().and_then(|a| a.model_id.clone()))
-            .unwrap_or(resolved_model);
-        let caps = crate::provider::registry::get_capabilities(&provider_type, &api_format, &transport_profile, &model)
-            .ok()?;
-        Some(caps.supports_images)
-    })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(false)
+    let sea = &state.services.sea;
+    let read = sea
+        .read(async |tx| {
+            let effective_aid = match state.config.assistant_id.clone() {
+                Some(aid) => Some(aid),
+                None => match crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? {
+                    Some(conv) => conv.assistant_id,
+                    None => return Ok(None),
+                },
+            };
+            let assistant = match effective_aid {
+                Some(aid) => crate::db::sea::ops::assistant::get_assistant(tx, &aid)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            Ok::<_, crate::db::sea::DbErr>(Some(assistant))
+        })
+        .await;
+    let Ok(Some(assistant)) = read else {
+        return false;
+    };
+    let Ok(crate::agent::ResolvedProvider {
+        provider_type,
+        model: resolved_model,
+        api_format,
+        transport_profile,
+        ..
+    }) = crate::agent::resolve_provider_config(&state.services.secrets, sea, assistant.as_ref()).await
+    else {
+        return false;
+    };
+    let model = model_override
+        .map(String::from)
+        .or_else(|| assistant.as_ref().and_then(|a| a.model_id.clone()))
+        .unwrap_or(resolved_model);
+    crate::provider::registry::get_capabilities(&provider_type, &api_format, &transport_profile, &model)
+        .is_ok_and(|caps| caps.supports_images)
 }
 
 async fn fetch_and_store_image(state: &Arc<SharedState>, conversation_id: &str, url: &str) -> Result<String, String> {

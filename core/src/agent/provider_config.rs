@@ -1,9 +1,12 @@
 use crate::agent::model_config::EffectiveModelConfig;
-use crate::db::entity::assistant;
-use crate::db::{self, DbPool};
+use std::sync::Arc;
+
+use crate::db::entity::{assistant, provider as provider_entity};
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops::{preference, provider as provider_ops};
+use crate::provider::registry::CredentialKind;
 use crate::provider::{self, ChatParams, ProviderCapabilities, ServerToolKind};
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
-use crate::util::get_conn;
 
 pub fn provider_secret_name(provider_id: &str) -> String {
     format!("PROVIDER_{}_KEY", provider_id.replace('-', "_").to_uppercase())
@@ -32,80 +35,92 @@ pub fn get_provider_api_key(secrets: &SecretsManager, provider_id: &str) -> Opti
 
 /// Secrets exposed to tool executors (web_search provider selection + service
 /// API keys). Shared by the desktop chat loop and the OneBot headless agent.
-pub fn build_tool_secrets(secrets: &SecretsManager, pool: &DbPool) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    if let Ok(mut conn) = pool.get()
-        && let Ok(Some(sp)) = db::ops::preference::get_preference(&mut conn, "search_provider")
-    {
-        map.insert("SEARCH_PROVIDER".to_string(), sp);
-    }
-    for key in ["SERVICE_TAVILY_KEY", "SERVICE_ZHIPU_SEARCH_KEY"] {
-        if let Ok(name) = SecretName::new(key)
-            && let Ok(Some(val)) = secrets.get(&SecretScope::Global, &name)
-        {
-            map.insert(key.to_string(), val);
+/// The keys come off the secret store on the blocking pool; a read that fails
+/// leaves its key out, as before.
+pub async fn build_tool_secrets(secrets: &Arc<SecretsManager>, db: &Db) -> std::collections::HashMap<String, String> {
+    let search_provider = preference::get_preference(db, "search_provider").await.ok().flatten();
+    let secrets = secrets.clone();
+    let mut map = tokio::task::spawn_blocking(move || {
+        let mut map = std::collections::HashMap::new();
+        for key in ["SERVICE_TAVILY_KEY", "SERVICE_ZHIPU_SEARCH_KEY"] {
+            if let Ok(name) = SecretName::new(key)
+                && let Ok(Some(val)) = secrets.get(&SecretScope::Global, &name)
+            {
+                map.insert(key.to_string(), val);
+            }
         }
+        map
+    })
+    .await
+    .unwrap_or_default();
+    if let Some(sp) = search_provider {
+        map.insert("SEARCH_PROVIDER".to_string(), sp);
     }
     map
 }
 
-pub fn resolve_provider_config(
-    secrets: &SecretsManager,
-    pool: &DbPool,
+/// A provider row and a model as a destination: the credential from the
+/// secret store (on the blocking pool) and the Codex version override.
+async fn destination(
+    secrets: &Arc<SecretsManager>,
+    db: &Db,
+    provider: provider_entity::Model,
+    model: String,
+) -> Result<ResolvedProvider, String> {
+    let codex_client_version = codex_client_version(db, provider.codex_request_shape.get()).await;
+    let credential = {
+        let secrets = secrets.clone();
+        let provider = provider.clone();
+        tokio::task::spawn_blocking(move || resolve_credential(&secrets, &provider))
+            .await
+            .map_err(|error| error.to_string())??
+    };
+    Ok(ResolvedProvider {
+        base_url: provider.base_url.trim_end_matches('/').to_string(),
+        provider_id: provider.id,
+        provider_name: provider.name,
+        provider_type: provider.provider_type.as_str().to_string(),
+        credential,
+        model,
+        api_format: provider.api_format.as_str().to_string(),
+        transport_profile: provider.transport_profile.as_str().to_string(),
+        codex_request_shape: provider.codex_request_shape.get(),
+        codex_client_version,
+    })
+}
+
+pub async fn resolve_provider_config(
+    secrets: &Arc<SecretsManager>,
+    db: &Db,
     assistant: Option<&assistant::Model>,
 ) -> Result<ResolvedProvider, String> {
     if let Some(provider_id) = assistant.and_then(|a| a.provider_id.as_deref()) {
-        let mut conn = get_conn(pool)?;
-        let provider =
-            db::ops::provider::get_provider(&mut conn, provider_id).map_err(|e| format!("Provider not found: {e}"))?;
-        let credential = resolve_credential(secrets, &provider)?;
+        let provider = provider_ops::get_provider(db, provider_id)
+            .await
+            .map_err(|e| format!("Provider not found: {e}"))?
+            .ok_or_else(|| format!("Provider not found: {provider_id}"))?;
         let model = assistant
             .and_then(|a| a.model_id.clone())
             .ok_or("No model configured. Go to Settings → Assistant to set a model.")?;
-        let base_url = provider.base_url.trim_end_matches('/').to_string();
-        return Ok(ResolvedProvider {
-            provider_id: provider.id,
-            provider_name: provider.name,
-            provider_type: provider.provider_type,
-            base_url,
-            credential,
-            model,
-            api_format: provider.api_format,
-            transport_profile: provider.transport_profile,
-            codex_request_shape: provider.codex_request_shape != 0,
-            codex_client_version: codex_client_version(&mut conn, provider.codex_request_shape != 0),
-        });
+        return destination(secrets, db, provider, model).await;
     }
 
-    // Fallback: first enabled provider
-    let mut conn = get_conn(pool)?;
+    // Fallback: first enabled provider.
     // Still only the first enabled provider, and still all-or-nothing on it.
     // A damaged row or unreadable credential is reported as itself rather than
     // being relabelled "no provider configured" or silently moving to a
     // different endpoint.
-    let providers = db::ops::provider::list_providers(&mut conn)
+    let providers = provider_ops::list_providers(db)
+        .await
         .map_err(|error| format!("could not read configured providers: {error}"))?;
     let p = providers
         .into_iter()
-        .find(|p| p.is_enabled != 0)
+        .find(|p| p.is_enabled.get())
         .ok_or("No provider configured. Go to Settings → Provider to add one.")?;
-    let credential = resolve_credential(secrets, &p)?;
     let model = assistant
         .and_then(|a| a.model_id.clone())
         .ok_or("No model configured. Go to Settings → Assistant to set a model.")?;
-    let base_url = p.base_url.trim_end_matches('/').to_string();
-    Ok(ResolvedProvider {
-        provider_id: p.id,
-        provider_name: p.name,
-        provider_type: p.provider_type,
-        base_url,
-        credential,
-        model,
-        api_format: p.api_format,
-        transport_profile: p.transport_profile,
-        codex_request_shape: p.codex_request_shape != 0,
-        codex_client_version: codex_client_version(&mut conn, p.codex_request_shape != 0),
-    })
+    destination(secrets, db, p, model).await
 }
 
 /// Where a request is going, once the caller's overrides have had their say.
@@ -170,16 +185,16 @@ impl ResolvedProvider {
 /// override rather than as an error — the default is a working value, and
 /// refusing the turn over an unreadable cosmetic preference would be worse than
 /// sending the version we shipped with.
-fn codex_client_version(conn: &mut diesel::sqlite::SqliteConnection, wanted: bool) -> Option<String> {
+async fn codex_client_version(db: &Db, wanted: bool) -> Option<String> {
     if !wanted {
         return None;
     }
-    db::ops::preference::get_preference(conn, provider::codex_identity::CODEX_CLIENT_VERSION_PREF).unwrap_or_else(
-        |error| {
+    preference::get_preference(db, provider::codex_identity::CODEX_CLIENT_VERSION_PREF)
+        .await
+        .unwrap_or_else(|error| {
             tracing::warn!(error = %error, "could not read the Codex client version override");
             None
-        },
-    )
+        })
 }
 
 /// The credential for a provider row, by whatever route its login uses.
@@ -188,21 +203,22 @@ fn codex_client_version(conn: &mut diesel::sqlite::SqliteConnection, wanted: boo
 /// produce has to keep appearing for every provider that does need one. Folding
 /// the bypass into each call site is how a login that needs no key ends up
 /// letting a misconfigured API-key provider through as an anonymous request.
+/// Blocking: the secret store reads a file.
 fn resolve_credential(
     secrets: &SecretsManager,
-    provider: &db::models::provider::ProviderRow,
+    provider: &provider_entity::Model,
 ) -> Result<provider::Credential, String> {
     provider::registry::validate_stored_contract(
-        &provider.provider_type,
-        &provider.api_format,
-        &provider.transport_profile,
-        &provider.credential_kind,
+        provider.provider_type.as_str(),
+        provider.api_format.as_str(),
+        provider.transport_profile.as_str(),
+        provider.credential_kind.as_str(),
     )?;
-    match provider.credential_kind.as_str() {
-        "api_key" => get_provider_api_key(secrets, &provider.id)
+    match provider.credential_kind {
+        CredentialKind::ApiKey => get_provider_api_key(secrets, &provider.id)
             .map(provider::Credential::ApiKey)
             .ok_or_else(|| format!("API Key not set for provider '{}'", provider.name)),
-        "codex_cli" => {
+        CredentialKind::CodexCli => {
             let home = crate::codex_auth::storage::find_codex_home()
                 .ok_or("Could not work out where the Codex CLI keeps its login (no home directory).")?;
             // Resolved, not validated: whether the login is present, usable, or
@@ -217,13 +233,12 @@ fn resolve_credential(
         // Reserved: the in-app login writes to a store this app owns. Nothing
         // creates such a row yet, and the manager refuses it with a message
         // rather than pretending.
-        "chatgpt_oauth" => Ok(provider::Credential::ChatGpt(crate::codex_auth::registry().get(
+        CredentialKind::ChatgptOauth => Ok(provider::Credential::ChatGpt(crate::codex_auth::registry().get(
             crate::codex_auth::StoreId::MeridianOwned {
                 provider_id: provider.id.clone(),
                 slot: "default".into(),
             },
         ))),
-        other => Err(format!("unknown provider credential kind `{other}`")),
     }
 }
 
@@ -236,12 +251,9 @@ fn resolve_credential(
 /// host, and it leaves the model name alone. So "same model, different endpoint"
 /// and "same endpoint, different model" are both expressible, which is what the
 /// model picker in the composer actually offers.
-///
-/// Synchronous: every read here is a pooled connection or the OS credential
-/// store, both of which block. Callers put it in `spawn_blocking`.
-pub fn resolve_with_overrides(
-    secrets: &SecretsManager,
-    pool: &DbPool,
+pub async fn resolve_with_overrides(
+    secrets: &Arc<SecretsManager>,
+    db: &Db,
     assistant: Option<&assistant::Model>,
     model_override: Option<String>,
     provider_override: Option<&str>,
@@ -254,16 +266,16 @@ pub fn resolve_with_overrides(
         // configured" on every review while the pair the user had picked sat
         // unread in the overrides.
         if let Some(model) = model_override {
-            return resolve_named(secrets, pool, pid, model);
+            return resolve_named(secrets, db, pid, model).await;
         }
         // The identity moves with the endpoint. A row attributed to the
         // assistant's standing choice while the request went somewhere else
         // would be worse than no attribution at all — it would look measured.
-        let resolved = resolve_provider_config(secrets, pool, assistant)?;
-        return resolve_named(secrets, pool, pid, resolved.model);
+        let resolved = resolve_provider_config(secrets, db, assistant).await?;
+        return resolve_named(secrets, db, pid, resolved.model).await;
     }
 
-    let mut resolved = resolve_provider_config(secrets, pool, assistant)?;
+    let mut resolved = resolve_provider_config(secrets, db, assistant).await?;
     if let Some(m) = model_override {
         resolved.model = m;
     }
@@ -273,27 +285,17 @@ pub fn resolve_with_overrides(
 /// A provider row plus a model name — everything a request needs, with no
 /// assistant in the picture. This being total is what lets the pair of
 /// overrides above skip the assistant resolution entirely.
-fn resolve_named(
-    secrets: &SecretsManager,
-    pool: &DbPool,
+async fn resolve_named(
+    secrets: &Arc<SecretsManager>,
+    db: &Db,
     provider_id: &str,
     model: String,
 ) -> Result<ResolvedProvider, String> {
-    let mut conn = get_conn(pool)?;
-    let p = db::ops::provider::get_provider(&mut conn, provider_id).map_err(|e| e.to_string())?;
-    let credential = resolve_credential(secrets, &p)?;
-    Ok(ResolvedProvider {
-        provider_id: p.id,
-        provider_name: p.name,
-        provider_type: p.provider_type,
-        base_url: p.base_url.trim_end_matches('/').to_string(),
-        credential,
-        model,
-        api_format: p.api_format,
-        transport_profile: p.transport_profile,
-        codex_request_shape: p.codex_request_shape != 0,
-        codex_client_version: codex_client_version(&mut conn, p.codex_request_shape != 0),
-    })
+    let provider = provider_ops::get_provider(db, provider_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("provider {provider_id} not found"))?;
+    destination(secrets, db, provider, model).await
 }
 
 /// For the passes that only read a conversation and write prose about it —
@@ -424,7 +426,7 @@ pub fn resolve_max_tokens(assistant_override: Option<i32>, model_max_output: usi
     }
 }
 
-pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -> Result<TurnParams, String> {
+pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -> Result<TurnParams, String> {
     let TurnParamsResolveRequest {
         assistant,
         provider_id,
@@ -445,11 +447,9 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
     // and capability set than the user configured. Failing visibly beats
     // quietly changing the parameters of the request.
     let model_config = match provider_id {
-        Some(pid) => {
-            let mut conn = get_conn(pool)?;
-            crate::agent::model_config::load(&mut conn, pid, model)
-                .map_err(|e| format!("could not read the stored config for '{model}': {e}"))?
-        }
+        Some(pid) => crate::agent::model_config::load_one(db, pid, model)
+            .await
+            .map_err(|e| format!("could not read the stored config for '{model}': {e}"))?,
         None => None,
     };
 
@@ -503,17 +503,13 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
         // and an install that never turns the switch on never mints an
         // installation id. The turn's own ids are added by the caller, which is
         // the layer that has them.
-        codex_turn: codex_request_shape
-            .then(|| {
-                let mut conn = get_conn(pool)?;
-                Ok::<_, String>(provider::codex_metadata::CodexTurnMetadata::for_install(
-                    &mut conn,
-                    codex_request_kind,
-                    codex_thread_source,
-                ))
-            })
-            .transpose()?
-            .flatten(),
+        codex_turn: match codex_request_shape {
+            true => {
+                provider::codex_metadata::CodexTurnMetadata::for_install(db, codex_request_kind, codex_thread_source)
+                    .await
+            }
+            false => None,
+        },
         // thinking_style and verbosity are derived from the catalog by
         // filter_params below, not supplied by the caller.
         ..Default::default()
@@ -533,6 +529,46 @@ pub fn resolve_turn_params(pool: &DbPool, input: TurnParamsResolveRequest<'_>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::sea::ops::model_config::{FlatModelConfig, seed_flat};
+    use crate::db::sea::sea_test_db;
+    use crate::db::types::SqlBool;
+    use crate::provider::registry::{ApiFormat, ProviderType, TransportProfile};
+
+    fn provider_row(
+        provider_type: ProviderType,
+        name: &str,
+        base_url: &str,
+        api_format: ApiFormat,
+    ) -> provider_entity::Model {
+        provider_entity::Model {
+            id: "p1".into(),
+            name: name.into(),
+            provider_type,
+            base_url: base_url.into(),
+            is_enabled: SqlBool::TRUE,
+            sort_order: 0,
+            created_at: 0,
+            updated_at: 0,
+            api_format,
+            catalog_id: None,
+            credential_kind: CredentialKind::ApiKey,
+            transport_profile: TransportProfile::Standard,
+            icon: None,
+            codex_request_shape: SqlBool::FALSE,
+        }
+    }
+
+    async fn seed(db: &Db, provider: provider_entity::Model, config: Option<FlatModelConfig<'_>>) {
+        db.write(async |tx| {
+            provider_ops::create_provider(tx, provider).await?;
+            if let Some(config) = config {
+                seed_flat(tx, &config).await?;
+            }
+            Ok::<_, crate::db::sea::DbErr>(())
+        })
+        .await
+        .unwrap();
+    }
 
     fn decimal(raw: &str) -> crate::decimal::Decimal {
         raw.parse().unwrap()
@@ -582,9 +618,9 @@ mod tests {
         }
     }
 
-    fn resolve_for(pool: &DbPool, model: &str, assistant: &assistant::Model) -> TurnParams {
+    async fn resolve_for(db: &Db, model: &str, assistant: &assistant::Model) -> TurnParams {
         resolve_turn_params(
-            pool,
+            db,
             TurnParamsResolveRequest {
                 assistant: Some(assistant),
                 provider_id: None,
@@ -599,25 +635,26 @@ mod tests {
                 fast: false,
             },
         )
+        .await
         .unwrap()
     }
 
-    #[test]
-    fn a_model_that_rejects_temperature_never_sees_one() {
-        let pool = crate::db::diesel_test_db();
+    #[tokio::test]
+    async fn a_model_that_rejects_temperature_never_sees_one() {
+        let db = sea_test_db().await;
         let assistant = assistant_with(Some(0.7));
 
-        let turn = resolve_for(&pool, "o3", &assistant);
+        let turn = resolve_for(&db, "o3", &assistant).await;
 
         assert_eq!(turn.params.temperature, None);
     }
 
-    #[test]
-    fn dropping_thinking_leaves_the_rest_of_the_turn_alone() {
-        let pool = crate::db::diesel_test_db();
+    #[tokio::test]
+    async fn dropping_thinking_leaves_the_rest_of_the_turn_alone() {
+        let db = sea_test_db().await;
         let assistant = assistant_with(Some(0.7));
 
-        let turn = resolve_for(&pool, "gpt-4o", &assistant);
+        let turn = resolve_for(&db, "gpt-4o", &assistant).await;
         let summarising = without_thinking(turn.params.clone());
 
         assert_eq!(summarising.temperature, turn.params.temperature);
@@ -633,59 +670,31 @@ mod tests {
     /// apply overrides — so a model the user had told us takes no tools was
     /// still sent them, while every other parameter of the same request came
     /// from here and did honour the override.
-    #[test]
-    fn a_capability_override_reaches_the_turns_capabilities() {
-        let pool = crate::db::diesel_test_db();
-        {
-            let mut conn = pool.get().unwrap();
-            db::ops::provider::create_provider(
-                &mut conn,
-                &db::models::provider::ProviderInsert {
-                    id: "p1",
-                    name: "P",
-                    provider_type: "openai",
-                    base_url: "https://example.invalid",
-                    is_enabled: 1,
-                    sort_order: 0,
-                    created_at: 0,
-                    updated_at: 0,
-                    api_format: "chat_completions",
-                    catalog_id: None,
-                    credential_kind: "api_key",
-                    transport_profile: "standard",
-                    icon: None,
-                    codex_request_shape: 0,
-                },
-            )
-            .unwrap();
-            db::ops::model_config::seed_flat(
-                &mut conn,
-                &db::ops::model_config::FlatModelConfig {
-                    id: "mc1",
-                    provider_id: "p1",
-                    model_id: "gpt-4o",
-                    display_name: None,
-                    context_window: 128_000,
-                    compact_threshold: 0,
-                    max_output_tokens: Some(16_384),
-                    input_price: None,
-                    output_price: None,
-                    cache_read_price: None,
-                    cache_write_price: None,
-                    created_at: 0,
-                    updated_at: 0,
-                    capability_overrides: Some(r#"{"supports_tools": false}"#),
-                    pricing_tiers: None,
-                    server_tools: None,
-                    server_tool_price: None,
-                },
-            )
-            .unwrap();
-        }
+    #[tokio::test]
+    async fn a_capability_override_reaches_the_turns_capabilities() {
+        let db = sea_test_db().await;
+        seed(
+            &db,
+            provider_row(
+                ProviderType::Openai,
+                "P",
+                "https://example.invalid",
+                ApiFormat::ChatCompletions,
+            ),
+            Some(FlatModelConfig {
+                model_id: "gpt-4o",
+                context_window: 128_000,
+                compact_threshold: 0,
+                max_output_tokens: Some(16_384),
+                capability_overrides: Some(r#"{"supports_tools": false}"#),
+                ..Default::default()
+            }),
+        )
+        .await;
         let assistant = assistant_with(None);
 
         let with_provider = resolve_turn_params(
-            &pool,
+            &db,
             TurnParamsResolveRequest {
                 assistant: Some(&assistant),
                 provider_id: Some("p1"),
@@ -700,11 +709,12 @@ mod tests {
                 fast: false,
             },
         )
+        .await
         .unwrap();
         assert!(!with_provider.caps.supports_tools);
 
         // And it is the row that says so, not the catalog.
-        assert!(resolve_for(&pool, "gpt-4o", &assistant).caps.supports_tools);
+        assert!(resolve_for(&db, "gpt-4o", &assistant).await.caps.supports_tools);
     }
 
     /// The stored list outlives what it names. Moving a model from the Responses
@@ -739,59 +749,29 @@ mod tests {
     /// list is then intersected with capabilities that depend on `api_format`.
     /// Either one failing looks identical from the outside: the model quietly
     /// goes on using the built-in `web_search`.
-    #[test]
-    fn a_configured_server_tool_reaches_the_turn() {
-        let pool = crate::db::diesel_test_db();
-        {
-            let mut conn = pool.get().unwrap();
-            db::ops::provider::create_provider(
-                &mut conn,
-                &db::models::provider::ProviderInsert {
-                    id: "p1",
-                    name: "xAI",
-                    provider_type: "xai",
-                    base_url: "https://api.x.ai/v1",
-                    is_enabled: 1,
-                    sort_order: 0,
-                    created_at: 0,
-                    updated_at: 0,
-                    api_format: "responses",
-                    catalog_id: None,
-                    credential_kind: "api_key",
-                    transport_profile: "standard",
-                    icon: None,
-                    codex_request_shape: 0,
-                },
-            )
-            .unwrap();
-            db::ops::model_config::seed_flat(
-                &mut conn,
-                &db::ops::model_config::FlatModelConfig {
-                    id: "mc1",
-                    provider_id: "p1",
-                    model_id: "grok-4.6",
-                    display_name: None,
-                    context_window: 500_000,
-                    compact_threshold: 400_000,
-                    max_output_tokens: Some(64_000),
-                    input_price: Some(decimal("2")),
-                    output_price: Some(decimal("6")),
-                    cache_read_price: Some(decimal("0.5")),
-                    cache_write_price: None,
-                    created_at: 0,
-                    updated_at: 0,
-                    capability_overrides: None,
-                    pricing_tiers: None,
-                    server_tools: Some(r#"["web_search"]"#),
-                    server_tool_price: None,
-                },
-            )
-            .unwrap();
-        }
+    #[tokio::test]
+    async fn a_configured_server_tool_reaches_the_turn() {
+        let db = sea_test_db().await;
+        seed(
+            &db,
+            provider_row(ProviderType::Xai, "xAI", "https://api.x.ai/v1", ApiFormat::Responses),
+            Some(FlatModelConfig {
+                model_id: "grok-4.6",
+                context_window: 500_000,
+                compact_threshold: 400_000,
+                max_output_tokens: Some(64_000),
+                input_price: Some(decimal("2")),
+                output_price: Some(decimal("6")),
+                cache_read_price: Some(decimal("0.5")),
+                server_tools: Some(r#"["web_search"]"#),
+                ..Default::default()
+            }),
+        )
+        .await;
         let assistant = assistant_with(None);
 
         let turn = resolve_turn_params(
-            &pool,
+            &db,
             TurnParamsResolveRequest {
                 assistant: Some(&assistant),
                 provider_id: Some("p1"),
@@ -806,12 +786,13 @@ mod tests {
                 fast: false,
             },
         )
+        .await
         .unwrap();
         assert_eq!(turn.params.server_tools, vec![ServerToolKind::WebSearch]);
 
         // The same row, reached over the dialect that has no such thing.
         let error = resolve_turn_params(
-            &pool,
+            &db,
             TurnParamsResolveRequest {
                 assistant: Some(&assistant),
                 provider_id: Some("p1"),
@@ -826,6 +807,7 @@ mod tests {
                 fast: false,
             },
         )
+        .await
         .unwrap_err();
         assert!(error.contains("web_search"), "{error}");
     }
@@ -855,51 +837,43 @@ mod tests {
         }
     }
 
-    fn seed_provider_with(pool: &DbPool, api_format: &str, credential_kind: &str, transport_profile: &str) {
-        let mut conn = pool.get().unwrap();
-        db::ops::provider::create_provider(
-            &mut conn,
-            &db::models::provider::ProviderInsert {
-                id: "p1",
-                name: "Deepseek",
-                provider_type: "deepseek",
-                base_url: "https://api.deepseek.com/v1/",
-                is_enabled: 1,
-                sort_order: 0,
-                created_at: 0,
-                updated_at: 0,
-                api_format,
-                catalog_id: None,
-                credential_kind,
-                transport_profile,
-                icon: None,
-                codex_request_shape: 0,
-            },
+    async fn seed_provider(db: &Db) {
+        seed(
+            db,
+            provider_row(
+                ProviderType::Deepseek,
+                "Deepseek",
+                "https://api.deepseek.com/v1/",
+                ApiFormat::ChatCompletions,
+            ),
+            None,
         )
-        .unwrap();
+        .await;
     }
 
-    fn seed_provider(pool: &DbPool) {
-        seed_provider_with(pool, "chat_completions", "api_key", "standard");
-    }
-
-    fn mock_secrets(dir: &std::path::Path) -> SecretsManager {
-        SecretsManager::new_with_keyring_store(
+    fn mock_secrets(dir: &std::path::Path) -> Arc<SecretsManager> {
+        Arc::new(SecretsManager::new_with_keyring_store(
             dir.to_path_buf(),
-            std::sync::Arc::new(crate::keyring::test_support::MockKeyringStore::new()),
-        )
+            Arc::new(crate::keyring::test_support::MockKeyringStore::new()),
+        ))
     }
 
-    #[test]
-    fn an_unknown_stored_credential_kind_is_reported_through_fallback_resolution() {
-        let pool = crate::db::diesel_test_db();
-        seed_provider_with(&pool, "chat_completions", "future_login", "standard");
+    #[tokio::test]
+    async fn an_unknown_stored_credential_kind_is_reported_through_fallback_resolution() {
+        let db = sea_test_db().await;
+        seed_provider(&db).await;
+        // The column carries no CHECK; the row is what an older or newer build
+        // could have left behind.
+        crate::db::sea::execute_for_tests(&db, "UPDATE providers SET credential_kind = 'future_login'")
+            .await
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let secrets = mock_secrets(dir.path());
         let mut assistant = assistant_with(None);
         assistant.model_id = Some("deepseek-chat".into());
 
-        let error = resolve_provider_config(&secrets, &pool, Some(&assistant))
+        let error = resolve_provider_config(&secrets, &db, Some(&assistant))
+            .await
             .err()
             .expect("an unknown credential kind must not become an API-key provider");
 
@@ -913,10 +887,10 @@ mod tests {
     /// and fail on the assistant it did not have — so every review, however
     /// the feature was configured, came back "No model configured" while the
     /// pair the user had saved sat unread in the overrides.
-    #[test]
-    fn a_full_override_pair_needs_no_assistant() {
-        let pool = crate::db::diesel_test_db();
-        seed_provider(&pool);
+    #[tokio::test]
+    async fn a_full_override_pair_needs_no_assistant() {
+        let db = sea_test_db().await;
+        seed_provider(&db).await;
         let dir = tempfile::tempdir().unwrap();
         let secrets = mock_secrets(dir.path());
         secrets
@@ -927,7 +901,8 @@ mod tests {
             )
             .unwrap();
 
-        let resolved = resolve_with_overrides(&secrets, &pool, None, Some("deepseek-v4-flash".into()), Some("p1"))
+        let resolved = resolve_with_overrides(&secrets, &db, None, Some("deepseek-v4-flash".into()), Some("p1"))
+            .await
             .expect("a complete pair of overrides is a complete destination");
 
         assert_eq!(resolved.provider_id, "p1");
@@ -943,14 +918,14 @@ mod tests {
 
     /// And when the pair cannot resolve, the error is about the pair — the
     /// named provider's missing key — never about the assistant nobody passed.
-    #[test]
-    fn a_full_override_pair_fails_about_itself() {
-        let pool = crate::db::diesel_test_db();
-        seed_provider(&pool);
+    #[tokio::test]
+    async fn a_full_override_pair_fails_about_itself() {
+        let db = sea_test_db().await;
+        seed_provider(&db).await;
         let dir = tempfile::tempdir().unwrap();
         let secrets = mock_secrets(dir.path());
 
-        let Err(err) = resolve_with_overrides(&secrets, &pool, None, Some("deepseek-v4-flash".into()), Some("p1"))
+        let Err(err) = resolve_with_overrides(&secrets, &db, None, Some("deepseek-v4-flash".into()), Some("p1")).await
         else {
             panic!("no key was stored, so this cannot resolve");
         };
@@ -980,13 +955,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_unknown_model_asks_the_user_to_configure_it() {
-        let pool = crate::db::diesel_test_db();
+    #[tokio::test]
+    async fn an_unknown_model_asks_the_user_to_configure_it() {
+        let db = sea_test_db().await;
         let assistant = assistant_with(None);
 
         let err = resolve_turn_params(
-            &pool,
+            &db,
             TurnParamsResolveRequest {
                 assistant: Some(&assistant),
                 provider_id: None,
@@ -1001,6 +976,7 @@ mod tests {
                 fast: false,
             },
         )
+        .await
         .unwrap_err();
 
         assert!(err.contains("Settings"), "{err}");

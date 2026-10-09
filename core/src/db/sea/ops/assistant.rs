@@ -9,7 +9,7 @@
 //! `WriteTx`, and the caller's `Db::write` is the `BEGIN IMMEDIATE`.
 
 use sea_orm::ActiveValue::Unchanged;
-use sea_orm::{ActiveModelTrait, DbErr, EntityTrait, IntoActiveModel, QueryOrder};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder};
 
 use crate::db::entity::assistant;
 use crate::db::entity::assistant::AssistantChangeset;
@@ -25,6 +25,15 @@ pub async fn list_assistants(db: &impl Read) -> Result<Vec<assistant::Model>, Db
 
 pub async fn get_assistant(db: &impl Read, id: &str) -> Result<Option<assistant::Model>, DbErr> {
     assistant::Entity::find_by_id(id).one(db.conn()?).await
+}
+
+/// The assistant marked default, if any. More than one is not prevented by
+/// the schema; the first the table yields wins, as it always has.
+pub async fn get_default_assistant(db: &impl Read) -> Result<Option<assistant::Model>, DbErr> {
+    assistant::Entity::find()
+        .filter(assistant::Column::IsDefault.eq(crate::db::types::SqlBool::TRUE))
+        .one(db.conn()?)
+        .await
 }
 
 fn not_found(id: &str) -> DbErr {
@@ -92,6 +101,24 @@ mod tests {
             tool_preset_id: None,
             auto_compact_enabled: SqlBool::FALSE,
         }
+    }
+
+    #[tokio::test]
+    async fn the_default_assistant_is_the_one_marked_default() {
+        let db = sea_test_db().await;
+        assert!(get_default_assistant(&db).await.unwrap().is_none());
+        let mut marked = assistant_row("b", 1);
+        marked.is_default = SqlBool::TRUE;
+        db.write(async |tx| {
+            create_assistant(tx, assistant_row("a", 0)).await?;
+            create_assistant(tx, marked).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            get_default_assistant(&db).await.unwrap().map(|a| a.id).as_deref(),
+            Some("b")
+        );
     }
 
     #[tokio::test]

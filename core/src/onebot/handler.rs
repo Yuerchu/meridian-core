@@ -1872,7 +1872,7 @@ async fn dispatch_compact(
     };
 
     match crate::agent::do_compact(
-        pool,
+        &state.services.sea,
         secrets,
         &conversation_id,
         assistant.as_ref(),

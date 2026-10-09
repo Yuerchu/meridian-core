@@ -3,7 +3,6 @@ pub mod acp_session_notice;
 pub mod assistant;
 pub mod audit;
 pub mod conversation;
-pub mod memory;
 pub mod message;
 pub mod message_context_item;
 pub mod model_config;

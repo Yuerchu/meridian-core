@@ -119,6 +119,19 @@ pub fn load_all(conn: &mut SqliteConnection) -> QueryResult<Vec<EffectiveModelCo
     Ok(rows.into_iter().map(|(c, p)| effective(&c.into(), &p.into())).collect())
 }
 
+/// [`load`] on SeaORM: one provider's config for one model, resolved
+/// against its profile, in one snapshot.
+pub async fn load_one(
+    db: &crate::db::sea::cap::Db,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<Option<EffectiveModelConfig>, crate::db::sea::DbErr> {
+    Ok(db
+        .read(async |tx| crate::db::sea::ops::model_config::get_with_profile(tx, provider_id, model_id).await)
+        .await?
+        .map(|(config, profile)| effective(&config, &profile)))
+}
+
 /// [`load_all`] on SeaORM: every configuration with its profile, in one
 /// snapshot so a profile edited between the two reads cannot price half the
 /// models at the old rates.

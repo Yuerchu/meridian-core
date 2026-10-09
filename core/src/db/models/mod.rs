@@ -8,7 +8,6 @@ pub mod cached_model;
 pub mod conversation;
 pub mod emoji;
 pub mod emoji_pack;
-pub mod memory;
 pub mod message;
 pub mod message_context_item;
 pub mod message_sticker;

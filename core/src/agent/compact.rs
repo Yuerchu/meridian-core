@@ -8,13 +8,16 @@ use super::provider_config::{
 };
 use super::stream::is_context_window_error;
 use super::tokenizer::TokenBudget;
+use crate::db;
 use crate::db::entity::assistant;
 use crate::db::entity::message_context_item;
-use crate::db::models::message::MessageInsert;
-use crate::db::{self, DbPool};
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops as sea_ops;
+use crate::db::types::SqlBool;
 use crate::provider::{self, ChatMessage, ChatProvider};
 use crate::secrets::SecretsManager;
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 pub(crate) const COMPACT_PROMPT: &str = "\
 You are a summarization assistant for an AI coding agent conversation. \
@@ -214,10 +217,8 @@ fn prepare_chat_compact_input(messages: &[ChatMessage]) -> Result<Vec<CompactSec
     Ok(sections)
 }
 
-// Takes the `Arc` rather than a plain reference so the provider resolution below
-// can be handed to `spawn_blocking`, which needs an owned handle.
 pub async fn do_compact(
-    pool: &DbPool,
+    db: &Db,
     secrets: &Arc<SecretsManager>,
     conversation_id: &str,
     assistant: Option<&assistant::Model>,
@@ -226,24 +227,22 @@ pub async fn do_compact(
 ) -> Result<String, String> {
     // Only the active path is summarised. Folding in a branch the user has
     // switched away from would put events in the summary that never happened on
-    // the conversation being continued.
-    let (ctx, context_items, sender_names) = {
-        let pool = pool.clone();
-        let conv_id = conversation_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let conv = db::ops::conversation::get_conversation(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-            let history = db::ops::message::list_messages(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-            let ctx = db::ops::message::active_context(&history, conv.head_message_id.as_deref());
+    // the conversation being continued. One snapshot: the head, the rows it
+    // names and their items are read at the same instant.
+    let (ctx, context_items, sender_names) = db
+        .read(async |tx| {
+            let Some(conv) = sea_ops::conversation::get_conversation(tx, conversation_id).await? else {
+                return Ok(Err(format!("conversation {conversation_id} not found")));
+            };
+            let history = sea_ops::message::list_messages(tx, conversation_id).await?;
+            let ctx = sea_ops::message::active_context(&history, conv.head_message_id.as_deref());
             let path_ids = ctx.path.iter().map(|message| message.id.clone()).collect::<Vec<_>>();
-            let context_items =
-                db::ops::message_context_item::list_for_messages(&mut conn, &path_ids).map_err(|e| e.to_string())?;
-            let sender_names = crate::agent::load_sender_names(&mut conn)?;
-            Ok::<_, String>((ctx, context_items, sender_names))
+            let context_items = sea_ops::message_context_item::list_for_messages(tx, &path_ids).await?;
+            let sender_names = crate::agent::load_sender_names(tx).await?;
+            Ok::<_, DbErr>(Ok((ctx, context_items, sender_names)))
         })
         .await
-        .map_err(|e| e.to_string())??
-    };
+        .map_err(|e| e.to_string())??;
 
     // Injected background is not conversation and takes no part in any of the
     // arithmetic below. Counted, it inflates `path.len()` and brings compaction
@@ -273,9 +272,6 @@ pub async fn do_compact(
         compact_system.push_str(&format!("\n\nAdditional instructions: {instructions}"));
     }
 
-    // Both resolutions take a pooled connection, and the first also reads the OS
-    // credential store, so they run off the async thread.
-    //
     // The turn parameters use the same resolution as a normal turn: a
     // summarisation request that invents its own temperature or output ceiling
     // is rejected by models the chat path already knows how to talk to.
@@ -292,56 +288,50 @@ pub async fn do_compact(
         provider_id,
         provider_name,
     ) = {
-        let pool2 = pool.clone();
-        let secrets2 = secrets.clone();
-        let assistant2 = assistant.cloned();
-        tokio::task::spawn_blocking(move || {
-            let crate::agent::ResolvedProvider {
-                provider_type,
-                base_url,
-                credential,
-                model,
-                api_format,
-                transport_profile,
-                codex_request_shape,
-                codex_client_version,
-                provider_id,
-                provider_name,
-            } = resolve_provider_config(&secrets2, &pool2, assistant2.as_ref())?;
-            let turn = resolve_turn_params(
-                &pool2,
-                TurnParamsResolveRequest {
-                    assistant: assistant2.as_ref(),
-                    provider_id: assistant2.as_ref().and_then(|a| a.provider_id.as_deref()),
-                    provider_type: &provider_type,
-                    api_format: &api_format,
+        let crate::agent::ResolvedProvider {
+            provider_type,
+            base_url,
+            credential,
+            model,
+            api_format,
+            transport_profile,
+            codex_request_shape,
+            codex_client_version,
+            provider_id,
+            provider_name,
+        } = resolve_provider_config(secrets, db, assistant).await?;
+        let turn = resolve_turn_params(
+            db,
+            TurnParamsResolveRequest {
+                assistant,
+                provider_id: assistant.and_then(|a| a.provider_id.as_deref()),
+                provider_type: &provider_type,
+                api_format: &api_format,
 
-                    transport_profile: &transport_profile,
-                    codex_request_shape,
-                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Compaction,
-                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
-                    model: &model,
-                    thinking_level: None,
-                    // Summarising is background work; it does not take the priority tier.
-                    fast: false,
-                },
-            )?;
-            Ok::<_, String>((
-                provider_type,
-                base_url,
-                credential,
-                model,
-                api_format,
-                transport_profile,
+                transport_profile: &transport_profile,
                 codex_request_shape,
-                codex_client_version,
-                turn,
-                provider_id,
-                provider_name,
-            ))
-        })
-        .await
-        .map_err(|e| e.to_string())??
+                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Compaction,
+                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
+                model: &model,
+                thinking_level: None,
+                // Summarising is background work; it does not take the priority tier.
+                fast: false,
+            },
+        )
+        .await?;
+        (
+            provider_type,
+            base_url,
+            credential,
+            model,
+            api_format,
+            transport_profile,
+            codex_request_shape,
+            codex_client_version,
+            turn,
+            provider_id,
+            provider_name,
+        )
     };
     let prov = provider::registry::create_provider(provider::registry::ProviderWire {
         provider_type: &provider_type,
@@ -368,103 +358,68 @@ pub async fn do_compact(
         format!("{summary}\n\n---\n{project_context}")
     };
 
-    {
-        let pool = pool.clone();
-        let conv_id = conversation_id.to_string();
-        let anchor = anchor_id.clone();
-        let path_ids: Vec<String> = ctx.path.iter().map(|m| m.id.clone()).collect();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            // Scoped to this path: another branch's summary is still valid for
-            // that branch.
-            db::ops::message::delete_summaries_anchored_in(&mut conn, &conv_id, &path_ids)
-                .map_err(|e| e.to_string())?;
-            let msg_id = uuid::Uuid::new_v4().to_string();
-            let now = now_ms();
-            db::ops::message::insert_message(
-                &mut conn,
-                &MessageInsert {
-                    id: &msg_id,
-                    conversation_id: &conv_id,
-                    role: "user",
-                    content: &final_summary,
-                    provider_id: None,
-                    model_id: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    sort_order: -1,
-                    created_at: now,
-                    reasoning_content: None,
-                    rating: None,
-                    schema_version: 2,
-                    is_compact_summary: 1,
-                    // A summary is written by the compaction pass, not by any speaker.
-                    sender_id: None,
-                    // A summary is not a node in the tree; it sits beside it and
-                    // names the message it stands in front of.
-                    parent_id: None,
-                    compact_anchor_id: Some(&anchor),
-                    source: None,
-                    // Nor by any one turn. A summary outlives the turns whose
-                    // history it replaced, and attributing it to whichever turn
-                    // happened to trigger the compaction would make it disappear
-                    // with that turn's record.
-                    turn_id: None,
-                    tool_outcome: None,
-                    // The summarising request's usage is not this row's: the row
-                    // is the summary, and it is written with `role = "user"`
-                    // because that is how it re-enters the context. What the
-                    // request cost is filed separately, below.
-                    //
-                    // This comment used to say the cost was already recorded by
-                    // the turn that triggered the compaction. It was not — the
-                    // summariser called `chat`, which returns a bare `String`,
-                    // so its usage was discarded at the adapter and reached no
-                    // ledger at all. On a long conversation it is the largest
-                    // single request this app makes.
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
-                    server_tool_calls: None,
-                    provider_name: None,
-                    response_model_id: None,
-                },
-            )
-            .map_err(|e| e.to_string())?;
+    let path_ids: Vec<String> = ctx.path.iter().map(|m| m.id.clone()).collect();
+    db.write(async |tx| {
+        // Scoped to this path: another branch's summary is still valid for
+        // that branch.
+        sea_ops::message::delete_summaries_anchored_in(tx, conversation_id, &path_ids).await?;
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let mut row = sea_ops::message::new_row(&msg_id, conversation_id, "user", &final_summary, now_ms());
+        // A summary is not a node in the tree; it sits beside it and names the
+        // message it stands in front of. It has no speaker, and no turn: it
+        // outlives the turns whose history it replaced, and attributing it to
+        // whichever turn happened to trigger the compaction would make it
+        // disappear with that turn's record. -1 keeps it out of the sort-order
+        // trigger.
+        //
+        // The summarising request's usage is not this row's: the row is the
+        // summary, and it is written with `role = "user"` because that is how
+        // it re-enters the context. What the request cost is filed separately,
+        // below. (A comment here used to say the cost was already recorded by
+        // the turn that triggered the compaction. It was not — the summariser
+        // called `chat`, which returns a bare `String`, so its usage reached no
+        // ledger at all. On a long conversation it is the largest single
+        // request this app makes.)
+        row.sort_order = -1;
+        row.is_compact_summary = SqlBool::TRUE;
+        row.compact_anchor_id = Some(anchor_id.clone());
+        sea_ops::message::insert_message(tx, row).await?;
 
-            // Best effort, like every other audit write: a summary that was
-            // produced and not accounted for is a gap in the ledger, and
-            // refusing to save it would be a lost summary as well.
-            if let Some(usage) = summary_usage {
-                let cost = db::ops::audit::SideRequestCost {
-                    role: db::ops::audit::COMPACTION_ROLE,
-                    message_id: &msg_id,
-                    conversation_id: &conv_id,
-                    turn_id: None,
-                    provider_id: Some(provider_id.as_str()),
-                    provider_name: Some(provider_name.as_str()),
-                    model_id: Some(&model),
-                    usage: db::models::message::MessageUsage {
-                        input_tokens: usage.prompt_tokens,
-                        output_tokens: usage.completion_tokens,
-                        cache_read_tokens: usage.cache_read_tokens,
-                        cache_write_tokens: usage.cache_write_tokens,
-                        server_tool_calls: usage.billable_tool_calls,
-                    },
-                    // One request, so the sum and the peak are the same number.
-                    peak_prompt_tokens: usage.prompt_tokens,
-                    summary: "compaction",
-                };
-                if let Err(e) = db::ops::audit::record_side_request(&mut conn, cost) {
-                    tracing::warn!(error = %e, "could not record what the compaction cost");
-                }
+        // Best effort, like every other audit write: a summary that was
+        // produced and not accounted for is a gap in the ledger, and refusing
+        // to save it would be a lost summary as well. In a savepoint, so a
+        // failed ledger write does not take the summary with it.
+        if let Some(usage) = summary_usage {
+            let cost = db::ops::audit::SideRequestCost {
+                role: db::ops::audit::COMPACTION_ROLE,
+                message_id: &msg_id,
+                conversation_id,
+                turn_id: None,
+                provider_id: Some(provider_id.as_str()),
+                provider_name: Some(provider_name.as_str()),
+                model_id: Some(&model),
+                usage: db::models::message::MessageUsage {
+                    input_tokens: usage.prompt_tokens,
+                    output_tokens: usage.completion_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                    server_tool_calls: usage.billable_tool_calls,
+                },
+                // One request, so the sum and the peak are the same number.
+                peak_prompt_tokens: usage.prompt_tokens,
+                summary: "compaction",
+            };
+            if let Err(e) = tx
+                .nested(async |tx| sea_ops::audit::record_side_request(tx, cost).await)
+                .await
+            {
+                tracing::warn!(error = %e, "could not record what the compaction cost");
             }
-            Ok::<_, String>(())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-    }
+        }
+        Ok::<_, DbErr>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(anchor_id)
 }

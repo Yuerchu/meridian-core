@@ -343,47 +343,34 @@ impl Active {
             .split_once(':')
             .ok_or_else(|| format!("`{model}` is not a provider:model pair"))?;
 
-        let secrets = self.context.services.secrets.clone();
-        let pool = self.context.services.db.clone();
-        let (pid, mid) = (provider_id.to_string(), model_id.to_string());
-        let resolved = tokio::task::spawn_blocking(move || {
-            crate::agent::resolve_with_overrides(&secrets, &pool, None, Some(mid), Some(&pid))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let services = &self.context.services;
+        let resolved = crate::agent::resolve_with_overrides(
+            &services.secrets,
+            &services.sea,
+            None,
+            Some(model_id.to_string()),
+            Some(provider_id),
+        )
+        .await?;
 
-        let pool = self.context.services.db.clone();
-        // `ResolvedProvider` is not `Clone`, and these strings are all the
-        // resolver wants from it.
-        let r = (
-            resolved.provider_id.clone(),
-            resolved.provider_type.clone(),
-            resolved.api_format.clone(),
-            resolved.model.clone(),
-            resolved.transport_profile.clone(),
-            resolved.codex_request_shape,
-        );
-        let params = tokio::task::spawn_blocking(move || {
-            crate::agent::resolve_turn_params(
-                &pool,
-                crate::agent::TurnParamsResolveRequest {
-                    assistant: None,
-                    provider_id: Some(&r.0),
-                    provider_type: &r.1,
-                    api_format: &r.2,
+        let params = crate::agent::resolve_turn_params(
+            &services.sea,
+            crate::agent::TurnParamsResolveRequest {
+                assistant: None,
+                provider_id: Some(&resolved.provider_id),
+                provider_type: &resolved.provider_type,
+                api_format: &resolved.api_format,
 
-                    transport_profile: &r.4,
-                    codex_request_shape: r.5,
-                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
-                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
-                    model: &r.3,
-                    thinking_level: None,
-                    fast: false,
-                },
-            )
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+                transport_profile: &resolved.transport_profile,
+                codex_request_shape: resolved.codex_request_shape,
+                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
+                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
+                model: &resolved.model,
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await?;
 
         // Zero temperature and no reasoning budget: this is a classification,
         // and a review paid for in thinking tokens on every tool call is one

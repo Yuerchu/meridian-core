@@ -300,42 +300,36 @@ async fn resolve_params(
     state: &SharedState,
     assistant: &assistant::Model,
 ) -> Result<crate::agent::TurnParams, Refused> {
-    let pool = state.services.db.clone();
-    let secrets = state.services.secrets.clone();
-    let a = assistant.clone();
-    let resolved = {
-        let pool = pool.clone();
-        tokio::task::spawn_blocking(move || crate::agent::resolve_with_overrides(&secrets, &pool, Some(&a), None, None))
-            .await
-            .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?
-    };
+    let resolved = crate::agent::resolve_with_overrides(
+        &state.services.secrets,
+        &state.services.sea,
+        Some(assistant),
+        None,
+        None,
+    )
+    .await
+    .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
 
-    let assistant = assistant.clone();
-    let provider_id = assistant.provider_id.clone();
     // A missing `model_configs` row is an error rather than a fallback: this
     // project's rule is that turn parameters are configured, never invented.
-    let mut params = tokio::task::spawn_blocking(move || {
-        crate::agent::resolve_turn_params(
-            &pool,
-            crate::agent::TurnParamsResolveRequest {
-                assistant: Some(&assistant),
-                provider_id: provider_id.as_deref(),
-                provider_type: &resolved.provider_type,
-                api_format: &resolved.api_format,
+    let mut params = crate::agent::resolve_turn_params(
+        &state.services.sea,
+        crate::agent::TurnParamsResolveRequest {
+            assistant: Some(assistant),
+            provider_id: assistant.provider_id.as_deref(),
+            provider_type: &resolved.provider_type,
+            api_format: &resolved.api_format,
 
-                transport_profile: &resolved.transport_profile,
-                codex_request_shape: resolved.codex_request_shape,
-                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
-                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Hook,
-                model: &resolved.model,
-                thinking_level: None,
-                fast: false,
-            },
-        )
-    })
+            transport_profile: &resolved.transport_profile,
+            codex_request_shape: resolved.codex_request_shape,
+            codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
+            codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Hook,
+            model: &resolved.model,
+            thinking_level: None,
+            fast: false,
+        },
+    )
     .await
-    .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
 
     // `max_tokens` here is the model's own maximum, not the baseline assistant's
@@ -624,13 +618,7 @@ async fn run_turn(
     );
     budget.update_estimate(&chat_messages);
 
-    let tool_secrets = {
-        let pool = state.services.db.clone();
-        let secrets = state.services.secrets.clone();
-        tokio::task::spawn_blocking(move || crate::agent::build_tool_secrets(&secrets, &pool))
-            .await
-            .unwrap_or_default()
-    };
+    let tool_secrets = crate::agent::build_tool_secrets(&state.services.secrets, &state.services.sea).await;
 
     let tool_context = ToolContext {
         // The one field the whole review depends on. See the module header.
@@ -775,14 +763,14 @@ async fn build_provider(
     state: &SharedState,
     assistant: &assistant::Model,
 ) -> Result<(Box<dyn crate::provider::ChatProvider>, crate::agent::ResolvedProvider), String> {
-    let pool = state.services.db.clone();
-    let secrets = state.services.secrets.clone();
-    let a = assistant.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        crate::agent::resolve_with_overrides(&secrets, &pool, Some(&a), None, None)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let resolved = crate::agent::resolve_with_overrides(
+        &state.services.secrets,
+        &state.services.sea,
+        Some(assistant),
+        None,
+        None,
+    )
+    .await?;
     let provider = crate::provider::registry::create_provider(resolved.wire())?;
     Ok((provider, resolved))
 }

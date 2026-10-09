@@ -135,8 +135,8 @@ pub(crate) fn sender_ref(user_id: i64, names: &SenderNames) -> SenderRef {
 /// Last known nickname per platform user, read off the subject table. Both the
 /// history replay and the live turn resolve a speaker through this one map, so
 /// the same person renders the same way on both sides of a turn boundary.
-pub fn load_sender_names(conn: &mut diesel::SqliteConnection) -> Result<SenderNames, String> {
-    let subjects = crate::db::ops::memory::list_subjects(conn).map_err(|e| e.to_string())?;
+pub async fn load_sender_names(db: &impl crate::db::sea::cap::Read) -> Result<SenderNames, crate::db::sea::DbErr> {
+    let subjects = crate::db::sea::ops::memory::list_subjects(db).await?;
     Ok(subjects
         .into_iter()
         .filter_map(|s| {

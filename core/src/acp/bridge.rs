@@ -548,13 +548,7 @@ impl Bridge {
     /// command, so both are inert — and if one ever does, the default it meets
     /// should be the closed one.
     async fn context(&self, turn: &TurnSnapshot) -> ToolContext {
-        let tool_secrets = {
-            let pool = self.services.db.clone();
-            let secrets = self.services.secrets.clone();
-            tokio::task::spawn_blocking(move || crate::agent::build_tool_secrets(&secrets, &pool))
-                .await
-                .unwrap_or_default()
-        };
+        let tool_secrets = crate::agent::build_tool_secrets(&self.services.secrets, &self.services.sea).await;
 
         ToolContext {
             working_directory: None,
