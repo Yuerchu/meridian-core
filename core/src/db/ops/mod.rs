@@ -6,7 +6,6 @@ pub mod conversation;
 pub mod message;
 pub mod model_config;
 pub mod plan;
-pub mod plan_review;
 pub mod preference;
 pub mod project;
 pub mod provider;

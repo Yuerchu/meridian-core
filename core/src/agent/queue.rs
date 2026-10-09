@@ -492,42 +492,47 @@ mod tests {
         let starter = std::sync::Arc::new(CountingStarter::default());
         services.turn_starter.set(starter.clone()).ok().unwrap();
         {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::conversation::create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-            let document = crate::db::ops::plan_review::create_or_resume_document(&mut conn, "c1", 2).unwrap();
-            let appended = crate::db::ops::plan_review::append_assistant_revision(
-                &mut conn,
-                &crate::db::ops::plan_review::PlanRevisionAppend {
-                    document_id: &document.id,
-                    expected_generation: 0,
-                    expected_head_sha256: None,
-                    content_markdown: "# Plan\n",
-                    patch: "*** Add File: plan.md",
-                    source_message_id: None,
-                    source_call_id: None,
-                    responding_to_suggestion_revision_id: None,
-                    now: 3,
-                },
-            )
-            .unwrap();
-            crate::db::ops::plan_review::mark_materialization_applied(&mut conn, &appended.materialization.id, 4)
+            use crate::db::sea::ops::plan_review as review_ops;
+            services
+                .sea
+                .write(async |tx| {
+                    crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
+                    let document = review_ops::create_or_resume_document(tx, "c1", 2).await?;
+                    let appended = review_ops::append_assistant_revision(
+                        tx,
+                        &review_ops::PlanRevisionAppend {
+                            document_id: &document.id,
+                            expected_generation: 0,
+                            expected_head_sha256: None,
+                            content_markdown: "# Plan\n",
+                            patch: "*** Add File: plan.md",
+                            source_message_id: None,
+                            source_call_id: None,
+                            responding_to_suggestion_revision_id: None,
+                            now: 3,
+                        },
+                    )
+                    .await?;
+                    review_ops::mark_materialization_applied(tx, &appended.materialization.id, 4).await?;
+                    crate::db::sea::ops::turn::begin(tx, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 5).await?;
+                    review_ops::submit_native_head_for_review(
+                        tx,
+                        &review_ops::PlanReviewSubmit {
+                            document_id: &document.id,
+                            expected_generation: 1,
+                            expected_head_sha256: &appended.revision.content_sha256,
+                            turn_id: Some("t1"),
+                            assistant_message_id: None,
+                            provider_call_id: None,
+                            provider_kind: crate::db::models::plan_review::PlanReviewProviderKind::Native,
+                            now: 6,
+                        },
+                        &crate::db::models::plan_review::NativePlanReviewRuntimeConfig::fixture(),
+                    )
+                    .await
+                })
+                .await
                 .unwrap();
-            crate::db::ops::turn::begin(&mut conn, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 5).unwrap();
-            crate::db::ops::plan_review::submit_native_head_for_review(
-                &mut conn,
-                &crate::db::ops::plan_review::PlanReviewSubmit {
-                    document_id: &document.id,
-                    expected_generation: 1,
-                    expected_head_sha256: &appended.revision.content_sha256,
-                    turn_id: Some("t1"),
-                    assistant_message_id: None,
-                    provider_call_id: None,
-                    provider_kind: crate::db::models::plan_review::PlanReviewProviderKind::Native,
-                    now: 6,
-                },
-                &crate::db::models::plan_review::NativePlanReviewRuntimeConfig::fixture(),
-            )
-            .unwrap();
         }
         services
             .sea
@@ -555,31 +560,37 @@ mod tests {
         );
 
         {
-            let mut conn = services.db.get().unwrap();
-            let review = crate::db::ops::plan_review::get_pending_review_for_conversation(&mut conn, "c1")
-                .unwrap()
+            use crate::db::sea::ops::plan_review as review_ops;
+            services
+                .sea
+                .write(async |tx| {
+                    let review = review_ops::get_pending_review_for_conversation(tx, "c1")
+                        .await?
+                        .expect("the review is pending");
+                    let bundle = review_ops::get_review_bundle(tx, &review.id).await?;
+                    let decided = review_ops::decide_review(
+                        tx,
+                        &review_ops::PlanReviewDecision {
+                            review_id: &review.id,
+                            decision_id: "approve-1",
+                            expected_lock_version: review.lock_version,
+                            expected_draft_generation: bundle.draft.generation,
+                            expected_draft_sha256: &bundle.draft.draft_sha256,
+                            action: review_ops::PlanReviewDecisionAction::Approve,
+                            decision_summary: None,
+                            delivery_target: Some(crate::db::models::plan_review::PlanDeliveryTarget::Native),
+                            target_session_id: None,
+                            target_turn_id: Some("continuation-1"),
+                            now: 8,
+                        },
+                    )
+                    .await?;
+                    let delivery = decided.delivery.expect("an approval delivers");
+                    review_ops::mark_delivery_dispatched(tx, &delivery.id, "attempt-1", 9).await?;
+                    review_ops::mark_delivery_acknowledged(tx, &delivery.id, "attempt-1", 10).await
+                })
+                .await
                 .unwrap();
-            let bundle = crate::db::ops::plan_review::get_review_bundle(&mut conn, &review.id).unwrap();
-            let decided = crate::db::ops::plan_review::decide_review(
-                &mut conn,
-                &crate::db::ops::plan_review::PlanReviewDecision {
-                    review_id: &review.id,
-                    decision_id: "approve-1",
-                    expected_lock_version: review.lock_version,
-                    expected_draft_generation: bundle.draft.generation,
-                    expected_draft_sha256: &bundle.draft.draft_sha256,
-                    action: crate::db::ops::plan_review::PlanReviewDecisionAction::Approve,
-                    decision_summary: None,
-                    delivery_target: Some(crate::db::models::plan_review::PlanDeliveryTarget::Native),
-                    target_session_id: None,
-                    target_turn_id: Some("continuation-1"),
-                    now: 8,
-                },
-            )
-            .unwrap();
-            let delivery = decided.delivery.unwrap();
-            crate::db::ops::plan_review::mark_delivery_dispatched(&mut conn, &delivery.id, "attempt-1", 9).unwrap();
-            crate::db::ops::plan_review::mark_delivery_acknowledged(&mut conn, &delivery.id, "attempt-1", 10).unwrap();
         }
 
         pump(&services, "c1").await;
@@ -594,10 +605,13 @@ mod tests {
     async fn waiting_review_never_marks_an_ordinary_queued_prompt_held() {
         let dir = tempfile::tempdir().unwrap();
         let services = crate::services::bare_services(dir.path()).await;
-        {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::conversation::create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-        }
+        services
+            .sea
+            .write(async |tx| {
+                crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await
+            })
+            .await
+            .unwrap();
         services
             .sea
             .write(async |tx| queue_ops::enqueue(tx, "q1", "c1", "after review", Delivery::FollowUp, 2).await)

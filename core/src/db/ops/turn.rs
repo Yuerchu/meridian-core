@@ -103,23 +103,6 @@ pub fn set_phase(
         .execute(conn)
 }
 
-/// Release a turn at the durable human-review boundary.
-///
-/// Unlike a running turn, this state survives process death honestly: the
-/// review row contains everything needed to continue, and no task or lease is
-/// expected to remain alive. `ended_at` stays NULL because the tool call has
-/// not received its decision yet.
-pub(super) fn wait_for_review(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<usize> {
-    diesel::update(running(id))
-        .set((
-            turns::status.eq(TurnStatus::WaitingReview.as_str()),
-            turns::phase.eq(Some(TurnPhase::AwaitingApproval.as_str())),
-            turns::phase_tool.eq(Some(crate::agent::modes::EXIT_PLAN_TOOL)),
-            turns::updated_at.eq(now),
-        ))
-        .execute(conn)
-}
-
 /// Settle a durable review boundary after its transcript tool result has been
 /// committed. Callers may wrap both writes in one outer transaction.
 pub fn finish_waiting_review(

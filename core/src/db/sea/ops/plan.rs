@@ -1,6 +1,6 @@
 //! Reading and writing `mode_artifacts`, the legacy approved-plan rows.
 //!
-//! The versioned plan documents (`db::ops::plan_review`) are the source of
+//! The versioned plan documents (`db::sea::ops::plan_review`) are the source of
 //! truth; what is left here is the active-plan read the prompt builder makes
 //! and the completion that retires both kinds at once. The Diesel
 //! `db::ops::plan` keeps only the completion the Diesel checklist write

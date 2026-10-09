@@ -11,9 +11,7 @@
 //!
 //! Every read that issues several statements and joins the answers takes
 //! `&impl Snapshot`: on the pool, a review settling between two of them could
-//! make a conversation look blocked by nothing, or free. The Diesel
-//! `db::ops::plan_review` stays while Diesel roots still use it
-//! (`docs/dual-impl.md`).
+//! make a conversation look blocked by nothing, or free.
 
 use std::collections::{HashMap, HashSet};
 

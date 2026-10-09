@@ -228,7 +228,6 @@ impl Tool for UpdateTodosTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::DbPool;
     use crate::tools::{FileAccess, ShellType};
 
     fn ctx(sea: Db, conversation_id: &str) -> ToolContext {
@@ -251,18 +250,16 @@ mod tests {
         }
     }
 
-    /// A file both pools open, holding conversation `c1`: the tool writes
-    /// through SeaORM, and the checklist freezer still reads through Diesel.
-    async fn shared() -> (tempfile::TempDir, DbPool, Db) {
-        let dir = tempfile::tempdir().unwrap();
-        let (pool, sea) = crate::db::sea::shared_test_db(dir.path()).await;
+    /// A database holding conversation `c1`.
+    async fn shared() -> Db {
+        let sea = crate::db::sea::sea_test_db().await;
         crate::db::sea::execute_for_tests(
             &sea,
             "INSERT INTO conversations (id, created_at, updated_at) VALUES ('c1', 1, 1)",
         )
         .await
         .unwrap();
-        (dir, pool, sea)
+        sea
     }
 
     async fn active(sea: &Db) -> Option<crate::db::sea::ops::todo::TodoListView> {
@@ -281,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn writes_the_checklist_and_reports_the_current_step() {
-        let (_dir, _pool, sea) = shared().await;
+        let sea = shared().await;
         let ctx = ctx(sea.clone(), "c1");
 
         let out = UpdateTodosTool
@@ -303,7 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_two_steps_in_progress() {
-        let (_dir, _pool, sea) = shared().await;
+        let sea = shared().await;
         let ctx = ctx(sea.clone(), "c1");
 
         let err = UpdateTodosTool
@@ -324,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_blank_and_unknown_fields() {
-        let (_dir, _pool, sea) = shared().await;
+        let sea = shared().await;
         let ctx = ctx(sea.clone(), "c1");
 
         let blank = UpdateTodosTool
@@ -350,7 +347,7 @@ mod tests {
     /// stays in the system prompt for the rest of the conversation.
     #[tokio::test]
     async fn finishing_the_checklist_retires_the_approved_plan() {
-        let (_dir, _pool, sea) = shared().await;
+        let sea = shared().await;
         let ctx = ctx(sea.clone(), "c1");
         crate::db::sea::execute_for_tests(
             &sea,
@@ -383,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_completion_when_every_step_is_done() {
-        let (_dir, _pool, sea) = shared().await;
+        let sea = shared().await;
         let ctx = ctx(sea.clone(), "c1");
 
         let out = UpdateTodosTool
@@ -404,18 +401,17 @@ mod tests {
     /// back.
     #[tokio::test]
     async fn the_prompt_block_follows_the_tool_across_calls() {
-        let (_dir, pool, sea) = shared().await;
+        let sea = shared().await;
         let ctx = ctx(sea.clone(), "c1");
 
-        let block_now = || {
-            let mut conn = pool.get().unwrap();
-            crate::db::ops::todo::get_active_view(&mut conn, "c1")
-                .unwrap()
+        let block_now = async || {
+            active(&sea)
+                .await
                 .as_ref()
-                .and_then(crate::db::ops::todo::format_todo_block)
+                .and_then(crate::db::sea::ops::todo::format_todo_block)
         };
 
-        assert!(block_now().is_none(), "nothing to inject before the first call");
+        assert!(block_now().await.is_none(), "nothing to inject before the first call");
 
         UpdateTodosTool
             .execute(
@@ -427,7 +423,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let first = block_now().unwrap();
+        let first = block_now().await.unwrap();
         assert!(first.contains("Title: Refactor auth"));
         assert!(first.contains("1. [in_progress] Extract token check"));
         assert!(first.contains("2. [pending] Add tests"));
@@ -442,7 +438,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let second = block_now().unwrap();
+        let second = block_now().await.unwrap();
         assert!(second.contains("1. [completed] Extract token check"));
         assert!(second.contains("2. [in_progress] Add tests"));
 
@@ -456,7 +452,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(block_now().is_none(), "a finished checklist stops being injected");
+        assert!(block_now().await.is_none(), "a finished checklist stops being injected");
     }
 
     #[tokio::test]
