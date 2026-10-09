@@ -1348,7 +1348,7 @@ impl OneBotServer {
         let (conn_closed, _) = watch::channel(0);
         Self {
             state: Arc::new(SharedState {
-                sessions: Mutex::new(SessionManager::new(services.db.clone())),
+                sessions: Mutex::new(SessionManager::new(services.sea.clone())),
                 pending_approvals: Arc::new(PendingApprovals::default()),
                 pending_api_responses: std::sync::Mutex::new(HashMap::new()),
                 pending_requests: Mutex::new(HashMap::new()),

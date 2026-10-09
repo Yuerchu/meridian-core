@@ -9,7 +9,7 @@
 //! `WriteTx`, and the caller's `Db::write` is the `BEGIN IMMEDIATE`.
 
 use sea_orm::ActiveValue::Unchanged;
-use sea_orm::{ActiveModelTrait, DbErr, EntityTrait, IntoActiveModel, QueryOrder};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder};
 
 use crate::db::entity::project;
 use crate::db::entity::project::ProjectChangeset;
@@ -56,6 +56,19 @@ pub async fn update_project(tx: &WriteTx, id: &str, changeset: ProjectChangeset)
 /// write: memories reach a project by a polymorphic scope id, not a foreign
 /// key, so nothing would cascade on its own. Conversations in it keep their
 /// rows with no project. How many projects went: 0 for an id already gone.
+/// The project a OneBot session lives in, by where its messages come from.
+pub async fn find_project_by_source(
+    db: &impl Read,
+    source_type: project::ProjectSource,
+    source_id: &str,
+) -> Result<Option<project::Model>, DbErr> {
+    project::Entity::find()
+        .filter(project::Column::SourceType.eq(source_type))
+        .filter(project::Column::SourceId.eq(source_id))
+        .one(db.conn()?)
+        .await
+}
+
 /// The project whose directory this is, however the two sides spelled it
 /// (`db::ops::project::normalize_path`). Most recently touched first, so of
 /// two spellings of one directory the live project wins.

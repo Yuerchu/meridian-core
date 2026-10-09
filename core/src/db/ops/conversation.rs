@@ -135,13 +135,6 @@ pub fn toggle_pin(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResul
     })
 }
 
-pub fn archive_conversation(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<()> {
-    diesel::update(conversations::table.find(id))
-        .set((conversations::is_archived.eq(1), conversations::updated_at.eq(now)))
-        .execute(conn)?;
-    Ok(())
-}
-
 /// The archive flag's `toggle_pin`, under the same lock for the same reason.
 pub fn toggle_archive(conn: &mut SqliteConnection, id: &str, now: i64) -> QueryResult<conversation::Model> {
     conn.immediate_transaction(|conn| {

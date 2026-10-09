@@ -32,11 +32,6 @@ pub fn set_preference(conn: &mut SqliteConnection, key: &str, value: &str, now: 
     Ok(())
 }
 
-pub fn delete_preference(conn: &mut SqliteConnection, key: &str) -> QueryResult<()> {
-    diesel::delete(preferences::table.find(key)).execute(conn)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::parse_bool_preference;

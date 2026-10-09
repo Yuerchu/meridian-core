@@ -9,18 +9,6 @@ pub fn get_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<Project
     projects::table.find(id).first::<ProjectRow>(conn)
 }
 
-pub fn find_project_by_source(
-    conn: &mut SqliteConnection,
-    source_type: &str,
-    source_id: &str,
-) -> QueryResult<Option<ProjectRow>> {
-    projects::table
-        .filter(projects::source_type.eq(source_type))
-        .filter(projects::source_id.eq(source_id))
-        .first::<ProjectRow>(conn)
-        .optional()
-}
-
 /// The project whose working directory is `path`, if there is one.
 ///
 /// Compared in Rust over the whole (small) table rather than in SQL, because

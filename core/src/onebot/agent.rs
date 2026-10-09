@@ -14,7 +14,7 @@ use crate::mcp::McpRegistry;
 use crate::provider::{self, ChatMessage, ToolCall};
 use crate::secrets::SecretsManager;
 use crate::tools::{self, ToolRegistry};
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 static DISABLED_REDACTION: std::sync::LazyLock<crate::redaction::RedactionEngine> =
     std::sync::LazyLock::new(crate::redaction::RedactionEngine::disabled);
@@ -453,41 +453,43 @@ pub(super) async fn oneshot_completion(
         .map_err(|e| e.to_string())?;
 
     if let Some(usage) = answer.usage {
-        let pool = state.services.db.clone();
-        let conv_id = conversation_id.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let Some(message_id) = crate::db::ops::conversation::get_conversation(&mut conn, &conv_id)
-                .ok()
-                .and_then(|c| c.head_message_id)
-            else {
-                tracing::warn!("could not record what the extraction cost: no message to file it against");
-                return Ok(());
-            };
-            let cost = crate::db::ops::audit::SideRequestCost {
-                role: crate::db::ops::audit::EXTRACTION_ROLE,
-                message_id: &message_id,
-                conversation_id: &conv_id,
-                turn_id: None,
-                provider_id: Some(&provider_id),
-                provider_name: Some(&provider_name),
-                model_id: Some(&model),
-                usage: crate::db::models::message::MessageUsage {
-                    input_tokens: usage.prompt_tokens,
-                    output_tokens: usage.completion_tokens,
-                    cache_read_tokens: usage.cache_read_tokens,
-                    cache_write_tokens: usage.cache_write_tokens,
-                    server_tool_calls: usage.billable_tool_calls,
-                },
-                peak_prompt_tokens: usage.prompt_tokens,
-                summary: "extraction",
-            };
-            if let Err(e) = crate::db::ops::audit::record_side_request(&mut conn, cost) {
-                tracing::warn!(error = %e, "could not record what the extraction cost");
-            }
-            Ok::<_, String>(())
-        })
-        .await;
+        // Filed against the conversation's head, read under the same lock the
+        // cost is written under.
+        let written = state
+            .services
+            .sea
+            .write(async |tx| {
+                let head = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+                    .await?
+                    .and_then(|c| c.head_message_id);
+                let Some(message_id) = head else {
+                    tracing::warn!("could not record what the extraction cost: no message to file it against");
+                    return Ok(());
+                };
+                let cost = crate::db::ops::audit::SideRequestCost {
+                    role: crate::db::ops::audit::EXTRACTION_ROLE,
+                    message_id: &message_id,
+                    conversation_id,
+                    turn_id: None,
+                    provider_id: Some(&provider_id),
+                    provider_name: Some(&provider_name),
+                    model_id: Some(&model),
+                    usage: crate::db::models::message::MessageUsage {
+                        input_tokens: usage.prompt_tokens,
+                        output_tokens: usage.completion_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
+                        server_tool_calls: usage.billable_tool_calls,
+                    },
+                    peak_prompt_tokens: usage.prompt_tokens,
+                    summary: "extraction",
+                };
+                crate::db::sea::ops::audit::record_side_request(tx, cost).await
+            })
+            .await;
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "could not record what the extraction cost");
+        }
     }
 
     Ok(answer.text)
@@ -607,26 +609,27 @@ async fn headless_chat_inner(
         None => None,
     };
 
-    // Load assistant + the conversation's active path
-    let (assistant, ctx) = {
-        let pool = pool.clone();
-        let conv_id = conversation_id.to_string();
-        let aid = assistant_id.map(String::from);
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let conv =
-                crate::db::ops::conversation::get_conversation(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-            let effective_aid = aid.as_deref().or(conv.assistant_id.as_deref());
-            let assistant = effective_aid.and_then(|aid| crate::db::ops::assistant::get_assistant(&mut conn, aid).ok());
-            let history = crate::db::ops::message::list_messages(&mut conn, &conv_id).map_err(|e| e.to_string())?;
+    // Load assistant + the conversation's active path, in one snapshot.
+    let (assistant, ctx) = sea
+        .read(async |tx| {
+            let Some(conv) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? else {
+                return Ok(Err(format!("conversation {conversation_id} not found")));
+            };
+            let assistant = match assistant_id.or(conv.assistant_id.as_deref()) {
+                Some(aid) => crate::db::sea::ops::assistant::get_assistant(tx, aid)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let history = crate::db::sea::ops::message::list_messages(tx, conversation_id).await?;
             // Resolved once and carried for the turn; see the desktop loop for
             // why the head is not re-read per row.
-            let ctx = crate::db::ops::message::active_context(&history, conv.head_message_id.as_deref());
-            Ok::<_, String>((assistant, ctx))
+            let ctx = crate::db::sea::ops::message::active_context(&history, conv.head_message_id.as_deref());
+            Ok::<_, crate::db::sea::DbErr>(Ok((assistant, ctx)))
         })
         .await
-        .map_err(|e| e.to_string())??
-    };
+        .map_err(|e| e.to_string())??;
 
     let resolved = resolve_provider_config(secrets, sea, assistant.as_ref()).await?;
     let provider = provider::registry::create_provider(resolved.wire())?;
