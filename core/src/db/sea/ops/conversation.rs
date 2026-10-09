@@ -534,6 +534,54 @@ pub fn snippet_around(text: &str, query: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn snippet_centres_the_match_and_marks_the_cuts() {
+        let text = format!("{}目标词{}", "前".repeat(50), "后".repeat(100));
+        let s = snippet_around(&text, "目标词").unwrap();
+        assert!(s.starts_with('…') && s.ends_with('…'), "{s}");
+        assert!(s.contains("目标词"));
+    }
+
+    #[test]
+    fn snippet_is_case_insensitive_and_none_when_absent() {
+        assert!(snippet_around("Hello Meridian", "meridian").is_some());
+        assert!(snippet_around("Hello Meridian", "absent").is_none());
+    }
+
+    #[test]
+    fn multimodal_rows_match_on_their_words_not_their_bytes() {
+        let content = r#"[{"type":"text","text":"看看这张图"},{"type":"image_url","image_url":{"url":"data:image/png;base64,xyzzy"}}]"#;
+        assert_eq!(searchable_text(content), "看看这张图");
+        // A match that only exists inside the data URI is not a mention.
+        assert!(snippet_around(&searchable_text(content), "xyzzy").is_none());
+    }
+
+    #[test]
+    fn newlines_do_not_break_the_row() {
+        let s = snippet_around("first line\nsecond target line\r\nthird", "target").unwrap();
+        assert!(!s.contains('\n') && !s.contains('\r'), "{s}");
+    }
+
+    /// A pasted JSON array is somebody's text, not a block array — the `type`
+    /// gate is what tells them apart.
+    #[test]
+    fn a_pasted_json_array_stays_text() {
+        assert_eq!(searchable_text("[1, 2, 3]"), "[1, 2, 3]");
+        assert!(snippet_around(&searchable_text("[1, 2, 3]"), "2, 3").is_some());
+    }
+
+    /// The fold is ASCII on purpose — the same one LIKE applies — so both
+    /// layers of the pipeline promise the same matches. See `snippet_around`.
+    #[test]
+    fn case_folding_is_ascii_like_the_prefilter() {
+        assert!(snippet_around("ÄPFEL kaufen", "äpfel").is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::sea::cap::Db;

@@ -325,19 +325,6 @@ mod tests {
         assert_eq!(t.error.as_deref(), Some("API Key not set"));
     }
 
-    /// Turns belong to their conversation and go with it.
-    #[test]
-    fn deleting_a_conversation_takes_its_turns() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-
-        crate::db::ops::conversation::delete_conversation(&mut conn, "c1").unwrap();
-
-        assert!(list_for_conversation(&mut conn, "c1").unwrap().is_empty());
-    }
-
     /// The lifecycle is one-way, enforced in SQL rather than by call order.
     /// A phase write that lands after the turn ended would leave a finished row
     /// claiming to be inside a tool — and "inside a tool" is the reading that

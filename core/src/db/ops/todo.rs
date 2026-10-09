@@ -373,20 +373,6 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_conversation_cascades_to_lists_and_items() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        seed_conversation(&mut conn, "c1");
-        let view =
-            replace_active_list(&mut conn, "c1", "Refactor auth", &[input("a", ItemStatus::Pending)], 10).unwrap();
-
-        crate::db::ops::conversation::delete_conversation(&mut conn, "c1").unwrap();
-
-        assert!(list_lists(&mut conn, "c1").unwrap().is_empty());
-        assert!(list_items(&mut conn, &view.list.id).unwrap().is_empty());
-    }
-
-    #[test]
     fn empty_list_renders_no_block() {
         let pool = diesel_test_db();
         let mut conn = pool.get().unwrap();

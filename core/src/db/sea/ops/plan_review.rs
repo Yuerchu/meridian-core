@@ -2218,6 +2218,59 @@ pub async fn barrier_conversations_for_model(
     .await
 }
 
+/// A native review waiting on a person: a document, one applied revision and
+/// its head submitted, the way a plan-mode turn leaves it. For tests that
+/// need a conversation behind the barrier; `project` is the (id, path) the
+/// approved plan would run against.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn seed_pending_native_review(
+    tx: &WriteTx,
+    conversation_id: &str,
+    project: Option<(&str, &str)>,
+) -> PlanReviewStoreResult<PlanReviewBundle> {
+    let document = create_or_resume_document(tx, conversation_id, 2).await?;
+    let appended = append_assistant_revision(
+        tx,
+        &PlanRevisionAppend {
+            document_id: &document.id,
+            expected_generation: 0,
+            expected_head_sha256: None,
+            content_markdown: "# Plan\n",
+            patch: "first patch",
+            source_message_id: Some("m1"),
+            source_call_id: Some("update-1"),
+            responding_to_suggestion_revision_id: None,
+            now: 3,
+        },
+    )
+    .await?;
+    mark_materialization_applied(tx, &appended.materialization.id, 4).await?;
+    submit_native_head_for_review(
+        tx,
+        &PlanReviewSubmit {
+            document_id: &document.id,
+            expected_generation: appended.document.working_generation,
+            expected_head_sha256: &appended.revision.content_sha256,
+            turn_id: None,
+            assistant_message_id: Some("m1"),
+            provider_call_id: Some("exit-1"),
+            provider_kind: PlanReviewProviderKind::Native,
+            now: 5,
+        },
+        &NativePlanReviewRuntimeConfig {
+            provider_id: "provider-test".into(),
+            model: "model-test".into(),
+            assistant_id: None,
+            thinking_level: None,
+            fast: false,
+            project_id: project.map(|(id, _)| id.to_owned()),
+            project_path: project.map(|(_, path)| path.to_owned()),
+            accept_edits: false,
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

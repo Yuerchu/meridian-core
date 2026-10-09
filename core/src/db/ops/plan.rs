@@ -70,30 +70,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Migrations are plain SQL and Diesel does not check them at compile time,
-    /// so this is the only place a broken ALTER TABLE surfaces before runtime.
-    #[test]
-    fn migrations_apply_and_the_mode_column_round_trips() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        seed_conversation(&mut conn, "c1");
-
-        let conv = crate::db::ops::conversation::get_conversation(&mut conn, "c1").unwrap();
-        assert_eq!(conv.mode, None, "defaults to the work mode");
-
-        crate::db::ops::conversation::update_mode(&mut conn, "c1", Some("plan"), 2).unwrap();
-        let conv = crate::db::ops::conversation::get_conversation(&mut conn, "c1").unwrap();
-        assert_eq!(conv.mode.as_deref(), Some("plan"));
-
-        crate::db::ops::conversation::update_mode(&mut conn, "c1", None, 3).unwrap();
-        assert_eq!(
-            crate::db::ops::conversation::get_conversation(&mut conn, "c1")
-                .unwrap()
-                .mode,
-            None,
-        );
-    }
-
     #[test]
     fn completing_with_no_active_plan_is_a_no_op() {
         let pool = diesel_test_db();

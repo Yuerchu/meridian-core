@@ -156,18 +156,4 @@ mod tests {
             ]
         );
     }
-
-    /// The row belongs to the conversation and goes with it. Left behind, it
-    /// would be a session id nothing can reach and a UNIQUE index entry blocking
-    /// a conversation that legitimately resumes it later.
-    #[test]
-    fn deleting_the_conversation_takes_the_row() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conversation(&mut conn, "c1");
-        upsert(&mut conn, "c1", Some("sess-1"), "/a", 1).unwrap();
-
-        crate::db::ops::conversation::delete_conversation(&mut conn, "c1").unwrap();
-        assert!(get(&mut conn, "c1").unwrap().is_none());
-    }
 }

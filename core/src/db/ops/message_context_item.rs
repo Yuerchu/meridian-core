@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
@@ -34,28 +32,6 @@ pub fn list_for_message(
         .into_iter()
         .map(model)
         .collect()
-}
-
-pub fn list_for_messages(
-    conn: &mut SqliteConnection,
-    message_ids: &[String],
-) -> QueryResult<HashMap<String, Vec<message_context_item::Model>>> {
-    if message_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let rows = message_context_items::table
-        .filter(message_context_items::message_id.eq_any(message_ids))
-        .order((
-            message_context_items::message_id.asc(),
-            message_context_items::position.asc(),
-        ))
-        .select(MessageContextItemRow::as_select())
-        .load::<MessageContextItemRow>(conn)?;
-    let mut by_message: HashMap<String, Vec<message_context_item::Model>> = HashMap::new();
-    for row in rows {
-        by_message.entry(row.message_id.clone()).or_default().push(model(row)?);
-    }
-    Ok(by_message)
 }
 
 #[cfg(test)]

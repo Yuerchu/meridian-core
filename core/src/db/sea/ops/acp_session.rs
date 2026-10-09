@@ -97,4 +97,26 @@ mod tests {
         assert_eq!(owners(&db).await.unwrap(), [("s2".to_string(), "c1".to_string())]);
         assert_eq!(get(&db, "nope").await.unwrap(), None);
     }
+
+    /// The row belongs to the conversation and goes with it. Left behind, it
+    /// would be a session id nothing can reach and a UNIQUE index entry
+    /// blocking a conversation that legitimately resumes it later.
+    #[tokio::test]
+    async fn deleting_the_conversation_takes_the_row() {
+        let db = sea_test_db().await;
+        execute_for_tests(
+            &db,
+            "INSERT INTO conversations (id, created_at, updated_at) VALUES ('c1', 1, 1)",
+        )
+        .await
+        .unwrap();
+        db.write(async |tx| upsert(tx, "c1", Some("sess-1"), "/a", 1).await)
+            .await
+            .unwrap();
+        db.write(async |tx| crate::db::sea::ops::conversation::delete_conversation(tx, "c1").await)
+            .await
+            .unwrap();
+        assert_eq!(get(&db, "c1").await.unwrap(), None);
+        assert!(owners(&db).await.unwrap().is_empty());
+    }
 }

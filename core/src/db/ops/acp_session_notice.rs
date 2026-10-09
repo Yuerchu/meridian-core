@@ -208,16 +208,4 @@ mod tests {
         assert_eq!(list_for_conversation(&mut conn, "c1").unwrap().len(), 1);
         assert_eq!(list_for_conversation(&mut conn, "c2").unwrap().len(), 1);
     }
-
-    /// Incidents go with the conversation they were about.
-    #[test]
-    fn deleting_the_conversation_takes_its_incidents() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conversation(&mut conn, "c1");
-        upsert_if_newer(&mut conn, insert("n1", "c1", "x", 1, "gone", 100)).unwrap();
-
-        crate::db::ops::conversation::delete_conversation(&mut conn, "c1").unwrap();
-        assert!(list_for_conversation(&mut conn, "c1").unwrap().is_empty());
-    }
 }

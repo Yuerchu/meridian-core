@@ -70,10 +70,10 @@ pub async fn find_project_by_source(
 }
 
 /// The project whose directory this is, however the two sides spelled it
-/// (`db::ops::project::normalize_path`). Most recently touched first, so of
+/// (`normalize_path`). Most recently touched first, so of
 /// two spellings of one directory the live project wins.
 pub async fn find_project_by_path(db: &impl Read, path: &str) -> Result<Option<project::Model>, DbErr> {
-    let wanted = crate::db::ops::project::normalize_path(path);
+    let wanted = normalize_path(path);
     if wanted.is_empty() {
         return Ok(None);
     }
@@ -82,13 +82,30 @@ pub async fn find_project_by_path(db: &impl Read, path: &str) -> Result<Option<p
         .all(db.conn()?)
         .await?
         .into_iter()
-        .find(|p| {
-            p.path
-                .as_deref()
-                .map(crate::db::ops::project::normalize_path)
-                .as_deref()
-                == Some(wanted.as_str())
-        }))
+        .find(|p| p.path.as_deref().map(normalize_path).as_deref() == Some(wanted.as_str())))
+}
+
+/// Enough normalisation to compare two paths that name the same directory.
+///
+/// Deliberately textual: `canonicalize` would be stricter but touches the disk
+/// and fails outright on a directory that has been moved or unmounted, which
+/// would turn "cannot check right now" into "not this project".
+///
+/// Not the journal's file key. Journal identity lives in
+/// `journal::normalize_file_key`: a trailing space on Unix is a different
+/// file, and folding it here is what a directory picker needs and what a
+/// chain key must not do.
+///
+/// The backslash is a separator only on Windows. On Unix it is an ordinary
+/// filename character, and folding it into `/` there would make `a\b` and a
+/// real `a/b` the same directory.
+pub(crate) fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if cfg!(windows) {
+        trimmed.replace('\\', "/").trim_end_matches('/').to_lowercase()
+    } else {
+        trimmed.trim_end_matches('/').to_string()
+    }
 }
 
 pub async fn delete_project(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
@@ -166,6 +183,14 @@ mod tests {
         assert!(find_project_by_path(&db, "C:/Code/other").await.unwrap().is_none());
         assert!(find_project_by_path(&db, "C:/Code").await.unwrap().is_none());
         assert!(find_project_by_path(&db, "").await.unwrap().is_none());
+    }
+
+    /// Project comparison still trims: a picker or another program's cwd
+    /// grows spaces. The journal's file key deliberately does not — see
+    /// `journal::normalize_file_key`.
+    #[test]
+    fn project_comparison_still_trims_surrounding_whitespace() {
+        assert_eq!(normalize_path("/tmp/file"), normalize_path(" /tmp/file "));
     }
 
     /// Listed newest first; an update writes only what it names and clears

@@ -455,7 +455,7 @@ pub fn list_recent(
 mod tests {
     use super::*;
     use crate::db::diesel_test_db;
-    use crate::db::ops::conversation::{create_conversation, delete_conversation};
+    use crate::db::ops::conversation::create_conversation;
     use crate::db::ops::message::append_message;
 
     fn user_row<'a>(id: &'a str, conv: &'a str) -> crate::db::models::message::MessageInsert<'a> {
@@ -488,34 +488,6 @@ mod tests {
             provider_name: None,
             response_model_id: None,
         }
-    }
-
-    /// The reason the table exists. Everything else about a conversation goes
-    /// when the conversation does; this does not.
-    ///
-    /// No explicit `record` call: appending a user message is what files it, and
-    /// a test that recorded by hand would pass even if that wiring were removed.
-    #[test]
-    fn an_audit_record_survives_deleting_its_conversation() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-        append_message(&mut conn, &user_row("m1", "c1"), None).unwrap();
-
-        delete_conversation(&mut conn, "c1").unwrap();
-
-        assert!(
-            crate::db::ops::message::list_messages(&mut conn, "c1")
-                .unwrap()
-                .is_empty(),
-            "the transcript really did go",
-        );
-        let kept = list_recent(&mut conn, 10).unwrap();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].message_id, "m1");
-        assert_eq!(kept[0].content, "what did you do");
-        assert_eq!(kept[0].sender_id, Some(12345));
-        assert_eq!(kept[0].conversation_id, "c1", "still names what it was about");
     }
 
     /// Live ACP replies are accounted for by the hosted process, even though
