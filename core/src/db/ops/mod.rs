@@ -4,7 +4,6 @@ pub mod assistant;
 pub mod audit;
 pub mod conversation;
 pub mod message;
-pub mod message_context_item;
 pub mod model_config;
 pub mod plan;
 pub mod plan_review;

@@ -2220,13 +2220,13 @@ pub async fn barrier_conversations_for_model(
 
 /// A native review waiting on a person: a document, one applied revision and
 /// its head submitted, the way a plan-mode turn leaves it. For tests that
-/// need a conversation behind the barrier; `project` is the (id, path) the
-/// approved plan would run against.
+/// need a conversation behind the barrier; `runtime` is what the approved
+/// plan would run with, which is what the settings barriers compare against.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn seed_pending_native_review(
     tx: &WriteTx,
     conversation_id: &str,
-    project: Option<(&str, &str)>,
+    runtime: &NativePlanReviewRuntimeConfig,
 ) -> PlanReviewStoreResult<PlanReviewBundle> {
     let document = create_or_resume_document(tx, conversation_id, 2).await?;
     let appended = append_assistant_revision(
@@ -2257,18 +2257,25 @@ pub async fn seed_pending_native_review(
             provider_kind: PlanReviewProviderKind::Native,
             now: 5,
         },
-        &NativePlanReviewRuntimeConfig {
-            provider_id: "provider-test".into(),
-            model: "model-test".into(),
-            assistant_id: None,
-            thinking_level: None,
-            fast: false,
-            project_id: project.map(|(id, _)| id.to_owned()),
-            project_path: project.map(|(_, path)| path.to_owned()),
-            accept_edits: false,
-        },
+        runtime,
     )
     .await
+}
+
+/// A runtime for [`seed_pending_native_review`]: provider, model and
+/// project, everything else off.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_runtime(provider_id: &str, model: &str, project: Option<(&str, &str)>) -> NativePlanReviewRuntimeConfig {
+    NativePlanReviewRuntimeConfig {
+        provider_id: provider_id.into(),
+        model: model.into(),
+        assistant_id: None,
+        thinking_level: None,
+        fast: false,
+        project_id: project.map(|(id, _)| id.to_owned()),
+        project_path: project.map(|(_, path)| path.to_owned()),
+        accept_edits: false,
+    }
 }
 
 #[cfg(test)]

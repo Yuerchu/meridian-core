@@ -143,6 +143,36 @@ async fn audit_copy(tx: &WriteTx, row: &message::Model) {
     }
 }
 
+/// The row with this id, in this conversation, written by this source —
+/// `None` for any other row, so an id from somewhere else reads as absent.
+pub async fn get_with_source(
+    db: &impl Read,
+    conversation_id: &str,
+    id: &str,
+    source: &str,
+) -> Result<Option<message::Model>, DbErr> {
+    message::Entity::find_by_id(id)
+        .filter(message::Column::ConversationId.eq(conversation_id))
+        .filter(message::Column::Source.eq(source))
+        .one(db.conn()?)
+        .await
+}
+
+/// The row a turn wrote from this source, if it wrote one.
+pub async fn find_by_turn_and_source(
+    db: &impl Read,
+    conversation_id: &str,
+    turn_id: &str,
+    source: &str,
+) -> Result<Option<message::Model>, DbErr> {
+    message::Entity::find()
+        .filter(message::Column::ConversationId.eq(conversation_id))
+        .filter(message::Column::TurnId.eq(turn_id))
+        .filter(message::Column::Source.eq(source))
+        .one(db.conn()?)
+        .await
+}
+
 /// A conversation's rows in insertion order (`sort_order`), every branch.
 pub async fn list_messages(db: &impl Read, conversation_id: &str) -> Result<Vec<message::Model>, DbErr> {
     message::Entity::find()

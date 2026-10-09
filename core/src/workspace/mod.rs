@@ -24,10 +24,11 @@ pub mod tree;
 
 use std::path::PathBuf;
 
-use diesel::sqlite::SqliteConnection;
 use serde::Serialize;
 
-use crate::db;
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::{Db, Snapshot};
+use crate::db::sea::ops as sea_ops;
 
 /// Where a conversation's files live, or the reason there is nowhere to look.
 ///
@@ -59,11 +60,15 @@ pub enum WorkspaceRoot {
 /// panel shows the same tree the tools can reach. The `bool` says whether a
 /// project row existed at all, which is what separates `NoProject` from
 /// `NoPath` when the answer is `None`.
-fn configured_dir(conn: &mut SqliteConnection, conversation_id: &str) -> Result<(Option<PathBuf>, bool), String> {
-    let conv = db::ops::conversation::get_conversation(conn, conversation_id).map_err(|e| e.to_string())?;
+pub async fn configured_dir_in(db: &impl Snapshot, conversation_id: &str) -> Result<(Option<PathBuf>, bool), String> {
+    let conv = sea_ops::conversation::get_conversation(db, conversation_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {conversation_id} not found"))?;
 
     if conv.agent_kind.as_deref() == Some("claude_code") {
-        let cwd = db::ops::acp_session::get(conn, conversation_id)
+        let cwd = sea_ops::acp_session::get(db, conversation_id)
+            .await
             .map_err(|e| e.to_string())?
             .map(|row| PathBuf::from(row.cwd));
         return Ok((cwd, false));
@@ -71,8 +76,10 @@ fn configured_dir(conn: &mut SqliteConnection, conversation_id: &str) -> Result<
 
     match conv.project_id.as_deref() {
         Some(pid) => {
-            let path = db::ops::project::get_project(conn, pid)
+            let path = sea_ops::project::get_project(db, pid)
+                .await
                 .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("project {pid} not found"))?
                 .path
                 .map(PathBuf::from);
             Ok((path, true))
@@ -81,9 +88,16 @@ fn configured_dir(conn: &mut SqliteConnection, conversation_id: &str) -> Result<
     }
 }
 
+/// [`configured_dir_in`] in a snapshot of its own.
+async fn configured_dir(db: &Db, conversation_id: &str) -> Result<(Option<PathBuf>, bool), String> {
+    db.read(async |tx| Ok::<_, DbErr>(configured_dir_in(tx, conversation_id).await))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// The configured directory alone, for callers that resolve it themselves.
-pub fn resolve_workspace_dir(conn: &mut SqliteConnection, conversation_id: &str) -> Result<Option<PathBuf>, String> {
-    configured_dir(conn, conversation_id).map(|(dir, _)| dir)
+pub async fn resolve_workspace_dir(db: &Db, conversation_id: &str) -> Result<Option<PathBuf>, String> {
+    configured_dir(db, conversation_id).await.map(|(dir, _)| dir)
 }
 
 /// Resolve the configured directory against the filesystem.
@@ -92,16 +106,24 @@ pub fn resolve_workspace_dir(conn: &mut SqliteConnection, conversation_id: &str)
 /// directory is absent, unreadable or a file, the panel's answer is the same —
 /// there is nothing to browse, and here is the path that was tried.
 ///
-/// `git_available` / `is_repo` come back `false` from here: this runs under
-/// `spawn_blocking` and git is a subprocess, so the command layer fills them in.
-pub fn resolve_workspace_root(conn: &mut SqliteConnection, conversation_id: &str) -> Result<WorkspaceRoot, String> {
-    let (configured, has_project) = configured_dir(conn, conversation_id)?;
+/// `git_available` / `is_repo` come back `false` from here: git is a
+/// subprocess, so the command layer fills them in. The filesystem check runs
+/// on the blocking pool.
+pub async fn resolve_workspace_root(db: &Db, conversation_id: &str) -> Result<WorkspaceRoot, String> {
+    let (configured, has_project) = configured_dir(db, conversation_id).await?;
+    tokio::task::spawn_blocking(move || root_of(configured, has_project))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// A configured directory, checked against the filesystem. Blocking.
+fn root_of(configured: Option<PathBuf>, has_project: bool) -> WorkspaceRoot {
     let Some(configured) = configured else {
-        return Ok(if has_project {
+        return if has_project {
             WorkspaceRoot::NoPath
         } else {
             WorkspaceRoot::NoProject
-        });
+        };
     };
 
     match crate::tools::verified::resolve_root(&configured) {
@@ -109,13 +131,74 @@ pub fn resolve_workspace_root(conn: &mut SqliteConnection, conversation_id: &str
         // names a regular file would otherwise report `Ok` and then fail
         // strangely on every listing. Not-a-directory is the same answer as
         // not-there: nothing to browse, and here is the path that was tried.
-        Ok(real) if real.is_dir() => Ok(WorkspaceRoot::Ok {
+        Ok(real) if real.is_dir() => WorkspaceRoot::Ok {
             root: real.to_string_lossy().into_owned(),
             git_available: false,
             is_repo: false,
-        }),
-        _ => Ok(WorkspaceRoot::MissingDir {
+        },
+        _ => WorkspaceRoot::MissingDir {
             path: configured.to_string_lossy().into_owned(),
-        }),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::sea::{execute_for_tests, sea_test_db};
+
+    /// The four answers: no project, a project without a path, a path that is
+    /// not there, and one that is. A hosted conversation answers from its
+    /// session's directory, not the project's.
+    #[tokio::test]
+    async fn the_root_comes_from_the_project_or_the_hosted_session() {
+        let db = sea_test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().to_string_lossy().replace('\'', "''");
+        let gone = dir.path().join("gone").to_string_lossy().replace('\'', "''");
+        execute_for_tests(
+            &db,
+            &format!(
+                "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES
+                     ('p-real', 'P', '{real}', 1, 1), ('p-none', 'P', NULL, 1, 1), ('p-gone', 'P', '{gone}', 1, 1);
+                 INSERT INTO conversations (id, project_id, agent_kind, created_at, updated_at) VALUES
+                     ('loose', NULL, NULL, 1, 1), ('none', 'p-none', NULL, 1, 1),
+                     ('gone', 'p-gone', NULL, 1, 1), ('real', 'p-real', NULL, 1, 1),
+                     ('hosted', 'p-gone', 'claude_code', 1, 1);
+                 INSERT INTO acp_sessions (conversation_id, cwd, created_at, updated_at)
+                     VALUES ('hosted', '{real}', 1, 1)"
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            resolve_workspace_root(&db, "loose").await.unwrap(),
+            WorkspaceRoot::NoProject
+        ));
+        assert!(matches!(
+            resolve_workspace_root(&db, "none").await.unwrap(),
+            WorkspaceRoot::NoPath
+        ));
+        assert!(matches!(
+            resolve_workspace_root(&db, "gone").await.unwrap(),
+            WorkspaceRoot::MissingDir { .. }
+        ));
+        assert!(matches!(
+            resolve_workspace_root(&db, "real").await.unwrap(),
+            WorkspaceRoot::Ok { .. }
+        ));
+        assert!(
+            matches!(
+                resolve_workspace_root(&db, "hosted").await.unwrap(),
+                WorkspaceRoot::Ok { .. }
+            ),
+            "the session's directory outranks the project's"
+        );
+        assert_eq!(
+            resolve_workspace_dir(&db, "hosted").await.unwrap(),
+            Some(PathBuf::from(dir.path()))
+        );
+        assert!(resolve_workspace_dir(&db, "nope").await.is_err());
     }
 }
