@@ -60,6 +60,14 @@ pub enum WorkspaceRoot {
 /// panel shows the same tree the tools can reach. The `bool` says whether a
 /// project row existed at all, which is what separates `NoProject` from
 /// `NoPath` when the answer is `None`.
+///
+/// A native conversation that works an agent board card works in the card's
+/// worktree, not in the project it was made from: that is what keeps agents
+/// running at once out of each other's files. A card whose worktree a person
+/// removed is an error rather than the project's path — there is nowhere left
+/// for it to work, and falling back would set it loose in the main checkout.
+/// (A hosted card needs nothing here: its session was opened in the worktree,
+/// so `acp_sessions.cwd` already says so.)
 pub async fn configured_dir_in(db: &impl Snapshot, conversation_id: &str) -> Result<(Option<PathBuf>, bool), String> {
     let conv = sea_ops::conversation::get_conversation(db, conversation_id)
         .await
@@ -72,6 +80,19 @@ pub async fn configured_dir_in(db: &impl Snapshot, conversation_id: &str) -> Res
             .map_err(|e| e.to_string())?
             .map(|row| PathBuf::from(row.cwd));
         return Ok((cwd, false));
+    }
+
+    if let Some(card) = sea_ops::board_task::for_conversation(db, conversation_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return match card.worktree_path {
+            Some(worktree) => Ok((Some(PathBuf::from(worktree)), true)),
+            None => Err(format!(
+                "this conversation works board card \"{}\", whose worktree was removed; it has nowhere to work",
+                card.title
+            )),
+        };
     }
 
     match conv.project_id.as_deref() {
@@ -200,5 +221,44 @@ mod tests {
             Some(PathBuf::from(dir.path()))
         );
         assert!(resolve_workspace_dir(&db, "nope").await.is_err());
+    }
+
+    /// A conversation working a board card answers from the card's worktree,
+    /// not the project — and once a person removed the worktree, refuses
+    /// rather than falling back to the main checkout.
+    #[tokio::test]
+    async fn a_board_card_works_in_its_worktree_and_nowhere_once_removed() {
+        let db = sea_test_db().await;
+        let project = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_string_lossy().replace('\'', "''");
+        let worktree_path = worktree.path().to_string_lossy().replace('\'', "''");
+        execute_for_tests(
+            &db,
+            &format!(
+                "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES ('p', 'P', '{project_path}', 1, 1);
+                 INSERT INTO conversations (id, project_id, created_at, updated_at) VALUES
+                     ('card', 'p', 1, 1), ('plain', 'p', 1, 1), ('removed', 'p', 1, 1);
+                 INSERT INTO board_tasks (id, project_id, conversation_id, source, title, stage, position,
+                                          agent_kind, worktree_path, created_at, updated_at, worktree_removed_at)
+                 VALUES ('t1', 'p', 'card', 'local', 'fix', 'running', 0, 'native', '{worktree_path}', 1, 1, NULL),
+                        ('t2', 'p', 'removed', 'local', 'old', 'done', 0, 'native', NULL, 1, 1, 5)"
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resolve_workspace_dir(&db, "card").await.unwrap(),
+            Some(PathBuf::from(worktree.path()))
+        );
+        assert_eq!(
+            resolve_workspace_dir(&db, "plain").await.unwrap(),
+            Some(PathBuf::from(project.path())),
+            "a conversation that is not a card keeps the project's directory"
+        );
+        let refused = resolve_workspace_dir(&db, "removed").await.unwrap_err();
+        assert!(refused.contains("worktree was removed"), "{refused}");
+        assert!(resolve_workspace_root(&db, "removed").await.is_err());
     }
 }

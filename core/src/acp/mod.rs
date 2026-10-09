@@ -355,6 +355,41 @@ async fn remember_session(services: &crate::services::Services, session: &AcpSes
 /// row in the sidebar that can never be opened, and the usual reason for
 /// failure — the command is not installed — is one every attempt would repeat.
 pub async fn open_session(services: &crate::services::Services, cwd: &str) -> Result<String, String> {
+    open_session_as(
+        services,
+        SessionOpening {
+            cwd,
+            project: ProjectChoice::ByPath,
+            title: None,
+        },
+    )
+    .await
+}
+
+/// Which project a new hosted conversation is filed under.
+pub enum ProjectChoice<'a> {
+    /// The project whose path is the session's directory, if there is one.
+    ByPath,
+    /// This one, or none — for a session opened somewhere that is not a
+    /// project's own path but belongs to one: an agent board card's worktree.
+    Explicit(Option<&'a str>),
+}
+
+/// What a new hosted conversation is opened with.
+pub struct SessionOpening<'a> {
+    pub cwd: &'a str,
+    pub project: ProjectChoice<'a>,
+    /// The conversation's title; `None` names it after the directory.
+    pub title: Option<&'a str>,
+}
+
+/// `open_session` with the project and the title said rather than derived
+/// from the directory.
+pub async fn open_session_as(
+    services: &crate::services::Services,
+    opening: SessionOpening<'_>,
+) -> Result<String, String> {
+    let SessionOpening { cwd, project, title } = opening;
     let config = AcpConfig::load(&services.db).await?;
     let conversation_id = uuid::Uuid::new_v4().to_string();
 
@@ -368,10 +403,13 @@ pub async fn open_session(services: &crate::services::Services, cwd: &str) -> Re
     // pool-read-before-write: the directory's project is decided before the
     // adapter starts, which takes seconds and holds no lock; the row written
     // after it files the conversation under what was decided here.
-    let project_id = crate::db::sea::ops::project::find_project_by_path(&services.db, cwd)
-        .await
-        .map_err(|e| e.to_string())?
-        .map(|p| p.id);
+    let project_id = match project {
+        ProjectChoice::ByPath => crate::db::sea::ops::project::find_project_by_path(&services.db, cwd)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|p| p.id),
+        ProjectChoice::Explicit(id) => id.map(str::to_owned),
+    };
 
     let session = AcpSession::open(
         services.clone(),
@@ -386,7 +424,7 @@ pub async fn open_session(services: &crate::services::Services, cwd: &str) -> Re
     // strand it: nothing holds a handle, nothing can close it, and the adapter
     // outlives the app's interest in it. Close it by hand — this is the one
     // window where the registry cannot do it for us.
-    if let Err(e) = write_conversation_row(services, &conversation_id, cwd, project_id.as_deref()).await {
+    if let Err(e) = write_conversation_row(services, &conversation_id, cwd, project_id.as_deref(), title).await {
         session.close().await;
         return Err(e);
     }
@@ -480,9 +518,10 @@ async fn write_conversation_row(
     conversation_id: &str,
     cwd: &str,
     project_id: Option<&str>,
+    title: Option<&str>,
 ) -> Result<(), String> {
     let now = crate::util::now_ms();
-    let title = title_for(cwd);
+    let title = title.map_or_else(|| title_for(cwd), str::to_owned);
     services
         .db
         .write(async |tx| {
@@ -637,6 +676,55 @@ mod tests {
     /// The directory a session is about is the useful half of its name, and it
     /// has to survive both separators — a Windows path reaches this with
     /// backslashes and a trailing one is ordinary.
+    /// A session opened in a board card's worktree is filed under the card's
+    /// project and carries the card's title; its directory names neither — a
+    /// worktree path is no project's path, and its leaf is a short id.
+    #[tokio::test]
+    async fn a_said_project_and_title_reach_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::services::bare_services(dir.path()).await;
+        crate::db::sea::execute_for_tests(
+            &services.db,
+            "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES ('p', 'repo', '/r', 1, 1)",
+        )
+        .await
+        .unwrap();
+
+        write_conversation_row(
+            &services,
+            "said",
+            "/r.worktrees/a1b2c3d4",
+            Some("p"),
+            Some("fix the login loop"),
+        )
+        .await
+        .unwrap();
+        write_conversation_row(&services, "derived", "/r", None, None)
+            .await
+            .unwrap();
+
+        let said = crate::db::sea::ops::conversation::get_conversation(&services.db, "said")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (said.project_id.as_deref(), said.title.as_deref()),
+            (Some("p"), Some("fix the login loop"))
+        );
+        let cwd = crate::db::sea::ops::acp_session::get(&services.db, "said")
+            .await
+            .unwrap()
+            .unwrap()
+            .cwd;
+        assert_eq!(cwd, "/r.worktrees/a1b2c3d4", "the session works where it was opened");
+
+        let derived = crate::db::sea::ops::conversation::get_conversation(&services.db, "derived")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(derived.title.as_deref(), Some("Claude Code · r"));
+    }
+
     #[test]
     fn a_title_names_the_directory() {
         assert_eq!(title_for(r"C:\Users\me\Code\meridian"), "Claude Code · meridian");
