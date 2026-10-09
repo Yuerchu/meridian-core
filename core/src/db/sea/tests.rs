@@ -13,7 +13,9 @@ fn raw(sql: &str) -> Statement {
 
 #[test]
 fn every_migration_directory_is_embedded() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations")
+        .join("legacy");
     let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())

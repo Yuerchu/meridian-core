@@ -1142,7 +1142,7 @@ async fn acp_billing_migration_follows_origin_not_display_or_provider_shape() {
     .await;
     exec(
         &conn,
-        include_str!("../../../migrations/00000000000043_acp_external_billing/up.sql"),
+        include_str!("../../../migrations/legacy/00000000000043_acp_external_billing/up.sql"),
     )
     .await;
 
@@ -1162,7 +1162,7 @@ async fn acp_billing_migration_follows_origin_not_display_or_provider_shape() {
 
     exec(
         &conn,
-        include_str!("../../../migrations/00000000000043_acp_external_billing/down.sql"),
+        include_str!("../../../migrations/legacy/00000000000043_acp_external_billing/down.sql"),
     )
     .await;
     let hosted: String = one(
