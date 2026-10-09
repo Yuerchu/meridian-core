@@ -336,7 +336,7 @@ pub(super) async fn oneshot_completion(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
-    let sea = &state.services.sea;
+    let sea = &state.services.db;
     let assistant = sea
         .read(async |tx| {
             let Some(conv) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? else {
@@ -456,7 +456,7 @@ pub(super) async fn oneshot_completion(
         // cost is written under.
         let written = state
             .services
-            .sea
+            .db
             .write(async |tx| {
                 let head = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
                     .await?
@@ -595,7 +595,7 @@ async fn headless_chat_inner(
     // is no longer an error on that path, only on the one that acts on it.
     let _sleep_guard = match services {
         Some(s) => {
-            let stored = crate::db::sea::ops::preference::get_preference(&s.sea, "sleep_inhibitor.enabled")
+            let stored = crate::db::sea::ops::preference::get_preference(&s.db, "sleep_inhibitor.enabled")
                 .await
                 .map_err(|error| error.to_string())?;
             let enabled = crate::db::sea::ops::preference::parse_bool_preference(
@@ -900,7 +900,7 @@ async fn headless_chat_inner(
     let data_dir = services.map(|s| s.paths.data_dir.as_path());
     crate::agent::resolve_sticker_parts_in_messages(
         &mut chat_messages,
-        services.map(|s| &s.sea),
+        services.map(|s| &s.db),
         data_dir,
         supports_images,
     )
@@ -999,7 +999,7 @@ async fn headless_chat_inner(
         conversation_id: Some(conversation_id.to_string()),
         turn_id: Some(turn_id.to_string()),
         assistant_id: assistant_id.map(|s| s.to_string()),
-        sea: Some(sea.clone()),
+        db: Some(sea.clone()),
         // No journal: the empty root set above refuses every file write at the
         // validation layer, so there is nothing a journal here could ever
         // record — wiring one would be dead code asserting otherwise.
@@ -1121,7 +1121,7 @@ async fn headless_chat_inner(
             // rather than only in the setup above.
             files_root,
             stickers: services.map(|s| engine::StickerRendering {
-                db: s.sea.clone(),
+                db: s.db.clone(),
                 data_dir: s.paths.data_dir.clone(),
                 supports_images,
             }),

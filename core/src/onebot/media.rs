@@ -199,7 +199,7 @@ async fn resolve_supports_images(
     conversation_id: &str,
     model_override: Option<&str>,
 ) -> bool {
-    let sea = &state.services.sea;
+    let sea = &state.services.db;
     let read = sea
         .read(async |tx| {
             let effective_aid = match state.config.assistant_id.clone() {

@@ -164,7 +164,7 @@ async fn capture_one(
         return Ok(());
     }
 
-    let key_bytes = voice_corpus::storage_key(&state.services.sea).await?;
+    let key_bytes = voice_corpus::storage_key(&state.services.db).await?;
     let pseudonym = voice_corpus::session_pseudonym(
         &key_bytes,
         source.scope.bot_self_id,
@@ -184,7 +184,7 @@ async fn capture_one(
             tokio::time::sleep(CLAIM_BACKOFF).await;
         }
         let input = CommitInput {
-            sea: state.services.sea.clone(),
+            sea: state.services.db.clone(),
             auth: permit.authorisation(),
             permit: Arc::clone(permit),
             source: source.clone(),

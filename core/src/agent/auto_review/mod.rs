@@ -233,7 +233,7 @@ impl<'a> AutoReviewed<'a> {
         // The settings and the roster at one instant.
         let read = context
             .services
-            .sea
+            .db
             .read(async |tx| {
                 let settings = match Settings::read_in(tx).await {
                     Ok(settings) => settings,
@@ -322,7 +322,7 @@ impl Active {
         let history = self
             .context
             .services
-            .sea
+            .db
             .read(async |tx| {
                 let Some(conversation) = sea_ops::conversation::get_conversation(tx, id).await? else {
                     return Ok(Err(format!(
@@ -370,7 +370,7 @@ impl Active {
         let services = &self.context.services;
         let resolved = crate::agent::resolve_with_overrides(
             &services.secrets,
-            &services.sea,
+            &services.db,
             None,
             Some(model_id.to_string()),
             Some(provider_id),
@@ -378,7 +378,7 @@ impl Active {
         .await?;
 
         let params = crate::agent::resolve_turn_params(
-            &services.sea,
+            &services.db,
             crate::agent::TurnParamsResolveRequest {
                 assistant: None,
                 provider_id: Some(&resolved.provider_id),
@@ -482,7 +482,7 @@ impl Active {
         let written = self
             .context
             .services
-            .sea
+            .db
             .write(async |tx| {
                 if let Err(e) = tx
                     .nested(async |tx| {

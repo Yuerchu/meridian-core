@@ -85,7 +85,7 @@ pub async fn pump(services: &Services, conversation_id: &str) {
 /// unacknowledged delivery states.
 pub async fn has_plan_review_barrier(services: &Services, conversation_id: &str) -> Result<bool, String> {
     services
-        .sea
+        .db
         .read(async |tx| crate::db::sea::ops::plan_review::has_conversation_barrier(tx, conversation_id).await)
         .await
         .map_err(|error: DbErr| error.to_string())
@@ -100,7 +100,7 @@ async fn is_hosted(services: &Services, conversation_id: &str) -> bool {
     // short way, a busy pool or a transient query error read exactly like an
     // ordinary conversation — and the recovery from a transient error is a
     // Claude Code queue answered by the user's own provider.
-    match crate::db::sea::ops::conversation::get_conversation(&services.sea, conversation_id).await {
+    match crate::db::sea::ops::conversation::get_conversation(&services.db, conversation_id).await {
         Ok(Some(conversation)) => conversation.agent_kind.as_deref() == Some(crate::acp::AGENT_KIND),
         // Nothing was learned, and the two answers are not symmetrical:
         // `hosted::pump` with no session does nothing and the queue waits,
@@ -153,7 +153,7 @@ pub async fn after_turn(services: &Services, conversation_id: &str, status: Opti
 /// back is cheaper than threading the answer out through every early return of
 /// a function that has a dozen.
 pub async fn after_recorded_turn(services: &Services, conversation_id: &str, turn_id: &str) -> Result<(), String> {
-    let status = crate::db::sea::ops::turn::get(&services.sea, turn_id)
+    let status = crate::db::sea::ops::turn::get(&services.db, turn_id)
         .await
         .map_err(|error| error.to_string())?
         .map(|row| row.status);
@@ -168,7 +168,7 @@ pub async fn after_recorded_turn(services: &Services, conversation_id: &str, tur
 /// failed step broke.
 pub async fn hold(services: &Services, conversation_id: &str) {
     let held = services
-        .sea
+        .db
         .write(async |tx| queue_ops::hold_all(tx, conversation_id, now_ms()).await)
         .await;
 
@@ -248,7 +248,7 @@ impl Doubtful {
 ///
 /// Reading this settles nothing — see [`confirm_reported`].
 pub async fn owed(services: &Services, conversation_id: &str) -> Option<Doubtful> {
-    let items = queue_ops::unreported_in_doubt(&services.sea, conversation_id)
+    let items = queue_ops::unreported_in_doubt(&services.db, conversation_id)
         .await
         .ok()?;
 
@@ -271,7 +271,7 @@ pub async fn owed(services: &Services, conversation_id: &str) -> Option<Doubtful
 /// failed write, and that is the direction to fail in.
 pub async fn confirm_reported(services: &Services, report: Doubtful) {
     let written = services
-        .sea
+        .db
         .write(async |tx| queue_ops::mark_reported(tx, &report.ids, now_ms()).await)
         .await;
     if let Err(e) = written {
@@ -360,9 +360,9 @@ fn spoken(content: &str) -> String {
 /// has nothing to refer to.
 async fn read(services: &Services, conversation_id: &str, steerable: bool) -> Option<queued_prompt::Model> {
     let found = if steerable {
-        queue_ops::next_deliverable(&services.sea, conversation_id, Delivery::Interject).await
+        queue_ops::next_deliverable(&services.db, conversation_id, Delivery::Interject).await
     } else {
-        queue_ops::next_pending(&services.sea, conversation_id).await
+        queue_ops::next_pending(&services.db, conversation_id).await
     };
 
     match found {
@@ -415,7 +415,7 @@ mod tests {
         services.turn_starter.set(starter.clone()).ok().unwrap();
         let task = async |id: &str, state: BackgroundState| {
             services
-                .sea
+                .db
                 .write(async |tx| {
                     tasks::insert(
                         tx,
@@ -454,7 +454,7 @@ mod tests {
         // A conversation with one follow-up queued and the queue held, as a
         // failed turn leaves it.
         crate::db::sea::execute_for_tests(
-            &services.sea,
+            &services.db,
             "INSERT INTO conversations (id, title, is_pinned, is_archived, message_count, created_at, updated_at, fast_mode)
              VALUES ('c1', 't', 0, 0, 0, 1, 1, 0);
              INSERT INTO queued_prompts (id, conversation_id, content, delivery, position, created_at, held_at)
@@ -494,7 +494,7 @@ mod tests {
         {
             use crate::db::sea::ops::plan_review as review_ops;
             services
-                .sea
+                .db
                 .write(async |tx| {
                     crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
                     let document = review_ops::create_or_resume_document(tx, "c1", 2).await?;
@@ -535,7 +535,7 @@ mod tests {
                 .unwrap();
         }
         services
-            .sea
+            .db
             .write(async |tx| queue_ops::enqueue(tx, "q1", "c1", "bypass the review", Delivery::FollowUp, 7).await)
             .await
             .unwrap();
@@ -547,12 +547,12 @@ mod tests {
         pump(&services, "c1").await;
 
         assert_eq!(starter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let queued = queue_ops::list(&services.sea, "c1").await.unwrap();
+        let queued = queue_ops::list(&services.db, "c1").await.unwrap();
         assert_eq!(queued[0].settled_at, None, "the prompt remains durable and undelivered");
         assert_eq!(queued[0].state(), crate::db::models::queue::QueueState::Queued);
 
         after_recorded_turn(&services, "c1", "t1").await.unwrap();
-        let queued = queue_ops::list(&services.sea, "c1").await.unwrap();
+        let queued = queue_ops::list(&services.db, "c1").await.unwrap();
         assert_eq!(
             queued[0].state(),
             crate::db::models::queue::QueueState::Queued,
@@ -562,7 +562,7 @@ mod tests {
         {
             use crate::db::sea::ops::plan_review as review_ops;
             services
-                .sea
+                .db
                 .write(async |tx| {
                     let review = review_ops::get_pending_review_for_conversation(tx, "c1")
                         .await?
@@ -606,20 +606,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let services = crate::services::bare_services(dir.path()).await;
         services
-            .sea
+            .db
             .write(async |tx| {
                 crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await
             })
             .await
             .unwrap();
         services
-            .sea
+            .db
             .write(async |tx| queue_ops::enqueue(tx, "q1", "c1", "after review", Delivery::FollowUp, 2).await)
             .await
             .unwrap();
 
         after_turn(&services, "c1", Some(TurnStatus::WaitingReview)).await;
-        let queued = queue_ops::list(&services.sea, "c1").await.unwrap();
+        let queued = queue_ops::list(&services.db, "c1").await.unwrap();
         assert_eq!(queued[0].state(), crate::db::models::queue::QueueState::Queued);
     }
 
@@ -805,7 +805,7 @@ mod hosted {
         // be one step, and unlike `write_prompt_row` and `run_turn` this claim
         // is not already inside one.
         let claimed = services
-            .sea
+            .db
             .write(async |tx| {
                 queue_ops::mark_dispatched(
                     tx,
@@ -841,7 +841,7 @@ mod hosted {
             // delivery rather than the absence of it — so the item goes back.
             Ok(SteerOutcome::PromptRequired) => {
                 let _ = services
-                    .sea
+                    .db
                     .write(async |tx| queue_ops::undispatch(tx, &item.id).await)
                     .await;
                 Steered::NotTaken
@@ -857,7 +857,7 @@ mod hosted {
                     );
                 }
                 let _ = services
-                    .sea
+                    .db
                     .write(async |tx| queue_ops::mark_settled(tx, &item.id, None, now_ms()).await)
                     .await;
                 announce(services, &session.conversation_id);

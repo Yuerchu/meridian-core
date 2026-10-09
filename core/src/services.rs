@@ -45,7 +45,7 @@ pub struct ServicesInner {
     /// The same database through SeaORM, open beside the Diesel pool while
     /// modules move over one transaction root at a time. Nothing reaches the
     /// database through it yet.
-    pub sea: Db,
+    pub db: Db,
     pub secrets: Arc<SecretsManager>,
     pub tools: Arc<tools::ToolRegistry>,
     /// No outer mutex: the registry locks internally and never across I/O.
@@ -189,7 +189,7 @@ impl std::ops::Deref for Services {
 pub async fn bare_services(dir: &std::path::Path) -> Services {
     let sea = crate::db::sea::file_test_db(dir).await;
     Services::new(ServicesInner {
-        sea,
+        db: sea,
         secrets: Arc::new(crate::secrets::SecretsManager::new(dir.to_path_buf())),
         tools: Arc::new(tools::ToolRegistry::new(
             dir.join("skills"),

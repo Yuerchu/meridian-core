@@ -244,7 +244,7 @@ impl Launcher {
         // The count and the insert it guards are one write: read outside it,
         // two starts could both see four running and both insert a fifth.
         let row = services
-            .sea
+            .db
             .write(async |tx| {
                 if ops::count_running(tx, &start.conversation_id).await? >= MAX_RUNNING {
                     return Ok::<_, sea_orm::DbErr>(None);
@@ -304,7 +304,7 @@ impl Launcher {
 
     /// Stop one of this conversation's tasks.
     pub async fn stop(&self, conversation_id: &str, id: &str, by: StoppedBy) -> Result<background_task::Model, String> {
-        let row = get_in(&self.0.sea, conversation_id, id).await?;
+        let row = get_in(&self.0.db, conversation_id, id).await?;
         if row.state != BackgroundState::Running {
             return Ok(row);
         }
@@ -317,7 +317,7 @@ impl Launcher {
         // so the answer can say how it ended rather than "stopping".
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let row = get_in(&self.0.sea, conversation_id, id).await?;
+            let row = get_in(&self.0.db, conversation_id, id).await?;
             if row.state != BackgroundState::Running || tokio::time::Instant::now() >= deadline {
                 return Ok(row);
             }
@@ -326,7 +326,7 @@ impl Launcher {
     }
 
     pub async fn list(&self, conversation_id: &str) -> Result<Vec<background_task::Model>, String> {
-        list(&self.0.sea, conversation_id).await
+        list(&self.0.db, conversation_id).await
     }
 
     /// Read a task's log from `offset`, waiting up to `wait` for something new
@@ -367,7 +367,7 @@ pub async fn read(
 ) -> Result<Output, String> {
     let max_bytes = max_bytes.clamp(1, READ_MAX);
     let wait = wait.min(WAIT_MAX);
-    let row = get_in(&services.sea, conversation_id, id).await?;
+    let row = get_in(&services.db, conversation_id, id).await?;
     let path = row
         .output_path
         .clone()
@@ -388,7 +388,7 @@ pub async fn read(
 
     // Read the row again: the task may have ended while this waited, and
     // what it says has to match the bytes handed back.
-    let row = get_in(&services.sea, conversation_id, id).await?;
+    let row = get_in(&services.db, conversation_id, id).await?;
     let (text, total) = tokio::task::spawn_blocking(move || read_slice(Path::new(&path), offset, max_bytes))
         .await
         .map_err(|e| e.to_string())??;
@@ -491,7 +491,7 @@ async fn run(
 
     let told = stopped == Some(StoppedBy::Model);
     let written_db = services
-        .sea
+        .db
         .write(async |tx| {
             let changed = ops::finish(
                 tx,
@@ -784,7 +784,7 @@ mod tests {
     /// A conversation row, written the way the SeaORM tests write theirs.
     async fn conversation(services: &Services, id: &str) {
         crate::db::sea::execute_for_tests(
-            &services.sea,
+            &services.db,
             &format!(
                 "INSERT INTO conversations (id, title, is_pinned, is_archived, message_count, created_at, updated_at, fast_mode)
                  VALUES ('{id}', 't', 0, 0, 0, 0, 0, 0)"
@@ -815,7 +815,7 @@ mod tests {
 
     async fn ended(launcher: &Launcher, id: &str) -> background_task::Model {
         for _ in 0..400 {
-            let row = get_in(&launcher.0.sea, "c1", id).await.unwrap();
+            let row = get_in(&launcher.0.db, "c1", id).await.unwrap();
             if row.state != BackgroundState::Running {
                 return row;
             }
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(row.output_bytes as usize, log.len());
         assert!(services.background_tasks.lock().is_empty(), "no longer registered");
         assert!(
-            has_wake(&services.sea, "c1").await,
+            has_wake(&services.db, "c1").await,
             "a completion this process saw is worth a turn"
         );
     }
@@ -863,7 +863,7 @@ mod tests {
             .unwrap();
         ended(&launcher, &row.id).await;
 
-        let notices = claim(&services.sea, "c1", "t2").await.unwrap();
+        let notices = claim(&services.db, "c1", "t2").await.unwrap();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].task_id, row.id);
         assert!(notices[0].text.contains("status: completed"), "{}", notices[0].text);
@@ -873,7 +873,7 @@ mod tests {
             notices[0].text
         );
 
-        let stored = crate::db::sea::ops::message::get_message(&services.sea, &notices[0].message_id)
+        let stored = crate::db::sea::ops::message::get_message(&services.db, &notices[0].message_id)
             .await
             .unwrap()
             .expect("the notice row exists");
@@ -881,8 +881,8 @@ mod tests {
         assert_eq!(stored.source.as_deref(), Some(NOTICE_SOURCE));
         assert_eq!(stored.turn_id.as_deref(), Some("t2"));
 
-        assert!(claim(&services.sea, "c1", "t3").await.unwrap().is_empty(), "paid once");
-        assert!(!has_wake(&services.sea, "c1").await);
+        assert!(claim(&services.db, "c1", "t3").await.unwrap().is_empty(), "paid once");
+        assert!(!has_wake(&services.db, "c1").await);
     }
 
     /// The model stopping its own task needs no notice about it; a person
@@ -907,7 +907,7 @@ mod tests {
         assert_eq!(row.state, BackgroundState::Stopped);
         assert_eq!(row.ended_reason.as_deref(), Some("stopped by the user"));
         assert!(row.notified_at.is_none(), "owed to the next turn");
-        assert!(!has_wake(&services.sea, "c1").await, "but nobody asked for a turn");
+        assert!(!has_wake(&services.db, "c1").await, "but nobody asked for a turn");
     }
 
     /// Another conversation's task does not exist from here — not to read, not
@@ -972,7 +972,7 @@ mod tests {
         }
         let refused = launcher.start(start(long, dir.path())).await.unwrap_err();
         assert!(refused.contains("already has 5"), "{refused}");
-        assert_eq!(list(&services.sea, "c1").await.unwrap().len(), MAX_RUNNING as usize);
+        assert_eq!(list(&services.db, "c1").await.unwrap().len(), MAX_RUNNING as usize);
         assert_eq!(services.background_tasks.stop_conversation("c1"), MAX_RUNNING as usize);
         for id in &ids {
             assert_eq!(ended(&launcher, id).await.state, BackgroundState::Stopped);
@@ -991,7 +991,7 @@ mod tests {
             ..Default::default()
         });
         assert!(launcher.start(request).await.is_err());
-        assert!(list(&services.sea, "c1").await.unwrap().is_empty());
+        assert!(list(&services.db, "c1").await.unwrap().is_empty());
     }
 
     /// Past the cap nothing more is written, and the log says it was cut.

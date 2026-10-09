@@ -152,7 +152,7 @@ pub(crate) async fn run(state: Arc<SharedState>, job: ReviewJob) -> Result<Revie
     let assistant = effective_assistant(state, &model, &cwd, &job).await?;
     let params = resolve_params(state, &assistant).await?;
 
-    let (conversation_id, is_new) = open_or_reuse(&state.services.sea, &job).await;
+    let (conversation_id, is_new) = open_or_reuse(&state.services.db, &job).await;
     let turn_id = uuid::Uuid::new_v4().to_string();
     let cancel = CancellationToken::new();
 
@@ -167,16 +167,9 @@ pub(crate) async fn run(state: Arc<SharedState>, job: ReviewJob) -> Result<Revie
     // Nothing to undo on failure: the id was never handed out, so the client
     // still holds whatever it held before and the next round validates it the
     // same way. A half-written conversation is caught by the transaction.
-    let user_message_id = write_round(
-        &state.services.sea,
-        &conversation_id,
-        &turn_id,
-        &job,
-        &assistant,
-        is_new,
-    )
-    .await
-    .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let user_message_id = write_round(&state.services.db, &conversation_id, &turn_id, &job, &assistant, is_new)
+        .await
+        .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Before the model is called, not after: the subject is already written, and
     // a review that runs for minutes should be openable from the moment it
@@ -201,7 +194,7 @@ pub(crate) async fn run(state: Arc<SharedState>, job: ReviewJob) -> Result<Revie
         (Ok(_), true) => (TurnStatus::Cancelled, None),
         (Ok(_), false) => (TurnStatus::Done, None),
     };
-    turn_record::finish(&state.services.sea, &turn_id, status, error.as_deref()).await;
+    turn_record::finish(&state.services.db, &turn_id, status, error.as_deref()).await;
     stopped(state, &conversation_id, &turn_id, &outcome);
     announce(state, &conversation_id);
 
@@ -262,7 +255,7 @@ async fn effective_assistant(
         )
     })?;
 
-    let sea = &state.services.sea;
+    let sea = &state.services.db;
     let base = match state.config.assistant_id.as_deref() {
         Some(id) => sea_ops::assistant::get_assistant(sea, id)
             .await
@@ -303,20 +296,15 @@ async fn resolve_params(
     state: &SharedState,
     assistant: &assistant::Model,
 ) -> Result<crate::agent::TurnParams, Refused> {
-    let resolved = crate::agent::resolve_with_overrides(
-        &state.services.secrets,
-        &state.services.sea,
-        Some(assistant),
-        None,
-        None,
-    )
-    .await
-    .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let resolved =
+        crate::agent::resolve_with_overrides(&state.services.secrets, &state.services.db, Some(assistant), None, None)
+            .await
+            .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
 
     // A missing `model_configs` row is an error rather than a fallback: this
     // project's rule is that turn parameters are configured, never invented.
     let mut params = crate::agent::resolve_turn_params(
-        &state.services.sea,
+        &state.services.db,
         crate::agent::TurnParamsResolveRequest {
             assistant: Some(assistant),
             provider_id: assistant.provider_id.as_deref(),
@@ -557,7 +545,7 @@ async fn run_turn(
     );
     budget.update_estimate(&chat_messages);
 
-    let tool_secrets = crate::agent::build_tool_secrets(&state.services.secrets, &state.services.sea).await;
+    let tool_secrets = crate::agent::build_tool_secrets(&state.services.secrets, &state.services.db).await;
 
     let tool_context = ToolContext {
         // The one field the whole review depends on. See the module header.
@@ -568,7 +556,7 @@ async fn run_turn(
         conversation_id: Some(conversation_id.to_string()),
         turn_id: Some(turn_id.to_string()),
         assistant_id: Some(assistant.id.clone()),
-        sea: Some(state.services.sea.clone()),
+        db: Some(state.services.db.clone()),
         #[cfg(not(target_os = "android"))]
         sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
         #[cfg(not(target_os = "android"))]
@@ -625,7 +613,7 @@ async fn run_turn(
     };
 
     let services = engine::TurnServices {
-        db: &state.services.sea,
+        db: &state.services.db,
         tools: &state.services.tools,
         mcp: &state.services.mcp,
         redaction: &state.services.redaction,
@@ -649,7 +637,7 @@ async fn run_turn(
 async fn load_history(state: &SharedState, conversation_id: &str) -> sea_ops::message::ActiveContext {
     state
         .services
-        .sea
+        .db
         .read(async |tx| {
             let Some(conversation) = sea_ops::conversation::get_conversation(tx, conversation_id).await? else {
                 return Ok(None);
@@ -696,21 +684,16 @@ async fn build_config(
         // No shell either — see `hook-gates.md`.
         command_shell: None,
     };
-    crate::agent::turn_config::resolve_on(&state.services.sea, &state.services.tools, input).await
+    crate::agent::turn_config::resolve_on(&state.services.db, &state.services.tools, input).await
 }
 
 async fn build_provider(
     state: &SharedState,
     assistant: &assistant::Model,
 ) -> Result<(Box<dyn crate::provider::ChatProvider>, crate::agent::ResolvedProvider), String> {
-    let resolved = crate::agent::resolve_with_overrides(
-        &state.services.secrets,
-        &state.services.sea,
-        Some(assistant),
-        None,
-        None,
-    )
-    .await?;
+    let resolved =
+        crate::agent::resolve_with_overrides(&state.services.secrets, &state.services.db, Some(assistant), None, None)
+            .await?;
     let provider = crate::provider::registry::create_provider(resolved.wire())?;
     Ok((provider, resolved))
 }

@@ -1247,7 +1247,7 @@ pub async fn refresh_voice_policy(services: &Services, config: &OneBotConfig) ->
     // **读不到就报错，不能当作空名单。** 这张表通常是空的，所以"查询失败"和
     // "没人拒绝过"在结果上长得一模一样——而把失败读成后者，等于让一次瞬时的
     // 数据库错误重新开始录一个已经明确说过不要的人。
-    let optouts = crate::db::sea::ops::voice_corpus::optouts(&services.sea)
+    let optouts = crate::db::sea::ops::voice_corpus::optouts(&services.db)
         .await
         .map_err(|e| e.to_string())?;
     // keyring 是阻塞 IO，留在 blocking 线程上。
@@ -1348,7 +1348,7 @@ impl OneBotServer {
         let (conn_closed, _) = watch::channel(0);
         Self {
             state: Arc::new(SharedState {
-                sessions: Mutex::new(SessionManager::new(services.sea.clone())),
+                sessions: Mutex::new(SessionManager::new(services.db.clone())),
                 pending_approvals: Arc::new(PendingApprovals::default()),
                 pending_api_responses: std::sync::Mutex::new(HashMap::new()),
                 pending_requests: Mutex::new(HashMap::new()),
@@ -1432,8 +1432,8 @@ impl OneBotServer {
                 let recovered = if !writable {
                     Ok(crate::voice_corpus::recover::Recovered::default())
                 } else {
-                    match crate::voice_corpus::storage_key(&services.sea).await {
-                        Ok(key) => crate::voice_corpus::recover::run(&services.sea, &key, &data_dir, writable).await,
+                    match crate::voice_corpus::storage_key(&services.db).await {
+                        Ok(key) => crate::voice_corpus::recover::run(&services.db, &key, &data_dir, writable).await,
                         Err(error) => Err(error),
                     }
                 };

@@ -103,7 +103,7 @@ pub(super) async fn submit(
     assistant_message_id: &str,
     submission: ExitPlanSubmission,
 ) -> Result<SubmittedReview, String> {
-    let db = &services.sea;
+    let db = &services.db;
     let not_twice = async |tx: &crate::db::sea::cap::WriteTx| -> Result<(), ops::PlanReviewStoreError> {
         if ops::get_pending_review_for_conversation(tx, conversation_id)
             .await?
@@ -587,7 +587,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let services = bare_services(dir.path()).await;
         services
-            .sea
+            .db
             .write(async |tx| {
                 crate::db::sea::ops::conversation::create_conversation(
                     tx,
@@ -618,7 +618,7 @@ mod tests {
         .unwrap();
 
         let bundle = services
-            .sea
+            .db
             .read(async |tx| ops::get_review_bundle(tx, &submitted.event.review_id).await)
             .await
             .unwrap();
@@ -628,12 +628,12 @@ mod tests {
         assert_eq!(bundle.submitted_revision.content_markdown, "# Plan\n\n- one\n");
         let snapshot = services
             .plan_files
-            .read_document(&services.sea, &bundle.document.id)
+            .read_document(&services.db, &bundle.document.id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.content, bundle.submitted_revision.content_markdown);
-        let turn = crate::db::sea::ops::turn::get(&services.sea, "turn-1")
+        let turn = crate::db::sea::ops::turn::get(&services.db, "turn-1")
             .await
             .unwrap()
             .unwrap();
@@ -647,7 +647,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let services = bare_services(dir.path()).await;
         services
-            .sea
+            .db
             .write(async |tx| {
                 crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("plan"), None, None, 1).await?;
                 crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::ClaudeCode, None, 2).await?;
@@ -685,8 +685,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("already has a plan awaiting review"), "{error}");
-        let document = ops::get_active_document(&services.sea, "c1").await.unwrap().unwrap();
-        assert_eq!(ops::list_revisions(&services.sea, &document.id).await.unwrap().len(), 1);
+        let document = ops::get_active_document(&services.db, "c1").await.unwrap().unwrap();
+        assert_eq!(ops::list_revisions(&services.db, &document.id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

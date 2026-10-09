@@ -37,7 +37,7 @@ pub fn alert_key(provider_id: &str) -> String {
 ///
 /// Returns one outcome per provider it was able to consider, keyed by id.
 pub async fn check_all(services: &Services, threshold: &Decimal) -> Vec<(String, BalanceOutcome)> {
-    let providers = match crate::db::sea::ops::provider::list_providers(&services.sea).await {
+    let providers = match crate::db::sea::ops::provider::list_providers(&services.db).await {
         Ok(providers) => providers,
         Err(error) => {
             tracing::warn!(%error, "could not list providers for the balance check");

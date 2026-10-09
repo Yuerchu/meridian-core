@@ -273,7 +273,7 @@ pub async fn bootstrap_with_secrets(
     }
 
     Ok(Services::new(ServicesInner {
-        sea,
+        db: sea,
         secrets: mgr,
         tools: Arc::new(registry),
         mcp: mcp::McpRegistry::new(),
@@ -555,7 +555,7 @@ pub(crate) async fn startup_recovery(sea: &db::sea::cap::Db, plan_files: &crate:
 /// idempotence is what stops this and a hand-clicked Connect from starting two
 /// processes for one server.
 pub async fn reconnect_mcp(services: Services) {
-    let servers = match db::sea::ops::mcp_server::list_enabled_mcp_servers(&services.sea).await {
+    let servers = match db::sea::ops::mcp_server::list_enabled_mcp_servers(&services.db).await {
         Ok(servers) => servers,
         // A row that does not decode fails the whole list, and with it every
         // auto-connect; said here, since nobody is looking at the settings
@@ -595,7 +595,7 @@ pub async fn reconnect_mcp(services: Services) {
 /// overtake the already queued follow-up.
 pub async fn resume_completed_plan_review_queues(services: Services) {
     let resumes = services
-        .sea
+        .db
         .read(async |tx| crate::db::sea::ops::plan_review::list_startup_queue_resumes(tx).await)
         .await;
     let resumes = match resumes {
@@ -626,7 +626,7 @@ pub async fn resume_completed_plan_review_queues(services: Services) {
             continue;
         }
         let cleared = services
-            .sea
+            .db
             .write(async |tx| {
                 crate::db::sea::ops::plan_review::finish_startup_queue_resume(tx, &delivery_id, now_ms()).await
             })
@@ -641,7 +641,7 @@ pub async fn resume_completed_plan_review_queues(services: Services) {
 }
 
 async fn next_pending_queue_id(services: &Services, conversation_id: &str) -> Result<Option<String>, String> {
-    crate::db::sea::ops::queue::next_pending(&services.sea, conversation_id)
+    crate::db::sea::ops::queue::next_pending(&services.db, conversation_id)
         .await
         .map(|row| row.map(|row| row.id))
         .map_err(|error| error.to_string())
@@ -711,10 +711,10 @@ mod tests {
             .await
             .unwrap();
 
-        let queued = crate::db::sea::ops::queue::list(&services.sea, "c1").await.unwrap();
+        let queued = crate::db::sea::ops::queue::list(&services.db, "c1").await.unwrap();
         assert_eq!(queued[0].state(), QueueState::Held);
         assert!(
-            crate::db::sea::ops::queue::next_pending(&services.sea, "c1")
+            crate::db::sea::ops::queue::next_pending(&services.db, "c1")
                 .await
                 .unwrap()
                 .is_none(),
@@ -752,11 +752,11 @@ mod tests {
         };
 
         let services = start().await;
-        let providers = crate::db::sea::ops::provider::list_providers(&services.sea)
+        let providers = crate::db::sea::ops::provider::list_providers(&services.db)
             .await
             .unwrap();
         assert_eq!(providers.len(), 1);
-        let assistant = crate::db::sea::ops::assistant::get_default_assistant(&services.sea)
+        let assistant = crate::db::sea::ops::assistant::get_default_assistant(&services.db)
             .await
             .unwrap()
             .unwrap();
@@ -770,7 +770,7 @@ mod tests {
 
         let again = start().await;
         assert_eq!(
-            crate::db::sea::ops::provider::list_providers(&again.sea)
+            crate::db::sea::ops::provider::list_providers(&again.db)
                 .await
                 .unwrap()
                 .len(),

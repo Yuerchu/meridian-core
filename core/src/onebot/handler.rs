@@ -381,7 +381,7 @@ async fn handle_text_message(
     // Before anything renders or stores it, and for the steered path as much as
     // the first: `IncomingMessage` carries this string either way.
     let user_content = if has_stickers {
-        match crate::agent::freeze_sticker_parts(&state.services.sea, &user_content).await {
+        match crate::agent::freeze_sticker_parts(&state.services.db, &user_content).await {
             Ok(frozen) => frozen,
             Err(e) => {
                 tracing::warn!(error = %e, "could not record what a message's stickers were; message not handled");
@@ -593,7 +593,7 @@ pub(super) async fn run_agent_turn(
         let scope_id = sender.scope_id();
         let touched = state
             .services
-            .sea
+            .db
             .write(async |tx| {
                 crate::db::sea::ops::memory::touch_subject(
                     tx,
@@ -678,7 +678,7 @@ pub(super) async fn run_agent_turn(
     // outside, so the duplicate case is unreachable here — but it is worth
     // hearing about if it ever stops being. Returning drops `running`, which
     // announces the end and hands both claims back.
-    if let Err(e) = running.open_record(&state.services.sea, self_id).await {
+    if let Err(e) = running.open_record(&state.services.db, self_id).await {
         tracing::error!(turn_id = %turn_id, error = %e, "OneBot turn id collided");
         return build_session_reply(session_key, "内部错误,请重试。", reply_to);
     }
@@ -709,7 +709,7 @@ pub(super) async fn run_agent_turn(
         );
 
         let outcome = agent::headless_chat(
-            &state.services.sea,
+            &state.services.db,
             &state.services.secrets,
             &state.services.tools,
             &state.services.mcp,
@@ -795,7 +795,7 @@ pub(super) async fn run_agent_turn(
                     | crate::events::ChatStopReason::MaxTurnRequests
                     | crate::events::ChatStopReason::Refusal => (TurnStatus::Done, None),
                 };
-                crate::agent::turn_record::finish(&state.services.sea, &turn_id, status, error).await;
+                crate::agent::turn_record::finish(&state.services.db, &turn_id, status, error).await;
                 return actions;
             }
             Some(items) => {
@@ -1014,7 +1014,7 @@ async fn run_extraction_pass(
         };
         state
             .services
-            .sea
+            .db
             .read(async |tx| {
                 Ok::<_, crate::db::sea::DbErr>(extract::existing_for_extraction(tx, &facts_ref, &subjects).await)
             })
@@ -1041,7 +1041,7 @@ async fn run_extraction_pass(
         }
     };
 
-    let proposals = match extract::run_extraction(&state.services.sea, &raw, facts).await {
+    let proposals = match extract::run_extraction(&state.services.db, &raw, facts).await {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!("memory extraction produced nothing usable: {e}");
@@ -1057,7 +1057,7 @@ async fn run_extraction_pass(
     // person. The notice goes to the operator privately, wherever it came from.
     let mut summaries = Vec::new();
     for id in &proposals {
-        if let Ok(Some(p)) = crate::db::sea::ops::memory::get_proposal(&state.services.sea, *id).await {
+        if let Ok(Some(p)) = crate::db::sea::ops::memory::get_proposal(&state.services.db, *id).await {
             summaries.push(format!("M{} {}: {}", p.id, p.key, p.content));
         }
     }
@@ -1113,7 +1113,7 @@ async fn dispatch_decision(
         command::DecisionTarget::MemoryProposal(id) => id,
     };
 
-    let db = &state.services.sea;
+    let db = &state.services.db;
     let outcome = match super::extract::is_known_proposal(db, id).await {
         None => format!("没有找到编号 M{id} 的提议。"),
         // The approval and the reject each check `pending` inside their own
@@ -1319,7 +1319,7 @@ async fn dispatch_memory(
     // write nothing (each says so where it reads); the forget arms act on ids
     // from an earlier listing, which is the contract of a numbered list, and the
     // soft delete skips rows already gone.
-    let db = &state.services.sea;
+    let db = &state.services.db;
     let now = crate::util::now_ms();
     // An operator's note or rule, as the two `add` commands write it.
     let note = |scope: MemoryScope, scope_id: &str, key: String, content: String, memory_type, visibility| {
@@ -1871,7 +1871,7 @@ async fn dispatch_compact(
     };
 
     match crate::agent::do_compact(
-        &state.services.sea,
+        &state.services.db,
         secrets,
         &conversation_id,
         assistant.as_ref(),
@@ -2015,7 +2015,7 @@ async fn conversation_and_assistant(
 > {
     state
         .services
-        .sea
+        .db
         .read(async |tx| {
             Ok::<_, crate::db::sea::DbErr>(conversation_and_assistant_in(tx, conversation_id, preferred).await)
         })
@@ -2053,7 +2053,7 @@ async fn status_of(state: &SharedState, conversation_id: &str) -> Result<(String
     let preferred = state.config.assistant_id.as_deref();
     state
         .services
-        .sea
+        .db
         .read(async |tx| {
             let (conv, assistant) = match conversation_and_assistant_in(tx, conversation_id, preferred).await {
                 Ok(found) => found,

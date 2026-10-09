@@ -18,7 +18,7 @@ use crate::db::sea::ops::memory as mem_ops;
 /// into client conversations, so writing there would store rows nobody reads.
 fn get_db_and_scope(context: &ToolContext) -> Result<(&Db, MemoryScope, String), String> {
     let db = context
-        .sea
+        .db
         .as_ref()
         .ok_or("Memory tools are unavailable: no database handle")?;
     match context.project_id.as_ref() {

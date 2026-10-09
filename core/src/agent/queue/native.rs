@@ -43,7 +43,7 @@ pub(super) async fn pump(services: &Services, conversation_id: &str) {
     // have broken — it is something that happened, which the model is owed
     // before anything typed after it is answered.
     #[cfg(not(target_os = "android"))]
-    if crate::background::has_wake(&services.sea, conversation_id).await {
+    if crate::background::has_wake(&services.db, conversation_id).await {
         if let Err(e) = starter.start_unprompted(conversation_id).await {
             tracing::warn!(error = %e, conversation_id, "a background task's turn failed");
         }

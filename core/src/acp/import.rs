@@ -90,10 +90,10 @@ pub struct DiscoveredSession {
 /// opened, because listing is a question about the disk rather than about a
 /// conversation.
 pub async fn discover(services: &Services, cwd: Option<&str>) -> Result<Vec<DiscoveredSession>, String> {
-    let config = AcpConfig::load(&services.sea).await?;
+    let config = AcpConfig::load(&services.db).await?;
     let listed = list_sessions(&config, cwd).await?;
 
-    let owners = sea_ops::acp_session::owners(&services.sea)
+    let owners = sea_ops::acp_session::owners(&services.db)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -251,7 +251,7 @@ pub async fn import(services: &Services, listed: &ImportRequest) -> Result<Impor
     // read — and as a constraint violation naming a column.
     // pool-read-before-write: an early refusal with a sentence; the import
     // write that follows minutes later is guarded by the UNIQUE index itself.
-    let owner = sea_ops::acp_session::owners(&services.sea)
+    let owner = sea_ops::acp_session::owners(&services.db)
         .await
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -261,7 +261,7 @@ pub async fn import(services: &Services, listed: &ImportRequest) -> Result<Impor
         return Err(format!("this session is already open as conversation {owner}"));
     }
 
-    let config = AcpConfig::load(&services.sea).await?;
+    let config = AcpConfig::load(&services.db).await?;
     let conversation_id = uuid::Uuid::new_v4().to_string();
     let session = AcpSession::open_for_import(
         services.clone(),
@@ -349,7 +349,7 @@ pub async fn import(services: &Services, listed: &ImportRequest) -> Result<Impor
     // conversation's turn queues behind it.
     let started = std::time::Instant::now();
     let counts = services
-        .sea
+        .db
         .write(async |tx| write(tx, &written).await)
         .await
         .map_err(|e| e.to_string())?;
@@ -411,7 +411,7 @@ pub async fn attach(services: &Services, conversation_id: &str, session_id: &str
     // `UNIQUE constraint failed: acp_sessions.acp_session_id` — which is the
     // message those checks exist to keep off the screen.
     services
-        .sea
+        .db
         .write(async |tx| Ok::<_, DbErr>(repoint(tx, conversation_id, session_id, cwd).await))
         .await
         .map_err(|e| e.to_string())??;

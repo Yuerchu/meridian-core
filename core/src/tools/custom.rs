@@ -220,7 +220,7 @@ mod tests {
             conversation_id: Some("c-1".into()),
             turn_id: None,
             assistant_id: None,
-            sea: None,
+            db: None,
             sandbox_policy: crate::sandbox::CommandSandbox::Unreadable("database is locked".into()),
             #[cfg(not(target_os = "android"))]
             background: None,

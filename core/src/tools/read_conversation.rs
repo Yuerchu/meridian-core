@@ -154,7 +154,7 @@ impl Tool for ReadConversationTool {
             .ok_or("read_conversation is unavailable outside a conversation")?;
 
         let db = context
-            .sea
+            .db
             .as_ref()
             .ok_or("read_conversation is unavailable: no database handle")?;
 
@@ -226,7 +226,7 @@ mod tests {
             conversation_id: conversation_id.map(str::to_string),
             turn_id: None,
             assistant_id: None,
-            sea: Some(db),
+            db: Some(db),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]

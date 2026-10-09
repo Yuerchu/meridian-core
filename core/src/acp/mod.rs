@@ -332,7 +332,7 @@ impl AcpConfig {
 /// table existed.
 async fn remember_session(services: &crate::services::Services, session: &AcpSession) {
     let written = services
-        .sea
+        .db
         .write(async |tx| {
             crate::db::sea::ops::acp_session::upsert(
                 tx,
@@ -355,7 +355,7 @@ async fn remember_session(services: &crate::services::Services, session: &AcpSes
 /// row in the sidebar that can never be opened, and the usual reason for
 /// failure — the command is not installed — is one every attempt would repeat.
 pub async fn open_session(services: &crate::services::Services, cwd: &str) -> Result<String, String> {
-    let config = AcpConfig::load(&services.sea).await?;
+    let config = AcpConfig::load(&services.db).await?;
     let conversation_id = uuid::Uuid::new_v4().to_string();
 
     // Decided once, before the adapter: the bridge needs it in the first thing
@@ -368,7 +368,7 @@ pub async fn open_session(services: &crate::services::Services, cwd: &str) -> Re
     // pool-read-before-write: the directory's project is decided before the
     // adapter starts, which takes seconds and holds no lock; the row written
     // after it files the conversation under what was decided here.
-    let project_id = crate::db::sea::ops::project::find_project_by_path(&services.sea, cwd)
+    let project_id = crate::db::sea::ops::project::find_project_by_path(&services.db, cwd)
         .await
         .map_err(|e| e.to_string())?
         .map(|p| p.id);
@@ -426,7 +426,7 @@ pub async fn reopen_session(
     // and a conversation opened and never used has nothing, so telling it
     // would be noise.
     let (cwd, resume, transcript_above) = services
-        .sea
+        .db
         .read(async |tx| {
             let Some(row) = crate::db::sea::ops::acp_session::get(tx, conversation_id)
                 .await?
@@ -447,7 +447,7 @@ pub async fn reopen_session(
         .await
         .map_err(|e| e.to_string())??;
 
-    let config = AcpConfig::load(&services.sea).await?;
+    let config = AcpConfig::load(&services.db).await?;
     let session = AcpSession::reopen(
         services.clone(),
         &config,
@@ -484,7 +484,7 @@ async fn write_conversation_row(
     let now = crate::util::now_ms();
     let title = title_for(cwd);
     services
-        .sea
+        .db
         .write(async |tx| {
             // An assistant that cannot be read leaves the row with none, as
             // before.

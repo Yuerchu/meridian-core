@@ -203,7 +203,7 @@ pub async fn ask(
         "ACP permission asked"
     );
 
-    let db = services.sea.clone();
+    let db = services.db.clone();
     let decision = engine::in_phase(
         &db,
         &turn.turn_id,

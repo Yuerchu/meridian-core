@@ -2184,7 +2184,7 @@ mod tests {
             conversation_id: Some("c1".into()),
             turn_id: Some("t1".into()),
             assistant_id: None,
-            sea: Some(pool.clone()),
+            db: Some(pool.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]

@@ -113,7 +113,7 @@ fn context(job: &Job<'_>, cancel: &CancellationToken) -> ToolContext {
         job.file_access,
         job.conversation_id,
         job.turn_id,
-        Some(job.services.sea.clone()),
+        Some(job.services.db.clone()),
         cancel,
     )
 }
@@ -149,7 +149,7 @@ fn build_context(
         conversation_id: Some(conversation_id.to_string()),
         turn_id: Some(turn_id.to_string()),
         assistant_id: None,
-        sea,
+        db: sea,
         #[cfg(not(target_os = "android"))]
         sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
         // None of the four read a credential. An empty map is the honest

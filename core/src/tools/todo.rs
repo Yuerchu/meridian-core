@@ -11,7 +11,7 @@ const MAX_CONTENT_LEN: usize = 200;
 
 fn get_db_and_conversation(context: &ToolContext) -> Result<(Db, String), String> {
     let db = context
-        .sea
+        .db
         .as_ref()
         .ok_or("The todo list requires a conversation context")?
         .clone();
@@ -239,7 +239,7 @@ mod tests {
             conversation_id: Some(conversation_id.to_string()),
             turn_id: Some("t1".into()),
             assistant_id: None,
-            sea: Some(sea),
+            db: Some(sea),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]

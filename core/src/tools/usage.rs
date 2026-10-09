@@ -158,7 +158,7 @@ impl Tool for ConversationUsageTool {
             ..Default::default()
         };
 
-        let db = context.sea.as_ref().ok_or("Usage is unavailable: no database handle")?;
+        let db = context.db.as_ref().ok_or("Usage is unavailable: no database handle")?;
         let buckets = db
             .read(async |tx| report(tx, dimension, &filter).await)
             .await

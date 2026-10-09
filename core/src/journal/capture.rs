@@ -154,7 +154,7 @@ pub struct JournalRecord<'a> {
 /// The turn-scoped half of the journal: identity, storage, gitignore cache,
 /// and a borrow of the process-wide path locks.
 pub struct JournalCtx {
-    pub sea: Db,
+    pub db: Db,
     pub blob_root: PathBuf,
     pub conversation_id: String,
     pub turn_id: String,
@@ -191,7 +191,7 @@ impl JournalCtx {
         shared: Arc<JournalShared>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            sea,
+            db: sea,
             blob_root,
             conversation_id,
             turn_id,
@@ -220,7 +220,7 @@ impl JournalCtx {
         model_id: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            sea: self.sea.clone(),
+            db: self.db.clone(),
             blob_root: self.blob_root.clone(),
             conversation_id,
             turn_id,
@@ -315,7 +315,7 @@ impl JournalCtx {
 
         let display = path.to_string_lossy().into_owned();
         let appended = self
-            .sea
+            .db
             .write(async |tx| {
                 journal_ops::append_version(
                     tx,
@@ -687,7 +687,7 @@ impl JournalCtx {
         // pool-read-before-write: a pre-filter only. `reconcile_external` re-reads
         // the head inside its write and does nothing when it already matches, and
         // the per-path lock below serialises this with `record`.
-        let tracked = journal_ops::chains_under_prefix(&self.sea, &prefix, BRACKET_MAX_FILES + 1).await;
+        let tracked = journal_ops::chains_under_prefix(&self.db, &prefix, BRACKET_MAX_FILES + 1).await;
         let tracked = match tracked {
             Ok(t) => t,
             Err(e) => {
@@ -750,7 +750,7 @@ impl JournalCtx {
                 .and_then(|inner| inner);
                 let outcome = match stored {
                     Ok(stored) => self
-                        .sea
+                        .db
                         .write(async |tx| {
                             journal_ops::reconcile_external(tx, &norm, stored.as_ref(), crate::util::now_ms()).await
                         })
@@ -883,7 +883,7 @@ impl JournalCtx {
                 }
             };
             let outcome = self
-                .sea
+                .db
                 .write(async |tx| {
                     journal_ops::append_command_observed(
                         tx,
@@ -934,7 +934,7 @@ impl JournalCtx {
         if !prefix.ends_with('/') {
             prefix.push('/');
         }
-        match journal_ops::tracked_files(&self.sea, &prefix, usize::MAX).await {
+        match journal_ops::tracked_files(&self.db, &prefix, usize::MAX).await {
             Ok(files) => files.into_iter().map(|(f, _)| PathBuf::from(f.display_path)).collect(),
             Err(e) => {
                 tracing::warn!(error = %e, "journal: listing tracked files failed; no tombstones");
@@ -981,11 +981,11 @@ mod tests {
             .await
             .expect("recorded");
 
-        let file = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(Path::new("C:/p/a.rs")).unwrap())
+        let file = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(Path::new("C:/p/a.rs")).unwrap())
             .await
             .unwrap()
             .expect("file row");
-        let chain = journal_ops::chain(&ctx.sea, &file.id).await.unwrap();
+        let chain = journal_ops::chain(&ctx.db, &file.id).await.unwrap();
         assert_eq!(chain.len(), 1);
         let v = &chain[0];
         assert_eq!(v.id, id);
@@ -1097,11 +1097,11 @@ mod tests {
         racer.await.unwrap().unwrap();
 
         // Publication order matches lock order: A→B then B→C, no external rows.
-        let file = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(path).unwrap())
+        let file = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(path).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let chain = journal_ops::chain(&ctx.sea, &file.id).await.unwrap();
+        let chain = journal_ops::chain(&ctx.db, &file.id).await.unwrap();
         assert_eq!(chain.len(), 3);
         assert!(
             chain.iter().all(|v| v.source != VersionSource::External),
@@ -1483,11 +1483,11 @@ mod tests {
         std::fs::write(&file, "v1\nv2 from a script\n").unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
+        let chain = journal_ops::chain(&ctx.db, &row.id).await.unwrap();
         assert_eq!(chain.len(), 2);
         let v = &chain[1];
         assert_eq!((v.op, v.source), (VersionOp::CommandObserved, VersionSource::Inferred));
@@ -1520,11 +1520,11 @@ mod tests {
         // The command changes nothing.
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
+        let chain = journal_ops::chain(&ctx.db, &row.id).await.unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[1].op, VersionOp::External);
         assert_eq!(chain[1].conversation_id, None, "a hand edit is nobody's");
@@ -1544,7 +1544,7 @@ mod tests {
 
         let real = crate::tools::verified::resolve_root(&dir.path().join("stranger.txt")).unwrap();
         assert!(
-            journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+            journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(&real).unwrap())
                 .await
                 .unwrap()
                 .is_none()
@@ -1567,11 +1567,11 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
+        let chain = journal_ops::chain(&ctx.db, &row.id).await.unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(
             (chain[1].op, chain[1].new_sha.as_deref()),
@@ -1600,7 +1600,7 @@ mod tests {
         // that reason).
         std::fs::write(dir.path().join(".gitignore"), "config.txt\n").unwrap();
         let ctx2 = JournalCtx::new(
-            ctx.sea.clone(),
+            ctx.db.clone(),
             ctx.blob_root.clone(),
             "conv2".into(),
             "turn2".into(),
@@ -1683,11 +1683,11 @@ mod tests {
         std::fs::write(&file, "reborn\n").unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
+        let chain = journal_ops::chain(&ctx.db, &row.id).await.unwrap();
         assert_eq!(chain.len(), 3);
         let rebirth = &chain[2];
         assert_eq!(
@@ -1721,11 +1721,11 @@ mod tests {
         a.settle_command_bracket(bracket_a, "run_command").await;
         b.settle_command_bracket(bracket_b, "run_command").await;
 
-        let row = journal_ops::file_by_path(&a.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&a.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let chain = journal_ops::chain(&a.sea, &row.id).await.unwrap();
+        let chain = journal_ops::chain(&a.db, &row.id).await.unwrap();
         assert_eq!(chain.len(), 1, "voided windows record nothing: {chain:?}");
 
         // And the window closes with its brackets: a later lone bracket works.
@@ -1733,7 +1733,7 @@ mod tests {
         let bracket = a.command_bracket().await.unwrap();
         std::fs::write(&file, "solo command work\n").unwrap();
         a.settle_command_bracket(bracket, "run_command").await;
-        let chain = journal_ops::chain(&a.sea, &row.id).await.unwrap();
+        let chain = journal_ops::chain(&a.db, &row.id).await.unwrap();
         assert_eq!(
             chain.last().map(|v| v.op),
             Some(VersionOp::CommandObserved),
@@ -1777,11 +1777,11 @@ mod tests {
             blobs::load(&ctx.blob_root, &sha).is_err(),
             "the symlink target's bytes reached the store"
         );
-        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
+        let chain = journal_ops::chain(&ctx.db, &row.id).await.unwrap();
         assert_eq!(chain.len(), 1, "an unobservable path appends nothing: {chain:?}");
     }
 
@@ -1814,11 +1814,11 @@ mod tests {
         .unwrap();
         ctx.settle_command_bracket(bracket, "run_command").await;
 
-        let row = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let chain = journal_ops::chain(&ctx.sea, &row.id).await.unwrap();
+        let chain = journal_ops::chain(&ctx.db, &row.id).await.unwrap();
         assert_eq!(chain.len(), 2, "the stale observation must not append");
         assert!(
             chain.iter().all(|v| v.source != VersionSource::External),
@@ -1837,11 +1837,11 @@ mod tests {
             .await
             .unwrap();
 
-        let a = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(Path::new("/tmp/file")).unwrap())
+        let a = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(Path::new("/tmp/file")).unwrap())
             .await
             .unwrap()
             .unwrap();
-        let b = journal_ops::file_by_path(&ctx.sea, &crate::journal::norm_path(Path::new("/tmp/file ")).unwrap())
+        let b = journal_ops::file_by_path(&ctx.db, &crate::journal::norm_path(Path::new("/tmp/file ")).unwrap())
             .await
             .unwrap()
             .unwrap();

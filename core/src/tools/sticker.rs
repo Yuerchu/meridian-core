@@ -12,7 +12,7 @@ use crate::db::sea::cap::{Db, Snapshot};
 use crate::db::sea::ops::{emoji as emoji_ops, emoji_pack as pack_ops};
 
 fn context_parts(context: &ToolContext) -> Result<(&Db, &str), String> {
-    let db = context.sea.as_ref().ok_or("Sticker tools require a database context")?;
+    let db = context.db.as_ref().ok_or("Sticker tools require a database context")?;
     let assistant_id = context
         .assistant_id
         .as_deref()
