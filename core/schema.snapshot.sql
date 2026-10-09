@@ -397,3 +397,9 @@ CREATE TABLE "background_tasks" ( "id" text NOT NULL PRIMARY KEY, "conversation_
 
 CREATE INDEX "idx_background_tasks_conversation" ON "background_tasks" ("conversation_id" ASC, "started_at" ASC);
 
+CREATE TABLE "board_tasks" ( "id" text NOT NULL PRIMARY KEY, "project_id" text NOT NULL, "conversation_id" text, "source" text NOT NULL, "title" text NOT NULL, "request" text, "stage" text NOT NULL, "position" integer NOT NULL, "agent_kind" text, "worktree_path" text, "created_at" integer NOT NULL, "updated_at" integer NOT NULL, "worktree_removed_at" integer, FOREIGN KEY ("project_id") REFERENCES "projects" ("id") ON DELETE CASCADE, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE SET NULL, CHECK (source IN ('local')), CHECK (stage IN ('backlog', 'running', 'review', 'done')), CHECK (agent_kind IN ('native', 'claude_code')) );
+
+CREATE INDEX "idx_board_tasks_stage" ON "board_tasks" ("stage" ASC, "position" ASC);
+
+CREATE UNIQUE INDEX "idx_board_tasks_conversation" ON "board_tasks" ("conversation_id" ASC);
+

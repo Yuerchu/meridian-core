@@ -10,6 +10,7 @@ pub mod acp_session_notice;
 pub mod assistant;
 pub mod audit;
 pub mod background_task;
+pub mod board_task;
 pub mod cached_model;
 pub mod composer_draft;
 pub mod conversation;
