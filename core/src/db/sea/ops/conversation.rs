@@ -985,4 +985,84 @@ mod tests {
         assert!(list_conversations(&db, false).await.unwrap().is_empty());
         assert_eq!(list_conversations(&db, true).await.unwrap().len(), 1);
     }
+
+    /// A new conversation inherits the assistant's reasoning preferences and
+    /// is nobody's delegated run: every delegation column starts empty.
+    #[tokio::test]
+    async fn a_new_conversation_is_ordinary_and_inherits_its_reasoning_prefs() {
+        let db = sea_test_db().await;
+        let conv = db
+            .write(async |tx| create_conversation(tx, "c1", Some("t"), None, None, 1).await)
+            .await
+            .unwrap();
+        assert_eq!(conv.thinking_level, None, "defaults to inheriting the assistant");
+        assert!(!conv.fast_mode.get());
+        assert!(conv.parent_conversation_id.is_none());
+        assert!(conv.spawned_by_message_id.is_none());
+        assert!(conv.spawned_by_call_id.is_none());
+        assert!(conv.spawned_turn_id.is_none());
+        assert!(conv.agent_kind.is_none());
+        assert!(conv.agent_provider_id.is_none());
+        assert!(conv.agent_model_id.is_none(), "it goes on resolving from the assistant");
+    }
+
+    /// Three paths ask what model a conversation runs on — the next turn, the
+    /// context indicator, and manual compaction — and a delegated run has to
+    /// give all three the model its transcript was written by. Getting this
+    /// wrong is not visible as an error: a run on a 64K model reports how full
+    /// a 200K window is, and compaction waits for a threshold no request will
+    /// ever reach.
+    #[tokio::test]
+    async fn a_delegated_run_pins_the_model_its_transcript_was_written_by() {
+        let db = sea_test_db().await;
+        conversations(
+            &db,
+            vec![
+                titled("parent", "t", 1),
+                conversation::Model {
+                    agent_provider_id: Some("deepseek".into()),
+                    agent_model_id: Some("deepseek-chat".into()),
+                    ..delegated("child", "parent", "m1", "0", "t-a")
+                },
+            ],
+        )
+        .await;
+        let big = crate::db::entity::assistant::Model {
+            provider_id: Some("anthropic".into()),
+            model_id: Some("mythos".into()),
+            context_limit: 200_000,
+            ..crate::db::sea::ops::assistant::tests::assistant_row("a1", 0)
+        };
+
+        let parent = get_conversation(&db, "parent").await.unwrap().unwrap();
+        let unchanged = parent.pin_model(Some(big.clone())).unwrap();
+        assert_eq!(unchanged.model_id.as_deref(), Some("mythos"));
+        assert_eq!(
+            unchanged.context_limit, 200_000,
+            "an ordinary conversation keeps its own"
+        );
+
+        let child = get_conversation(&db, "child").await.unwrap().unwrap();
+        let pinned = child.pin_model(Some(big)).unwrap();
+        assert_eq!(pinned.provider_id.as_deref(), Some("deepseek"));
+        assert_eq!(pinned.model_id.as_deref(), Some("deepseek-chat"));
+        // The part that is easy to miss: a non-zero limit here outranks
+        // everything the model says, so leaving it would make the swap look
+        // done while changing nothing that matters.
+        assert_eq!(pinned.context_limit, 0, "the window comes from the model now");
+    }
+
+    /// A flag that is not 0/1 fails the read rather than reaching a response.
+    #[tokio::test]
+    async fn a_stored_flag_the_model_cannot_hold_fails_the_read() {
+        let db = sea_test_db().await;
+        execute_for_tests(
+            &db,
+            "INSERT INTO conversations (id, is_pinned, created_at, updated_at) VALUES ('c1', 2, 1, 1)",
+        )
+        .await
+        .unwrap();
+        assert!(get_conversation(&db, "c1").await.is_err());
+        assert!(list_conversations(&db, false).await.is_err());
+    }
 }

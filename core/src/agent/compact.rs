@@ -390,8 +390,8 @@ pub async fn do_compact(
         // to save it would be a lost summary as well. In a savepoint, so a
         // failed ledger write does not take the summary with it.
         if let Some(usage) = summary_usage {
-            let cost = db::ops::audit::SideRequestCost {
-                role: db::ops::audit::COMPACTION_ROLE,
+            let cost = db::sea::ops::audit::SideRequestCost {
+                role: db::sea::ops::audit::COMPACTION_ROLE,
                 message_id: &msg_id,
                 conversation_id,
                 turn_id: None,

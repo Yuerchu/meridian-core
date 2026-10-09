@@ -111,7 +111,7 @@ impl std::str::FromStr for BillingMode {
 /// knows — and adding zero for it would present what is left as the whole
 /// bill. So each part is either known (its amount in `RequestCost` is exact) or
 /// a gap (its amount there is the known contribution, zero, and the total is
-/// only a lower bound). The same split `db::ops::usage` makes between token and
+/// only a lower bound). The same split `db::sea::ops::usage` makes between token and
 /// tool gaps, made per request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CostGaps {

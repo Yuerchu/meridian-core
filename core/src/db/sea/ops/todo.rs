@@ -1,9 +1,5 @@
 //! Reading and writing `todo_lists` and `todo_items`.
 //!
-//! The `update_todos` tool and the shell's checklist read run on these. The
-//! checklist freezer (`agent::todo_context`) and ACP's mirrored checklists
-//! still use `db::ops::todo`; the pairs are listed in `docs/dual-impl.md`.
-//!
 //! No function here opens a transaction of its own: a write takes the caller's
 //! `WriteTx`, and the caller's `Db::write` is the `BEGIN IMMEDIATE`.
 

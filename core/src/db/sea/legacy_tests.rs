@@ -1124,3 +1124,61 @@ async fn an_emptied_threshold_migrates_to_nothing_at_all() {
     assert_eq!(preference(&conn, "notify.enabled").await, None);
     assert_eq!(preference(&conn, "onebot.balance_alert_threshold").await, None);
 }
+
+/// Migration 43 decides billing by where a request came from, not by what the
+/// row displays or which provider shape it had: a hosted turn is External, a
+/// desktop one stays Metered whatever its provider name says. Run against
+/// rows already at today's schema, as the Diesel test did, and its down
+/// migration puts the hosted row back.
+#[tokio::test]
+async fn acp_billing_migration_follows_origin_not_display_or_provider_shape() {
+    let conn = blank().await;
+    replay_in_transactions(&conn, 0..LEGACY.len()).await.unwrap();
+    exec(
+        &conn,
+        "INSERT INTO audit_messages
+            (id, recorded_at, message_id, conversation_id, turn_origin, role,
+             content, provider_id, provider_name, created_at, billing_mode)
+         VALUES
+            ('hosted', 1, 'm1', 'c1', 'claude_code', 'assistant', '', NULL,
+             'Claude Code', 1, 'metered'),
+            ('desktop', 1, 'm2', 'c2', 'desktop', 'assistant', '', NULL,
+             'Claude Code', 1, 'metered'),
+            ('provider-bound', 1, 'm3', 'c3', 'claude_code', 'assistant', '',
+             'p1', 'Claude Code', 1, 'metered');",
+    )
+    .await;
+    exec(
+        &conn,
+        include_str!("../../../migrations/00000000000043_acp_external_billing/up.sql"),
+    )
+    .await;
+
+    let modes: Vec<(String, String)> = rows(&conn, "SELECT id, billing_mode FROM audit_messages ORDER BY id")
+        .await
+        .into_iter()
+        .map(|r| (r.try_get("", "id").unwrap(), r.try_get("", "billing_mode").unwrap()))
+        .collect();
+    assert_eq!(
+        modes,
+        [
+            ("desktop".to_string(), "metered".to_string()),
+            ("hosted".to_string(), "external".to_string()),
+            ("provider-bound".to_string(), "external".to_string()),
+        ]
+    );
+
+    exec(
+        &conn,
+        include_str!("../../../migrations/00000000000043_acp_external_billing/down.sql"),
+    )
+    .await;
+    let hosted: String = one(
+        &conn,
+        "SELECT billing_mode FROM audit_messages WHERE id = 'hosted'",
+        vec![],
+        "billing_mode",
+    )
+    .await;
+    assert_eq!(hosted, "metered");
+}

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::db::entity::message as message_entity;
 use crate::db::entity::message_context_item;
-use crate::db::ops::message::ActiveContext;
+use crate::db::sea::ops::message::ActiveContext;
 use crate::provider::{self, ChatMessage, SenderRef};
 
 use super::tokenizer::{TokenBudget, TokenCounter, TokenizerKind};
@@ -1631,7 +1631,7 @@ mod injected_context_tests {
             tool_diffs: None,
             response_model_id: None,
         }];
-        let context = crate::db::ops::message::ActiveContext {
+        let context = crate::db::sea::ops::message::ActiveContext {
             path: Vec::new(),
             summary: Some(history[0].clone()),
             anchor_index: None,

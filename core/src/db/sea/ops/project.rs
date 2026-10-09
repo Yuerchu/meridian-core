@@ -1,10 +1,5 @@
 //! Reading and writing `projects`.
 //!
-//! The shell's project commands run on these. The project reads inside
-//! core's Diesel work (the workspace resolver, OneBot sessions, ACP import,
-//! the hook reviewer) and the projects created alongside conversations still
-//! use `db::ops::project`; the pairs are listed in `docs/dual-impl.md`.
-//!
 //! No function here opens a transaction of its own: a write takes the caller's
 //! `WriteTx`, and the caller's `Db::write` is the `BEGIN IMMEDIATE`.
 

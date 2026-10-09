@@ -4,8 +4,7 @@
 //! (`queued_prompt::Model::state`). A held or in-doubt row is a barrier: it
 //! stops the queue, because the instructions were written as a sequence and
 //! delivering number three while number two is unresolved runs them out of
-//! order. The Diesel `db::ops::queue` stays while Diesel roots still use it
-//! (`docs/dual-impl.md`).
+//! order.
 //!
 //! No function here opens a transaction of its own. The read-then-write ones
 //! (`enqueue_with_context`, `set_delivery`, `mark_dispatched`, `reorder`)

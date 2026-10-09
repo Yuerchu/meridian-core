@@ -29,7 +29,7 @@ pub struct Model {
     pub thinking_level: Option<String>,
     pub fast_mode: SqlBool,
     pub mode: Option<String>,
-    /// The leaf the active path ends at; see `db::ops::message::active_context`.
+    /// The leaf the active path ends at; see `db::sea::ops::message::active_context`.
     pub head_message_id: Option<String>,
     pub accept_edits: SqlBool,
     pub parent_conversation_id: Option<String>,

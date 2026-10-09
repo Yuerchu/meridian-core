@@ -30,18 +30,17 @@
 
 use std::sync::Arc;
 
-use diesel::Connection;
-use diesel::sqlite::SqliteConnection;
-
 use crate::agent::tool_calls::serialize_tool_calls_openai;
-use crate::db::models::conversation::ConversationInsert;
-use crate::db::models::message::MessageInsert;
+use crate::db::entity::message as message_entity;
 use crate::db::models::turn::TurnStatus;
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::WriteTx;
+use crate::db::sea::ops as sea_ops;
 use crate::events::ToolOutcome;
 use crate::provider;
 use crate::services::Services;
 use crate::turn::TurnOrigin;
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 use super::mapping::{Effect, PlanItem, SessionNoticeRecord};
 use super::peer::{Handler, Peer};
@@ -94,13 +93,9 @@ pub async fn discover(services: &Services, cwd: Option<&str>) -> Result<Vec<Disc
     let config = AcpConfig::load(&services.sea).await?;
     let listed = list_sessions(&config, cwd).await?;
 
-    let pool = services.db.clone();
-    let owners = tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        crate::db::ops::acp_session::owners(&mut conn).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let owners = sea_ops::acp_session::owners(&services.sea)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(listed
         .into_iter()
@@ -251,24 +246,17 @@ pub async fn import(services: &Services, listed: &ImportRequest) -> Result<Impor
         return Err(format!("`{}` is not a folder any more", listed.cwd));
     }
 
-    let pool = services.db.clone();
-    let wanted = listed.session_id.clone();
     // Read rather than trusted. The UNIQUE index refuses a second owner
     // anyway, but only after the adapter has been started and a whole session
     // read — and as a constraint violation naming a column.
-    let owner = tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        crate::db::ops::acp_session::owners(&mut conn)
-            .map(|owners| {
-                owners
-                    .into_iter()
-                    .find(|(session, _)| *session == wanted)
-                    .map(|(_, conversation)| conversation)
-            })
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    // pool-read-before-write: an early refusal with a sentence; the import
+    // write that follows minutes later is guarded by the UNIQUE index itself.
+    let owner = sea_ops::acp_session::owners(&services.sea)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|(session, _)| *session == listed.session_id)
+        .map(|(_, conversation)| conversation);
     if let Some(owner) = owner {
         return Err(format!("this session is already open as conversation {owner}"));
     }
@@ -345,7 +333,6 @@ pub async fn import(services: &Services, listed: &ImportRequest) -> Result<Impor
         .and_then(parse_iso_ms)
         .unwrap_or_else(now_ms);
 
-    let pool = services.db.clone();
     let cwd = listed.cwd.clone();
     let written = Written {
         conversation_id: conversation_id.clone(),
@@ -361,13 +348,11 @@ pub async fn import(services: &Services, listed: &ImportRequest) -> Result<Impor
     // write holds SQLite's one writer for as long as it takes — every other
     // conversation's turn queues behind it.
     let started = std::time::Instant::now();
-    let counts = tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| write(conn, &written))
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let counts = services
+        .sea
+        .write(async |tx| write(tx, &written).await)
+        .await
+        .map_err(|e| e.to_string())?;
 
     tracing::info!(
         conversation_id = %conversation_id,
@@ -420,24 +405,16 @@ pub async fn attach(services: &Services, conversation_id: &str, session_id: &str
         );
     }
 
-    let pool = services.db.clone();
-    let conversation = conversation_id.to_string();
-    let session = session_id.to_string();
-    let cwd = cwd.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        // One transaction, because the checks are read-then-write: two clients
-        // pointing two conversations at one session would both pass the
-        // ownership read and the loser would get the raw
-        // `UNIQUE constraint failed: acp_sessions.acp_session_id` — which is
-        // the message those checks exist to keep off the screen.
-        conn.transaction::<_, RepointFailed, _>(|conn| {
-            repoint(conn, &conversation, &session, &cwd).map_err(RepointFailed)
-        })
-        .map_err(|e| e.0)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    // One transaction, because the checks are read-then-write: two clients
+    // pointing two conversations at one session would both pass the ownership
+    // read and the loser would get the raw
+    // `UNIQUE constraint failed: acp_sessions.acp_session_id` — which is the
+    // message those checks exist to keep off the screen.
+    services
+        .sea
+        .write(async |tx| Ok::<_, DbErr>(repoint(tx, conversation_id, session_id, cwd).await))
+        .await
+        .map_err(|e| e.to_string())??;
 
     // Whatever adapter this conversation had is pointing at the old session.
     // Closed rather than reloaded: the next message reopens it lazily against
@@ -450,28 +427,16 @@ pub async fn attach(services: &Services, conversation_id: &str, session_id: &str
     Ok(())
 }
 
-/// A refusal from [`repoint`], carried out of `conn.transaction`.
-///
-/// Diesel wants the closure's error to be `From<diesel::result::Error>`, which
-/// `String` is not. A newtype rather than widening the signature: what
-/// `repoint` produces is a sentence for the user, and the only thing this has
-/// to do is survive the trip.
-#[derive(Debug)]
-struct RepointFailed(String);
-
-impl From<diesel::result::Error> for RepointFailed {
-    fn from(e: diesel::result::Error) -> Self {
-        Self(e.to_string())
-    }
-}
-
 /// The database half of [`attach`], and the whole of what it checks.
 ///
 /// Its own function so the refusals can be tested against a real SQLite. They
-/// are the point of the operation — writing the id is one line.
-fn repoint(conn: &mut SqliteConnection, conversation_id: &str, session_id: &str, cwd: &str) -> Result<(), String> {
-    let row = crate::db::ops::conversation::get_conversation(conn, conversation_id)
-        .map_err(|_| "no such conversation".to_string())?;
+/// are the point of the operation — writing the id is one line. A refusal is
+/// the inner `Err`, a sentence for the user; it writes nothing.
+async fn repoint(tx: &WriteTx, conversation_id: &str, session_id: &str, cwd: &str) -> Result<(), String> {
+    let row = sea_ops::conversation::get_conversation(tx, conversation_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no such conversation".to_string())?;
     // An ordinary conversation has no directory and no agent to resume, and
     // making it hosted by writing a row would leave a transcript no agent has
     // any record of under a header saying it does.
@@ -481,7 +446,7 @@ fn repoint(conn: &mut SqliteConnection, conversation_id: &str, session_id: &str,
     // Checked for the message. The UNIQUE index refuses it anyway, but as a
     // constraint violation naming a column rather than the conversation the
     // user would have to go and find.
-    let owners = crate::db::ops::acp_session::owners(conn).map_err(|e| e.to_string())?;
+    let owners = sea_ops::acp_session::owners(tx).await.map_err(|e| e.to_string())?;
     if let Some((_, owner)) = owners.iter().find(|(id, _)| id == session_id)
         && owner != conversation_id
     {
@@ -490,8 +455,8 @@ fn repoint(conn: &mut SqliteConnection, conversation_id: &str, session_id: &str,
     // The session's own directory rather than whatever the conversation had:
     // the two disagreeing means the stored one is wrong, and `session/load`
     // validates `cwd` against the session it is resuming.
-    crate::db::ops::acp_session::upsert(conn, conversation_id, Some(session_id), cwd, now_ms())
-        .map(|_| ())
+    sea_ops::acp_session::upsert(tx, conversation_id, Some(session_id), cwd, now_ms())
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -843,35 +808,32 @@ struct Clock(i64);
 /// One recited incident, through the same conditional write the live path
 /// uses — a recital can carry several revisions of one incident, and only the
 /// newest should be left standing.
-fn write_notice(
-    conn: &mut SqliteConnection,
+async fn write_notice(
+    tx: &WriteTx,
     conversation_id: &str,
     turn_id: Option<&str>,
     record: &SessionNoticeRecord,
     now: i64,
-) -> Result<(), diesel::result::Error> {
-    // A list of closed enum values cannot fail to serialise; the map is so a
-    // transaction is rolled back rather than unwound if it ever does.
-    let actions = serde_json::to_string(&record.actions).map_err(|_| diesel::result::Error::RollbackTransaction)?;
-    let id = uuid::Uuid::new_v4().to_string();
-    crate::db::ops::acp_session_notice::upsert_if_newer_in_transaction(
-        conn,
-        crate::db::models::acp_session_notice::AcpSessionNoticeInsert {
-            id: &id,
-            conversation_id,
-            turn_id,
-            notice_id: &record.notice_id,
+) -> Result<(), DbErr> {
+    sea_ops::acp_session_notice::upsert_if_newer(
+        tx,
+        crate::db::entity::acp_session_notice::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conversation_id.to_string(),
+            turn_id: turn_id.map(str::to_owned),
+            notice_id: record.notice_id.clone(),
             revision: i32::try_from(record.revision).unwrap_or(i32::MAX),
-            category: record.category.as_str(),
-            severity: record.severity.as_str(),
-            title: &record.title,
-            details: record.details.as_deref(),
-            reason: record.reason.as_deref(),
-            actions: &actions,
+            category: record.category,
+            severity: record.severity,
+            title: record.title.clone(),
+            details: record.details.clone(),
+            reason: record.reason.clone(),
+            actions: crate::db::types::Json(record.actions.clone()),
             created_at: now,
             updated_at: now,
         },
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -895,136 +857,104 @@ impl Clock {
 /// zero-valued audit rows would add volume but no accounting fact. (A user row
 /// still audit-copies, through `append_message`, and should: those are things a
 /// person said.)
-fn write(conn: &mut SqliteConnection, w: &Written) -> Result<Counts, diesel::result::Error> {
+async fn write(tx: &WriteTx, w: &Written) -> Result<Counts, DbErr> {
     let now = now_ms();
-    let project_id = crate::db::ops::project::find_project_by_path(conn, &w.cwd)?.map(|p| p.id);
-    let assistant_id = crate::db::ops::assistant::get_default_assistant(conn)
+    let project_id = sea_ops::project::find_project_by_path(tx, &w.cwd).await?.map(|p| p.id);
+    // An assistant that cannot be read leaves the row with none, as before.
+    let assistant_id = sea_ops::assistant::get_default_assistant(tx)
+        .await
         .ok()
         .flatten()
         .map(|a| a.id);
 
-    crate::db::ops::conversation::insert(
-        conn,
-        ConversationInsert {
-            id: &w.conversation_id,
-            title: Some(&w.title),
-            assistant_id: assistant_id.as_deref(),
-            is_pinned: 0,
-            is_archived: 0,
+    sea_ops::conversation::insert(
+        tx,
+        crate::db::entity::conversation::Model {
+            title: Some(w.title.clone()),
+            assistant_id,
+            project_id,
+            agent_kind: Some(super::AGENT_KIND.to_string()),
             // When the session was last worked on, not when it was imported.
             // `updated_at` is written again by the row trigger as each message
             // lands, which is why [`Clock`] starts here too — the two have to
             // agree or the sidebar files the conversation under today.
-            created_at: w.last_active,
-            updated_at: w.last_active,
-            project_id: project_id.as_deref(),
-            parent_conversation_id: None,
-            spawned_by_message_id: None,
-            spawned_by_call_id: None,
-            spawned_turn_id: None,
-            agent_kind: Some(super::AGENT_KIND),
-            agent_provider_id: None,
-            agent_model_id: None,
+            ..sea_ops::conversation::new_row(&w.conversation_id, w.last_active)
         },
-    )?;
-    crate::db::ops::acp_session::upsert(conn, &w.conversation_id, Some(&w.acp_session_id), &w.cwd, now)?;
+    )
+    .await?;
+    sea_ops::acp_session::upsert(tx, &w.conversation_id, Some(&w.acp_session_id), &w.cwd, now).await?;
 
     let mut clock = Clock(w.last_active);
     let mut parent: Option<String> = None;
     let mut counts = Counts { turns: 0, messages: 0 };
 
     for record in &w.imported.session_notices {
-        write_notice(conn, &w.conversation_id, None, record, clock.at())?;
+        write_notice(tx, &w.conversation_id, None, record, clock.at()).await?;
     }
 
     for turn in &w.imported.turns {
         let turn_id = uuid::Uuid::new_v4().to_string();
-        crate::db::ops::turn::begin(
-            conn,
+        sea_ops::turn::begin(
+            tx,
             &turn_id,
             &w.conversation_id,
             TurnOrigin::ClaudeCode,
             None,
             clock.at(),
-        )?;
+        )
+        .await?;
         for record in &turn.notices {
-            write_notice(conn, &w.conversation_id, Some(&turn_id), record, clock.at())?;
+            write_notice(tx, &w.conversation_id, Some(&turn_id), record, clock.at()).await?;
         }
 
         if !turn.question.trim().is_empty() {
-            parent = Some(row(
-                conn,
+            let question = sea_ops::message::new_row(
+                "",
                 &w.conversation_id,
-                &turn_id,
-                parent.as_deref(),
-                clock.tick(),
-                MessageInsert {
-                    id: "",
-                    conversation_id: "",
-                    // **A compaction summary is not something a person said.**
-                    // Filed as `user` it would be a model-written wall of text
-                    // in the only trust layer `auto_review`'s projection lets
-                    // authorise anything — while its contents came out of the
-                    // tool output of the conversation it summarises. It would
-                    // also be copied whole into `audit_messages`, and drawn as
-                    // a question nobody asked.
-                    //
-                    // `context` is where the frozen memory block already lives
-                    // for exactly these reasons: on the parent chain, skipped
-                    // by the audit copy, `untrusted_*` in the projection. Not
-                    // `is_compact_summary`, whose invariant wants an anchor and
-                    // no turn — this row has both.
-                    role: if turn.question_is_summary { "context" } else { "user" },
-                    content: &turn.question,
-                    ..blank()
-                },
-            )?);
+                // **A compaction summary is not something a person said.**
+                // Filed as `user` it would be a model-written wall of text
+                // in the only trust layer `auto_review`'s projection lets
+                // authorise anything — while its contents came out of the
+                // tool output of the conversation it summarises. It would
+                // also be copied whole into `audit_messages`, and drawn as
+                // a question nobody asked.
+                //
+                // `context` is where the frozen memory block already lives
+                // for exactly these reasons: on the parent chain, skipped
+                // by the audit copy, `untrusted_*` in the projection. Not
+                // `is_compact_summary`, whose invariant wants an anchor and
+                // no turn — this row has both.
+                if turn.question_is_summary { "context" } else { "user" },
+                &turn.question,
+                0,
+            );
+            parent = Some(row(tx, &turn_id, parent.as_deref(), clock.tick(), question).await?);
             counts.messages += 1;
         }
 
         for assistant in &turn.rows {
             let calls = (!assistant.calls.is_empty()).then(|| serialize_tool_calls_openai(&assistant.calls));
-            let assistant_id = row(
-                conn,
-                &w.conversation_id,
-                &turn_id,
-                parent.as_deref(),
-                clock.tick(),
-                MessageInsert {
-                    id: "",
-                    conversation_id: "",
-                    role: "assistant",
-                    content: &assistant.text,
-                    reasoning_content: (!assistant.reasoning.is_empty()).then_some(assistant.reasoning.as_str()),
-                    tool_calls: calls.as_deref(),
-                    model_id: Some(&w.model),
-                    provider_name: Some(PROVIDER_LABEL),
-                    ..blank()
-                },
-            )?;
+            let reply = message_entity::Model {
+                reasoning_content: (!assistant.reasoning.is_empty()).then(|| assistant.reasoning.clone()),
+                tool_calls: calls,
+                model_id: Some(w.model.clone()),
+                provider_name: Some(PROVIDER_LABEL.to_string()),
+                ..sea_ops::message::new_row("", &w.conversation_id, "assistant", &assistant.text, 0)
+            };
+            let assistant_id = row(tx, &turn_id, parent.as_deref(), clock.tick(), reply).await?;
             for (call_id, hunks) in &assistant.diffs {
-                crate::db::ops::message::record_tool_diffs(conn, &assistant_id, call_id, hunks)?;
+                sea_ops::message::record_tool_diffs(tx, &assistant_id, call_id, hunks).await?;
             }
             parent = Some(assistant_id);
             counts.messages += 1;
 
             for (call_id, output, outcome) in &assistant.results {
-                parent = Some(row(
-                    conn,
-                    &w.conversation_id,
-                    &turn_id,
-                    parent.as_deref(),
-                    clock.tick(),
-                    MessageInsert {
-                        id: "",
-                        conversation_id: "",
-                        role: "tool",
-                        content: output,
-                        tool_call_id: Some(call_id),
-                        tool_outcome: Some(outcome.as_str()),
-                        ..blank()
-                    },
-                )?);
+                let result = message_entity::Model {
+                    tool_call_id: Some(call_id.clone()),
+                    tool_outcome: Some(outcome.as_str().to_string()),
+                    ..sea_ops::message::new_row("", &w.conversation_id, "tool", output, 0)
+                };
+                parent = Some(row(tx, &turn_id, parent.as_deref(), clock.tick(), result).await?);
                 counts.messages += 1;
             }
         }
@@ -1032,85 +962,52 @@ fn write(conn: &mut SqliteConnection, w: &Written) -> Result<Counts, diesel::res
         // Every imported turn is over by definition. Left running they would be
         // exactly what startup reconciliation reports as cut off, on a
         // conversation nobody was in the room for.
-        crate::db::ops::turn::finish(conn, &turn_id, TurnStatus::Done, None, clock.at())?;
+        sea_ops::turn::finish(tx, &turn_id, TurnStatus::Done, None, clock.at()).await?;
         counts.turns += 1;
     }
 
     if !w.imported.plan.is_empty() {
-        let items: Vec<crate::db::ops::todo::TodoItemSpec> = w
+        let items: Vec<sea_ops::todo::TodoItemSpec> = w
             .imported
             .plan
             .iter()
-            .map(|item| crate::db::ops::todo::TodoItemSpec {
+            .map(|item| sea_ops::todo::TodoItemSpec {
                 active_form: item.content.clone(),
                 content: item.content.clone(),
                 status: crate::db::models::todo::ItemStatus::parse(&item.status)
                     .unwrap_or(crate::db::models::todo::ItemStatus::Pending),
             })
             .collect();
-        crate::db::ops::todo::replace_active_list(conn, &w.conversation_id, "Claude Code", &items, now)?;
+        sea_ops::todo::replace_active_list(tx, &w.conversation_id, "Claude Code", &items, now).await?;
     }
 
     Ok(counts)
 }
 
-/// One row, with the fields every caller here fills in the same way.
-fn row(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
+/// One row, with the fields every caller here fills in the same way: a fresh
+/// id, the turn, the clock's instant, linked under `parent`. Nobody was
+/// billed here, or rather nobody this app can see: the tokens went to whatever
+/// `claude` is signed in as.
+async fn row(
+    tx: &WriteTx,
     turn_id: &str,
     parent: Option<&str>,
     created_at: i64,
-    fields: MessageInsert<'_>,
-) -> Result<String, diesel::result::Error> {
+    fields: message_entity::Model,
+) -> Result<String, DbErr> {
     let id = uuid::Uuid::new_v4().to_string();
-    crate::db::ops::message::append_message(
-        conn,
-        &MessageInsert {
-            id: &id,
-            conversation_id,
-            turn_id: Some(turn_id),
+    sea_ops::message::append_message(
+        tx,
+        message_entity::Model {
+            id: id.clone(),
+            turn_id: Some(turn_id.to_string()),
             created_at,
             ..fields
         },
         parent,
-    )?;
+    )
+    .await?;
     Ok(id)
-}
-
-/// The empty `MessageInsert` the three shapes above vary from.
-fn blank<'a>() -> MessageInsert<'a> {
-    MessageInsert {
-        id: "",
-        conversation_id: "",
-        role: "",
-        content: "",
-        provider_id: None,
-        model_id: None,
-        input_tokens: None,
-        output_tokens: None,
-        tool_calls: None,
-        tool_call_id: None,
-        sort_order: 0,
-        created_at: 0,
-        reasoning_content: None,
-        rating: None,
-        schema_version: 2,
-        is_compact_summary: 0,
-        sender_id: None,
-        parent_id: None,
-        compact_anchor_id: None,
-        source: None,
-        turn_id: None,
-        tool_outcome: None,
-        // Nobody was billed here, or rather nobody this app can see: the tokens
-        // went to whatever `claude` is signed in as.
-        cache_read_tokens: None,
-        cache_write_tokens: None,
-        server_tool_calls: None,
-        provider_name: None,
-        response_model_id: None,
-    }
 }
 
 /// An ISO 8601 instant as epoch milliseconds.
@@ -1435,6 +1332,21 @@ mod tests {
         }
     }
 
+    async fn write_on(db: &crate::db::sea::cap::Db, written: &Written) -> Counts {
+        db.write(async |tx| write(tx, written).await).await.unwrap()
+    }
+
+    async fn repoint_on(
+        db: &crate::db::sea::cap::Db,
+        conversation_id: &str,
+        session_id: &str,
+        cwd: &str,
+    ) -> Result<(), String> {
+        db.write(async |tx| Ok::<_, DbErr>(repoint(tx, conversation_id, session_id, cwd).await))
+            .await
+            .unwrap()
+    }
+
     /// The rows an import produces, read back the way the transcript view
     /// reads them: down the parent chain from the head.
     ///
@@ -1444,12 +1356,9 @@ mod tests {
     /// imported conversation as cut off. And no assistant row reaches
     /// `audit_messages` — the recital has no trustworthy per-message usage to
     /// record, while live hosted replies are recorded separately as External.
-    #[test]
-    fn an_import_writes_one_readable_chain_and_bills_nobody() {
-        use diesel::prelude::*;
-
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn an_import_writes_one_readable_chain_and_bills_nobody() {
+        let db = crate::db::sea::sea_test_db().await;
 
         let imported = plan(vec![
             user("u1", "run the tests"),
@@ -1470,13 +1379,14 @@ mod tests {
             imported,
         };
 
-        let counts = conn
-            .transaction::<_, diesel::result::Error, _>(|conn| write(conn, &written))
-            .unwrap();
+        let counts = write_on(&db, &written).await;
         assert_eq!(counts.turns, 2);
         assert_eq!(counts.messages, 6);
 
-        let conversation = crate::db::ops::conversation::get_conversation(&mut conn, "imported-1").unwrap();
+        let conversation = sea_ops::conversation::get_conversation(&db, "imported-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(conversation.title.as_deref(), Some("Fix the queue"));
         assert_eq!(conversation.agent_kind.as_deref(), Some(super::super::AGENT_KIND));
         // Not exactly `last_active`: `trg_messages_count_insert` drags it to
@@ -1489,8 +1399,8 @@ mod tests {
             conversation.updated_at,
         );
 
-        let history = crate::db::ops::message::list_messages(&mut conn, "imported-1").unwrap();
-        let path = crate::db::ops::message::active_context(&history, conversation.head_message_id.as_deref());
+        let history = sea_ops::message::list_messages(&db, "imported-1").await.unwrap();
+        let path = sea_ops::message::active_context(&history, conversation.head_message_id.as_deref());
         let shape: Vec<(&str, &str)> = path
             .path
             .iter()
@@ -1520,20 +1430,19 @@ mod tests {
             "the call belongs on the row that made it",
         );
 
-        let session = crate::db::ops::acp_session::get(&mut conn, "imported-1")
-            .unwrap()
-            .unwrap();
+        let session = sea_ops::acp_session::get(&db, "imported-1").await.unwrap().unwrap();
         assert_eq!(session.acp_session_id.as_deref(), Some("sess-99"));
         assert_eq!(session.cwd, "/work/meridian");
 
-        let turns: Vec<String> = crate::db::schema::turns::table
-            .filter(crate::db::schema::turns::conversation_id.eq("imported-1"))
-            .select(crate::db::schema::turns::status)
-            .load(&mut conn)
-            .unwrap();
+        let turns: Vec<&str> = sea_ops::turn::list_for_conversation(&db, "imported-1")
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.status.as_str())
+            .collect();
         assert_eq!(turns, ["done", "done"], "an imported turn is over by definition");
 
-        let logged = crate::db::ops::audit::list_recent(&mut conn, 50).unwrap();
+        let logged = sea_ops::audit::list_recent(&db, 50).await.unwrap();
         assert!(
             logged.iter().all(|row| row.role == "user"),
             "an imported reply was billed to somebody else and is reported nowhere",
@@ -1543,12 +1452,11 @@ mod tests {
     /// A recited Write's refinement lands on the row that made the call, and
     /// is read back as the typed hunk list — with the pre-overwrite text the
     /// arguments alone could never give.
-    #[test]
-    fn an_import_keeps_the_diff_the_agent_reported_beside_its_call() {
+    #[tokio::test]
+    async fn an_import_keeps_the_diff_the_agent_reported_beside_its_call() {
         use crate::events::ToolCallDiff;
 
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
+        let db = crate::db::sea::sea_test_db().await;
         let hunk = ToolCallDiff {
             path: "/w/src/lib.rs".into(),
             old_text: Some("line1\nold line2\nline3".into()),
@@ -1578,10 +1486,9 @@ mod tests {
             last_active: 1_700_000_000_000,
             imported,
         };
-        conn.transaction::<_, diesel::result::Error, _>(|conn| write(conn, &written))
-            .unwrap();
+        write_on(&db, &written).await;
 
-        let rows = crate::db::ops::message::list_messages(&mut conn, "imported-3").unwrap();
+        let rows = sea_ops::message::list_messages(&db, "imported-3").await.unwrap();
         let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
         let stored: std::collections::BTreeMap<String, Vec<ToolCallDiff>> =
             serde_json::from_str(assistant.tool_diffs.as_deref().expect("the diff is on the row")).unwrap();
@@ -1593,8 +1500,8 @@ mod tests {
     /// and can recite one incident more than once. One row per incident, at
     /// its newest revision, on the turn that was open when it was said — and
     /// one from before any question this app can see, on no turn at all.
-    #[test]
-    fn an_import_keeps_each_recited_incident_once_at_its_newest_revision() {
+    #[tokio::test]
+    async fn an_import_keeps_each_recited_incident_once_at_its_newest_revision() {
         use crate::events::{AcpNoticeAction, AcpNoticeCategory, AcpNoticeSeverity};
 
         let notice = |revision: u32, severity: AcpNoticeSeverity, title: &str| {
@@ -1620,8 +1527,7 @@ mod tests {
             actions: vec![AcpNoticeAction::Login],
         });
 
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
+        let db = crate::db::sea::sea_test_db().await;
         let imported = plan(vec![
             orphan,
             user("u1", "run the tests"),
@@ -1640,19 +1546,21 @@ mod tests {
             last_active: 1_700_000_000_000,
             imported,
         };
-        conn.transaction::<_, diesel::result::Error, _>(|conn| write(conn, &written))
-            .unwrap();
+        write_on(&db, &written).await;
 
-        let notices = crate::db::ops::acp_session_notice::list_for_conversation(&mut conn, "imported-2").unwrap();
+        let notices = sea_ops::acp_session_notice::list_for_conversation(&db, "imported-2")
+            .await
+            .unwrap();
         assert_eq!(notices.len(), 2, "one row per incident: {notices:?}");
         let session_scoped = notices.iter().find(|n| n.notice_id == "sess:history-error:0").unwrap();
         assert_eq!(session_scoped.turn_id, None, "recited before any turn");
         let turn_scoped = notices.iter().find(|n| n.notice_id == "prompt-1:error").unwrap();
         assert_eq!(turn_scoped.revision, 2, "the newest revision wins");
-        assert_eq!(turn_scoped.severity, "error");
+        assert_eq!(turn_scoped.severity, AcpNoticeSeverity::Error);
         assert_eq!(turn_scoped.title, "Rate limit reached.");
         let turn_id = turn_scoped.turn_id.as_deref().expect("filed on the turn that was open");
-        let first_turn_question = crate::db::ops::message::list_messages(&mut conn, "imported-2")
+        let first_turn_question = sea_ops::message::list_messages(&db, "imported-2")
+            .await
             .unwrap()
             .into_iter()
             .find(|m| m.content == "run the tests")
@@ -1667,71 +1575,60 @@ mod tests {
     /// `acp_sessions` has a directory and no id, so every reopen starts a blank
     /// agent under a transcript it cannot see, and this is the only way to give
     /// it back the session that wrote those rows.
-    #[test]
-    fn attaching_refuses_the_wrong_conversation_and_a_session_already_taken() {
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
-
-        let hosted = |conn: &mut SqliteConnection, id: &str, kind: Option<&str>| {
-            crate::db::ops::conversation::insert(
-                conn,
-                ConversationInsert {
-                    id,
-                    title: Some(id),
-                    assistant_id: None,
-                    is_pinned: 0,
-                    is_archived: 0,
-                    created_at: 1,
-                    updated_at: 1,
-                    project_id: None,
-                    parent_conversation_id: None,
-                    spawned_by_message_id: None,
-                    spawned_by_call_id: None,
-                    spawned_turn_id: None,
-                    agent_kind: kind,
-                    agent_provider_id: None,
-                    agent_model_id: None,
-                },
-            )
-            .unwrap();
-        };
-        hosted(&mut conn, "ordinary", None);
-        hosted(&mut conn, "theirs", Some(super::super::AGENT_KIND));
-        hosted(&mut conn, "pre-migration", Some(super::super::AGENT_KIND));
-        crate::db::ops::acp_session::upsert(&mut conn, "theirs", Some("sess-taken"), "/work/a", 1).unwrap();
-        // The state this rescues: a directory, and no id to resume.
-        crate::db::ops::acp_session::upsert(&mut conn, "pre-migration", None, "/work/b", 1).unwrap();
+    #[tokio::test]
+    async fn attaching_refuses_the_wrong_conversation_and_a_session_already_taken() {
+        let db = crate::db::sea::sea_test_db().await;
+        db.write(async |tx| {
+            for (id, kind) in [
+                ("ordinary", None),
+                ("theirs", Some(super::super::AGENT_KIND)),
+                ("pre-migration", Some(super::super::AGENT_KIND)),
+            ] {
+                sea_ops::conversation::insert(
+                    tx,
+                    crate::db::entity::conversation::Model {
+                        title: Some(id.to_string()),
+                        agent_kind: kind.map(str::to_owned),
+                        ..sea_ops::conversation::new_row(id, 1)
+                    },
+                )
+                .await?;
+            }
+            sea_ops::acp_session::upsert(tx, "theirs", Some("sess-taken"), "/work/a", 1).await?;
+            // The state this rescues: a directory, and no id to resume.
+            sea_ops::acp_session::upsert(tx, "pre-migration", None, "/work/b", 1).await
+        })
+        .await
+        .unwrap();
 
         assert!(
-            repoint(&mut conn, "nobody", "sess-free", "/work/b").is_err(),
+            repoint_on(&db, "nobody", "sess-free", "/work/b").await.is_err(),
             "a conversation that is not there"
         );
         assert!(
-            repoint(&mut conn, "ordinary", "sess-free", "/work/b")
+            repoint_on(&db, "ordinary", "sess-free", "/work/b")
+                .await
                 .unwrap_err()
                 .contains("Claude Code"),
             "an ordinary conversation has no agent to resume",
         );
         assert!(
-            repoint(&mut conn, "pre-migration", "sess-taken", "/work/a")
+            repoint_on(&db, "pre-migration", "sess-taken", "/work/a")
+                .await
                 .unwrap_err()
                 .contains("theirs"),
             "the refusal names the conversation holding it, not a column",
         );
 
-        repoint(&mut conn, "pre-migration", "sess-free", "/work/b").unwrap();
-        let row = crate::db::ops::acp_session::get(&mut conn, "pre-migration")
-            .unwrap()
-            .unwrap();
+        repoint_on(&db, "pre-migration", "sess-free", "/work/b").await.unwrap();
+        let row = sea_ops::acp_session::get(&db, "pre-migration").await.unwrap().unwrap();
         assert_eq!(row.acp_session_id.as_deref(), Some("sess-free"));
 
         // Re-pointing at the session it already holds is not a collision with
         // itself, and re-pointing somewhere else afterwards still works.
-        repoint(&mut conn, "pre-migration", "sess-free", "/work/b").unwrap();
-        repoint(&mut conn, "pre-migration", "sess-other", "/work/c").unwrap();
-        let row = crate::db::ops::acp_session::get(&mut conn, "pre-migration")
-            .unwrap()
-            .unwrap();
+        repoint_on(&db, "pre-migration", "sess-free", "/work/b").await.unwrap();
+        repoint_on(&db, "pre-migration", "sess-other", "/work/c").await.unwrap();
+        let row = sea_ops::acp_session::get(&db, "pre-migration").await.unwrap().unwrap();
         assert_eq!(row.acp_session_id.as_deref(), Some("sess-other"));
         assert_eq!(row.cwd, "/work/c", "the session's own directory wins");
     }

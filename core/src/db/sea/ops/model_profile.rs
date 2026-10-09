@@ -1,9 +1,5 @@
 //! Reading and writing `model_profiles`.
 //!
-//! The shell's model commands run on these; `seed_flat`, the Diesel test
-//! seeder, still writes through `db::ops::model_profile`, and the pairs are
-//! listed in `docs/dual-impl.md`.
-//!
 //! No function here opens a transaction of its own: a write takes the caller's
 //! `WriteTx`, and the caller's `Db::write` is the `BEGIN IMMEDIATE`.
 

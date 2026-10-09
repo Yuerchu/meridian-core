@@ -1,10 +1,5 @@
 //! Reading and writing `model_configs`.
 //!
-//! The shell's model commands run on these. The turn loop, the price
-//! snapshot, the usage report and the sub-agent catalog still read through
-//! `db::ops::model_config` (via `agent::model_config::load`), and `seed_flat`
-//! writes through it; the pairs are listed in `docs/dual-impl.md`.
-//!
 //! Every config is read beside its profile — there is no window, no
 //! capability patch and usually no price without it — and the two are
 //! separate statements, so those reads take a snapshot.

@@ -1,10 +1,6 @@
 //! The `preferences` table through SeaORM.
 //!
-//! The twin of `db::ops::preference` for the transaction roots that have moved
-//! over, under the same names on purpose: the transaction-graph checker pairs
-//! a `db/sea/ops` function with the `db/ops` function of the same name and
-//! keeps `docs/dual-impl.md` honest about how many Diesel callers the old one
-//! still has. The Diesel version goes when that number reaches zero.
+//! Reads take any `Read`; writes take the caller's `WriteTx`.
 
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::OnConflict;

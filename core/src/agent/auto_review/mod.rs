@@ -492,8 +492,8 @@ impl Active {
                 {
                     tracing::warn!(error = %e, "could not file the auto-review verdict");
                 }
-                let side = crate::db::ops::audit::SideRequestCost {
-                    role: crate::db::ops::audit::AUTO_REVIEW_ROLE,
+                let side = crate::db::sea::ops::audit::SideRequestCost {
+                    role: crate::db::sea::ops::audit::AUTO_REVIEW_ROLE,
                     message_id,
                     conversation_id,
                     turn_id: Some(turn_id),

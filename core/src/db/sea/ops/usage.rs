@@ -21,9 +21,7 @@
 //! mid-month has to bill each half at what it was.
 //!
 //! The grouping statement is registered raw SQL (`db/sql.rs`, one per key):
-//! its key expressions and conditional sums are SQLite text. The Diesel
-//! `db::ops::usage` shares everything here but its database functions, and
-//! stays while the message snapshot still reads through it.
+//! its key expressions and conditional sums are SQLite text.
 
 use std::collections::HashMap;
 
@@ -1063,7 +1061,7 @@ mod tests {
         insert(
             db,
             audit_message::Model {
-                role: crate::db::ops::audit::AUTO_REVIEW_ROLE.into(),
+                role: crate::db::sea::ops::audit::AUTO_REVIEW_ROLE.into(),
                 model_id: Some("cheap".into()),
                 input_tokens: Some(input),
                 output_tokens: Some(0),

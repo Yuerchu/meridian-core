@@ -1294,4 +1294,284 @@ mod tests {
         assert!(list_messages(&db, "c1").await.is_err());
         assert!(get_message(&db, "m1").await.is_err());
     }
+
+    fn path_ids(ctx: &ActiveContext) -> Vec<&str> {
+        ctx.path.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn resolve_head_prefers_the_stored_head() {
+        let db = with_conversations(&["c1"]).await;
+        let q = append(&db, row("q", "c1", "user"), None).await;
+        append(&db, row("a1", "c1", "assistant"), Some(&q.id)).await;
+        append(&db, row("a2", "c1", "assistant"), Some(&q.id)).await;
+
+        let history = list_messages(&db, "c1").await.unwrap();
+        // a1 is not the newest row, so only the stored head can name it.
+        assert_eq!(resolve_head(Some("a1"), &history).as_deref(), Some("a1"));
+    }
+
+    /// A dangling head must not strand the transcript. The newest row is always
+    /// a leaf, since a child of it would have been inserted later still.
+    #[tokio::test]
+    async fn resolve_head_falls_back_to_the_newest_row() {
+        let db = with_conversations(&["c1"]).await;
+        let a = append(&db, row("a", "c1", "user"), None).await;
+        append(&db, row("b", "c1", "assistant"), Some(&a.id)).await;
+
+        let history = list_messages(&db, "c1").await.unwrap();
+        assert_eq!(resolve_head(None, &history).as_deref(), Some("b"));
+        assert_eq!(resolve_head(Some("gone"), &history).as_deref(), Some("b"));
+
+        let leaf_children = history.iter().filter(|m| m.parent_id.as_deref() == Some("b")).count();
+        assert_eq!(leaf_children, 0, "the fallback must name a leaf");
+    }
+
+    /// A summary sits beside the tree. Letting it answer "where does the path
+    /// end" would hang the next turn off something that is not conversation.
+    #[tokio::test]
+    async fn resolve_head_ignores_compaction_summaries() {
+        let db = with_conversations(&["c1"]).await;
+        let a = append(&db, row("a", "c1", "user"), None).await;
+        append(&db, row("b", "c1", "assistant"), Some(&a.id)).await;
+
+        let mut summary = row("s", "c1", "user");
+        summary.is_compact_summary = SqlBool::TRUE;
+        summary.sort_order = -1;
+        db.write(async |tx| insert_message(tx, summary).await).await.unwrap();
+
+        let history = list_messages(&db, "c1").await.unwrap();
+        assert_eq!(resolve_head(Some("s"), &history).as_deref(), Some("b"));
+        assert_eq!(resolve_head(None, &history).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn resolve_head_is_none_for_an_empty_conversation() {
+        assert_eq!(resolve_head(None, &[]), None);
+        assert_eq!(resolve_head(Some("ghost"), &[]), None);
+    }
+
+    #[tokio::test]
+    async fn active_context_follows_one_branch_and_ignores_the_other() {
+        let db = with_conversations(&["c1"]).await;
+        tree(
+            &db,
+            &[
+                ("q", None),
+                ("a1", Some("q")),
+                ("a1x", Some("a1")),
+                ("a2", Some("q")),
+                ("a2x", Some("a2")),
+            ],
+        )
+        .await;
+        let history = list_messages(&db, "c1").await.unwrap();
+
+        assert_eq!(path_ids(&active_context(&history, Some("a1x"))), ["q", "a1", "a1x"]);
+        assert_eq!(path_ids(&active_context(&history, Some("a2x"))), ["q", "a2", "a2x"]);
+    }
+
+    #[test]
+    fn active_context_is_empty_for_a_conversation_with_no_messages() {
+        let ctx = active_context(&[], None);
+        assert!(ctx.path.is_empty());
+        assert_eq!(ctx.head_id, None);
+        assert_eq!(ctx.anchor_index, None);
+    }
+
+    /// A corrupt parent link must not spin forever.
+    #[tokio::test]
+    async fn active_context_stops_on_a_cycle() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("a", None), ("b", Some("a"))]).await;
+        execute_for_tests(&db, "UPDATE messages SET parent_id = 'b' WHERE id = 'a'")
+            .await
+            .unwrap();
+        let history = list_messages(&db, "c1").await.unwrap();
+
+        let ctx = active_context(&history, Some("b"));
+        assert!(ctx.path.len() <= 2, "a cycle must terminate, got {:?}", path_ids(&ctx));
+    }
+
+    #[tokio::test]
+    async fn a_summary_anchored_on_the_path_takes_effect() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("m1", None), ("m2", Some("m1")), ("m3", Some("m2"))]).await;
+
+        let mut s = row("s", "c1", "user");
+        s.is_compact_summary = SqlBool::TRUE;
+        s.sort_order = -1;
+        s.compact_anchor_id = Some("m2".into());
+        db.write(async |tx| insert_message(tx, s).await).await.unwrap();
+        let history = list_messages(&db, "c1").await.unwrap();
+
+        let ctx = active_context(&history, Some("m3"));
+        assert_eq!(ctx.anchor_index, Some(1));
+        assert_eq!(ctx.summary.as_ref().map(|m| m.id.as_str()), Some("s"));
+        // m1 is represented by the summary, so it is not sent again.
+        assert_eq!(
+            ctx.live().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["m2", "m3"]
+        );
+    }
+
+    /// The whole point of anchoring: switching branches must not hand this one
+    /// a summary of a history it never had.
+    #[tokio::test]
+    async fn a_summary_anchored_off_the_path_is_ignored() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("q", None), ("a1", Some("q")), ("a2", Some("q"))]).await;
+
+        let mut s = row("s", "c1", "user");
+        s.is_compact_summary = SqlBool::TRUE;
+        s.sort_order = -1;
+        s.compact_anchor_id = Some("a1".into());
+        db.write(async |tx| insert_message(tx, s).await).await.unwrap();
+        let history = list_messages(&db, "c1").await.unwrap();
+
+        let ctx = active_context(&history, Some("a2"));
+        assert!(ctx.summary.is_none());
+        assert_eq!(ctx.anchor_index, None);
+        assert_eq!(ctx.live().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_deepest_anchored_summary_wins() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("m1", None), ("m2", Some("m1")), ("m3", Some("m2"))]).await;
+
+        for (id, anchor) in [("s1", "m1"), ("s2", "m3")] {
+            let mut s = row(id, "c1", "user");
+            s.is_compact_summary = SqlBool::TRUE;
+            s.sort_order = -1;
+            s.compact_anchor_id = Some(anchor.into());
+            db.write(async |tx| insert_message(tx, s).await).await.unwrap();
+        }
+        let history = list_messages(&db, "c1").await.unwrap();
+
+        let ctx = active_context(&history, Some("m3"));
+        assert_eq!(ctx.summary.as_ref().map(|m| m.id.as_str()), Some("s2"));
+        assert_eq!(ctx.anchor_index, Some(2));
+    }
+
+    /// Parentless rows are never bridged by sort_order. A gap is what deleting a
+    /// message leaves behind, and spanning it would invent a conversation that
+    /// never happened — and once editing the opening message is possible, two
+    /// roots are two versions of it, not one sequence.
+    #[tokio::test]
+    async fn parentless_rows_are_not_stitched_together() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("m1", None), ("m2", None), ("m3", Some("m2"))]).await;
+        let history = list_messages(&db, "c1").await.unwrap();
+
+        assert_eq!(path_ids(&active_context(&history, Some("m3"))), ["m2", "m3"]);
+    }
+
+    /// The guarantee this whole change rests on: for a conversation that has
+    /// never branched — every conversation that exists today — reading the tree
+    /// gives back exactly what ordering by sort_order gave.
+    #[tokio::test]
+    async fn a_linear_conversation_reads_back_identically() {
+        let db = with_conversations(&["c1"]).await;
+
+        let mut parent: Option<String> = None;
+        for i in 0..12 {
+            let id = format!("m{i}");
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let written = append(&db, row(&id, "c1", role), parent.as_deref()).await;
+            parent = Some(written.id);
+        }
+
+        let history = list_messages(&db, "c1").await.unwrap();
+        let by_sort_order: Vec<&str> = history.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(path_ids(&active_context(&history, None)), by_sort_order);
+    }
+
+    #[tokio::test]
+    async fn a_conversation_that_never_branched_has_no_branch_points() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("q", None), ("a", Some("q"))]).await;
+        let history = list_messages(&db, "c1").await.unwrap();
+        let ctx = active_context(&history, None);
+
+        assert!(branch_points(&history, &ctx.path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_branch_point_reports_the_active_version_and_its_siblings() {
+        let db = with_conversations(&["c1"]).await;
+        tree(
+            &db,
+            &[("q", None), ("a1", Some("q")), ("a2", Some("q")), ("a3", Some("q"))],
+        )
+        .await;
+        let history = list_messages(&db, "c1").await.unwrap();
+        let ctx = active_context(&history, Some("a2"));
+
+        let points = branch_points(&history, &ctx.path);
+        assert_eq!(points.len(), 1, "only the answer forked, not the question");
+        assert_eq!(points[0].message_id, "a2");
+        assert_eq!(points[0].index, 1);
+        assert_eq!(points[0].total, 3);
+        assert_eq!(points[0].sibling_ids, ["a1", "a2", "a3"]);
+    }
+
+    /// Editing the opening message leaves two roots, which are versions of the
+    /// same step and must page against each other.
+    #[tokio::test]
+    async fn sibling_roots_are_a_branch_point() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("q1", None), ("q2", None)]).await;
+        let history = list_messages(&db, "c1").await.unwrap();
+        let ctx = active_context(&history, Some("q2"));
+
+        let points = branch_points(&history, &ctx.path);
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].index, 1);
+        assert_eq!(points[0].sibling_ids, ["q1", "q2"]);
+    }
+
+    /// Flattening a real fork would splice two branches into one transcript.
+    #[tokio::test]
+    async fn a_forked_history_is_never_flattened() {
+        let db = with_conversations(&["c1"]).await;
+        tree(&db, &[("q", None), ("a1", Some("q")), ("a2", Some("q"))]).await;
+        let history = list_messages(&db, "c1").await.unwrap();
+
+        assert_eq!(path_ids(&active_context(&history, Some("a2"))), ["q", "a2"]);
+    }
+
+    /// Editing a message on a turn that also froze a memory block must still
+    /// leave two versions of that message, not one.
+    ///
+    /// The frozen row lands between the branch point and the new version, so by
+    /// `parent_id` alone the two versions have different parents and neither
+    /// looks like it has a sibling. What the user sees is the version pager
+    /// vanishing from a message they just created a second version of — and
+    /// their earlier text is still there, just unreachable.
+    #[tokio::test]
+    async fn a_frozen_memory_row_does_not_hide_the_other_version() {
+        let db = with_conversations(&["c1"]).await;
+
+        // A question and its answer.
+        append(&db, row("q", "c1", "user"), None).await;
+        append(&db, row("a", "c1", "assistant"), Some("q")).await;
+
+        // The question is edited on a turn that also froze a memory block, so
+        // the new version hangs off the context row rather than off nothing.
+        let mut ctx = row("mem", "c1", "context");
+        ctx.source = Some("memory|delta|100.x|-|".into());
+        append(&db, ctx, None).await;
+        append(&db, row("q2", "c1", "user"), Some("mem")).await;
+
+        let history = list_messages(&db, "c1").await.unwrap();
+        let path = active_context(&history, Some("q2")).path;
+        let points = branch_points(&history, &path);
+
+        let q2 = points.iter().find(|p| p.message_id == "q2").expect("q2 has a sibling");
+        assert_eq!(q2.total, 2, "both versions of the question must be reachable");
+        assert_eq!(q2.sibling_ids, vec!["q".to_string(), "q2".to_string()]);
+        // And the frozen row itself is not a version of anything.
+        assert!(points.iter().all(|p| p.message_id != "mem"));
+    }
 }

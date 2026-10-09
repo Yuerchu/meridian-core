@@ -286,7 +286,7 @@ mod tests {
     /// `BILLED_ROLES` and not here would be spend the report never shows.
     #[test]
     fn the_usage_statements_bill_exactly_the_billed_roles() {
-        let roles = crate::db::ops::audit::BILLED_ROLES
+        let roles = crate::db::sea::ops::audit::BILLED_ROLES
             .iter()
             .map(|role| format!("'{role}'"))
             .collect::<Vec<_>>()

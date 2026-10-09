@@ -1,9 +1,5 @@
 //! Reading and writing `emojis`.
 //!
-//! `message_stickers` is not here: a sticker is linked to a message inside the
-//! transaction that writes the message, which is still Diesel's, so the link
-//! stays in `db::ops::emoji` until those move.
-//!
 //! No function here opens a transaction of its own: a write takes the caller's
 //! `WriteTx`, and the caller's `Db::write` is the `BEGIN IMMEDIATE`.
 

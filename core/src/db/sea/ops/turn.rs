@@ -7,8 +7,7 @@
 //! record that the turn never reached its own ending, and
 //! `reconcile_interrupted` says so at the next launch.
 //!
-//! Every write takes the caller's `WriteTx`; the Diesel `db::ops::turn` stays
-//! while Diesel roots still write turns (`docs/dual-impl.md`).
+//! Every write takes the caller's `WriteTx`.
 
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
@@ -834,5 +833,29 @@ mod tests {
         )
         .await;
         assert!(refused.is_err());
+    }
+
+    /// A turn cut short by the loop guard did not complete, and its record must
+    /// not say it did — the stop event on the same turn says `loop_detected`.
+    #[tokio::test]
+    async fn a_turn_the_loop_guard_stopped_is_not_recorded_as_done() {
+        let db = crate::db::sea::sea_test_db().await;
+        db.write(async |tx| {
+            crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
+            begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await?;
+            finish(
+                tx,
+                "t1",
+                TurnStatus::Failed,
+                Some(crate::db::models::turn::ERROR_LOOP_DETECTED),
+                1500,
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        let t = get(&db, "t1").await.unwrap().unwrap();
+        assert_eq!(t.status, TurnStatus::Failed);
+        assert_eq!(t.error.as_deref(), Some("loop_detected"));
     }
 }

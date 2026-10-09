@@ -2982,7 +2982,7 @@ mod tests {
             row.created_at, 1_600_000_000_000,
             "the row carries the instant it arrived"
         );
-        let replay = crate::db::ops::message::ActiveContext {
+        let replay = crate::db::sea::ops::message::ActiveContext {
             path: vec![row],
             summary: None,
             anchor_index: None,

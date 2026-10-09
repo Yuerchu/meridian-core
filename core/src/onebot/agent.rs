@@ -465,8 +465,8 @@ pub(super) async fn oneshot_completion(
                     tracing::warn!("could not record what the extraction cost: no message to file it against");
                     return Ok(());
                 };
-                let cost = crate::db::ops::audit::SideRequestCost {
-                    role: crate::db::ops::audit::EXTRACTION_ROLE,
+                let cost = crate::db::sea::ops::audit::SideRequestCost {
+                    role: crate::db::sea::ops::audit::EXTRACTION_ROLE,
                     message_id: &message_id,
                     conversation_id,
                     turn_id: None,
@@ -1247,7 +1247,7 @@ mod tests {
                 tool_diffs: None,
                 response_model_id: None,
             };
-            let replay = crate::db::ops::message::ActiveContext {
+            let replay = crate::db::sea::ops::message::ActiveContext {
                 path: vec![stored],
                 summary: None,
                 anchor_index: None,

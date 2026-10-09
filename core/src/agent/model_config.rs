@@ -12,10 +12,7 @@
 //! the turn loop, the price snapshot, the usage report, the settings panel —
 //! reads the same answer.
 
-use diesel::prelude::*;
-
 use crate::db::entity::{model_config as config_entity, model_profile};
-use crate::db::ops::model_config;
 use crate::decimal::Decimal;
 
 /// One model, as one provider serves it, with every value resolved.
@@ -94,16 +91,6 @@ pub fn effective(config: &config_entity::Model, profile: &model_profile::Model) 
         server_tools: config.server_tools.clone(),
         server_tool_price: config.server_tool_price.clone(),
     }
-}
-
-/// The one read every turn and every price snapshot makes.
-pub fn load(
-    conn: &mut SqliteConnection,
-    provider_id: &str,
-    model_id: &str,
-) -> QueryResult<Option<EffectiveModelConfig>> {
-    Ok(model_config::get_with_profile(conn, provider_id, model_id)?
-        .map(|(config, profile)| effective(&config.into(), &profile.into())))
 }
 
 /// [`load`] on SeaORM: one provider's config for one model, resolved

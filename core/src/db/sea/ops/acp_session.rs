@@ -119,4 +119,39 @@ mod tests {
         assert_eq!(get(&db, "c1").await.unwrap(), None);
         assert!(owners(&db).await.unwrap().is_empty());
     }
+
+    async fn with(ids: &[&str]) -> crate::db::sea::cap::Db {
+        let db = sea_test_db().await;
+        for id in ids {
+            execute_for_tests(
+                &db,
+                &format!("INSERT INTO conversations (id, created_at, updated_at) VALUES ('{id}', 1, 1)"),
+            )
+            .await
+            .unwrap();
+        }
+        db
+    }
+
+    /// Two conversations must not name one agent session: they would be two
+    /// transcripts written from the same place. "Nothing to resume" is not a
+    /// value that collides with itself.
+    #[tokio::test]
+    async fn one_session_cannot_belong_to_two_conversations() {
+        let db = with(&["c1", "c2", "c3"]).await;
+        db.write(async |tx| upsert(tx, "c1", Some("sess-1"), "/a", 1).await)
+            .await
+            .unwrap();
+        assert!(
+            db.write(async |tx| upsert(tx, "c2", Some("sess-1"), "/b", 2).await)
+                .await
+                .is_err()
+        );
+        db.write(async |tx| {
+            upsert(tx, "c2", None, "/b", 2).await?;
+            upsert(tx, "c3", None, "/c", 3).await
+        })
+        .await
+        .unwrap();
+    }
 }

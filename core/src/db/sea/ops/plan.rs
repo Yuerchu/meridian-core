@@ -2,9 +2,7 @@
 //!
 //! The versioned plan documents (`db::sea::ops::plan_review`) are the source of
 //! truth; what is left here is the active-plan read the prompt builder makes
-//! and the completion that retires both kinds at once. The Diesel
-//! `db::ops::plan` keeps only the completion the Diesel checklist write
-//! still makes.
+//! and the completion that retires both kinds at once.
 
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{Expr, ExprTrait};
@@ -118,5 +116,33 @@ the plan
             get_active(&db, "c2").await.unwrap().is_some(),
             "and only that conversation's"
         );
+    }
+
+    #[tokio::test]
+    async fn completing_with_no_active_plan_is_a_no_op() {
+        let db = crate::db::sea::sea_test_db().await;
+        let retired = db
+            .write(async |tx| {
+                crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
+                complete_active(tx, "c1", 10).await
+            })
+            .await
+            .unwrap();
+        assert_eq!(retired, 0);
+    }
+
+    #[test]
+    fn statuses_round_trip_through_parse() {
+        use crate::db::entity::mode_artifact::PlanStatus;
+        for s in [
+            PlanStatus::Pending,
+            PlanStatus::Approved,
+            PlanStatus::Rejected,
+            PlanStatus::Superseded,
+            PlanStatus::Done,
+        ] {
+            assert_eq!(PlanStatus::parse(s.as_str()).unwrap(), s);
+        }
+        assert!(PlanStatus::parse("bogus").is_err());
     }
 }

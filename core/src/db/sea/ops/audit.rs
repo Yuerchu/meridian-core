@@ -1,10 +1,9 @@
 //! Writing `audit_messages`, on SeaORM: an append-only copy of every message
 //! as it was said, with what it was priced at taken at the time.
 //!
-//! The rules — which roles carry spend, where a price tier is decided, why a
-//! deleted provider still bills as metered — are the Diesel module's, stated
-//! there at length (`db::ops::audit`); this is the same record written through
-//! the caller's `WriteTx`, and the pairs are in `docs/dual-impl.md`.
+//! Every write takes the caller's `WriteTx`. Which roles carry spend is
+//! [`BILLED_ROLES`]; a price tier is decided by the prompt this one request
+//! sent, when the row is written, because nothing downstream still knows it.
 
 use sea_orm::ActiveValue::Set;
 use sea_orm::{DbErr, EntityTrait};
@@ -212,7 +211,86 @@ pub async fn record(tx: &WriteTx, msg: &message::Model) -> Result<(), DbErr> {
     Ok(())
 }
 
-pub use crate::db::ops::audit::SideRequestCost;
+/// The role an automatic-review request is filed under.
+///
+/// Its own value rather than `assistant`, because a review is spend the user
+/// did not ask for directly and a total that cannot separate the two is a
+/// total nobody can act on. `db::sea::ops::usage` counts both.
+pub const AUTO_REVIEW_ROLE: &str = "auto_review";
+
+/// Summarising a conversation so it fits again.
+///
+/// The most expensive request the app makes on its own behalf — its prompt is
+/// the whole history being compacted — and until this existed it was the one
+/// upstream charge that appeared nowhere at all. The summary it produces is
+/// written as a `user` row, so it could never have been counted through the
+/// ordinary path.
+pub const COMPACTION_ROLE: &str = "compaction";
+
+/// Naming a conversation from its first exchange. Small, frequent, and equally
+/// invisible before this.
+pub const TITLE_ROLE: &str = "title";
+
+/// Pulling durable facts out of a finished QQ turn. Another request nobody
+/// typed, and the same hole titles used to fall through: `chat()` throws the
+/// usage away at the adapter boundary.
+pub const EXTRACTION_ROLE: &str = "extraction";
+
+/// Every role that carries spend.
+///
+/// The list `db::sea::ops::usage` filters on. A role missing from here is traffic
+/// that was paid for and reported as nothing — which is how compaction and
+/// titles went unrecorded for as long as they did, so adding a role means adding
+/// it here in the same change.
+pub const BILLED_ROLES: &[&str] = &[
+    "assistant",
+    AUTO_REVIEW_ROLE,
+    COMPACTION_ROLE,
+    TITLE_ROLE,
+    EXTRACTION_ROLE,
+];
+
+/// What one request the app made on its own behalf cost.
+///
+/// A review, a summary, a title: none of them is something a person asked for
+/// directly, none has a `messages` row of its own to be copied from, and every
+/// one of them is charged for. `role` is what keeps them separable — a total
+/// nobody can decompose is one nobody can act on.
+#[derive(Debug, Clone)]
+pub struct SideRequestCost<'a> {
+    /// One of the `*_ROLE` constants above.
+    pub role: &'a str,
+    /// The row this spend is filed against: the message a review judged, the
+    /// summary a compaction wrote, the reply a title was taken from. Something
+    /// real, so the record can be traced back — never invented.
+    pub message_id: &'a str,
+    pub conversation_id: &'a str,
+    pub turn_id: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
+    pub provider_name: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    /// Summed across every request the review made — a quick pass plus up to six
+    /// escalating rounds.
+    pub usage: crate::db::models::message::MessageUsage,
+    /// The largest single request's prompt, which is what decides the price
+    /// tier.
+    ///
+    /// **Not `usage.input_tokens`, and the difference costs real money.** That
+    /// figure is a sum over as many as seven requests, so a review whose every
+    /// round sat comfortably under a threshold still adds up to something above
+    /// it — and billing the whole row at the long-context rate then doubles it.
+    /// This is the same mistake the turn loop avoids by pricing each round as it
+    /// goes; a review has one audit row to put its cost in, so the closest it can
+    /// get is the tier its biggest round actually reached.
+    ///
+    /// `None` falls back to the base rate, which is what a review with no
+    /// reported usage should cost.
+    pub peak_prompt_tokens: Option<i32>,
+    /// One line, for reading the log back. Never the transcript that was sent:
+    /// this table is exportable and the projection carries the user's own
+    /// messages.
+    pub summary: &'a str,
+}
 
 /// Record what a request the app made on its own behalf cost: the same
 /// snapshot, priced at the same moment against the same table, attributed to
@@ -591,7 +669,7 @@ mod tests {
             record_side_request(
                 tx,
                 SideRequestCost {
-                    role: crate::db::ops::audit::AUTO_REVIEW_ROLE,
+                    role: crate::db::sea::ops::audit::AUTO_REVIEW_ROLE,
                     message_id: "m1",
                     conversation_id: "c1",
                     turn_id: None,
@@ -612,7 +690,7 @@ mod tests {
         .await
         .unwrap();
         let review = logged(&db, "m1").await;
-        assert_eq!(review.role, crate::db::ops::audit::AUTO_REVIEW_ROLE);
+        assert_eq!(review.role, crate::db::sea::ops::audit::AUTO_REVIEW_ROLE);
         assert_eq!((review.input_tokens, review.sender_id), (Some(900), None));
         assert_eq!(
             (review.input_price, review.output_price),

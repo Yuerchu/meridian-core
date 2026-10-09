@@ -1,10 +1,5 @@
 //! Reading and writing `assistants`.
 //!
-//! The shell's assistant commands run on these; the assistant reads inside
-//! core's Diesel work (turn configuration, OneBot, the hook reviewer, ACP,
-//! first-run seeding) still use `db::ops::assistant`, and the pairs are listed
-//! in `docs/dual-impl.md`.
-//!
 //! No function here opens a transaction of its own: a write takes the caller's
 //! `WriteTx`, and the caller's `Db::write` is the `BEGIN IMMEDIATE`.
 
