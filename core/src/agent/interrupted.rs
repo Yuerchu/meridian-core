@@ -18,7 +18,7 @@
 
 use crate::db::entity::turn;
 use crate::db::models::turn::{TurnPhase, TurnStatus};
-use crate::db::ops::turn::{InterruptedCandidate, Ledger};
+use crate::db::sea::ops::turn::{InterruptedCandidate, Ledger};
 use crate::turn::{TurnCoordinator, TurnOrigin};
 
 /// Whether a recorded turn is one that stopped without finishing.
@@ -312,22 +312,21 @@ fn subject(candidate: &InterruptedCandidate) -> Option<String> {
 mod tests {
     use super::*;
     use crate::db::models::turn::ERROR_LOOP_DETECTED;
-    use crate::db::ops::conversation::create_conversation;
-    use crate::db::ops::turn;
     use crate::db::sea::cap::Db;
+    use crate::db::sea::ops::{conversation as conversation_ops, turn};
     use crate::turn::TurnOrigin;
     use std::sync::Arc;
 
-    /// One file both pools open: the rows are written the way the Diesel
-    /// writers still write them, and read the way the runners now read them.
-    async fn setup() -> (tempfile::TempDir, crate::db::DbPool, Db, Arc<TurnCoordinator>) {
-        let dir = tempfile::tempdir().unwrap();
-        let (pool, db) = crate::db::sea::shared_test_db(dir.path()).await;
-        {
-            let mut conn = pool.get().unwrap();
-            create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
-        }
-        (dir, pool, db, Arc::new(TurnCoordinator::new()))
+    async fn setup() -> (Db, Arc<TurnCoordinator>) {
+        let db = crate::db::sea::sea_test_db().await;
+        create_conversation(&db, "c1").await;
+        (db, Arc::new(TurnCoordinator::new()))
+    }
+
+    async fn create_conversation(db: &Db, id: &str) {
+        db.write(async |tx| conversation_ops::create_conversation(tx, id, Some("t"), None, None, 1).await)
+            .await
+            .unwrap();
     }
 
     async fn latest(db: &Db, coordinator: &Arc<TurnCoordinator>) -> Option<Report> {
@@ -343,8 +342,7 @@ mod tests {
 
     /// The other half of a real caller: the request got out, so what it carried
     /// is now on record as told.
-    fn delivered(pool: &crate::db::DbPool, report: Report, at: i64) {
-        let mut conn = pool.get().unwrap();
+    async fn delivered(db: &Db, report: Report, at: i64) {
         for ledger in [Ledger::Own, Ledger::Parent] {
             let ids: Vec<String> = report
                 .turns
@@ -352,23 +350,27 @@ mod tests {
                 .filter(|(_, l)| *l == ledger)
                 .map(|(id, _)| id.clone())
                 .collect();
-            turn::mark_reported(&mut conn, &ids, ledger, at).unwrap();
+            db.write(async |tx| turn::mark_reported(tx, &ids, ledger, at).await)
+                .await
+                .unwrap();
         }
     }
 
     #[tokio::test]
     async fn a_conversation_with_no_turns_says_nothing() {
-        let (_dir, _pool, db, c) = setup().await;
+        let (db, c) = setup().await;
         assert!(latest(&db, &c).await.is_none());
     }
 
     #[tokio::test]
     async fn a_turn_that_finished_says_nothing() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        turn::finish(&mut conn, "t1", TurnStatus::Done, None, 1500).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        db.write(async |tx| turn::begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::finish(tx, "t1", TurnStatus::Done, None, 1500).await)
+            .await
+            .unwrap();
 
         assert!(latest(&db, &c).await.is_none());
     }
@@ -377,11 +379,13 @@ mod tests {
     /// still says `running`. Trusting the column would miss it entirely.
     #[tokio::test]
     async fn a_turn_still_marked_running_but_held_by_nobody_was_cut_off() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        turn::set_phase(&mut conn, "t1", TurnPhase::RunningTool, Some("edit_file"), 1001).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        db.write(async |tx| turn::begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::set_phase(tx, "t1", TurnPhase::RunningTool, Some("edit_file"), 1001).await)
+            .await
+            .unwrap();
 
         let told = latest(&db, &c).await.expect("a turn nobody is running was cut off");
         assert!(told.text().contains("edit_file"));
@@ -393,11 +397,11 @@ mod tests {
     /// model about work still in progress.
     #[tokio::test]
     async fn a_turn_that_is_actually_running_is_not_an_interruption() {
-        let (_dir, pool, db, c) = setup().await;
+        let (db, c) = setup().await;
         let lease = c.try_acquire_turn_as("c1", TurnOrigin::Desktop, "t1".into()).unwrap();
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        drop(conn);
+        db.write(async |tx| turn::begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
 
         assert!(latest(&db, &c).await.is_none());
 
@@ -411,10 +415,10 @@ mod tests {
     /// not make the dead one before it look alive.
     #[tokio::test]
     async fn a_newer_turn_does_not_vouch_for_an_older_one() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "dead", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        db.write(async |tx| turn::begin(tx, "dead", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
         let _live = c.try_acquire_turn_as("c1", TurnOrigin::Desktop, "live".into()).unwrap();
 
         // `dead` is still the most recent recorded turn, and it is not the one
@@ -433,18 +437,20 @@ mod tests {
     /// no exclusion at all, which the token estimator does.
     #[tokio::test]
     async fn a_turn_asking_about_the_one_before_it_does_not_find_itself() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "dead", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        turn::set_phase(&mut conn, "dead", TurnPhase::RunningTool, Some("edit_file"), 1001).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        db.write(async |tx| turn::begin(tx, "dead", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::set_phase(tx, "dead", TurnPhase::RunningTool, Some("edit_file"), 1001).await)
+            .await
+            .unwrap();
 
         // The new turn takes the conversation and opens its record, exactly as
         // the runner does before assembling its request.
         let _live = c.try_acquire_turn_as("c1", TurnOrigin::Desktop, "live".into()).unwrap();
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "live", "c1", TurnOrigin::Desktop, None, 2000).unwrap();
-        drop(conn);
+        db.write(async |tx| turn::begin(tx, "live", "c1", TurnOrigin::Desktop, None, 2000).await)
+            .await
+            .unwrap();
 
         let told = asked_by(&db, &c, "live")
             .await
@@ -464,7 +470,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_startup_verdict_is_believed_without_asking_again() {
-        let (_dir, _pool, db, c) = setup().await;
+        let (db, c) = setup().await;
         db.write(async |tx| {
             use crate::db::sea::ops::turn as sea_turn;
             sea_turn::begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await?;
@@ -486,24 +492,26 @@ mod tests {
 
     #[tokio::test]
     async fn each_phase_says_something_different() {
-        let (_dir, pool, db, c) = setup().await;
+        let (db, c) = setup().await;
         for (phase, tool, expect) in [
             (TurnPhase::Streaming, None, "part way through writing a reply"),
             (TurnPhase::Compacting, None, "summarising this conversation"),
             (TurnPhase::AwaitingApproval, Some("run_command"), "did not run"),
             (TurnPhase::RunningTool, Some("edit_file"), "may have taken effect"),
         ] {
-            let mut conn = pool.get().unwrap();
             let id = format!("t-{}", phase.as_str());
-            turn::begin(&mut conn, &id, "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-            turn::set_phase(&mut conn, &id, phase, tool, 1001).unwrap();
-            drop(conn);
+            db.write(async |tx| turn::begin(tx, &id, "c1", TurnOrigin::Desktop, None, 1000).await)
+                .await
+                .unwrap();
+            db.write(async |tx| turn::set_phase(tx, &id, phase, tool, 1001).await)
+                .await
+                .unwrap();
 
             let told = latest(&db, &c).await.expect("cut off");
             assert!(told.text().contains(expect), "{}: {}", phase.as_str(), told.text());
             // Settle it, so the next phase is read on its own rather than
             // alongside everything before it.
-            delivered(&pool, told, 1002);
+            delivered(&db, told, 1002).await;
         }
     }
 
@@ -513,15 +521,17 @@ mod tests {
     /// This block is only for turns that never got to say anything.
     #[tokio::test]
     async fn a_turn_that_ended_badly_is_not_an_interruption() {
-        let (_dir, pool, db, c) = setup().await;
+        let (db, c) = setup().await;
         for (id, error) in [
             ("looped", Some(ERROR_LOOP_DETECTED)),
             ("broke", Some("API Key not set")),
         ] {
-            let mut conn = pool.get().unwrap();
-            turn::begin(&mut conn, id, "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-            turn::finish(&mut conn, id, TurnStatus::Failed, error, 1500).unwrap();
-            drop(conn);
+            db.write(async |tx| turn::begin(tx, id, "c1", TurnOrigin::Desktop, None, 1000).await)
+                .await
+                .unwrap();
+            db.write(async |tx| turn::finish(tx, id, TurnStatus::Failed, error, 1500).await)
+                .await
+                .unwrap();
 
             assert!(latest(&db, &c).await.is_none(), "{id} ended, badly but definitely");
         }
@@ -530,11 +540,13 @@ mod tests {
     /// Stopping is a decision the user made and watched happen.
     #[tokio::test]
     async fn a_turn_the_user_stopped_is_not_an_interruption() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        turn::finish(&mut conn, "t1", TurnStatus::Cancelled, None, 1500).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        db.write(async |tx| turn::begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::finish(tx, "t1", TurnStatus::Cancelled, None, 1500).await)
+            .await
+            .unwrap();
 
         assert!(latest(&db, &c).await.is_none());
     }
@@ -543,23 +555,22 @@ mod tests {
     /// come back.
     #[tokio::test]
     async fn a_turn_that_carried_the_notice_clears_it() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "dead", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        db.write(async |tx| turn::begin(tx, "dead", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
 
         // The good turn opens its record, reads the notice, and gets its
         // request away.
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "good", "c1", TurnOrigin::Desktop, None, 2000).unwrap();
-        drop(conn);
+        db.write(async |tx| turn::begin(tx, "good", "c1", TurnOrigin::Desktop, None, 2000).await)
+            .await
+            .unwrap();
         let told = asked_by(&db, &c, "good").await.expect("the turn before it was cut off");
         assert!(told.text().contains("cut off"));
-        delivered(&pool, told, 2100);
-
-        let mut conn = pool.get().unwrap();
-        turn::finish(&mut conn, "good", TurnStatus::Done, None, 2500).unwrap();
-        drop(conn);
+        delivered(&db, told, 2100).await;
+        db.write(async |tx| turn::finish(tx, "good", TurnStatus::Done, None, 2500).await)
+            .await
+            .unwrap();
 
         assert!(latest(&db, &c).await.is_none());
     }
@@ -573,36 +584,31 @@ mod tests {
     /// the model ever having seen it.
     #[tokio::test]
     async fn a_turn_that_died_before_reaching_the_provider_settles_nothing() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "dead", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        turn::set_phase(&mut conn, "dead", TurnPhase::RunningTool, Some("edit_file"), 1001).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        db.write(async |tx| turn::begin(tx, "dead", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::set_phase(tx, "dead", TurnPhase::RunningTool, Some("edit_file"), 1001).await)
+            .await
+            .unwrap();
 
         // The next turn reads the warning and then falls over on its way out —
         // a missing key, an unreadable config. It never sent anything.
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "stillborn", "c1", TurnOrigin::Desktop, None, 2000).unwrap();
-        drop(conn);
+        db.write(async |tx| turn::begin(tx, "stillborn", "c1", TurnOrigin::Desktop, None, 2000).await)
+            .await
+            .unwrap();
         assert!(
             asked_by(&db, &c, "stillborn").await.is_some(),
             "it read the warning, which is not the same as delivering it",
         );
-        let mut conn = pool.get().unwrap();
-        turn::finish(
-            &mut conn,
-            "stillborn",
-            TurnStatus::Failed,
-            Some("API Key not set"),
-            2100,
-        )
-        .unwrap();
-        drop(conn);
+        db.write(async |tx| turn::finish(tx, "stillborn", TurnStatus::Failed, Some("API Key not set"), 2100).await)
+            .await
+            .unwrap();
 
         // The turn after it still has to be told.
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "next", "c1", TurnOrigin::Desktop, None, 3000).unwrap();
-        drop(conn);
+        db.write(async |tx| turn::begin(tx, "next", "c1", TurnOrigin::Desktop, None, 3000).await)
+            .await
+            .unwrap();
         let told = asked_by(&db, &c, "next").await.expect("nobody has told the model yet");
         assert!(told.text().contains("edit_file"));
         assert!(told.text().contains("may have taken effect"));
@@ -618,13 +624,19 @@ mod tests {
     /// be left for a later message.
     #[tokio::test]
     async fn every_turn_still_owed_an_explanation_gets_one() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        turn::begin(&mut conn, "first", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        turn::set_phase(&mut conn, "first", TurnPhase::RunningTool, Some("edit_file"), 1001).unwrap();
-        turn::begin(&mut conn, "second", "c1", TurnOrigin::Desktop, None, 2000).unwrap();
-        turn::set_phase(&mut conn, "second", TurnPhase::Compacting, None, 2001).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        db.write(async |tx| turn::begin(tx, "first", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::set_phase(tx, "first", TurnPhase::RunningTool, Some("edit_file"), 1001).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::begin(tx, "second", "c1", TurnOrigin::Desktop, None, 2000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::set_phase(tx, "second", TurnPhase::Compacting, None, 2001).await)
+            .await
+            .unwrap();
 
         let told = latest(&db, &c).await.expect("both are still owed");
         assert_eq!(told.turn_ids(), ["first", "second"], "oldest first, as they happened");
@@ -632,7 +644,7 @@ mod tests {
         assert!(at("edit_file") < at("summarising"), "{}", told.text());
         assert!(told.text().contains("Several turns"));
 
-        delivered(&pool, told, 3000);
+        delivered(&db, told, 3000).await;
         assert!(latest(&db, &c).await.is_none());
     }
 
@@ -641,21 +653,22 @@ mod tests {
     /// bearing on what happens next.
     #[tokio::test]
     async fn more_wrecks_than_fit_are_deferred_rather_than_dropped() {
-        let (_dir, pool, db, c) = setup().await;
+        let (db, c) = setup().await;
         {
-            let mut conn = pool.get().unwrap();
             for n in 0..(AT_MOST as i64 + 1) {
-                turn::begin(&mut conn, &format!("t{n}"), "c1", TurnOrigin::Desktop, None, 1000 + n).unwrap();
+                db.write(async |tx| turn::begin(tx, &format!("t{n}"), "c1", TurnOrigin::Desktop, None, 1000 + n).await)
+                    .await
+                    .unwrap();
             }
         }
 
         let told = latest(&db, &c).await.expect("four wrecks");
         assert_eq!(told.turn_ids(), ["t1", "t2", "t3"]);
-        delivered(&pool, told, 5000);
+        delivered(&db, told, 5000).await;
 
         let rest = latest(&db, &c).await.expect("the oldest one is still owed");
         assert_eq!(rest.turn_ids(), ["t0"]);
-        delivered(&pool, rest, 5001);
+        delivered(&db, rest, 5001).await;
         assert!(latest(&db, &c).await.is_none());
     }
 
@@ -664,27 +677,21 @@ mod tests {
     /// before them, so they cannot be the reason the model is not told about it.
     #[tokio::test]
     async fn a_newer_wreck_cannot_bury_an_older_one_that_was_inside_a_tool() {
-        let (_dir, pool, db, c) = setup().await;
+        let (db, c) = setup().await;
         {
-            let mut conn = pool.get().unwrap();
-            turn::begin(&mut conn, "wrote-a-file", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-            turn::set_phase(
-                &mut conn,
-                "wrote-a-file",
-                TurnPhase::RunningTool,
-                Some("edit_file"),
-                1001,
-            )
+            db.write(async |tx| turn::begin(tx, "wrote-a-file", "c1", TurnOrigin::Desktop, None, 1000).await)
+                .await
+                .unwrap();
+            db.write(async |tx| {
+                turn::set_phase(tx, "wrote-a-file", TurnPhase::RunningTool, Some("edit_file"), 1001).await
+            })
+            .await
             .unwrap();
             for n in 0..(AT_MOST as i64) {
-                turn::begin(
-                    &mut conn,
-                    &format!("later{n}"),
-                    "c1",
-                    TurnOrigin::Desktop,
-                    None,
-                    2000 + n,
-                )
+                db.write(async |tx| {
+                    turn::begin(tx, &format!("later{n}"), "c1", TurnOrigin::Desktop, None, 2000 + n).await
+                })
+                .await
                 .unwrap();
             }
         }
@@ -705,32 +712,30 @@ mod tests {
     /// started, which reaches its own parent and no further.
     #[tokio::test]
     async fn another_conversations_wreck_is_not_reported_here() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        create_conversation(&mut conn, "c2", Some("t"), None, None, 1).unwrap();
-        turn::begin(&mut conn, "t1", "c2", TurnOrigin::Desktop, None, 1000).unwrap();
+        let (db, c) = setup().await;
+        create_conversation(&db, "c2").await;
+        db.write(async |tx| turn::begin(tx, "t1", "c2", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
         // And a sub-agent belonging to that other conversation.
-        delegated(&mut conn, "elsewhere", "c2", Some("their errand"));
-        turn::begin(&mut conn, "theirs", "elsewhere", TurnOrigin::SubAgent, None, 1000).unwrap();
-        drop(conn);
+        delegated(&db, "elsewhere", "c2", Some("their errand")).await;
+        db.write(async |tx| turn::begin(tx, "theirs", "elsewhere", TurnOrigin::SubAgent, None, 1000).await)
+            .await
+            .unwrap();
 
         assert!(latest(&db, &c).await.is_none());
     }
 
     /// A sub-agent's conversation, as `DesktopSubAgents` opens one.
-    fn delegated(conn: &mut diesel::sqlite::SqliteConnection, id: &str, parent: &str, title: Option<&str>) {
-        crate::db::ops::conversation::insert(
-            conn,
-            crate::db::models::conversation::ConversationInsert {
-                id,
-                title,
-                parent_conversation_id: Some(parent),
-                created_at: 1,
-                updated_at: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    async fn delegated(db: &Db, id: &str, parent: &str, title: Option<&str>) {
+        let row = crate::db::entity::conversation::Model {
+            title: title.map(str::to_owned),
+            parent_conversation_id: Some(parent.to_owned()),
+            ..conversation_ops::new_row(id, 1)
+        };
+        db.write(async |tx| conversation_ops::insert(tx, row).await)
+            .await
+            .unwrap();
     }
 
     /// The reason this batch exists. What the parent's own record can say is
@@ -739,12 +744,14 @@ mod tests {
     /// mentioned.
     #[tokio::test]
     async fn a_sub_agent_caught_inside_a_tool_is_reported_to_the_parent() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        delegated(&mut conn, "sub-1", "c1", Some("check the failing test"));
-        turn::begin(&mut conn, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).unwrap();
-        turn::set_phase(&mut conn, "run", TurnPhase::RunningTool, Some("edit_file"), 1001).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        delegated(&db, "sub-1", "c1", Some("check the failing test")).await;
+        db.write(async |tx| turn::begin(tx, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::set_phase(tx, "run", TurnPhase::RunningTool, Some("edit_file"), 1001).await)
+            .await
+            .unwrap();
 
         let told = latest(&db, &c).await.expect("the parent is owed this");
         assert_eq!(told.turn_ids(), ["run"]);
@@ -758,11 +765,11 @@ mod tests {
     /// was one. Missing, it says less rather than showing empty quotes.
     #[tokio::test]
     async fn a_sub_agent_with_no_title_still_introduces_itself() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        delegated(&mut conn, "sub-1", "c1", None);
-        turn::begin(&mut conn, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        delegated(&db, "sub-1", "c1", None).await;
+        db.write(async |tx| turn::begin(tx, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).await)
+            .await
+            .unwrap();
 
         let told = latest(&db, &c).await.expect("cut off");
         assert!(told.text().contains("A sub-agent you delegated to"), "{}", told.text());
@@ -775,12 +782,14 @@ mod tests {
     /// and the parent would go on working as if nothing had been left half-done.
     #[tokio::test]
     async fn the_sub_agents_own_conversation_being_told_does_not_settle_the_parents_debt() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        delegated(&mut conn, "sub-1", "c1", Some("an errand"));
-        turn::begin(&mut conn, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).unwrap();
-        turn::set_phase(&mut conn, "run", TurnPhase::RunningTool, Some("edit_file"), 1001).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        delegated(&db, "sub-1", "c1", Some("an errand")).await;
+        db.write(async |tx| turn::begin(tx, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::set_phase(tx, "run", TurnPhase::RunningTool, Some("edit_file"), 1001).await)
+            .await
+            .unwrap();
 
         // The user opens the sub-agent and asks it something. That turn carries
         // the notice, so the sub-agent's own conversation is settled.
@@ -791,7 +800,7 @@ mod tests {
                 .expect("its own history was cut off")
         };
         assert_eq!(inside.turn_ids(), ["run"]);
-        delivered(&pool, inside, 2000);
+        delivered(&db, inside, 2000).await;
 
         let told = latest(&db, &c).await.expect("the parent has still not been told");
         assert_eq!(told.turn_ids(), ["run"]);
@@ -799,7 +808,7 @@ mod tests {
 
         // And once the parent has been told, it stops asking — without having
         // un-told the sub-agent.
-        delivered(&pool, told, 3000);
+        delivered(&db, told, 3000).await;
         assert!(latest(&db, &c).await.is_none());
 
         assert!(load_block(&db, &c, "sub-1", "").await.unwrap().is_none());
@@ -809,13 +818,13 @@ mod tests {
     /// the sub-agent's own transcript hearing about it.
     #[tokio::test]
     async fn the_parent_being_told_does_not_settle_the_sub_agents_own_debt() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        delegated(&mut conn, "sub-1", "c1", Some("an errand"));
-        turn::begin(&mut conn, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        delegated(&db, "sub-1", "c1", Some("an errand")).await;
+        db.write(async |tx| turn::begin(tx, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).await)
+            .await
+            .unwrap();
 
-        delivered(&pool, latest(&db, &c).await.expect("the parent is owed it"), 2000);
+        delivered(&db, latest(&db, &c).await.expect("the parent is owed it"), 2000).await;
 
         let inside = load_block(&db, &c, "sub-1", "")
             .await
@@ -829,14 +838,18 @@ mod tests {
     /// there is not something it can be asked to reason about.
     #[tokio::test]
     async fn a_follow_up_chat_inside_a_sub_agent_is_not_the_parents_business() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        delegated(&mut conn, "sub-1", "c1", Some("an errand"));
-        turn::begin(&mut conn, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).unwrap();
-        turn::finish(&mut conn, "run", TurnStatus::Done, None, 1500).unwrap();
+        let (db, c) = setup().await;
+        delegated(&db, "sub-1", "c1", Some("an errand")).await;
+        db.write(async |tx| turn::begin(tx, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).await)
+            .await
+            .unwrap();
+        db.write(async |tx| turn::finish(tx, "run", TurnStatus::Done, None, 1500).await)
+            .await
+            .unwrap();
         // The user follows up inside the sub-agent, and that turn is cut off.
-        turn::begin(&mut conn, "follow-up", "sub-1", TurnOrigin::Desktop, None, 2000).unwrap();
-        drop(conn);
+        db.write(async |tx| turn::begin(tx, "follow-up", "sub-1", TurnOrigin::Desktop, None, 2000).await)
+            .await
+            .unwrap();
 
         assert!(latest(&db, &c).await.is_none(), "the parent has no business with it");
 
@@ -852,11 +865,11 @@ mod tests {
     /// wreck — while it is still working.
     #[tokio::test]
     async fn a_sub_agent_that_is_actually_running_is_not_an_interruption() {
-        let (_dir, pool, db, c) = setup().await;
-        let mut conn = pool.get().unwrap();
-        delegated(&mut conn, "sub-1", "c1", Some("an errand"));
-        turn::begin(&mut conn, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).unwrap();
-        drop(conn);
+        let (db, c) = setup().await;
+        delegated(&db, "sub-1", "c1", Some("an errand")).await;
+        db.write(async |tx| turn::begin(tx, "run", "sub-1", TurnOrigin::SubAgent, None, 1000).await)
+            .await
+            .unwrap();
         let lease = c
             .try_acquire_turn_as("sub-1", TurnOrigin::SubAgent, "run".into())
             .unwrap();

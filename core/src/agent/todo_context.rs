@@ -20,8 +20,6 @@
 //! marker once, so the model stops acting on a list the last frozen row still
 //! shows as open.
 
-use diesel::sqlite::SqliteConnection;
-
 use crate::db::entity::message as message_entity;
 use crate::db::sea::DbErr;
 use crate::db::sea::cap::Db;
@@ -89,25 +87,6 @@ fn prior(live: &[message_entity::Model]) -> Result<Option<(TodoKind, &str)>, Str
     Ok(None)
 }
 
-/// Decide what, if anything, to send and freeze this turn. Reads only.
-///
-/// The block is compared against the frozen one as *bytes*, trimmed the way
-/// it is sent, so "unchanged" is exactly "the model already has this".
-pub fn plan_todo_injection(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-    live: &[message_entity::Model],
-) -> Result<Option<TodoInjection>, String> {
-    let rendered = crate::db::ops::todo::get_active_view(conn, conversation_id)
-        .map(|view| {
-            view.as_ref()
-                .and_then(crate::db::ops::todo::format_todo_block)
-                .map(|block| block.trim_start().to_string())
-        })
-        .map_err(|e| e.to_string());
-    decide(conversation_id, live, rendered)
-}
-
 /// What to freeze, given the live path and the checklist as it renders now.
 fn decide(
     conversation_id: &str,
@@ -144,9 +123,12 @@ fn decide(
     })
 }
 
-/// [`plan_todo_injection`] on SeaORM, for the turns: the list and its items
-/// are read in one snapshot.
-pub async fn plan_todo_injection_async(
+/// Decide what, if anything, to send and freeze this turn. Reads only: the
+/// list and its items in one snapshot.
+///
+/// The block is compared against the frozen one as *bytes*, trimmed the way
+/// it is sent, so "unchanged" is exactly "the model already has this".
+pub async fn plan_todo_injection(
     db: &Db,
     conversation_id: &str,
     live: &[message_entity::Model],
@@ -190,14 +172,24 @@ pub async fn persist_todo_injection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
     use crate::db::models::todo::ItemStatus;
-    use crate::db::ops::todo::{TodoItemSpec, replace_active_list};
+    use crate::db::sea::ops::todo::TodoItemSpec;
 
-    fn seed(pool: &crate::db::DbPool) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
-        crate::db::ops::turn::begin(&mut conn, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).unwrap();
+    async fn seeded() -> Db {
+        let db = crate::db::sea::sea_test_db().await;
+        db.write(async |tx| {
+            crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("t"), None, None, 1).await?;
+            crate::db::sea::ops::turn::begin(tx, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).await
+        })
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn replace_active_list(db: &Db, title: &str, items: &[TodoItemSpec], now: i64) {
+        db.write(async |tx| crate::db::sea::ops::todo::replace_active_list(tx, "c1", title, items, now).await)
+            .await
+            .unwrap();
     }
 
     fn step(content: &str, status: ItemStatus) -> TodoItemSpec {
@@ -246,8 +238,8 @@ mod tests {
 
     /// Run a turn start the way a surface would: plan against the rows frozen
     /// so far, then append this turn's row to them.
-    fn round(conn: &mut SqliteConnection, history: &mut Vec<message_entity::Model>) -> Option<TodoInjection> {
-        let injection = plan_todo_injection(conn, "c1", history).unwrap();
+    async fn round(db: &Db, history: &mut Vec<message_entity::Model>) -> Option<TodoInjection> {
+        let injection = plan_todo_injection(db, "c1", history).await.unwrap();
         if let Some(injection) = &injection {
             history.push(frozen(injection));
         }
@@ -255,22 +247,20 @@ mod tests {
     }
 
     /// The QQ group and the sub-agent: no list, nothing frozen, nothing to say.
-    #[test]
-    fn a_conversation_without_a_checklist_writes_nothing() {
-        let pool = diesel_test_db();
-        seed(&pool);
-        let mut conn = pool.get().unwrap();
-        assert_eq!(round(&mut conn, &mut Vec::new()), None);
+    #[tokio::test]
+    async fn a_conversation_without_a_checklist_writes_nothing() {
+        let db = seeded().await;
+        assert_eq!(round(&db, &mut Vec::new()).await, None);
     }
 
-    #[test]
-    fn a_new_checklist_is_frozen_in_full() {
-        let pool = diesel_test_db();
-        seed(&pool);
-        let mut conn = pool.get().unwrap();
-        replace_active_list(&mut conn, "c1", "Ship it", &[step("step", ItemStatus::Pending)], 10).unwrap();
+    #[tokio::test]
+    async fn a_new_checklist_is_frozen_in_full() {
+        let db = seeded().await;
+        replace_active_list(&db, "Ship it", &[step("step", ItemStatus::Pending)], 10).await;
 
-        let first = round(&mut conn, &mut Vec::new()).expect("a list nobody has seen is sent");
+        let first = round(&db, &mut Vec::new())
+            .await
+            .expect("a list nobody has seen is sent");
         assert_eq!(first.kind, TodoKind::List);
         assert!(
             first.text.starts_with("<todo_list>\nTitle: Ship it\n"),
@@ -282,17 +272,15 @@ mod tests {
 
     /// Nothing changed, so nothing is sent — the row from the earlier turn is
     /// still in the history and the model can still read it.
-    #[test]
-    fn an_unchanged_checklist_injects_nothing() {
-        let pool = diesel_test_db();
-        seed(&pool);
-        let mut conn = pool.get().unwrap();
-        replace_active_list(&mut conn, "c1", "Ship it", &[step("step", ItemStatus::Pending)], 10).unwrap();
+    #[tokio::test]
+    async fn an_unchanged_checklist_injects_nothing() {
+        let db = seeded().await;
+        replace_active_list(&db, "Ship it", &[step("step", ItemStatus::Pending)], 10).await;
         let mut history = Vec::new();
 
-        assert!(round(&mut conn, &mut history).is_some());
-        assert_eq!(round(&mut conn, &mut history), None);
-        assert_eq!(round(&mut conn, &mut history), None);
+        assert!(round(&db, &mut history).await.is_some());
+        assert_eq!(round(&db, &mut history).await, None);
+        assert_eq!(round(&db, &mut history).await, None);
     }
 
     /// A tick between turns writes one new row, hung where the message will hang
@@ -336,17 +324,14 @@ mod tests {
         }
 
         tick(&db, ItemStatus::Pending, 10).await;
-        let first = plan_todo_injection_async(&db, "c1", &live(&db).await)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = plan_todo_injection(&db, "c1", &live(&db).await).await.unwrap().unwrap();
         let first_row = persist_todo_injection(&db, &first, "c1", "t1", None, 100)
             .await
             .expect("the row is written and its id handed back");
         user_row(&db, "u1", Some(&first_row), 101).await;
 
         tick(&db, ItemStatus::InProgress, 200).await;
-        let second = plan_todo_injection_async(&db, "c1", &live(&db).await)
+        let second = plan_todo_injection(&db, "c1", &live(&db).await)
             .await
             .unwrap()
             .expect("a ticked step is a changed list");
@@ -370,53 +355,52 @@ mod tests {
             "the message hangs off the new row"
         );
 
-        assert_eq!(plan_todo_injection_async(&db, "c1", &path).await.unwrap(), None);
+        assert_eq!(plan_todo_injection(&db, "c1", &path).await.unwrap(), None);
     }
 
     /// Finishing the last step archives the list. The model's newest frozen row
     /// still shows it open, so it is told once that nothing is in progress — and
     /// only once.
-    #[test]
-    fn an_emptied_checklist_writes_the_cleared_marker_once() {
-        let pool = diesel_test_db();
-        seed(&pool);
-        let mut conn = pool.get().unwrap();
-        replace_active_list(&mut conn, "c1", "Ship it", &[step("step", ItemStatus::InProgress)], 10).unwrap();
+    #[tokio::test]
+    async fn an_emptied_checklist_writes_the_cleared_marker_once() {
+        let db = seeded().await;
+        replace_active_list(&db, "Ship it", &[step("step", ItemStatus::InProgress)], 10).await;
         let mut history = Vec::new();
-        assert_eq!(round(&mut conn, &mut history).map(|i| i.kind), Some(TodoKind::List));
+        assert_eq!(round(&db, &mut history).await.map(|i| i.kind), Some(TodoKind::List));
 
-        replace_active_list(&mut conn, "c1", "Ship it", &[step("step", ItemStatus::Completed)], 20).unwrap();
+        replace_active_list(&db, "Ship it", &[step("step", ItemStatus::Completed)], 20).await;
         assert!(
-            crate::db::ops::todo::get_active_view(&mut conn, "c1")
+            db.read(async |tx| crate::db::sea::ops::todo::get_active_view(tx, "c1").await)
+                .await
                 .unwrap()
                 .is_none(),
             "a finished list is archived"
         );
-        let cleared = round(&mut conn, &mut history).expect("the model is told the list is gone");
+        let cleared = round(&db, &mut history)
+            .await
+            .expect("the model is told the list is gone");
         assert_eq!(cleared.kind, TodoKind::None);
         assert_eq!(cleared.text, TODO_CLEARED_MARKER);
         assert_eq!(cleared.source(), "todo|none");
 
-        assert_eq!(round(&mut conn, &mut history), None, "and told once");
+        assert_eq!(round(&db, &mut history).await, None, "and told once");
 
         // A new list after that is a list nobody has seen.
-        replace_active_list(&mut conn, "c1", "Again", &[step("more", ItemStatus::Pending)], 30).unwrap();
-        assert_eq!(round(&mut conn, &mut history).map(|i| i.kind), Some(TodoKind::List));
+        replace_active_list(&db, "Again", &[step("more", ItemStatus::Pending)], 30).await;
+        assert_eq!(round(&db, &mut history).await.map(|i| i.kind), Some(TodoKind::List));
     }
 
     /// Compaction leaves `live()` starting at its anchor; a frozen row before the
     /// anchor is simply not there, and the rule says: write it all again.
-    #[test]
-    fn a_history_cut_before_the_todo_row_starts_over() {
-        let pool = diesel_test_db();
-        seed(&pool);
-        let mut conn = pool.get().unwrap();
-        replace_active_list(&mut conn, "c1", "Ship it", &[step("step", ItemStatus::Pending)], 10).unwrap();
+    #[tokio::test]
+    async fn a_history_cut_before_the_todo_row_starts_over() {
+        let db = seeded().await;
+        replace_active_list(&db, "Ship it", &[step("step", ItemStatus::Pending)], 10).await;
         let mut history = Vec::new();
-        let first = round(&mut conn, &mut history).unwrap();
+        let first = round(&db, &mut history).await.unwrap();
 
-        assert_eq!(plan_todo_injection(&mut conn, "c1", &history).unwrap(), None);
-        let after_cut = plan_todo_injection(&mut conn, "c1", &history[1..]).unwrap();
+        assert_eq!(plan_todo_injection(&db, "c1", &history).await.unwrap(), None);
+        let after_cut = plan_todo_injection(&db, "c1", &history[1..]).await.unwrap();
         assert_eq!(after_cut, Some(first), "the same full block, as if never sent");
     }
 

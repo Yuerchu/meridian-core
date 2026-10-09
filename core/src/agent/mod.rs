@@ -72,10 +72,7 @@ pub(crate) use stream::{
     MAX_STREAM_RETRIES, STREAM_RETRY_BASE, StreamResult, is_context_window_error, is_retryable_stream_error,
     parse_retry_after,
 };
-pub use todo_context::{
-    TODO_CLEARED_MARKER, TodoInjection, TodoKind, persist_todo_injection, plan_todo_injection,
-    plan_todo_injection_async,
-};
+pub use todo_context::{TODO_CLEARED_MARKER, TodoInjection, TodoKind, persist_todo_injection, plan_todo_injection};
 pub use tokenizer::{TokenBudget, TokenCounter, TokenizerKind};
 pub(crate) use tool_calls::serialize_tool_calls_openai;
 pub use tool_calls::{extract_tool_calls_from_blocks, parse_stored_tool_calls};

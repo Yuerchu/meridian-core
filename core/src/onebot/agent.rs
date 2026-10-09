@@ -829,7 +829,7 @@ async fn headless_chat_inner(
     let injection = crate::agent::plan_injection_async(sea, memory_request, ctx.live().to_vec(), t0).await?;
     // The checklist, frozen the same way and placed right after memory. A QQ
     // group never has one and this is a no-op there; a private admin chat can.
-    let todo = crate::agent::plan_todo_injection_async(sea, conversation_id, ctx.live()).await?;
+    let todo = crate::agent::plan_todo_injection(sea, conversation_id, ctx.live()).await?;
     let keep_recent = assistant.as_ref().map(|a| a.compact_keep_recent as usize).unwrap_or(10);
 
     let budget = TokenBudget::new(

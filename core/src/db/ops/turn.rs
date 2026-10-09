@@ -188,29 +188,6 @@ fn running(
 
 pub use crate::db::sea::ops::turn::{InterruptedCandidate, Ledger};
 
-/// Record that these turns have now been described to the model.
-///
-/// `updated_at` is left alone on purpose: it says when the turn itself last did
-/// something, and the turn is dead. Being talked about is not doing something.
-///
-/// The `IS NULL` filter keeps the first telling as the recorded one, which
-/// matters because two runners can read the same unreported turn before either
-/// of them dispatches.
-pub fn mark_reported(conn: &mut SqliteConnection, ids: &[String], ledger: Ledger, now: i64) -> QueryResult<usize> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let rows = turns::table.filter(turns::id.eq_any(ids));
-    match ledger {
-        Ledger::Own => diesel::update(rows.filter(turns::reported_at.is_null()))
-            .set(turns::reported_at.eq(Some(now)))
-            .execute(conn),
-        Ledger::Parent => diesel::update(rows.filter(turns::parent_reported_at.is_null()))
-            .set(turns::parent_reported_at.eq(Some(now)))
-            .execute(conn),
-    }
-}
-
 /// Tie-break for turns that started in the same millisecond.
 ///
 /// One conversation's turns are strictly sequential — the coordinator sees to
