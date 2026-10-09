@@ -26,6 +26,8 @@ use serde_json::{Value, json};
 
 use super::{Permission, Tool, ToolContext};
 use crate::agent::conversation_excerpt::{TOOL_READ_TOKENS, referenced_conversation_id, render_excerpt};
+use crate::db::sea::DbErr;
+use crate::db::sea::ops as sea_ops;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,14 +69,17 @@ impl Default for ReadConversationTool {
 
 /// Every conversation id the user has attached to `current` as a
 /// `conversation` context item, on any branch.
-fn granted_targets(
-    conn: &mut diesel::sqlite::SqliteConnection,
+async fn granted_targets(
+    db: &impl crate::db::sea::cap::Snapshot,
     current: &str,
 ) -> Result<std::collections::HashSet<String>, String> {
-    let history = crate::db::ops::message::list_messages(conn, current).map_err(|e| e.to_string())?;
+    let history = sea_ops::message::list_messages(db, current)
+        .await
+        .map_err(|e| e.to_string())?;
     let message_ids: Vec<String> = history.iter().map(|m| m.id.clone()).collect();
-    let items =
-        crate::db::ops::message_context_item::list_for_messages(conn, &message_ids).map_err(|e| e.to_string())?;
+    let items = sea_ops::message_context_item::list_for_messages(db, &message_ids)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut granted = std::collections::HashSet::new();
     for item in items.into_values().flatten() {
         if item.kind == crate::workspace::reference::MessageContextKind::Conversation
@@ -148,29 +153,37 @@ impl Tool for ReadConversationTool {
             .or_else(|| context.conversation_id.clone())
             .ok_or("read_conversation is unavailable outside a conversation")?;
 
-        let pool = context
-            .db_pool
+        let db = context
+            .sea
             .as_ref()
-            .ok_or("read_conversation is unavailable: no database handle")?
-            .clone();
+            .ok_or("read_conversation is unavailable: no database handle")?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-
-            let granted = granted_targets(&mut conn, &current)?;
-            if !granted.contains(&request.conversation_id) {
-                return Err(format!(
-                    "conversation {} has not been attached to this conversation; only threads the \
-                     user dragged in can be read",
-                    request.conversation_id
-                ));
-            }
-
-            let conversation = crate::db::ops::conversation::get_conversation(&mut conn, &request.conversation_id)
-                .map_err(|_| "the referenced conversation no longer exists".to_string())?;
-            let history = crate::db::ops::message::list_messages(&mut conn, &request.conversation_id)
-                .map_err(|e| e.to_string())?;
-            let active = crate::db::ops::message::active_context(&history, conversation.head_message_id.as_deref());
+        // The grant and the transcript at one instant.
+        let read = db
+            .read(async |tx| {
+                let granted = match granted_targets(tx, &current).await {
+                    Ok(granted) => granted,
+                    Err(error) => return Ok::<_, DbErr>(Err(error)),
+                };
+                if !granted.contains(&request.conversation_id) {
+                    return Ok(Err(format!(
+                        "conversation {} has not been attached to this conversation; only threads the \
+                         user dragged in can be read",
+                        request.conversation_id
+                    )));
+                }
+                let Some(conversation) = sea_ops::conversation::get_conversation(tx, &request.conversation_id).await?
+                else {
+                    return Ok(Err("the referenced conversation no longer exists".to_string()));
+                };
+                let history = sea_ops::message::list_messages(tx, &request.conversation_id).await?;
+                Ok(Ok((conversation, history)))
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let (conversation, history) = read?;
+        {
+            let active = sea_ops::message::active_context(&history, conversation.head_message_id.as_deref());
             let live = active.live();
             let total = live.len();
             if request.skip_newest >= total && total > 0 {
@@ -195,19 +208,16 @@ impl Tool for ReadConversationTool {
             out.push('\n');
             out.push_str(&excerpt);
             Ok(out)
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::message::MessageInsert;
-    use crate::db::models::message_context_item::MessageContextItemInsert;
+    use crate::db::sea::cap::Db;
 
-    fn context(pool: crate::db::DbPool, conversation_id: Option<&str>) -> ToolContext {
+    fn context(db: Db, conversation_id: Option<&str>) -> ToolContext {
         ToolContext {
             working_directory: None,
             shell: crate::tools::ShellType::Bash,
@@ -216,8 +226,8 @@ mod tests {
             conversation_id: conversation_id.map(str::to_string),
             turn_id: None,
             assistant_id: None,
-            db_pool: Some(pool),
-            sea: None,
+            db_pool: None,
+            sea: Some(db),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]
@@ -228,79 +238,51 @@ mod tests {
         }
     }
 
-    fn user_row<'a>(id: &'a str, conversation_id: &'a str, content: &'a str) -> MessageInsert<'a> {
-        MessageInsert {
-            id,
-            conversation_id,
-            role: "user",
-            content,
-            provider_id: None,
-            model_id: None,
-            input_tokens: None,
-            output_tokens: None,
-            tool_calls: None,
-            tool_call_id: None,
-            sort_order: 0,
-            created_at: 2,
-            reasoning_content: None,
-            rating: None,
-            schema_version: 2,
-            is_compact_summary: 0,
-            sender_id: None,
-            parent_id: None,
-            compact_anchor_id: None,
-            source: None,
-            turn_id: None,
-            tool_outcome: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            server_tool_calls: None,
-            provider_name: None,
-            response_model_id: None,
-        }
-    }
-
-    fn seed_reference(pool: &crate::db::DbPool) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::conversation::create_conversation(&mut conn, "c-here", Some("here"), None, None, 1).unwrap();
-        crate::db::ops::conversation::create_conversation(&mut conn, "c-there", Some("那边的线程"), None, None, 1)
-            .unwrap();
-        crate::db::ops::message::append_message(&mut conn, &user_row("m-user", "c-here", "看看我拖进来的线程"), None)
-            .unwrap();
-        crate::db::ops::message::append_message(&mut conn, &user_row("m-t1", "c-there", "那边说过的话"), None).unwrap();
-        crate::db::ops::message_context_item::insert_many(
-            &mut conn,
-            &[MessageContextItemInsert {
-                id: "ctx-1",
-                message_id: "m-user",
-                position: 0,
-                kind: "conversation",
-                content: "{}",
-                display_path: Some("那边的线程"),
-                line_start: None,
-                line_end: None,
-                content_hash: "h",
-                byte_count: 2,
-                line_count: 1,
-                token_count: 1,
-                truncated: 0,
-                metadata: Some("{\"conversation_id\":\"c-there\"}"),
-                created_at: 3,
-            }],
-        )
+    async fn seeded() -> Db {
+        let db = crate::db::sea::sea_test_db().await;
+        db.write(async |tx| {
+            sea_ops::conversation::create_conversation(tx, "c-here", Some("here"), None, None, 1).await?;
+            sea_ops::conversation::create_conversation(tx, "c-there", Some("那边的线程"), None, None, 1).await?;
+            let here = sea_ops::message::new_row("m-user", "c-here", "user", "看看我拖进来的线程", 2);
+            sea_ops::message::append_message(tx, here, None).await?;
+            let there = sea_ops::message::new_row("m-t1", "c-there", "user", "那边说过的话", 2);
+            sea_ops::message::append_message(tx, there, None).await?;
+            sea_ops::message_context_item::insert_many(
+                tx,
+                vec![crate::db::entity::message_context_item::Model {
+                    id: "ctx-1".into(),
+                    message_id: "m-user".into(),
+                    position: 0,
+                    kind: crate::workspace::reference::MessageContextKind::Conversation,
+                    content: "{}".into(),
+                    display_path: Some("那边的线程".into()),
+                    line_start: None,
+                    line_end: None,
+                    content_hash: "h".into(),
+                    byte_count: 2,
+                    line_count: 1,
+                    token_count: 1,
+                    truncated: crate::db::types::SqlBool::FALSE,
+                    metadata: Some("{\"conversation_id\":\"c-there\"}".into()),
+                    created_at: 3,
+                }],
+            )
+            .await
+        })
+        .await
         .unwrap();
+        db
     }
 
     #[tokio::test]
     async fn reads_only_what_the_user_attached() {
-        let pool = crate::db::diesel_test_db();
-        seed_reference(&pool);
+        let db = seeded().await;
         let tool = ReadConversationTool::new();
 
         let ok = tool
             .execute(
                 json!({ "conversation_id": "c-there" }),
-                &context(pool.clone(), Some("c-here")),
+                &context(db.clone(), Some("c-here")),
             )
             .await
             .unwrap();
@@ -312,7 +294,7 @@ mod tests {
         let refused = tool
             .execute(
                 json!({ "conversation_id": "c-here" }),
-                &context(pool.clone(), Some("c-there")),
+                &context(db.clone(), Some("c-there")),
             )
             .await
             .unwrap_err();
@@ -321,15 +303,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_grant_set_refuses_everything() {
-        let pool = crate::db::diesel_test_db();
-        seed_reference(&pool);
+        let db = seeded().await;
         // `c-there` has no conversation items of its own, so nothing may be
         // read from it — the QQ case in miniature, where no drag surface
         // exists and the set stays empty for ever.
         let refused = ReadConversationTool::new()
             .execute(
                 json!({ "conversation_id": "c-there" }),
-                &context(pool.clone(), Some("c-there")),
+                &context(db.clone(), Some("c-there")),
             )
             .await
             .unwrap_err();
@@ -338,14 +319,13 @@ mod tests {
 
     #[tokio::test]
     async fn the_bridge_pin_outranks_the_context() {
-        let pool = crate::db::diesel_test_db();
-        seed_reference(&pool);
+        let db = seeded().await;
         // Pinned to `c-there` (no grants), the context claiming `c-here`
         // must not widen it — the wrapper overwrites, never asserts.
         let refused = ReadConversationTool::pinned("c-there".into())
             .execute(
                 json!({ "conversation_id": "c-there" }),
-                &context(pool.clone(), Some("c-here")),
+                &context(db.clone(), Some("c-here")),
             )
             .await
             .unwrap_err();
@@ -354,16 +334,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_deleted_target_reads_as_gone_not_as_a_crash() {
-        let pool = crate::db::diesel_test_db();
-        seed_reference(&pool);
-        {
-            let mut conn = pool.get().unwrap();
-            crate::db::ops::conversation::delete_conversation(&mut conn, "c-there").unwrap();
-        }
+        let db = seeded().await;
+        db.write(async |tx| sea_ops::conversation::delete_conversation(tx, "c-there").await)
+            .await
+            .unwrap();
         let refused = ReadConversationTool::new()
             .execute(
                 json!({ "conversation_id": "c-there" }),
-                &context(pool.clone(), Some("c-here")),
+                &context(db.clone(), Some("c-here")),
             )
             .await
             .unwrap_err();
