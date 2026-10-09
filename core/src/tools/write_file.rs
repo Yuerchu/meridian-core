@@ -80,8 +80,7 @@ mod tests {
             conversation_id: None,
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
-            sea: None,
+            db: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]
@@ -196,7 +195,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "ok");
 
         let real = crate::tools::verified::resolve_root(&file).unwrap();
-        let row = crate::db::sea::ops::journal::file_by_path(&journal.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = crate::db::sea::ops::journal::file_by_path(&journal.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap();
         assert!(row.is_none(), "unreadable old bytes are not journalled");

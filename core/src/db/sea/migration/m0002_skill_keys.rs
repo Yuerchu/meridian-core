@@ -33,8 +33,7 @@ pub const SLUG_CHECK: &str = "length(dir_name) BETWEEN 1 AND 64 \
 /// The statements SQLite runs, in order. They must run with foreign keys off:
 /// with them on, `DROP TABLE skills` deletes every row first and the binding
 /// tables' `ON DELETE CASCADE` empties them. `M0002SkillKeys::up` refuses a
-/// connection with foreign keys on; `diesel_test_db` runs these on an empty
-/// schema, where there is nothing to cascade.
+/// connection with foreign keys on.
 pub fn sqlite_statements() -> Vec<String> {
     vec![
         format!(

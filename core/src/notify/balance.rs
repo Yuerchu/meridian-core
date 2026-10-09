@@ -37,20 +37,10 @@ pub fn alert_key(provider_id: &str) -> String {
 ///
 /// Returns one outcome per provider it was able to consider, keyed by id.
 pub async fn check_all(services: &Services, threshold: &Decimal) -> Vec<(String, BalanceOutcome)> {
-    let pool = services.db.clone();
-    let providers = match tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::provider::list_providers(&mut conn).map_err(|error| error.to_string())
-    })
-    .await
-    {
-        Ok(Ok(providers)) => providers,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "could not list providers for the balance check");
-            return Vec::new();
-        }
+    let providers = match crate::db::sea::ops::provider::list_providers(&services.db).await {
+        Ok(providers) => providers,
         Err(error) => {
-            tracing::warn!(%error, "the balance check could not read the provider list");
+            tracing::warn!(%error, "could not list providers for the balance check");
             return Vec::new();
         }
     };
@@ -59,10 +49,10 @@ pub async fn check_all(services: &Services, threshold: &Decimal) -> Vec<(String,
     for provider in providers {
         let identity = ProviderIdentity::new(
             provider.catalog_id.as_deref(),
-            &provider.provider_type,
+            provider.provider_type.as_str(),
             &provider.base_url,
         );
-        if provider.is_enabled == 0 || !supports_balance(identity) {
+        if !provider.is_enabled.get() || !supports_balance(identity) {
             continue;
         }
         let Some(api_key) = crate::agent::get_provider_api_key(&services.secrets, &provider.id) else {

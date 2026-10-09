@@ -16,7 +16,7 @@ pub enum PricingError {
 ///
 /// It lives here, beside `compute_cost`, because it is a pricing rule and not a
 /// reporting preference: it decides whether a rate is *owed*, which has to be
-/// settled before anything goes looking for one. `db::ops::usage::resolve` falls
+/// settled before anything goes looking for one. `db::sea::ops::usage::resolve` falls
 /// back to today's `model_configs` when a row carries no snapshotted rate, so a
 /// subscription request under a provider that happens to have a price on file
 /// would otherwise be billed at it — "no rate stored" and "no rate exists" are
@@ -84,6 +84,13 @@ impl BillingMode {
     }
 }
 
+impl BillingMode {
+    /// The stored spelling back to the mode; an unknown one is an error.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        value.parse().map_err(|error: PricingError| error.to_string())
+    }
+}
+
 impl std::str::FromStr for BillingMode {
     type Err = PricingError;
 
@@ -104,7 +111,7 @@ impl std::str::FromStr for BillingMode {
 /// knows — and adding zero for it would present what is left as the whole
 /// bill. So each part is either known (its amount in `RequestCost` is exact) or
 /// a gap (its amount there is the known contribution, zero, and the total is
-/// only a lower bound). The same split `db::ops::usage` makes between token and
+/// only a lower bound). The same split `db::sea::ops::usage` makes between token and
 /// tool gaps, made per request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CostGaps {

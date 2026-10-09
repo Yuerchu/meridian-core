@@ -34,7 +34,6 @@ use crate::agent::modes::ModeSpec;
 use crate::agent::tokenizer::MIN_REPLY_TOKENS;
 use crate::agent::{MAX_STREAM_RETRIES, STREAM_RETRY_BASE, is_context_window_error, is_retryable_stream_error};
 use crate::agent::{TokenBudget, serialize_tool_calls_openai};
-use crate::db::DbPool;
 use crate::db::models::message::MessageUsage;
 use crate::db::models::turn::TurnPhase;
 use crate::events::{ChatStopReason, ChatStreamEvent, ToolOutcome};
@@ -227,7 +226,7 @@ fn sub_agent_result(report: &SubAgentReport) -> String {
 /// them explicit on the desktop side is most of what stops the loop from needing
 /// a window.
 pub struct TurnServices<'a> {
-    pub pool: &'a DbPool,
+    pub db: &'a crate::db::sea::cap::Db,
     pub tools: &'a ToolRegistry,
     pub mcp: &'a McpRegistry,
     pub redaction: &'a crate::redaction::RedactionEngine,
@@ -510,7 +509,7 @@ async fn run(
         pricing,
         trigger,
     } = setup;
-    let pool = services.pool;
+    let pool = services.db;
     let emit = ports.emit;
 
     // Two ways to send, and the difference is the whole reason `Emit` returns a
@@ -1664,7 +1663,7 @@ fn narrow_offered(offered: &mut HashSet<String>, steering: Option<&dyn Steering>
 }
 
 async fn inject_steering(
-    pool: &crate::db::DbPool,
+    pool: &crate::db::sea::cap::Db,
     conversation_id: &str,
     turn_id: &str,
     items: Vec<Steered>,
@@ -1737,10 +1736,9 @@ mod tests {
     use super::super::ports::{Approvals, Steered, Steering, SurfaceTools};
     use super::*;
     use crate::agent::turn_config::TurnConfig;
-    use crate::db::diesel_test_db;
+    use crate::db::sea::cap::Db;
     use crate::provider::{ProviderError, SenderRef, StreamEvent, TokenUsage, ToolCall};
     use crate::turn::TurnOrigin;
-    use diesel::connection::SimpleConnection;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -2139,15 +2137,20 @@ mod tests {
 
     // --- the fixtures ----------------------------------------------------
 
-    fn conversation(pool: &DbPool) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
-        crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
+    async fn conversation(pool: &Db) {
+        crate::db::sea::execute_for_tests(
+            pool,
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c1', 't', 1, 1)",
+        )
+        .await
+        .unwrap();
+        pool.write(async |tx| crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await)
+            .await
+            .unwrap();
     }
 
-    fn rows(pool: &DbPool) -> Vec<crate::db::models::message::MessageRow> {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::message::list_messages(&mut conn, "c1").unwrap()
+    async fn rows(pool: &Db) -> Vec<crate::db::entity::message::Model> {
+        crate::db::sea::ops::message::list_messages(pool, "c1").await.unwrap()
     }
 
     fn def(name: &str) -> ToolDefinition {
@@ -2172,7 +2175,7 @@ mod tests {
         )
     }
 
-    fn context(pool: &DbPool, cancel: &CancellationToken) -> ToolContext {
+    fn context(pool: &Db, cancel: &CancellationToken) -> ToolContext {
         ToolContext {
             working_directory: None,
             shell: tools::ShellType::default_for_platform(),
@@ -2181,8 +2184,7 @@ mod tests {
             conversation_id: Some("c1".into()),
             turn_id: Some("t1".into()),
             assistant_id: None,
-            db_pool: Some(pool.clone()),
-            sea: None,
+            db: Some(pool.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]
@@ -2193,7 +2195,7 @@ mod tests {
         }
     }
 
-    fn setup<'a>(provider: &'a Scripted, pool: &DbPool, cancel: &CancellationToken, offered: &[&str]) -> TurnSetup<'a> {
+    fn setup<'a>(provider: &'a Scripted, pool: &Db, cancel: &CancellationToken, offered: &[&str]) -> TurnSetup<'a> {
         TurnSetup {
             trigger: crate::turn::TurnTrigger::User,
             provider,
@@ -2245,9 +2247,9 @@ mod tests {
     static TEST_MAPPINGS: std::sync::LazyLock<crate::redaction::RedactionMappings> =
         std::sync::LazyLock::new(crate::redaction::RedactionMappings::new);
 
-    fn services<'a>(pool: &'a DbPool, tools: &'a ToolRegistry, mcp: &'a McpRegistry) -> TurnServices<'a> {
+    fn services<'a>(pool: &'a Db, tools: &'a ToolRegistry, mcp: &'a McpRegistry) -> TurnServices<'a> {
         TurnServices {
-            pool,
+            db: pool,
             tools,
             mcp,
             redaction: &TEST_REDACTION,
@@ -2321,8 +2323,8 @@ mod tests {
 
     #[tokio::test]
     async fn provider_boundary_caps_user_context_even_below_a_large_windows_trim_threshold() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("done")]);
         let approvals = Answers::nobody();
@@ -2371,8 +2373,8 @@ mod tests {
     /// and puts the answer back where a tool result goes.
     #[tokio::test]
     async fn a_delegated_run_reaches_the_port_and_its_answer_reaches_the_model() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("c1", ERRAND), says("thanks")]);
         let approvals = Answers::nobody();
@@ -2386,18 +2388,19 @@ mod tests {
         .await;
 
         assert_eq!(outcome.reply.as_deref(), Ok("thanks"));
-        let seen = delegate.seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].kind, crate::agent::sub_agents::SubAgentKind::Explore);
-        assert_eq!(seen[0].description, "find the caller");
-        assert!(seen[0].prompt.contains("resolve_head"));
-        assert_eq!(seen[0].parent_call_id, "c1");
-        assert!(seen[0].model.is_none(), "an omitted model stays omitted");
-        drop(seen);
+        {
+            let seen = delegate.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].kind, crate::agent::sub_agents::SubAgentKind::Explore);
+            assert_eq!(seen[0].description, "find the caller");
+            assert!(seen[0].prompt.contains("resolve_head"));
+            assert_eq!(seen[0].parent_call_id, "c1");
+            assert!(seen[0].model.is_none(), "an omitted model stays omitted");
+        }
 
         // The verdict and the count travel with the text; the model is not left
         // to infer either from prose.
-        let tool_row = rows(&pool).into_iter().find(|r| r.role == "tool").unwrap();
+        let tool_row = rows(&pool).await.into_iter().find(|r| r.role == "tool").unwrap();
         assert!(
             tool_row.content.contains("finished after 4 steps"),
             "{}",
@@ -2412,8 +2415,8 @@ mod tests {
     /// half an answer as the answer.
     #[tokio::test]
     async fn a_stopped_sub_agent_does_not_come_back_looking_like_a_conclusion() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("c1", ERRAND), says("ok")]);
         let approvals = Answers::nobody();
@@ -2426,7 +2429,7 @@ mod tests {
         )
         .await;
 
-        let tool_row = rows(&pool).into_iter().find(|r| r.role == "tool").unwrap();
+        let tool_row = rows(&pool).await.into_iter().find(|r| r.role == "tool").unwrap();
         assert!(tool_row.content.contains("stopped"), "{}", tool_row.content);
         assert!(tool_row.content.contains("do not treat it as a conclusion"));
         assert!(
@@ -2444,8 +2447,8 @@ mod tests {
     /// turn over it would throw away everything the parent had already done.
     #[tokio::test]
     async fn a_port_that_refuses_is_a_tool_result_and_the_turn_carries_on() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("c1", ERRAND), says("I will do it myself")]);
         let approvals = Answers::nobody();
@@ -2460,7 +2463,7 @@ mod tests {
 
         assert_eq!(outcome.reply.as_deref(), Ok("I will do it myself"));
         assert_eq!(provider.rounds(), 2, "the loop went round again");
-        let tool_row = rows(&pool).into_iter().find(|r| r.role == "tool").unwrap();
+        let tool_row = rows(&pool).await.into_iter().find(|r| r.role == "tool").unwrap();
         assert!(tool_row.content.contains("no model configured"), "{}", tool_row.content);
         assert_eq!(tool_row.tool_outcome.as_deref(), Some("error"));
     }
@@ -2479,8 +2482,8 @@ mod tests {
             ),
             ("not json at all", "not valid JSON"),
         ] {
-            let pool = diesel_test_db();
-            conversation(&pool);
+            let pool = crate::db::sea::sea_test_db().await;
+            conversation(&pool).await;
             let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
             let provider = Scripted::of(vec![run_agent_call("c1", args), says("fine")]);
             let approvals = Answers::nobody();
@@ -2494,7 +2497,7 @@ mod tests {
             .await;
 
             assert_eq!(delegate.asked(), 0, "nothing was started for `{args}`");
-            let tool_row = rows(&pool).into_iter().find(|r| r.role == "tool").unwrap();
+            let tool_row = rows(&pool).await.into_iter().find(|r| r.role == "tool").unwrap();
             assert!(
                 tool_row.content.contains(expected),
                 "for `{args}` expected {expected:?} in {:?}",
@@ -2508,8 +2511,8 @@ mod tests {
     /// keeps a sub-agent from delegating to a sub-agent.
     #[tokio::test]
     async fn without_a_port_the_name_is_withheld_and_nothing_is_started() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("c1", ERRAND), says("understood")]);
         let approvals = Answers::nobody();
@@ -2521,7 +2524,7 @@ mod tests {
         )
         .await;
 
-        let tool_row = rows(&pool).into_iter().find(|r| r.role == "tool").unwrap();
+        let tool_row = rows(&pool).await.into_iter().find(|r| r.role == "tool").unwrap();
         assert_eq!(tool_row.tool_outcome.as_deref(), Some("error"));
         assert!(
             !tool_row.content.contains("must be handled by the agent loop"),
@@ -2534,8 +2537,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_turn_with_nothing_to_run_asks_once_and_answers() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("here you go")]);
         let approvals = Answers::nobody();
@@ -2554,7 +2557,7 @@ mod tests {
         assert_eq!(provider.rounds(), 1);
         assert_eq!(emit.kinds(), ["message_start", "text"]);
 
-        let rows = rows(&pool);
+        let rows = rows(&pool).await;
         assert_eq!(rows.len(), 1, "one assistant row and nothing else");
         assert_eq!(rows[0].content, "here you go");
         assert_eq!(outcome.progress.message_id.as_deref(), Some(rows[0].id.as_str()));
@@ -2564,8 +2567,8 @@ mod tests {
     /// without ever seeing what it asked for.
     #[tokio::test]
     async fn a_tool_call_runs_and_its_answer_goes_into_the_next_request() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", r#"{"x":1}"#), says("that worked")]);
         let approvals = Answers::nobody();
@@ -2594,7 +2597,7 @@ mod tests {
         assert_eq!(second.last().unwrap().content, "42");
         assert_eq!(second.last().unwrap().role, "tool");
 
-        let rows = rows(&pool);
+        let rows = rows(&pool).await;
         assert_eq!(
             rows.iter().map(|r| r.role.as_str()).collect::<Vec<_>>(),
             ["assistant", "tool", "assistant"],
@@ -2612,8 +2615,8 @@ mod tests {
     /// as an error.
     #[tokio::test]
     async fn cancelling_ends_the_turn_without_making_it_an_error() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("never asked for")]);
         let approvals = Answers::nobody();
@@ -2636,7 +2639,7 @@ mod tests {
         assert_eq!(provider.rounds(), 1, "the second request is never made");
         // The tool did run and its row is written: the world had already
         // changed by the time the token was cancelled.
-        assert_eq!(rows(&pool).iter().filter(|r| r.role == "tool").count(), 1);
+        assert_eq!(rows(&pool).await.iter().filter(|r| r.role == "tool").count(), 1);
     }
 
     /// The guard exists so a stuck model cannot spend a person's attention, or
@@ -2644,8 +2647,8 @@ mod tests {
     /// carrying whatever was said — an error would lose that.
     #[tokio::test]
     async fn a_model_repeating_itself_is_stopped_and_the_caller_is_told_why() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let rounds: Vec<_> = (0..crate::agent::loop_guard::LOOP_ABORT_AFTER + 2)
             .map(|_| calls("call-1", "fixture", r#"{"same":true}"#))
@@ -2682,17 +2685,16 @@ mod tests {
     /// has already touched the world, so the row is worth less than the turn.
     #[tokio::test]
     async fn a_tool_row_the_database_refuses_does_not_stop_the_turn_or_move_the_cursor() {
-        let pool = diesel_test_db();
-        conversation(&pool);
-        {
-            let mut conn = pool.get().unwrap();
-            conn.batch_execute(
-                "CREATE TRIGGER no_tool_rows BEFORE INSERT ON messages \
-                 WHEN NEW.role = 'tool' \
-                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
-            )
-            .unwrap();
-        }
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
+        crate::db::sea::execute_for_tests(
+            &pool,
+            "CREATE TRIGGER no_tool_rows BEFORE INSERT ON messages \
+             WHEN NEW.role = 'tool' \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .await
+        .unwrap();
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("carried on")]);
         let approvals = Answers::nobody();
@@ -2713,7 +2715,7 @@ mod tests {
         // The model still sees the result — only the transcript lost it.
         assert_eq!(provider.requests()[1].0.last().unwrap().content, "the tool still ran");
 
-        let rows = rows(&pool);
+        let rows = rows(&pool).await;
         assert_eq!(
             rows.iter().map(|r| r.role.as_str()).collect::<Vec<_>>(),
             ["assistant", "assistant"]
@@ -2740,8 +2742,8 @@ mod tests {
             ("desktop", &Broken("tool_call") as &dyn Emit, true),
             ("onebot", &Deaf as &dyn Emit, false),
         ] {
-            let pool = diesel_test_db();
-            conversation(&pool);
+            let pool = crate::db::sea::sea_test_db().await;
+            conversation(&pool).await;
             let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
             let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("carried on")]);
             let approvals = Answers::nobody();
@@ -2773,8 +2775,8 @@ mod tests {
     /// `streaming` flag its optimistic send set.
     #[tokio::test]
     async fn a_failed_turn_still_reports_what_it_had_got_done() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![]);
         let approvals = Answers::nobody();
@@ -2790,7 +2792,7 @@ mod tests {
         assert_eq!(outcome.stop_reason(), "error");
         assert_eq!(
             outcome.progress.message_id.as_deref(),
-            Some(rows(&pool)[0].id.as_str()),
+            Some(rows(&pool).await[0].id.as_str()),
             "the row it had opened",
         );
     }
@@ -2800,8 +2802,8 @@ mod tests {
     /// while it still cannot.
     #[tokio::test]
     async fn a_mode_switch_reaches_the_very_next_request() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
             calls("call-1", crate::agent::modes::ENTER_PLAN_TOOL, "{}"),
@@ -2838,8 +2840,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_update_in_the_batch_prevents_exit_from_submitting_a_review() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let patch = serde_json::json!({
             "base_generation": 1,
@@ -2886,6 +2888,7 @@ mod tests {
         );
         assert!(outcome.progress.waiting_review.is_none());
         let tool_rows = rows(&pool)
+            .await
             .into_iter()
             .filter(|row| row.role == "tool")
             .collect::<Vec<_>>();
@@ -2899,8 +2902,8 @@ mod tests {
     /// cache on every following request of the turn.
     #[tokio::test]
     async fn steering_lands_at_the_end_and_leaves_the_prefix_alone() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("noted")]);
         let approvals = Answers::nobody();
@@ -2946,12 +2949,12 @@ mod tests {
             requests[1].0[requests[1].0.len() - 2].origin,
             crate::provider::MessageOrigin::User(_)
         ));
-        assert_eq!(rows(&pool).iter().filter(|r| r.sender_id == Some(7)).count(), 1);
+        assert_eq!(rows(&pool).await.iter().filter(|r| r.sender_id == Some(7)).count(), 1);
 
         // And each is stored as what it was sent as. The next turn is built
         // from these rows, so a notice stored as `user` is a notice that
         // becomes somebody talking one request later.
-        let stored = rows(&pool);
+        let stored = rows(&pool).await;
         let role_of = |text: &str| {
             stored
                 .iter()
@@ -2979,7 +2982,7 @@ mod tests {
             row.created_at, 1_600_000_000_000,
             "the row carries the instant it arrived"
         );
-        let replay = crate::db::ops::message::ActiveContext {
+        let replay = crate::db::sea::ops::message::ActiveContext {
             path: vec![row],
             summary: None,
             anchor_index: None,
@@ -3025,8 +3028,8 @@ mod tests {
             }
         }
 
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
             calls("call-1", "fixture", "{}"),
@@ -3071,8 +3074,8 @@ mod tests {
     /// turn instead.
     #[tokio::test]
     async fn a_message_that_lands_on_the_last_round_still_gets_an_answer() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("here is the answer"), says("and about that")]);
         let approvals = Answers::nobody();
@@ -3127,8 +3130,8 @@ mod tests {
     /// turn off a row the queue has never heard of.
     #[tokio::test]
     async fn a_steered_message_that_already_has_a_row_is_not_written_again() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("here is the answer"), says("and about that")]);
         let approvals = Answers::nobody();
@@ -3146,7 +3149,7 @@ mod tests {
         .await
         .expect("the queue wrote it");
 
-        let before = rows(&pool).len();
+        let before = rows(&pool).await.len();
         let inbox = Inbox(Mutex::new(vec![Steered {
             text: "already on the record".into(),
             origin: SteeredOrigin::User(None),
@@ -3165,7 +3168,7 @@ mod tests {
         .await;
         assert_eq!(outcome.reply.as_deref(), Ok("and about that"));
 
-        let after = rows(&pool);
+        let after = rows(&pool).await;
         assert_eq!(
             after.iter().filter(|r| r.content == "already on the record").count(),
             1,
@@ -3188,8 +3191,8 @@ mod tests {
     /// to them — draining and then stopping would make them disappear.
     #[tokio::test]
     async fn the_continuation_cap_leaves_the_inbox_alone() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         // Enough replies for every continuation plus the one that stops.
         let provider = Scripted::of((0..MAX_TAIL_CONTINUATIONS + 1).map(|_| says("ok")).collect::<Vec<_>>());
@@ -3242,8 +3245,8 @@ mod tests {
     /// opens a branch that pushes the result off the active path.
     #[tokio::test]
     async fn the_final_cursor_is_the_last_row_that_landed_not_the_last_reply() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("never asked")]);
         let approvals = Answers::nobody();
@@ -3263,7 +3266,7 @@ mod tests {
         )
         .await;
 
-        let rows = rows(&pool);
+        let rows = rows(&pool).await;
         let last = rows.last().unwrap();
         assert_eq!(
             outcome.progress.final_cursor.as_deref(),
@@ -3286,8 +3289,8 @@ mod tests {
             (2, 2, "None of them could be written down"),
             (3, 1, "1 of them could not be written down"),
         ] {
-            let pool = diesel_test_db();
-            conversation(&pool);
+            let pool = crate::db::sea::sea_test_db().await;
+            conversation(&pool).await;
             let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
             let provider = Scripted::of(vec![run_agent_call("call-1", ERRAND), says("understood")]);
             let approvals = Answers::nobody();
@@ -3310,8 +3313,8 @@ mod tests {
     /// The ordinary case says nothing about it, because there is nothing to say.
     #[tokio::test]
     async fn a_run_that_saw_everything_is_not_reported_as_having_missed_something() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![run_agent_call("call-1", ERRAND), says("understood")]);
         let approvals = Answers::nobody();
@@ -3328,15 +3331,17 @@ mod tests {
         assert!(!result.contains("never saw"), "{result}");
     }
 
-    fn owed(pool: &DbPool, asking: &str) -> Option<crate::agent::interrupted::Report> {
-        let mut conn = pool.get().unwrap();
-        let idle = crate::turn::TurnCoordinator::default();
-        crate::agent::interrupted::block(&mut conn, &idle, "c1", Some(asking)).unwrap()
+    async fn owed(pool: &Db, asking: &str) -> Option<crate::agent::interrupted::Report> {
+        let idle = std::sync::Arc::new(crate::turn::TurnCoordinator::default());
+        crate::agent::interrupted::load_block(pool, &idle, "c1", asking)
+            .await
+            .unwrap()
     }
 
-    fn ended(pool: &DbPool, turn: &str, status: crate::db::models::turn::TurnStatus, at: i64) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::turn::finish(&mut conn, turn, status, None, at).unwrap();
+    async fn ended(pool: &Db, turn: &str, status: crate::db::models::turn::TurnStatus, at: i64) {
+        pool.write(async |tx| crate::db::sea::ops::turn::finish(tx, turn, status, None, at).await)
+            .await
+            .unwrap();
     }
 
     /// The notice that an earlier turn may have left a tool half-run is retired
@@ -3350,13 +3355,14 @@ mod tests {
     /// warning was protecting.
     #[tokio::test]
     async fn a_stopped_reply_does_not_retire_the_interruption_notice() {
-        let pool = diesel_test_db();
-        conversation(&pool);
-        {
-            let mut conn = pool.get().unwrap();
-            crate::db::ops::turn::begin(&mut conn, "t0", "c1", TurnOrigin::Desktop, None, 500).unwrap();
-        }
-        let report = owed(&pool, "t1").expect("t0 is running and held by nobody, so it counts as cut off");
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
+        pool.write(async |tx| crate::db::sea::ops::turn::begin(tx, "t0", "c1", TurnOrigin::Desktop, None, 500).await)
+            .await
+            .unwrap();
+        let report = owed(&pool, "t1")
+            .await
+            .expect("t0 is running and held by nobody, so it counts as cut off");
         let (tools, mcp) = (registry(), McpRegistry::new());
         let approvals = Answers::nobody();
 
@@ -3376,8 +3382,8 @@ mod tests {
         let outcome = run_turn(&services(&pool, &tools, &mcp), first, ports(&approvals, Some(&stopper))).await;
         assert!(outcome.reply.is_ok(), "being stopped is not a failure");
 
-        ended(&pool, "t1", crate::db::models::turn::TurnStatus::Cancelled, 1500);
-        let still_owed = owed(&pool, "t2");
+        ended(&pool, "t1", crate::db::models::turn::TurnStatus::Cancelled, 1500).await;
+        let still_owed = owed(&pool, "t2").await;
         assert!(
             still_owed.is_some(),
             "the reply was never read to the end, so it consumed nothing",
@@ -3389,10 +3395,9 @@ mod tests {
         let mut second = setup(&answering, &pool, &cancel, &[]);
         second.interrupted = still_owed;
         second.turn_id = "t2".into();
-        {
-            let mut conn = pool.get().unwrap();
-            crate::db::ops::turn::begin(&mut conn, "t2", "c1", TurnOrigin::Desktop, None, 2000).unwrap();
-        }
+        pool.write(async |tx| crate::db::sea::ops::turn::begin(tx, "t2", "c1", TurnOrigin::Desktop, None, 2000).await)
+            .await
+            .unwrap();
         assert!(
             run_turn(&services(&pool, &tools, &mcp), second, ports(&approvals, None))
                 .await
@@ -3400,8 +3405,8 @@ mod tests {
                 .is_ok()
         );
 
-        ended(&pool, "t2", crate::db::models::turn::TurnStatus::Done, 2500);
-        assert!(owed(&pool, "t3").is_none(), "and that one does retire it");
+        ended(&pool, "t2", crate::db::models::turn::TurnStatus::Done, 2500).await;
+        assert!(owed(&pool, "t3").await.is_none(), "and that one does retire it");
     }
 
     /// Stops the turn from inside the stream, which is the only way to reach
@@ -3423,8 +3428,8 @@ mod tests {
     /// conversation itself would have fitted.
     #[tokio::test]
     async fn the_output_allowance_is_trimmed_to_what_the_prompt_left() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("brief")]);
         let approvals = Answers::nobody();
@@ -3456,8 +3461,8 @@ mod tests {
     /// not made at all, and what comes back names the numbers.
     #[tokio::test]
     async fn a_prompt_that_fills_the_window_is_never_sent() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("never reached")]);
         let approvals = Answers::nobody();
@@ -3489,8 +3494,8 @@ mod tests {
     /// the turn worse off than the refusal did.
     #[tokio::test]
     async fn recovery_that_frees_nothing_fails_instead_of_asking_again() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![vec![StreamEvent::Error {
             message: "context_length_exceeded".into(),
@@ -3524,8 +3529,8 @@ mod tests {
     /// A short conversation is not penalised for the long ones' sake.
     #[tokio::test]
     async fn a_short_prompt_still_gets_the_whole_allowance() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![says("hi")]);
         let approvals = Answers::nobody();
@@ -3545,8 +3550,8 @@ mod tests {
     /// carry the assistant row that holds them, or the search starts over.
     #[tokio::test]
     async fn a_pause_turn_is_resumed_with_the_rounds_blocks_on_the_request() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let paused = vec![
             StreamEvent::ProviderStateUpdate {
@@ -3595,8 +3600,8 @@ mod tests {
     /// what keeps it from being a loop the loop guard cannot see.
     #[tokio::test]
     async fn pause_turn_resumption_is_bounded() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let pause = || {
             vec![StreamEvent::Stop {
@@ -3628,8 +3633,8 @@ mod tests {
             ("length", ChatStopReason::MaxTokens),
             ("end_turn", ChatStopReason::EndTurn),
         ] {
-            let pool = diesel_test_db();
-            conversation(&pool);
+            let pool = crate::db::sea::sea_test_db().await;
+            conversation(&pool).await;
             let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
             let provider = Scripted::of(vec![vec![StreamEvent::Stop {
                 reason: reason.into(),
@@ -3655,8 +3660,8 @@ mod tests {
     /// already recovers from.
     #[tokio::test]
     async fn a_call_whose_arguments_never_arrived_intact_is_stored_empty() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let truncated = vec![
             StreamEvent::ToolCallStart {
@@ -3686,6 +3691,7 @@ mod tests {
 
         // The row on disk is parseable under the read contract.
         let assistant = rows(&pool)
+            .await
             .into_iter()
             .find(|m| m.role == "assistant" && m.tool_calls.is_some())
             .unwrap();
@@ -3698,7 +3704,7 @@ mod tests {
 
         // And the original arguments reached dispatch, which answered the call
         // as invalid rather than running it.
-        let tool_row = rows(&pool).into_iter().find(|m| m.role == "tool").unwrap();
+        let tool_row = rows(&pool).await.into_iter().find(|m| m.role == "tool").unwrap();
         assert!(
             tool_row.content.contains("invalid tool arguments JSON"),
             "dispatch answered the original arguments: {:?}",
@@ -3710,8 +3716,8 @@ mod tests {
     /// Usage is accumulated across every round, not taken from the last one.
     #[tokio::test]
     async fn the_tokens_of_every_round_are_added_up() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let used = |p: i32, c: i32| StreamEvent::Stop {
             reason: "stop".into(),
@@ -3760,8 +3766,8 @@ mod tests {
     /// priced model the cost carries gaps where the zeros used to be.
     #[tokio::test]
     async fn an_unreported_count_leaves_the_turn_total_unknown_not_short() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
             vec![
@@ -3841,8 +3847,8 @@ mod tests {
     /// total on every row would pass a single-round test.
     #[tokio::test]
     async fn a_cache_hit_reaches_the_row_that_got_it() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let used = |p: i32, c: i32, read: i32| StreamEvent::Stop {
             reason: "stop".into(),
@@ -3882,7 +3888,11 @@ mod tests {
         .await;
         assert!(outcome.reply.is_ok());
 
-        let assistant: Vec<_> = rows(&pool).into_iter().filter(|m| m.role == "assistant").collect();
+        let assistant: Vec<_> = rows(&pool)
+            .await
+            .into_iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
         assert_eq!(assistant.len(), 2, "one row per round");
         // The cold round is stored as a reported zero, not as absent: the
         // provider said nothing was cached, which is a different claim from
@@ -3909,8 +3919,8 @@ mod tests {
     /// about the data.
     #[tokio::test]
     async fn a_provider_that_says_nothing_about_caching_stores_nothing() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![vec![
             StreamEvent::Text { content: "hi".into() },
@@ -3932,7 +3942,7 @@ mod tests {
         )
         .await;
 
-        let row = rows(&pool).into_iter().find(|m| m.role == "assistant").unwrap();
+        let row = rows(&pool).await.into_iter().find(|m| m.role == "assistant").unwrap();
         assert_eq!(row.input_tokens, Some(50));
         assert_eq!(row.cache_read_tokens, None);
         assert_eq!(row.cache_write_tokens, None);
@@ -3943,8 +3953,8 @@ mod tests {
     /// decorative if naming it anyway worked.
     #[tokio::test]
     async fn a_tool_that_was_not_offered_is_refused_before_anything_runs() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("fine then")]);
         let approvals = Answers::nobody();
@@ -3985,8 +3995,8 @@ mod tests {
     /// the port's own documentation is what holds it.
     #[tokio::test]
     async fn typed_words_answer_a_question_and_authorise_nothing_else() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
             calls("call-1", "fixture", "{}"),
@@ -4026,8 +4036,8 @@ mod tests {
     /// path where saying yes runs a command.
     #[tokio::test]
     async fn a_tool_nobody_approved_is_not_run() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("fine")]);
         let approvals = Answers::nobody();
@@ -4063,8 +4073,8 @@ mod tests {
     /// still telling the model a person refused.
     #[tokio::test]
     async fn an_unanswered_registry_tool_is_not_reported_as_a_users_refusal() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![
             calls("call-1", "run_command", r#"{"command":"echo hi"}"#),
@@ -4128,8 +4138,8 @@ mod tests {
     /// the model was told comes back with the file's path.
     #[cfg(not(target_os = "android"))]
     async fn run_with_unreadable_settings(approvals: &Sequence) -> (String, std::path::PathBuf, tempfile::TempDir) {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
         let command = format!("echo ran > \"{}\"", marker.display().to_string().replace('\\', "/"));

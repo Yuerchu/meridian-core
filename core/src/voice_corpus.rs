@@ -715,7 +715,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_first_callers_agree_on_one_key() {
         let dir = tempfile::tempdir().unwrap();
-        let (_diesel, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let db = crate::db::sea::file_test_db(dir.path()).await;
         let tasks: Vec<_> = (0..16)
             .map(|_| {
                 let db = db.clone();

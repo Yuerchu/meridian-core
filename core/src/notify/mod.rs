@@ -400,7 +400,7 @@ pub async fn dispatch(services: &Services, alert: &Alert) -> usize {
     // A row whose JSON will not decode fails this read as a whole, and the
     // error names it; the subscription is decoded at the read now, so there is
     // no per-row "unreadable" case left to skip.
-    let endpoints = match notification_ops::list_enabled_webhooks(&services.sea).await {
+    let endpoints = match notification_ops::list_enabled_webhooks(&services.db).await {
         Ok(endpoints) => endpoints,
         Err(error) => {
             tracing::warn!(%error, "could not read the notification endpoints");
@@ -441,7 +441,7 @@ pub async fn dispatch(services: &Services, alert: &Alert) -> usize {
 async fn record_attempt(services: &Services, id: &str, error: Option<&str>) {
     let now = now_ms();
     let written = services
-        .sea
+        .db
         .write(async |tx| notification_ops::record_delivery_attempt(tx, id, now, error).await)
         .await;
     if let Err(error) = written {
@@ -458,7 +458,7 @@ pub async fn raise_and_dispatch(services: &Services, alert: &Alert, cooldown_ms:
     let fingerprint = alert.fingerprint();
     let now = alert.raised_at;
     let state = services
-        .sea
+        .db
         .write(async |tx| notification_ops::record_raised(tx, &alert.alert_key, &fingerprint, now).await)
         .await;
     let state = match state {
@@ -487,7 +487,7 @@ pub async fn raise_and_dispatch(services: &Services, alert: &Alert, cooldown_ms:
                 return;
             }
             let written = services
-                .sea
+                .db
                 .write(async |tx| notification_ops::record_notified(tx, &alert.alert_key, now).await)
                 .await;
             match written {
@@ -502,7 +502,7 @@ pub async fn raise_and_dispatch(services: &Services, alert: &Alert, cooldown_ms:
 /// repeat of this one.
 pub async fn clear(services: &Services, alert_key: &str) {
     let cleared = services
-        .sea
+        .db
         .write(async |tx| notification_ops::clear_alert(tx, alert_key).await)
         .await;
     if let Err(error) = cleared {
@@ -516,7 +516,7 @@ pub async fn clear(services: &Services, alert_key: &str) {
 /// and nothing to suppress. Routed through `raise_and_dispatch` it would leave
 /// a row behind and the second press would do nothing.
 pub async fn send_test(services: &Services, endpoint_id: &str) -> Result<DeliveryReport, String> {
-    let endpoint = notification_ops::get_webhook(&services.sea, endpoint_id)
+    let endpoint = notification_ops::get_webhook(&services.db, endpoint_id)
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("notification endpoint `{endpoint_id}` does not exist"))?;
@@ -689,19 +689,16 @@ async fn check_balances(services: &Services, config: &NotifyConfig) {
 }
 
 async fn check_usage(services: &Services, config: &NotifyConfig) {
-    let pool = services.db.clone();
     let thresholds = config.usage_thresholds();
     let now = now_ms();
-    let found = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        usage::collect(&mut conn, &thresholds, now)
-    })
-    .await;
+    let found = services
+        .db
+        .read(async |tx| usage::collect(tx, &thresholds, now).await)
+        .await;
     match found {
-        Ok(Ok(Some(alert))) => raise_and_dispatch(services, &alert, config.usage_cooldown_ms()).await,
-        Ok(Ok(None)) => clear(services, usage::USAGE_ALERT_KEY).await,
-        Ok(Err(error)) => tracing::warn!(%error, "the usage check could not read the ledger"),
-        Err(error) => tracing::warn!(%error, "the usage check panicked"),
+        Ok(Some(alert)) => raise_and_dispatch(services, &alert, config.usage_cooldown_ms()).await,
+        Ok(None) => clear(services, usage::USAGE_ALERT_KEY).await,
+        Err(error) => tracing::warn!(%error, "the usage check could not read the ledger"),
     }
 }
 

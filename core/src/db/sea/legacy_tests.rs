@@ -96,33 +96,25 @@ fn no_two_migrations_claim_the_same_version() {
     assert_eq!(versions.len(), total, "duplicate migration version among {versions:?}");
 }
 
-/// Selecting the model checks every column the schema declares, so this
-/// fails if `schema.rs` and the schema the baseline builds have drifted apart
-/// — which is otherwise a runtime error rather than a compile one.
-#[test]
-fn a_conversation_starts_out_asking_about_every_edit() {
-    use diesel::connection::SimpleConnection;
-    use diesel::prelude::*;
-
-    use crate::db::models::conversation::ConversationRow;
-    use crate::db::schema::conversations::dsl::*;
-
-    let pool = crate::db::diesel_test_db();
-    let mut conn = pool.get().unwrap();
-    conn.batch_execute(
+/// A row written before the column existed reads back asking about every
+/// edit: the column's default is "ask".
+#[tokio::test]
+async fn a_conversation_starts_out_asking_about_every_edit() {
+    let db = super::sea_test_db().await;
+    super::execute_for_tests(
+        &db,
         "INSERT INTO conversations
              (id, is_pinned, is_archived, message_count, created_at, updated_at)
          VALUES ('c1', 0, 0, 0, 1, 1)",
     )
+    .await
     .unwrap();
-
-    let c: ConversationRow = conversations
-        .find("c1")
-        .select(ConversationRow::as_select())
-        .first(&mut conn)
+    let c = super::ops::conversation::get_conversation(&db, "c1")
+        .await
+        .unwrap()
         .unwrap();
-    assert_eq!(
-        c.accept_edits, 0,
+    assert!(
+        !c.accept_edits.get(),
         "a conversation that predates the column must keep asking"
     );
 }
@@ -1123,4 +1115,62 @@ async fn an_emptied_threshold_migrates_to_nothing_at_all() {
     assert_eq!(preference(&conn, "notify.balance.threshold").await, None);
     assert_eq!(preference(&conn, "notify.enabled").await, None);
     assert_eq!(preference(&conn, "onebot.balance_alert_threshold").await, None);
+}
+
+/// Migration 43 decides billing by where a request came from, not by what the
+/// row displays or which provider shape it had: a hosted turn is External, a
+/// desktop one stays Metered whatever its provider name says. Run against
+/// rows already at today's schema, as the Diesel test did, and its down
+/// migration puts the hosted row back.
+#[tokio::test]
+async fn acp_billing_migration_follows_origin_not_display_or_provider_shape() {
+    let conn = blank().await;
+    replay_in_transactions(&conn, 0..LEGACY.len()).await.unwrap();
+    exec(
+        &conn,
+        "INSERT INTO audit_messages
+            (id, recorded_at, message_id, conversation_id, turn_origin, role,
+             content, provider_id, provider_name, created_at, billing_mode)
+         VALUES
+            ('hosted', 1, 'm1', 'c1', 'claude_code', 'assistant', '', NULL,
+             'Claude Code', 1, 'metered'),
+            ('desktop', 1, 'm2', 'c2', 'desktop', 'assistant', '', NULL,
+             'Claude Code', 1, 'metered'),
+            ('provider-bound', 1, 'm3', 'c3', 'claude_code', 'assistant', '',
+             'p1', 'Claude Code', 1, 'metered');",
+    )
+    .await;
+    exec(
+        &conn,
+        include_str!("../../../migrations/legacy/00000000000043_acp_external_billing/up.sql"),
+    )
+    .await;
+
+    let modes: Vec<(String, String)> = rows(&conn, "SELECT id, billing_mode FROM audit_messages ORDER BY id")
+        .await
+        .into_iter()
+        .map(|r| (r.try_get("", "id").unwrap(), r.try_get("", "billing_mode").unwrap()))
+        .collect();
+    assert_eq!(
+        modes,
+        [
+            ("desktop".to_string(), "metered".to_string()),
+            ("hosted".to_string(), "external".to_string()),
+            ("provider-bound".to_string(), "external".to_string()),
+        ]
+    );
+
+    exec(
+        &conn,
+        include_str!("../../../migrations/legacy/00000000000043_acp_external_billing/down.sql"),
+    )
+    .await;
+    let hosted: String = one(
+        &conn,
+        "SELECT billing_mode FROM audit_messages WHERE id = 'hosted'",
+        vec![],
+        "billing_mode",
+    )
+    .await;
+    assert_eq!(hosted, "metered");
 }

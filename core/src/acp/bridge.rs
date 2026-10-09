@@ -548,13 +548,7 @@ impl Bridge {
     /// command, so both are inert — and if one ever does, the default it meets
     /// should be the closed one.
     async fn context(&self, turn: &TurnSnapshot) -> ToolContext {
-        let tool_secrets = {
-            let pool = self.services.db.clone();
-            let secrets = self.services.secrets.clone();
-            tokio::task::spawn_blocking(move || crate::agent::build_tool_secrets(&secrets, &pool))
-                .await
-                .unwrap_or_default()
-        };
+        let tool_secrets = crate::agent::build_tool_secrets(&self.services.secrets, &self.services.db).await;
 
         ToolContext {
             working_directory: None,
@@ -567,8 +561,7 @@ impl Bridge {
             conversation_id: Some(self.conversation_id.clone()),
             turn_id: Some(turn.turn_id.clone()),
             assistant_id: turn.assistant_id.clone(),
-            db_pool: Some(self.services.db.clone()),
-            sea: Some(self.services.sea.clone()),
+            db: Some(self.services.db.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]
@@ -958,8 +951,7 @@ mod tests {
             conversation_id: None,
             turn_id: Some("t-1".into()),
             assistant_id: None,
-            db_pool: None,
-            sea: None,
+            db: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]

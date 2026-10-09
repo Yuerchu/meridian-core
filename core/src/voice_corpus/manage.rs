@@ -434,11 +434,11 @@ pub async fn untranscribed_counts(db: &Db) -> Result<HashMap<String, i64>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::sea::{execute_for_tests, shared_test_db};
+    use crate::db::sea::{execute_for_tests, file_test_db};
 
     /// 一个库文件：行和 key 都走 SeaORM。
     async fn dbs(dir: &Path) -> (Db, Vec<u8>) {
-        let (_diesel, sea) = shared_test_db(dir).await;
+        let sea = file_test_db(dir).await;
         let key = crate::voice_corpus::storage_key(&sea).await.unwrap();
         (sea, key)
     }

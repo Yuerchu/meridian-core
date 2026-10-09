@@ -4,10 +4,9 @@
 //! (desktop chat, its token-counting mirror, and OneBot) cannot drift apart on
 //! privacy rules the way three hand-copied loaders would.
 
-use crate::db::DbPool;
 use crate::db::entity::memory;
 use crate::db::entity::memory::{GLOBAL_SCOPE_ID, MemoryScope, Visibility, onebot_user_scope_id};
-use crate::db::models::message::MessageRow;
+use crate::db::entity::message as message_entity;
 use crate::db::sea::DbErr;
 use crate::db::sea::cap::{Db, Snapshot};
 use crate::db::sea::ops::memory::{
@@ -440,7 +439,7 @@ fn parse_source(source: &str) -> Result<Option<(InjectionKind, InjectionState)>,
 ///   discoverable while its tombstone survives (`purge_expired_trash` drops it
 ///   after `TRASH_RETENTION_MS`), so past that horizon "nothing was deleted" and
 ///   "the evidence is gone" are the same answer.
-fn scan_prior_state(live: &[MessageRow], t0: i64) -> Result<Option<InjectionState>, String> {
+fn scan_prior_state(live: &[message_entity::Model], t0: i64) -> Result<Option<InjectionState>, String> {
     let mut people: Vec<String> = Vec::new();
     let mut newest: Option<InjectionState> = None;
 
@@ -793,7 +792,7 @@ fn subject_scope_ids(req: &MemoryRequest) -> Vec<String> {
 pub async fn plan_injection(
     db: &impl Snapshot,
     req: &MemoryRequest,
-    live: &[MessageRow],
+    live: &[message_entity::Model],
     t0: i64,
 ) -> Result<Injection, String> {
     match scan_prior_state(live, t0)? {
@@ -1125,7 +1124,7 @@ async fn forgotten_section(
 /// `Full` to scan back to and send everything again. Degrading into a re-send is
 /// the right direction for this to fail in.
 pub async fn persist_injection(
-    pool: &DbPool,
+    db: &Db,
     injection: &Injection,
     conversation_id: &str,
     turn_id: &str,
@@ -1136,7 +1135,7 @@ pub async fn persist_injection(
         return parent;
     };
     persist_context_row(
-        pool,
+        db,
         text.trim_start().to_string(),
         injection.source(),
         "memory",
@@ -1158,7 +1157,7 @@ pub async fn persist_injection(
 /// failed turn (see `persist_injection`); `label` names the block in the warning.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_context_row(
-    pool: &DbPool,
+    db: &Db,
     text: String,
     source: String,
     label: &'static str,
@@ -1168,63 +1167,26 @@ pub(crate) async fn persist_context_row(
     now: i64,
 ) -> Option<String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let (pool2, conv, turn, hang_on) = (
-        pool.clone(),
-        conversation_id.to_string(),
-        turn_id.to_string(),
-        parent.clone(),
-    );
-    let written = tokio::task::spawn_blocking(move || {
-        let mut conn = pool2.get().map_err(|e| e.to_string())?;
-        crate::db::ops::message::append_message(
-            &mut conn,
-            &crate::db::models::message::MessageInsert {
-                id: &id,
-                conversation_id: &conv,
-                role: "context",
-                content: &text,
-                provider_id: None,
-                model_id: None,
-                input_tokens: None,
-                output_tokens: None,
-                tool_calls: None,
-                tool_call_id: None,
-                sort_order: 0,
-                created_at: now,
-                reasoning_content: None,
-                rating: None,
-                schema_version: 2,
-                is_compact_summary: 0,
-                sender_id: None,
-                parent_id: None,
-                compact_anchor_id: None,
-                source: Some(&source),
-                turn_id: Some(&turn),
-                tool_outcome: None,
-                // Nobody was billed for remembering something.
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                server_tool_calls: None,
-                provider_name: None,
-                response_model_id: None,
-            },
-            hang_on.as_deref(),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok::<_, String>(id)
-    })
-    .await;
-    let reason = match written {
-        Ok(Ok(id)) => return Some(id),
-        Ok(Err(e)) => e,
-        Err(e) => e.to_string(),
+    let row = crate::db::sea::ops::message::ContextRowInsert {
+        id: &id,
+        conversation_id,
+        content: &text,
+        source: &source,
+        turn_id: Some(turn_id),
+        created_at: now,
     };
-    tracing::warn!(
-        conversation_id = %conversation_id,
-        block = label,
-        error = %reason,
-        "the {label} block could not be recorded; the next turn will send it again",
-    );
+    let written = db
+        .write(async |tx| crate::db::sea::ops::message::append_context(tx, &row, parent.as_deref()).await)
+        .await;
+    match written {
+        Ok(()) => return Some(id),
+        Err(e) => tracing::warn!(
+            conversation_id = %conversation_id,
+            block = label,
+            error = %e,
+            "the {label} block could not be recorded; the next turn will send it again",
+        ),
+    }
     parent
 }
 
@@ -1234,7 +1196,7 @@ pub(crate) async fn persist_context_row(
 pub async fn plan_injection_async(
     db: &Db,
     req: MemoryRequest,
-    live: Vec<MessageRow>,
+    live: Vec<message_entity::Model>,
     t0: i64,
 ) -> Result<Option<Injection>, String> {
     db.read(async |tx| Ok::<_, DbErr>(plan_injection(tx, &req, &live, t0).await))
@@ -1315,7 +1277,12 @@ mod tests {
             .unwrap()
     }
 
-    async fn plan(conn: &Db, req: &MemoryRequest, live: &[MessageRow], t0: i64) -> Result<Injection, String> {
+    async fn plan(
+        conn: &Db,
+        req: &MemoryRequest,
+        live: &[message_entity::Model],
+        t0: i64,
+    ) -> Result<Injection, String> {
         conn.read(async |tx| Ok::<_, DbErr>(plan_injection(tx, req, live, t0).await))
             .await
             .unwrap()
@@ -1380,8 +1347,8 @@ mod tests {
     }
 
     /// A frozen injection row, as `plan_injection` would have left it.
-    fn frozen(injection: &Injection) -> MessageRow {
-        MessageRow {
+    fn frozen(injection: &Injection) -> message_entity::Model {
+        message_entity::Model {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: "c".into(),
             role: "context".into(),
@@ -1397,7 +1364,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -1434,7 +1401,7 @@ mod tests {
 
         /// Run a round the way a surface would: plan against the rows frozen so
         /// far, then append this round's row to them.
-        async fn round(conn: &Db, req: &MemoryRequest, history: &mut Vec<MessageRow>, t0: i64) -> Injection {
+        async fn round(conn: &Db, req: &MemoryRequest, history: &mut Vec<message_entity::Model>, t0: i64) -> Injection {
             let injection = plan(conn, req, history, t0).await.unwrap();
             if injection.text.is_some() {
                 history.push(frozen(&injection));

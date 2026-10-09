@@ -203,9 +203,9 @@ pub async fn ask(
         "ACP permission asked"
     );
 
-    let pool = services.db.clone();
+    let db = services.db.clone();
     let decision = engine::in_phase(
-        &pool,
+        &db,
         &turn.turn_id,
         TurnPhase::AwaitingApproval,
         Some(&tool_name),

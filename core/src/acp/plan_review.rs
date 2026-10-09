@@ -12,11 +12,11 @@ use std::sync::Mutex;
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::models::plan_review::{PlanReviewProviderKind, PlanReviewState};
-use crate::db::ops::plan_review as ops;
+use crate::db::entity::plan_review_session::{PlanReviewProviderKind, PlanReviewState};
+use crate::db::sea::ops::plan_review as ops;
 use crate::events::PlanReviewEvent;
 use crate::services::Services;
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 use super::mapping;
 use super::protocol::{PermissionOption, RequestPermissionParams};
@@ -103,105 +103,109 @@ pub(super) async fn submit(
     assistant_message_id: &str,
     submission: ExitPlanSubmission,
 ) -> Result<SubmittedReview, String> {
-    let pool = services.db.clone();
-    let files = services.plan_files.clone();
-    let conversation_id = conversation_id.to_string();
-    let turn_id = turn_id.to_string();
-    let assistant_message_id = assistant_message_id.to_string();
-    let stored_submission = submission.clone();
-
-    let event = tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        if ops::get_pending_review_for_conversation(&mut conn, &conversation_id)
-            .map_err(|error| error.to_string())?
+    let db = &services.db;
+    let not_twice = async |tx: &crate::db::sea::cap::WriteTx| -> Result<(), ops::PlanReviewStoreError> {
+        if ops::get_pending_review_for_conversation(tx, conversation_id)
+            .await?
             .is_some()
         {
             return Err("this conversation already has a plan awaiting review".into());
         }
+        Ok(())
+    };
 
-        let now = now_ms();
-        let document =
-            ops::create_or_resume_document(&mut conn, &conversation_id, now).map_err(|error| error.to_string())?;
-        let head = ops::get_head_revision(&mut conn, &document.id).map_err(|error| error.to_string())?;
-        let desired_sha = ops::markdown_sha256(&stored_submission.markdown);
-
-        let revision = if head
-            .as_ref()
-            .is_some_and(|revision| revision.content_sha256 == desired_sha)
-        {
-            head.expect("checked above")
-        } else {
+    // The snapshot as the document's head: one write, so the pending check,
+    // the head it compares against and the append describe one moment.
+    let (document_id, revision) = db
+        .write(async |tx| {
+            not_twice(tx).await?;
+            let now = now_ms();
+            let document = ops::create_or_resume_document(tx, conversation_id, now).await?;
+            let head = ops::get_head_revision(tx, &document.id).await?;
+            let desired_sha = ops::markdown_sha256(&submission.markdown);
+            if let Some(head) = head.clone().filter(|revision| revision.content_sha256 == desired_sha) {
+                return Ok::<_, ops::PlanReviewStoreError>((document.id, head));
+            }
             let before = head
                 .as_ref()
                 .map(|revision| revision.content_markdown.as_str())
                 .unwrap_or("");
-            let patch = similar::TextDiff::from_lines(before, &stored_submission.markdown)
+            let patch = similar::TextDiff::from_lines(before, &submission.markdown)
                 .unified_diff()
                 .context_radius(3)
                 .header("a/plan.md", "b/plan.md")
                 .to_string();
-            let responding_to = ops::list_reviews(&mut conn, &document.id)
-                .map_err(|error| error.to_string())?
+            let responding_to = ops::list_reviews(tx, &document.id)
+                .await?
                 .into_iter()
                 .rev()
                 .find_map(|review| {
-                    (review.state == PlanReviewState::ChangesRequested.as_str())
+                    (review.state == PlanReviewState::ChangesRequested)
                         .then_some(review.suggestion_revision_id)
                         .flatten()
                 });
-            ops::append_assistant_revision(
-                &mut conn,
+            let appended = ops::append_assistant_revision(
+                tx,
                 &ops::PlanRevisionAppend {
                     document_id: &document.id,
                     expected_generation: document.working_generation,
                     expected_head_sha256: head.as_ref().map(|revision| revision.content_sha256.as_str()),
-                    content_markdown: &stored_submission.markdown,
+                    content_markdown: &submission.markdown,
                     patch: &patch,
-                    source_message_id: Some(&assistant_message_id),
-                    source_call_id: Some(&stored_submission.call_id),
+                    source_message_id: Some(assistant_message_id),
+                    source_call_id: Some(&submission.call_id),
                     responding_to_suggestion_revision_id: responding_to.as_deref(),
                     now,
                 },
             )
-            .map_err(|error| error.to_string())?
-            .revision
-        };
-
-        let document = ops::get_document(&mut conn, &document.id).map_err(|error| error.to_string())?;
-        let materialized = files
-            .reconcile_document(&mut conn, &document.id, now_ms())
-            .map_err(|error| error.to_string())?;
-        if materialized.conflict.is_some() {
-            return Err("the durable plan.md projection is in conflict".into());
-        }
-
-        let bundle = ops::submit_head_for_review(
-            &mut conn,
-            &ops::PlanReviewSubmit {
-                document_id: &document.id,
-                expected_generation: document.working_generation,
-                expected_head_sha256: &revision.content_sha256,
-                turn_id: Some(&turn_id),
-                assistant_message_id: Some(&assistant_message_id),
-                provider_call_id: Some(&stored_submission.call_id),
-                provider_kind: PlanReviewProviderKind::Acp,
-                now: now_ms(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        Ok::<_, String>(PlanReviewEvent {
-            review_id: bundle.review.id,
-            conversation_id,
-            document_id: bundle.document.id,
-            revision_id: bundle.submitted_revision.id,
-            turn_id,
-            status: bundle.review.state,
-            lock_version: bundle.review.lock_version,
-            delivery_state: None,
+            .await?;
+            Ok((document.id, appended.revision))
         })
-    })
-    .await
-    .map_err(|error| format!("ACP plan submission task failed: {error}"))??;
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // plan.md on disk before the review is of it; the store acknowledges
+    // each write on its own.
+    let materialized = services
+        .plan_files
+        .reconcile_document(db, &document_id, now_ms())
+        .await
+        .map_err(|error| error.to_string())?;
+    if materialized.conflict.is_some() {
+        return Err("the durable plan.md projection is in conflict".into());
+    }
+
+    let event = db
+        .write(async |tx| {
+            not_twice(tx).await?;
+            let document = ops::get_document(tx, &document_id).await?;
+            let bundle = ops::submit_head_for_review(
+                tx,
+                &ops::PlanReviewSubmit {
+                    document_id: &document.id,
+                    expected_generation: document.working_generation,
+                    expected_head_sha256: &revision.content_sha256,
+                    turn_id: Some(turn_id),
+                    assistant_message_id: Some(assistant_message_id),
+                    provider_call_id: Some(&submission.call_id),
+                    provider_kind: PlanReviewProviderKind::Acp,
+                    now: now_ms(),
+                },
+            )
+            .await?;
+            Ok::<_, ops::PlanReviewStoreError>(PlanReviewEvent {
+                review_id: bundle.review.id,
+                conversation_id: conversation_id.to_string(),
+                document_id: bundle.document.id,
+                revision_id: bundle.submitted_revision.id,
+                turn_id: turn_id.to_string(),
+                status: bundle.review.state.as_str().to_string(),
+                lock_version: bundle.review.lock_version,
+                delivery_state: None,
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
 
     Ok(SubmittedReview {
         event,
@@ -485,10 +489,9 @@ pub(super) async fn await_permission_decision(
 mod tests {
     use super::*;
     use crate::acp::protocol::{ClaudeCodeMeta, ToolCall, ToolCallMeta};
-    use crate::db::models::turn::{TurnRow, TurnStatus};
+    use crate::db::models::turn::TurnStatus;
     use crate::services::bare_services;
     use crate::turn::TurnOrigin;
-    use diesel::prelude::*;
 
     fn request(tool_name: &str, raw_input: serde_json::Value) -> RequestPermissionParams {
         RequestPermissionParams {
@@ -583,13 +586,22 @@ mod tests {
     async fn an_acp_snapshot_becomes_a_materialized_waiting_review() {
         let dir = tempfile::tempdir().unwrap();
         let services = bare_services(dir.path()).await;
-        {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::conversation::create_conversation(&mut conn, "conversation-1", Some("plan"), None, None, 1)
-                .unwrap();
-            crate::db::ops::turn::begin(&mut conn, "turn-1", "conversation-1", TurnOrigin::ClaudeCode, None, 2)
-                .unwrap();
-        }
+        services
+            .db
+            .write(async |tx| {
+                crate::db::sea::ops::conversation::create_conversation(
+                    tx,
+                    "conversation-1",
+                    Some("plan"),
+                    None,
+                    None,
+                    1,
+                )
+                .await?;
+                crate::db::sea::ops::turn::begin(tx, "turn-1", "conversation-1", TurnOrigin::ClaudeCode, None, 2).await
+            })
+            .await
+            .unwrap();
 
         let submitted = submit(
             &services,
@@ -605,20 +617,76 @@ mod tests {
         .await
         .unwrap();
 
-        let mut conn = services.db.get().unwrap();
-        let bundle = ops::get_review_bundle(&mut conn, &submitted.event.review_id).unwrap();
-        assert_eq!(bundle.review.provider_kind, PlanReviewProviderKind::Acp.as_str());
+        let bundle = services
+            .db
+            .read(async |tx| ops::get_review_bundle(tx, &submitted.event.review_id).await)
+            .await
+            .unwrap();
+        assert_eq!(bundle.review.provider_kind, PlanReviewProviderKind::Acp);
         assert_eq!(bundle.review.provider_call_id.as_deref(), Some("call-1"));
         assert_eq!(bundle.review.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(bundle.submitted_revision.content_markdown, "# Plan\n\n- one\n");
         let snapshot = services
             .plan_files
-            .read_document(&mut conn, &bundle.document.id)
+            .read_document(&services.db, &bundle.document.id)
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.content, bundle.submitted_revision.content_markdown);
-        let turn: TurnRow = crate::db::schema::turns::table.find("turn-1").first(&mut conn).unwrap();
-        assert_eq!(turn.status, TurnStatus::WaitingReview.as_str());
+        let turn = crate::db::sea::ops::turn::get(&services.db, "turn-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.status, TurnStatus::WaitingReview);
+    }
+
+    /// A second ExitPlanMode while one review is waiting is refused before it
+    /// writes anything: the conversation has one review at a time.
+    #[tokio::test]
+    async fn a_second_snapshot_waits_for_the_first_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = bare_services(dir.path()).await;
+        services
+            .db
+            .write(async |tx| {
+                crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("plan"), None, None, 1).await?;
+                crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::ClaudeCode, None, 2).await?;
+                crate::db::sea::ops::turn::begin(tx, "t2", "c1", TurnOrigin::ClaudeCode, None, 3).await
+            })
+            .await
+            .unwrap();
+        let snapshot = |call: &str, markdown: &str| ExitPlanSubmission {
+            session_id: "session-1".into(),
+            call_id: call.into(),
+            markdown: markdown.into(),
+        };
+        submit(
+            &services,
+            "c1",
+            "t1",
+            "m1",
+            snapshot(
+                "call-1", "# One
+",
+            ),
+        )
+        .await
+        .unwrap();
+        let error = submit(
+            &services,
+            "c1",
+            "t2",
+            "m2",
+            snapshot(
+                "call-2", "# Two
+",
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("already has a plan awaiting review"), "{error}");
+        let document = ops::get_active_document(&services.db, "c1").await.unwrap().unwrap();
+        assert_eq!(ops::list_revisions(&services.db, &document.id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

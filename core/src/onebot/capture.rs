@@ -164,7 +164,7 @@ async fn capture_one(
         return Ok(());
     }
 
-    let key_bytes = voice_corpus::storage_key(&state.services.sea).await?;
+    let key_bytes = voice_corpus::storage_key(&state.services.db).await?;
     let pseudonym = voice_corpus::session_pseudonym(
         &key_bytes,
         source.scope.bot_self_id,
@@ -184,7 +184,7 @@ async fn capture_one(
             tokio::time::sleep(CLAIM_BACKOFF).await;
         }
         let input = CommitInput {
-            sea: state.services.sea.clone(),
+            sea: state.services.db.clone(),
             auth: permit.authorisation(),
             permit: Arc::clone(permit),
             source: source.clone(),
@@ -655,7 +655,7 @@ mod tests {
     use super::*;
     use crate::db::entity::voice_blob::VoiceBlobStatus;
     use crate::db::entity::voice_clip;
-    use crate::db::sea::shared_test_db;
+    use crate::db::sea::file_test_db;
     use crate::voice_corpus::CorpusCoordinator;
 
     /// 格式认的是字节。QQ 的 SILK 常带一个前导字节，所以第二个位置也要看。
@@ -700,7 +700,7 @@ mod tests {
     impl Fixture {
         async fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let (_diesel, db) = shared_test_db(dir.path()).await;
+            let db = file_test_db(dir.path()).await;
             let coordinator = Arc::new(CorpusCoordinator::new(dir.path()));
             coordinator.apply(HashSet::from([scope()]), HashSet::new()).await;
             let key = voice_corpus::storage_key(&db).await.unwrap();

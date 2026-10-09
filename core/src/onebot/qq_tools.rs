@@ -613,7 +613,7 @@ impl QqToolExecutor {
         let stickers = self
             .state
             .services
-            .sea
+            .db
             .read(
                 async |tx| match crate::db::sea::ops::emoji_pack::get_by_source_account(tx, &self_id).await? {
                     Some(pack) => crate::db::sea::ops::emoji::list_confirmed_for_packs(tx, &[pack.id]).await,
@@ -789,7 +789,7 @@ impl QqToolExecutor {
         let (pack, sticker) = self
             .state
             .services
-            .sea
+            .db
             .read(async |tx| {
                 let pack = crate::db::sea::ops::emoji_pack::get_by_source_account(tx, &self_id).await?;
                 let sticker = crate::db::sea::ops::emoji::get_emoji(tx, &sticker_id).await?;

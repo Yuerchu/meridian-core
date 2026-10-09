@@ -12,12 +12,7 @@
 //! the turn loop, the price snapshot, the usage report, the settings panel —
 //! reads the same answer.
 
-use diesel::prelude::*;
-
 use crate::db::entity::{model_config as config_entity, model_profile};
-use crate::db::models::model_config::ModelConfigRow;
-use crate::db::models::model_profile::ModelProfileRow;
-use crate::db::ops::model_config;
 use crate::decimal::Decimal;
 
 /// One model, as one provider serves it, with every value resolved.
@@ -98,25 +93,30 @@ pub fn effective(config: &config_entity::Model, profile: &model_profile::Model) 
     }
 }
 
-/// The one read every turn and every price snapshot makes.
-pub fn load(
-    conn: &mut SqliteConnection,
+/// [`load`] on SeaORM: one provider's config for one model, resolved
+/// against its profile, in one snapshot.
+pub async fn load_one(
+    db: &crate::db::sea::cap::Db,
     provider_id: &str,
     model_id: &str,
-) -> QueryResult<Option<EffectiveModelConfig>> {
-    Ok(model_config::get_with_profile(conn, provider_id, model_id)?
-        .map(|(config, profile)| effective(&config.into(), &profile.into())))
+) -> Result<Option<EffectiveModelConfig>, crate::db::sea::DbErr> {
+    Ok(db
+        .read(async |tx| crate::db::sea::ops::model_config::get_with_profile(tx, provider_id, model_id).await)
+        .await?
+        .map(|(config, profile)| effective(&config, &profile)))
 }
 
-/// Every configured model on this machine, for readers that price many rows at
-/// once rather than one turn.
-pub fn load_all(conn: &mut SqliteConnection) -> QueryResult<Vec<EffectiveModelConfig>> {
-    use crate::db::schema::{model_configs, model_profiles};
-    let rows: Vec<(ModelConfigRow, ModelProfileRow)> = model_configs::table
-        .inner_join(model_profiles::table)
-        .select((ModelConfigRow::as_select(), ModelProfileRow::as_select()))
-        .load(conn)?;
-    Ok(rows.into_iter().map(|(c, p)| effective(&c.into(), &p.into())).collect())
+/// [`load_all`] on SeaORM: every configuration with its profile, in one
+/// snapshot so a profile edited between the two reads cannot price half the
+/// models at the old rates.
+pub async fn load_every(
+    db: &impl crate::db::sea::cap::Snapshot,
+) -> Result<Vec<EffectiveModelConfig>, crate::db::sea::DbErr> {
+    Ok(crate::db::sea::ops::model_config::list_with_profiles(db)
+        .await?
+        .iter()
+        .map(|(config, profile)| effective(config, profile))
+        .collect())
 }
 
 #[cfg(test)]

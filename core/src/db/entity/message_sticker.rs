@@ -1,8 +1,6 @@
 //! `message_stickers`: which sticker a message showed, in order.
 //!
-//! The links are still written by Diesel (`db::ops::emoji`), inside the
-//! message transactions; the entity is here because both tables it joins now
-//! have one.
+//! The links are written inside the transaction that writes the message.
 
 use sea_orm::entity::prelude::*;
 

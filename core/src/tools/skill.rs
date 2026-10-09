@@ -82,10 +82,7 @@ impl Tool for LoadSkillTool {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let db = context
-            .sea
-            .as_ref()
-            .ok_or("Skills are unavailable without a database")?;
+        let db = context.db.as_ref().ok_or("Skills are unavailable without a database")?;
         let project_id = context.project_id.as_deref();
         let assistant_id = context.assistant_id.as_deref();
 
@@ -203,8 +200,7 @@ mod tests {
             conversation_id: None,
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
-            sea: Some(db.clone()),
+            db: Some(db.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]

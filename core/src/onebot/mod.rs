@@ -536,8 +536,8 @@ impl RunningTurn {
     /// rather than read from the config, because the config names the listener
     /// and the event names who answered — and those stop being the same thing
     /// the moment a second account connects to that listener.
-    pub async fn open_record(&self, pool: &crate::db::DbPool, self_id: Option<i64>) -> Result<(), String> {
-        crate::agent::turn_record::begin(pool, &self.turn_id, &self.conversation_id, TurnOrigin::OneBot, self_id).await
+    pub async fn open_record(&self, db: &crate::db::sea::cap::Db, self_id: Option<i64>) -> Result<(), String> {
+        crate::agent::turn_record::begin(db, &self.turn_id, &self.conversation_id, TurnOrigin::OneBot, self_id).await
     }
 
     /// Fold a finished round's numbers in. Follow-up rounds are the same turn,
@@ -1247,7 +1247,7 @@ pub async fn refresh_voice_policy(services: &Services, config: &OneBotConfig) ->
     // **读不到就报错，不能当作空名单。** 这张表通常是空的，所以"查询失败"和
     // "没人拒绝过"在结果上长得一模一样——而把失败读成后者，等于让一次瞬时的
     // 数据库错误重新开始录一个已经明确说过不要的人。
-    let optouts = crate::db::sea::ops::voice_corpus::optouts(&services.sea)
+    let optouts = crate::db::sea::ops::voice_corpus::optouts(&services.db)
         .await
         .map_err(|e| e.to_string())?;
     // keyring 是阻塞 IO，留在 blocking 线程上。
@@ -1432,8 +1432,8 @@ impl OneBotServer {
                 let recovered = if !writable {
                     Ok(crate::voice_corpus::recover::Recovered::default())
                 } else {
-                    match crate::voice_corpus::storage_key(&services.sea).await {
-                        Ok(key) => crate::voice_corpus::recover::run(&services.sea, &key, &data_dir, writable).await,
+                    match crate::voice_corpus::storage_key(&services.db).await {
+                        Ok(key) => crate::voice_corpus::recover::run(&services.db, &key, &data_dir, writable).await,
                         Err(error) => Err(error),
                     }
                 };

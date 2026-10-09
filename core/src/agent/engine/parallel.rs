@@ -167,8 +167,7 @@ mod tests {
             conversation_id: Some("c1".into()),
             turn_id: Some("t1".into()),
             assistant_id: None,
-            db_pool: None,
-            sea: None,
+            db: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]

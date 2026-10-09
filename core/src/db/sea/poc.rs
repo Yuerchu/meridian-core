@@ -13,7 +13,6 @@ use sea_orm::{
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
 use super::cap::{Db, Read, WriteTx, sealed::Access};
-use crate::db::ops::conversation as diesel_conversation;
 use crate::decimal::Decimal;
 
 /// The two flags the toggle race is about, and nothing else of the row.
@@ -62,13 +61,15 @@ async fn toggle_archive(tx: &WriteTx, id: &str, now: i64) -> Result<flags::Model
     active.update(conn).await
 }
 
-/// A migrated file with one conversation in it, written through Diesel.
-async fn diesel_file(dir: &Path) -> (std::path::PathBuf, crate::db::DbPool) {
+/// A migrated file with one conversation in it.
+async fn seeded_file(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("poc.sqlite");
     super::bridge::migrate_file(&path).await.unwrap();
-    let pool = crate::db::init_db(path.to_str().unwrap());
-    diesel_conversation::create_conversation(&mut pool.get().unwrap(), "c1", None, None, None, 1).unwrap();
-    (path, pool)
+    let db = super::open(&path).await.unwrap();
+    db.write(async |tx| super::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await)
+        .await
+        .unwrap();
+    path
 }
 
 /// The sqlx pool the plan describes, minus durability: `synchronous=OFF` as
@@ -130,7 +131,7 @@ async fn flags_of(db: &Db) -> (i32, i32) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_toggles_are_each_applied() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _diesel) = diesel_file(dir.path()).await;
+    let path = seeded_file(dir.path()).await;
     let db = Db::new(SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_file(&path).await));
 
     const ROUNDS: i64 = 2000;
@@ -166,7 +167,7 @@ async fn concurrent_toggles_are_each_applied() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_holds_the_lock_from_its_first_read() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _diesel) = diesel_file(dir.path()).await;
+    let path = seeded_file(dir.path()).await;
     let pool = sqlx_file(&path).await;
     let db = Db::new(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool.clone()));
     let read_done = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -203,7 +204,7 @@ async fn a_write_holds_the_lock_from_its_first_read() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_savepoint_in_a_deferred_read_fails_once_another_connection_commits() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _diesel) = diesel_file(dir.path()).await;
+    let path = seeded_file(dir.path()).await;
     let conn = SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_file(&path).await);
 
     let deferred = TransactionOptions {
@@ -235,7 +236,7 @@ async fn a_savepoint_in_a_deferred_read_fails_once_another_connection_commits() 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_savepoint_in_an_immediate_transaction_keeps_the_lock() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _diesel) = diesel_file(dir.path()).await;
+    let path = seeded_file(dir.path()).await;
     let conn = SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_file(&path).await);
 
     let immediate = TransactionOptions {
@@ -402,42 +403,19 @@ async fn decimals_round_trip_as_canonical_text() {
     assert!(error.to_string().contains("canonical"), "{error}");
 }
 
-/// (c) The claim the whole incremental plan rests on: a Diesel transaction and
-/// a SeaORM one on the same file are serialised by SQLite's own lock, whichever
-/// pool they came from. Two Diesel threads and two SeaORM tasks toggle the same
-/// row; every toggle must land.
+/// (c) Writers on one file are serialised by SQLite's own lock: four tasks
+/// toggle the same row through the pool and every toggle lands. (While Diesel
+/// and SeaORM shared the file this ran two of them on each; the claim it pinned
+/// — one lock, whichever pool — went with Diesel.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn diesel_and_seaorm_writers_on_one_file_do_not_lose_each_others_writes() {
-    use diesel::RunQueryDsl;
-
+async fn concurrent_writers_on_one_file_do_not_lose_each_others_writes() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, diesel) = diesel_file(dir.path()).await;
+    let path = seeded_file(dir.path()).await;
     let pool = sqlx_file(&path).await;
     let db = Db::new(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool.clone()));
 
     const ROUNDS: i64 = 1000;
-    let diesel_workers: Vec<_> = (0..2)
-        .map(|_| {
-            let diesel = diesel.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut conn = diesel.get().unwrap();
-                diesel::sql_query("PRAGMA synchronous=OFF").execute(&mut conn).unwrap();
-                let mut until_applied = |op: &mut dyn FnMut(&mut _) -> diesel::QueryResult<_>| loop {
-                    match op(&mut conn) {
-                        Ok(_) => return,
-                        Err(diesel::result::Error::DatabaseError(_, info))
-                            if info.message() == "database is locked" => {}
-                        Err(error) => panic!("{error}"),
-                    }
-                };
-                for i in 0..ROUNDS {
-                    until_applied(&mut |conn| diesel_conversation::toggle_archive(conn, "c1", i));
-                    until_applied(&mut |conn| diesel_conversation::toggle_pin(conn, "c1", i));
-                }
-            })
-        })
-        .collect();
-    let sea_workers: Vec<_> = (0..2)
+    let sea_workers: Vec<_> = (0..4)
         .map(|_| {
             let db = db.clone();
             tokio::spawn(async move {
@@ -448,13 +426,14 @@ async fn diesel_and_seaorm_writers_on_one_file_do_not_lose_each_others_writes() 
             })
         })
         .collect();
-    for worker in diesel_workers {
-        worker.await.unwrap();
-    }
     for worker in sea_workers {
         worker.await.unwrap();
     }
-    assert_eq!(flags_of(&db).await, (0, 0), "an even number of toggles from each side");
+    assert_eq!(
+        flags_of(&db).await,
+        (0, 0),
+        "an even number of toggles from every worker"
+    );
 
     // Every connection the sqlx pool hands out has foreign keys on and sees WAL.
     let mut held = Vec::new();

@@ -119,8 +119,7 @@ mod tests {
             conversation_id: None,
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
-            sea: None,
+            db: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]
@@ -164,13 +163,11 @@ mod tests {
             .unwrap();
 
         let real = crate::tools::verified::resolve_root(&file).unwrap();
-        let row = crate::db::sea::ops::journal::file_by_path(&journal.sea, &crate::journal::norm_path(&real).unwrap())
+        let row = crate::db::sea::ops::journal::file_by_path(&journal.db, &crate::journal::norm_path(&real).unwrap())
             .await
             .unwrap()
             .expect("the edit should be journalled");
-        let chain = crate::db::sea::ops::journal::chain(&journal.sea, &row.id)
-            .await
-            .unwrap();
+        let chain = crate::db::sea::ops::journal::chain(&journal.db, &row.id).await.unwrap();
         assert_eq!(chain.len(), 1);
         let v = &chain[0];
         assert_eq!(

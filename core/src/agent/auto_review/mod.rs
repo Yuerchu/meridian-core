@@ -46,13 +46,15 @@ pub use assessment::{Assessment, AuthLevel, Outcome, Read, RiskLevel};
 
 use crate::agent::engine::{ApprovalDecision, Approvals};
 use crate::db::models::message::MessageUsage;
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::{Read as DbRead, Snapshot};
+use crate::db::sea::ops as sea_ops;
 use crate::events::{
     ApprovalRetryKind, AutoReviewAuthorization, AutoReviewEvidence, AutoReviewOutcome as EventOutcome, AutoReviewRisk,
     AutoReviewStage, AutoReviewVerdict, ChatStreamEvent,
 };
 use crate::provider::{ChatMessage, TokenUsage, ToolCall};
 use crate::services::Services;
-use crate::util::get_conn;
 
 /// The policy the reviewer is briefed with, before the user's own additions.
 const POLICY: &str = include_str!("policy.md");
@@ -85,23 +87,23 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// `autoreview.*`, read straight from preferences.
-    pub fn load(pool: &crate::db::DbPool) -> Result<Self, String> {
-        let mut conn = get_conn(pool)?;
-        fn read(conn: &mut diesel::SqliteConnection, key: &str) -> Result<Option<String>, String> {
-            crate::db::ops::preference::get_preference(conn, key)
+    /// `autoreview.*`, read straight from preferences, in one snapshot.
+    pub async fn read_in(db: &impl Snapshot) -> Result<Self, String> {
+        let read = async |key: &str| {
+            sea_ops::preference::get_preference(db, key)
+                .await
                 .map_err(|error| format!("failed to read preference {key}: {error}"))
-        }
+        };
         Ok(Settings {
-            enabled: parse_stored_bool("autoreview.enabled", read(&mut conn, "autoreview.enabled")?, false)?,
-            model: read(&mut conn, "autoreview.model")?.filter(|m| !m.trim().is_empty()),
+            enabled: parse_stored_bool("autoreview.enabled", read("autoreview.enabled").await?, false)?,
+            model: read("autoreview.model").await?.filter(|m| !m.trim().is_empty()),
             // Defaults on: the escalating pass is what keeps false positives
             // from making the whole mode unusable, and it only runs when the
             // cheap pass was not sure.
-            escalate: parse_stored_bool("autoreview.escalate", read(&mut conn, "autoreview.escalate")?, true)?,
-            allow_rules: read(&mut conn, "autoreview.allow_rules")?.unwrap_or_default(),
-            deny_rules: read(&mut conn, "autoreview.deny_rules")?.unwrap_or_default(),
-            environment: read(&mut conn, "autoreview.environment")?.unwrap_or_default(),
+            escalate: parse_stored_bool("autoreview.escalate", read("autoreview.escalate").await?, true)?,
+            allow_rules: read("autoreview.allow_rules").await?.unwrap_or_default(),
+            deny_rules: read("autoreview.deny_rules").await?.unwrap_or_default(),
+            environment: read("autoreview.environment").await?.unwrap_or_default(),
         })
     }
 }
@@ -201,9 +203,9 @@ struct Active {
 /// An absent list is an empty one, which makes every speaker a bystander — the
 /// cautious end. An unreadable list is a damaged first-party contract and must
 /// stop the turn rather than silently changing who may authorise it.
-fn admin_roster(pool: &crate::db::DbPool) -> Result<Vec<i64>, String> {
-    let mut conn = get_conn(pool)?;
-    let stored = crate::db::ops::preference::get_preference(&mut conn, "onebot.admin_users")
+async fn admin_roster(db: &impl DbRead) -> Result<Vec<i64>, String> {
+    let stored = sea_ops::preference::get_preference(db, "onebot.admin_users")
+        .await
         .map_err(|error| format!("failed to read preference onebot.admin_users: {error}"))?;
     match stored {
         None => Ok(Vec::new()),
@@ -226,15 +228,33 @@ impl<'a> AutoReviewed<'a> {
         AutoReviewed { inner, active: None }
     }
 
-    pub fn wrap(inner: &'a dyn Approvals, context: Context) -> Result<Self, String> {
-        let settings = Settings::load(&context.services.db)?;
-        if !settings.enabled || settings.model.is_none() {
+    pub async fn wrap(inner: &'a dyn Approvals, context: Context) -> Result<Self, String> {
+        let multi_party = context.multi_party;
+        // The settings and the roster at one instant.
+        let read = context
+            .services
+            .db
+            .read(async |tx| {
+                let settings = match Settings::read_in(tx).await {
+                    Ok(settings) => settings,
+                    Err(error) => return Ok::<_, DbErr>(Err(error)),
+                };
+                if !settings.enabled || settings.model.is_none() {
+                    return Ok(Ok(None));
+                }
+                let admins = match multi_party {
+                    true => match admin_roster(tx).await {
+                        Ok(admins) => admins,
+                        Err(error) => return Ok(Err(error)),
+                    },
+                    false => Vec::new(),
+                };
+                Ok(Ok(Some((settings, admins))))
+            })
+            .await
+            .map_err(|error| format!("failed to read the auto-review settings: {error}"))??;
+        let Some((settings, admins)) = read else {
             return Ok(AutoReviewed { inner, active: None });
-        }
-        let admins = if context.multi_party {
-            admin_roster(&context.services.db)?
-        } else {
-            Vec::new()
         };
         Ok(AutoReviewed {
             inner,
@@ -298,21 +318,25 @@ impl Active {
 
     /// Everything the reviewer is shown, assembled from the database.
     async fn scene_text(&self, call: &ToolCall, retry_reason: Option<&str>) -> Result<String, String> {
-        let pool = self.context.services.db.clone();
-        let id = self.context.conversation_id.clone();
-        let history = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let conversation = crate::db::ops::conversation::get_conversation(&mut conn, &id)
-                .map_err(|error| format!("failed to load conversation {id} for auto review: {error}"))?;
-            let messages = crate::db::ops::message::list_messages(&mut conn, &id)
-                .map_err(|error| format!("failed to load conversation {id} messages for auto review: {error}"))?;
-            Ok::<_, String>(crate::db::ops::message::active_context(
-                &messages,
-                conversation.head_message_id.as_deref(),
-            ))
-        })
-        .await
-        .map_err(|error| format!("auto-review transcript task failed: {error}"))??;
+        let id = &self.context.conversation_id;
+        let history = self
+            .context
+            .services
+            .db
+            .read(async |tx| {
+                let Some(conversation) = sea_ops::conversation::get_conversation(tx, id).await? else {
+                    return Ok(Err(format!(
+                        "failed to load conversation {id} for auto review: no such conversation"
+                    )));
+                };
+                let messages = sea_ops::message::list_messages(tx, id).await?;
+                Ok::<_, DbErr>(Ok(sea_ops::message::active_context(
+                    &messages,
+                    conversation.head_message_id.as_deref(),
+                )))
+            })
+            .await
+            .map_err(|error| format!("failed to load conversation {id} for auto review: {error}"))??;
 
         let live = history.live();
         // The roster only means anything where there is more than one person to
@@ -343,47 +367,34 @@ impl Active {
             .split_once(':')
             .ok_or_else(|| format!("`{model}` is not a provider:model pair"))?;
 
-        let secrets = self.context.services.secrets.clone();
-        let pool = self.context.services.db.clone();
-        let (pid, mid) = (provider_id.to_string(), model_id.to_string());
-        let resolved = tokio::task::spawn_blocking(move || {
-            crate::agent::resolve_with_overrides(&secrets, &pool, None, Some(mid), Some(&pid))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let services = &self.context.services;
+        let resolved = crate::agent::resolve_with_overrides(
+            &services.secrets,
+            &services.db,
+            None,
+            Some(model_id.to_string()),
+            Some(provider_id),
+        )
+        .await?;
 
-        let pool = self.context.services.db.clone();
-        // `ResolvedProvider` is not `Clone`, and these strings are all the
-        // resolver wants from it.
-        let r = (
-            resolved.provider_id.clone(),
-            resolved.provider_type.clone(),
-            resolved.api_format.clone(),
-            resolved.model.clone(),
-            resolved.transport_profile.clone(),
-            resolved.codex_request_shape,
-        );
-        let params = tokio::task::spawn_blocking(move || {
-            crate::agent::resolve_turn_params(
-                &pool,
-                crate::agent::TurnParamsResolveRequest {
-                    assistant: None,
-                    provider_id: Some(&r.0),
-                    provider_type: &r.1,
-                    api_format: &r.2,
+        let params = crate::agent::resolve_turn_params(
+            &services.db,
+            crate::agent::TurnParamsResolveRequest {
+                assistant: None,
+                provider_id: Some(&resolved.provider_id),
+                provider_type: &resolved.provider_type,
+                api_format: &resolved.api_format,
 
-                    transport_profile: &r.4,
-                    codex_request_shape: r.5,
-                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
-                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
-                    model: &r.3,
-                    thinking_level: None,
-                    fast: false,
-                },
-            )
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+                transport_profile: &resolved.transport_profile,
+                codex_request_shape: resolved.codex_request_shape,
+                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
+                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
+                model: &resolved.model,
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await?;
 
         // Zero temperature and no reasoning budget: this is a classification,
         // and a review paid for in thinking tokens on every tool call is one
@@ -460,41 +471,51 @@ impl Active {
     /// refusing to act on it because a bookkeeping write failed would turn a
     /// database hiccup into a stuck turn.
     async fn record(&self, call: &ToolCall, verdict: &Verdict, stored_verdict: AutoReviewVerdict) {
-        let pool = self.context.services.db.clone();
-        let (message_id, call_id) = (verdict.message_id.clone(), call.id.clone());
-        let cost = verdict.clone();
-        let conversation_id = self.context.conversation_id.clone();
-        let turn_id = self.context.turn_id.clone();
+        let (message_id, call_id) = (verdict.message_id.as_str(), call.id.as_str());
+        let cost = verdict;
+        let conversation_id = self.context.conversation_id.as_str();
+        let turn_id = self.context.turn_id.as_str();
         let summary = summary_of(&verdict.read);
 
-        let _ = tokio::task::spawn_blocking(move || {
-            let Ok(mut conn) = get_conn(&pool) else {
-                return;
-            };
-            if let Err(e) =
-                crate::db::ops::message::record_auto_review(&mut conn, &message_id, &call_id, &stored_verdict)
-            {
-                tracing::warn!(error = %e, "could not file the auto-review verdict");
-            }
-            if let Err(e) = crate::db::ops::audit::record_side_request(
-                &mut conn,
-                crate::db::ops::audit::SideRequestCost {
-                    role: crate::db::ops::audit::AUTO_REVIEW_ROLE,
-                    message_id: &message_id,
-                    conversation_id: &conversation_id,
-                    turn_id: Some(&turn_id),
+        // One transaction, each write in a savepoint of its own: either can
+        // fail without taking the other with it.
+        let written = self
+            .context
+            .services
+            .db
+            .write(async |tx| {
+                if let Err(e) = tx
+                    .nested(async |tx| {
+                        sea_ops::message::record_auto_review(tx, message_id, call_id, &stored_verdict).await
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %e, "could not file the auto-review verdict");
+                }
+                let side = crate::db::sea::ops::audit::SideRequestCost {
+                    role: crate::db::sea::ops::audit::AUTO_REVIEW_ROLE,
+                    message_id,
+                    conversation_id,
+                    turn_id: Some(turn_id),
                     provider_id: Some(&cost.provider_id),
                     provider_name: Some(&cost.provider_name),
                     model_id: Some(&cost.model_id),
                     usage: cost.usage,
                     peak_prompt_tokens: cost.peak_prompt,
                     summary: &summary,
-                },
-            ) {
-                tracing::warn!(error = %e, "could not record what the auto review cost");
-            }
-        })
-        .await;
+                };
+                if let Err(e) = tx
+                    .nested(async |tx| sea_ops::audit::record_side_request(tx, side).await)
+                    .await
+                {
+                    tracing::warn!(error = %e, "could not record what the auto review cost");
+                }
+                Ok::<_, DbErr>(())
+            })
+            .await;
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "could not file the auto review");
+        }
     }
 }
 
@@ -773,18 +794,25 @@ impl AutoReviewed<'_> {
 mod tests {
     use super::*;
     use crate::agent::modes::{ENTER_PLAN_TOOL, EXIT_PLAN_TOOL};
-    use crate::db::diesel_test_db;
-    use diesel::RunQueryDsl;
+    use crate::db::sea::cap::Db;
+    use crate::db::sea::sea_test_db;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn set_preference(pool: &crate::db::DbPool, key: &str, value: &str) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::preference::set_preference(&mut conn, key, value, 1).unwrap();
+    async fn set_preference(db: &Db, key: &str, value: &str) {
+        db.write(async |tx| sea_ops::preference::set_preference(tx, key, value, 1).await)
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn absent_auto_review_preferences_keep_the_existing_defaults() {
-        let settings = Settings::load(&diesel_test_db()).unwrap();
+    async fn load(db: &Db) -> Result<Settings, String> {
+        db.read(async |tx| Ok::<_, DbErr>(Settings::read_in(tx).await))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
+    #[tokio::test]
+    async fn absent_auto_review_preferences_keep_the_existing_defaults() {
+        let settings = load(&sea_test_db().await).await.unwrap();
 
         assert!(!settings.enabled);
         assert!(settings.escalate);
@@ -794,39 +822,41 @@ mod tests {
         assert!(settings.environment.is_empty());
     }
 
-    #[test]
-    fn malformed_auto_review_boole_are_not_defaulted() {
+    #[tokio::test]
+    async fn malformed_auto_review_boole_are_not_defaulted() {
         for (key, value) in [("autoreview.enabled", "1"), ("autoreview.escalate", "FALSE")] {
-            let pool = diesel_test_db();
-            set_preference(&pool, key, value);
-            let error = Settings::load(&pool).expect_err("malformed stored boolean must fail settings loading");
+            let db = sea_test_db().await;
+            set_preference(&db, key, value).await;
+            let error = load(&db)
+                .await
+                .expect_err("malformed stored boolean must fail settings loading");
             assert!(error.contains(key), "{key}: {error}");
         }
     }
 
-    #[test]
-    fn malformed_admin_roster_is_not_an_empty_roster() {
+    #[tokio::test]
+    async fn malformed_admin_roster_is_not_an_empty_roster() {
         for value in ["not json", r#"{"admin": 1}"#, r#"[1,"2"]"#] {
-            let pool = diesel_test_db();
-            set_preference(&pool, "onebot.admin_users", value);
-            let error = admin_roster(&pool).expect_err("malformed admin roster must fail");
+            let db = sea_test_db().await;
+            set_preference(&db, "onebot.admin_users", value).await;
+            let error = admin_roster(&db).await.expect_err("malformed admin roster must fail");
             assert!(error.contains("onebot.admin_users"), "{value}: {error}");
         }
 
-        let pool = diesel_test_db();
-        assert!(admin_roster(&pool).unwrap().is_empty());
-        set_preference(&pool, "onebot.admin_users", "[1,2]");
-        assert_eq!(admin_roster(&pool).unwrap(), vec![1, 2]);
+        let db = sea_test_db().await;
+        assert!(admin_roster(&db).await.unwrap().is_empty());
+        set_preference(&db, "onebot.admin_users", "[1,2]").await;
+        assert_eq!(admin_roster(&db).await.unwrap(), vec![1, 2]);
     }
 
-    #[test]
-    fn auto_review_preference_read_errors_are_not_defaulted() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        diesel::sql_query("DROP TABLE preferences").execute(&mut conn).unwrap();
-        drop(conn);
+    #[tokio::test]
+    async fn auto_review_preference_read_errors_are_not_defaulted() {
+        let db = sea_test_db().await;
+        crate::db::sea::execute_for_tests(&db, "DROP TABLE preferences")
+            .await
+            .unwrap();
 
-        let error = Settings::load(&pool).expect_err("database errors must fail settings loading");
+        let error = load(&db).await.expect_err("database errors must fail settings loading");
         assert!(error.contains("autoreview.enabled"), "{error}");
     }
 

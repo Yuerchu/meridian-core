@@ -31,7 +31,7 @@ pub async fn build_file_access(db: &Db) -> Result<tools::FileAccess, String> {
         let saf_pref = crate::db::sea::ops::preference::get_preference(db, "android.saf_roots")
             .await
             .map_err(|error| error.to_string())?;
-        let manage_enabled = crate::db::ops::preference::parse_bool_preference(
+        let manage_enabled = crate::db::sea::ops::preference::parse_bool_preference(
             "android.manage_storage_enabled",
             manage_pref.as_deref(),
             false,

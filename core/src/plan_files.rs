@@ -5,17 +5,24 @@
 //! and fsyncs a sibling staging file before atomically renaming it.  A restart
 //! can therefore distinguish DB-ahead, rename-before-ack and unexpected-file
 //! windows without guessing.
+//!
+//! Each acknowledgement is its own write, after the file it describes is on
+//! disk, so a crash between the two leaves exactly the DB-ahead window the
+//! next reconcile recognises. The file work runs on the blocking pool; a
+//! per-document async lock keeps two reconciles of one document from
+//! interleaving across those awaits.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use diesel::sqlite::SqliteConnection;
 use sha2::{Digest, Sha256};
 
-use crate::db::models::plan_review::{PlanDocumentRow, PlanMaterializationRow, PlanMaterializationState};
-use crate::db::ops::plan_review::{self, PlanReviewStoreError};
+use crate::db::entity::plan_document;
+use crate::db::entity::plan_materialization::{self, PlanMaterializationState};
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops::plan_review::{self, PlanReviewStoreError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanFileError {
@@ -29,6 +36,8 @@ pub enum PlanFileError {
     Io { path: PathBuf, source: std::io::Error },
     #[error("plan file lock was poisoned")]
     PoisonedLock,
+    #[error("plan file work did not finish: {0}")]
+    Blocking(String),
 }
 
 fn io(path: &Path, source: std::io::Error) -> PlanFileError {
@@ -36,6 +45,15 @@ fn io(path: &Path, source: std::io::Error) -> PlanFileError {
         path: path.to_path_buf(),
         source,
     }
+}
+
+/// Run file work on the blocking pool.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, PlanFileError> + Send + 'static,
+) -> Result<T, PlanFileError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| PlanFileError::Blocking(error.to_string()))?
 }
 
 #[derive(Debug, Clone)]
@@ -47,14 +65,18 @@ pub struct PlanFileSnapshot {
 
 #[derive(Debug, Default)]
 pub struct PlanMaterializationReport {
-    pub applied: Vec<PlanMaterializationRow>,
-    pub conflict: Option<PlanMaterializationRow>,
+    pub applied: Vec<plan_materialization::Model>,
+    pub conflict: Option<plan_materialization::Model>,
 }
+
+/// Called between staging and publication; tests use it to edit the file in
+/// that window.
+type BeforePublish = Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct PlanFileStore {
     files_root: PathBuf,
-    locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl PlanFileStore {
@@ -65,15 +87,15 @@ impl PlanFileStore {
         }
     }
 
-    fn document_lock(&self, document_id: &str) -> Result<Arc<Mutex<()>>, PlanFileError> {
+    fn document_lock(&self, document_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>, PlanFileError> {
         let mut locks = self.locks.lock().map_err(|_| PlanFileError::PoisonedLock)?;
         Ok(locks
             .entry(document_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone())
     }
 
-    pub fn path_for(&self, document: &PlanDocumentRow) -> Result<PathBuf, PlanFileError> {
+    pub fn path_for(&self, document: &plan_document::Model) -> Result<PathBuf, PlanFileError> {
         if !safe_id(&document.conversation_id) || !safe_id(&document.id) {
             return Err(PlanFileError::InvalidPath("unsafe conversation or document id".into()));
         }
@@ -92,17 +114,13 @@ impl PlanFileStore {
             .join("plan.md"))
     }
 
-    pub fn read_document(
-        &self,
-        conn: &mut SqliteConnection,
-        document_id: &str,
-    ) -> Result<Option<PlanFileSnapshot>, PlanFileError> {
-        let document = plan_review::get_document(conn, document_id)?;
+    pub async fn read_document(&self, db: &Db, document_id: &str) -> Result<Option<PlanFileSnapshot>, PlanFileError> {
+        let document = plan_review::get_document(db, document_id).await?;
         if document.head_revision_id.is_none() {
             return Ok(None);
         }
         let path = self.path_for(&document)?;
-        let bytes = match std::fs::read(&path) {
+        let bytes = match tokio::fs::read(&path).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io(&path, error)),
@@ -113,33 +131,38 @@ impl PlanFileStore {
         Ok(Some(PlanFileSnapshot { path, content, sha256 }))
     }
 
-    pub fn reconcile_document(
+    pub async fn reconcile_document(
         &self,
-        conn: &mut SqliteConnection,
+        db: &Db,
         document_id: &str,
         now: i64,
     ) -> Result<PlanMaterializationReport, PlanFileError> {
-        self.reconcile_document_inner(conn, document_id, now, &|_| {})
+        self.reconcile_document_inner(db, document_id, now, Arc::new(|_| {}))
+            .await
     }
 
-    fn reconcile_document_inner<F>(
+    async fn reconcile_document_inner(
         &self,
-        conn: &mut SqliteConnection,
+        db: &Db,
         document_id: &str,
         now: i64,
-        before_publish_check: &F,
-    ) -> Result<PlanMaterializationReport, PlanFileError>
-    where
-        F: Fn(&Path),
-    {
+        before_publish_check: BeforePublish,
+    ) -> Result<PlanMaterializationReport, PlanFileError> {
         let lock = self.document_lock(document_id)?;
-        let _guard = lock.lock().map_err(|_| PlanFileError::PoisonedLock)?;
-        let document = plan_review::get_document(conn, document_id)?;
+        let _guard = lock.lock().await;
+        // The reads below are outside the writes that act on them: file I/O sits
+        // between, and a write lock is not held across an fsync. Each write is a
+        // state CAS (pending -> applied or conflict, applied -> conflict) made under
+        // this document's lock, so a stale read fails the CAS rather than overwrite.
+        // pool-read-before-write: see above.
+        let document = plan_review::get_document(db, document_id).await?;
         let path = self.path_for(&document)?;
         let mut report = PlanMaterializationReport::default();
 
-        for materialization in plan_review::pending_materializations(conn, Some(document_id))? {
-            let revision = plan_review::get_revision(conn, &materialization.revision_id)?;
+        // pool-read-before-write: see above.
+        for materialization in plan_review::pending_materializations(db, Some(document_id)).await? {
+            // pool-read-before-write: see above.
+            let revision = plan_review::get_revision(db, &materialization.revision_id).await?;
             if plan_review::markdown_sha256(&revision.content_markdown) != materialization.desired_sha256
                 || revision.content_sha256 != materialization.desired_sha256
             {
@@ -148,47 +171,51 @@ impl PlanFileStore {
                 });
             }
 
-            let current_sha = file_sha256(&path)?;
+            let current_sha = file_sha256(&path).await?;
             if current_sha.as_deref() == Some(&materialization.desired_sha256) {
-                report.applied.push(plan_review::mark_materialization_applied(
-                    conn,
-                    &materialization.id,
-                    now,
-                )?);
+                report.applied.push(mark_applied(db, &materialization.id, now).await?);
                 continue;
             }
             let expected_matches = current_sha.as_deref() == materialization.expected_sha256.as_deref();
             let initial_missing = current_sha.is_none() && materialization.expected_sha256.is_none();
-            if materialization.force_replace == 1 || expected_matches || initial_missing {
-                let publish = if materialization.force_replace == 1 {
-                    atomic_replace(&path, &revision.content_markdown)?;
-                    PublishDecision::Publish
-                } else {
-                    // The first hash check happens before staging I/O. Recheck
-                    // after the staging file is durable and immediately before
-                    // publication so an external edit during that interval is
-                    // not knowingly overwritten. This deliberately narrows the
-                    // race; it is not an inter-process atomic compare-and-swap.
-                    atomic_replace_guarded(&path, &revision.content_markdown, || {
-                        before_publish_check(&path);
-                        let observed = file_sha256(&path)?;
-                        if observed.as_deref() == materialization.expected_sha256.as_deref() {
-                            Ok(PublishDecision::Publish)
-                        } else {
-                            Ok(PublishDecision::Changed(observed))
+            let force_replace = materialization.force_replace.get();
+            if force_replace || expected_matches || initial_missing {
+                let publish = {
+                    let path = path.clone();
+                    let content = revision.content_markdown.clone();
+                    let expected = materialization.expected_sha256.clone();
+                    let check = before_publish_check.clone();
+                    blocking(move || {
+                        if force_replace {
+                            atomic_replace(&path, &content)?;
+                            return Ok(PublishDecision::Publish);
                         }
-                    })?
+                        // The first hash check happens before staging I/O. Recheck
+                        // after the staging file is durable and immediately before
+                        // publication so an external edit during that interval is
+                        // not knowingly overwritten. This deliberately narrows the
+                        // race; it is not an inter-process atomic compare-and-swap.
+                        atomic_replace_guarded(&path, &content, || {
+                            check(&path);
+                            let observed = file_sha256_now(&path)?;
+                            if observed.as_deref() == expected.as_deref() {
+                                Ok(PublishDecision::Publish)
+                            } else {
+                                Ok(PublishDecision::Changed(observed))
+                            }
+                        })
+                    })
+                    .await?
                 };
                 if let PublishDecision::Changed(observed) = publish {
                     let error = format!(
                         "plan.md hash changed outside Meridian before publish (expected {:?}, found {:?})",
                         materialization.expected_sha256, observed
                     );
-                    let conflict = plan_review::mark_materialization_conflict(conn, &materialization.id, &error, now)?;
-                    report.conflict = Some(conflict);
+                    report.conflict = Some(mark_conflict(db, &materialization.id, &error, now).await?);
                     return Ok(report);
                 }
-                let written_sha = file_sha256(&path)?;
+                let written_sha = file_sha256(&path).await?;
                 if written_sha.as_deref() != Some(materialization.desired_sha256.as_str()) {
                     return Err(PlanFileError::Io {
                         path: path.clone(),
@@ -198,18 +225,13 @@ impl PlanFileStore {
                         ),
                     });
                 }
-                report.applied.push(plan_review::mark_materialization_applied(
-                    conn,
-                    &materialization.id,
-                    now,
-                )?);
+                report.applied.push(mark_applied(db, &materialization.id, now).await?);
             } else {
                 let error = format!(
                     "plan.md hash changed outside Meridian (expected {:?}, found {:?})",
                     materialization.expected_sha256, current_sha
                 );
-                let conflict = plan_review::mark_materialization_conflict(conn, &materialization.id, &error, now)?;
-                report.conflict = Some(conflict);
+                report.conflict = Some(mark_conflict(db, &materialization.id, &error, now).await?);
                 return Ok(report);
             }
         }
@@ -217,16 +239,22 @@ impl PlanFileStore {
         // Detect deletion or external modification even when no new revision is
         // pending.  The applied row becomes the durable conflict the UI can
         // offer to restore; startup never overwrites it.
-        if let Some(latest) = plan_review::latest_materialization(conn, document_id)? {
-            match latest.state().map_err(PlanReviewStoreError::from)? {
+        // pool-read-before-write: see above; drift is the applied -> conflict CAS.
+        if let Some(latest) = plan_review::latest_materialization(db, document_id).await? {
+            match latest.state {
                 PlanMaterializationState::Applied => {
-                    let current_sha = file_sha256(&path)?;
+                    let current_sha = file_sha256(&path).await?;
                     if current_sha.as_deref() != Some(latest.desired_sha256.as_str()) {
                         let error = format!(
                             "plan.md no longer matches the applied revision (expected {}, found {:?})",
                             latest.desired_sha256, current_sha
                         );
-                        report.conflict = Some(plan_review::mark_materialization_drift(conn, &latest.id, &error, now)?);
+                        let drifted = db
+                            .write(async |tx| {
+                                plan_review::mark_materialization_drift(tx, &latest.id, &error, now).await
+                            })
+                            .await?;
+                        report.conflict = Some(drifted);
                     }
                 }
                 PlanMaterializationState::Conflict => report.conflict = Some(latest),
@@ -236,17 +264,19 @@ impl PlanFileStore {
         Ok(report)
     }
 
-    pub fn reconcile_all(
+    pub async fn reconcile_all(
         &self,
-        conn: &mut SqliteConnection,
+        db: &Db,
         now: i64,
     ) -> Result<Vec<(String, PlanMaterializationReport)>, PlanFileError> {
-        let mut document_ids = plan_review::pending_materializations(conn, None)?
+        let mut document_ids = plan_review::pending_materializations(db, None)
+            .await?
             .into_iter()
             .map(|row| row.document_id)
             .collect::<HashSet<_>>();
         document_ids.extend(
-            plan_review::list_active_documents(conn)?
+            plan_review::list_active_documents(db)
+                .await?
                 .into_iter()
                 .map(|document| document.id),
         );
@@ -255,7 +285,7 @@ impl PlanFileStore {
         let mut reports = Vec::with_capacity(document_ids.len());
         let mut first_error = None;
         for document_id in document_ids {
-            match self.reconcile_document(conn, &document_id, now) {
+            match self.reconcile_document(db, &document_id, now).await {
                 Ok(report) => reports.push((document_id, report)),
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
@@ -268,12 +298,13 @@ impl PlanFileStore {
     }
 
     /// Narrow variant for callers that only need to drain DB-ahead writes.
-    pub fn reconcile_pending(
+    pub async fn reconcile_pending(
         &self,
-        conn: &mut SqliteConnection,
+        db: &Db,
         now: i64,
     ) -> Result<Vec<(String, PlanMaterializationReport)>, PlanFileError> {
-        let mut document_ids = plan_review::pending_materializations(conn, None)?
+        let mut document_ids = plan_review::pending_materializations(db, None)
+            .await?
             .into_iter()
             .map(|row| row.document_id)
             .collect::<Vec<_>>();
@@ -281,11 +312,26 @@ impl PlanFileStore {
         document_ids.dedup();
         let mut reports = Vec::with_capacity(document_ids.len());
         for document_id in document_ids {
-            let report = self.reconcile_document(conn, &document_id, now)?;
+            let report = self.reconcile_document(db, &document_id, now).await?;
             reports.push((document_id, report));
         }
         Ok(reports)
     }
+}
+
+async fn mark_applied(db: &Db, id: &str, now: i64) -> Result<plan_materialization::Model, PlanReviewStoreError> {
+    db.write(async |tx| plan_review::mark_materialization_applied(tx, id, now).await)
+        .await
+}
+
+async fn mark_conflict(
+    db: &Db,
+    id: &str,
+    error: &str,
+    now: i64,
+) -> Result<plan_materialization::Model, PlanReviewStoreError> {
+    db.write(async |tx| plan_review::mark_materialization_conflict(tx, id, error, now).await)
+        .await
 }
 
 fn safe_id(value: &str) -> bool {
@@ -302,8 +348,18 @@ fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn file_sha256(path: &Path) -> Result<Option<String>, PlanFileError> {
+/// The file's hash, or `None` when there is no file, read on the blocking
+/// pool's terms from inside file work.
+fn file_sha256_now(path: &Path) -> Result<Option<String>, PlanFileError> {
     match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes_sha256(&bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io(path, error)),
+    }
+}
+
+async fn file_sha256(path: &Path) -> Result<Option<String>, PlanFileError> {
+    match tokio::fs::read(path).await {
         Ok(bytes) => Ok(Some(bytes_sha256(&bytes))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io(path, error)),
@@ -412,29 +468,30 @@ fn publish_staging(staging: &Path, destination: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diesel::prelude::*;
+    use crate::db::entity::plan_document::PlanDocumentState;
+    use crate::db::sea::{execute_for_tests, sea_test_db};
 
-    fn pending_plan(
-        conn: &mut SqliteConnection,
-        conversation_id: &str,
-        content: &str,
-    ) -> plan_review::PlanRevisionAppendResult {
-        crate::db::ops::conversation::create_conversation(conn, conversation_id, None, None, None, 1).unwrap();
-        let document = plan_review::create_or_resume_document(conn, conversation_id, 2).unwrap();
-        plan_review::append_assistant_revision(
-            conn,
-            &plan_review::PlanRevisionAppend {
-                document_id: &document.id,
-                expected_generation: 0,
-                expected_head_sha256: None,
-                content_markdown: content,
-                patch: "*** Add File: plan.md",
-                source_message_id: None,
-                source_call_id: None,
-                responding_to_suggestion_revision_id: None,
-                now: 3,
-            },
-        )
+    async fn pending_plan(db: &Db, conversation_id: &str, content: &str) -> plan_review::PlanRevisionAppendResult {
+        db.write(async |tx| {
+            crate::db::sea::ops::conversation::create_conversation(tx, conversation_id, None, None, None, 1).await?;
+            let document = plan_review::create_or_resume_document(tx, conversation_id, 2).await?;
+            plan_review::append_assistant_revision(
+                tx,
+                &plan_review::PlanRevisionAppend {
+                    document_id: &document.id,
+                    expected_generation: 0,
+                    expected_head_sha256: None,
+                    content_markdown: content,
+                    patch: "*** Add File: plan.md",
+                    source_message_id: None,
+                    source_call_id: None,
+                    responding_to_suggestion_revision_id: None,
+                    now: 3,
+                },
+            )
+            .await
+        })
+        .await
         .unwrap()
     }
 
@@ -442,10 +499,10 @@ mod tests {
     fn path_is_derived_instead_of_trusting_the_database() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let mut document = PlanDocumentRow {
+        let mut document = plan_document::Model {
             id: "doc-1".into(),
             conversation_id: "conv-1".into(),
-            state: "drafting".into(),
+            state: PlanDocumentState::Drafting,
             head_revision_id: None,
             approved_revision_id: None,
             working_generation: 0,
@@ -482,108 +539,110 @@ mod tests {
         assert_eq!(debris, 0);
     }
 
-    #[test]
-    fn reconcile_covers_write_drift_and_explicit_restore() {
+    #[tokio::test]
+    async fn reconcile_covers_write_drift_and_explicit_restore() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        let appended = pending_plan(&mut conn, "conv-1", "# Durable\n");
+        let db = sea_test_db().await;
+        let appended = pending_plan(&db, "conv-1", "# Durable\n").await;
 
-        let first = store.reconcile_document(&mut conn, &appended.document.id, 4).unwrap();
+        let first = store.reconcile_document(&db, &appended.document.id, 4).await.unwrap();
         assert_eq!(first.applied.len(), 1);
         assert!(first.conflict.is_none());
-        let snapshot = store.read_document(&mut conn, &appended.document.id).unwrap().unwrap();
+        let snapshot = store.read_document(&db, &appended.document.id).await.unwrap().unwrap();
         assert_eq!(snapshot.content, "# Durable\n");
 
         std::fs::write(&snapshot.path, "external edit").unwrap();
-        let drift = store.reconcile_document(&mut conn, &appended.document.id, 5).unwrap();
-        assert_eq!(
-            drift.conflict.unwrap().state,
-            PlanMaterializationState::Conflict.as_str()
-        );
+        let drift = store.reconcile_document(&db, &appended.document.id, 5).await.unwrap();
+        assert_eq!(drift.conflict.unwrap().state, PlanMaterializationState::Conflict);
         assert_eq!(std::fs::read_to_string(&snapshot.path).unwrap(), "external edit");
 
-        plan_review::retry_materialization_from_database(&mut conn, &appended.document.id, 6).unwrap();
-        let restored = store.reconcile_document(&mut conn, &appended.document.id, 7).unwrap();
+        db.write(async |tx| plan_review::retry_materialization_from_database(tx, &appended.document.id, 6).await)
+            .await
+            .unwrap();
+        let restored = store.reconcile_document(&db, &appended.document.id, 7).await.unwrap();
         assert_eq!(restored.applied.len(), 1);
         assert!(restored.conflict.is_none());
         assert_eq!(std::fs::read_to_string(&snapshot.path).unwrap(), "# Durable\n");
     }
 
-    #[test]
-    fn external_change_after_staging_becomes_a_conflict_instead_of_being_overwritten() {
+    #[tokio::test]
+    async fn external_change_after_staging_becomes_a_conflict_instead_of_being_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        let appended = pending_plan(&mut conn, "conv-1", "# Durable\n");
+        let db = sea_test_db().await;
+        let appended = pending_plan(&db, "conv-1", "# Durable\n").await;
 
         let report = store
-            .reconcile_document_inner(&mut conn, &appended.document.id, 4, &|path| {
-                std::fs::write(path, "external edit during staging").unwrap();
-            })
+            .reconcile_document_inner(
+                &db,
+                &appended.document.id,
+                4,
+                Arc::new(|path| std::fs::write(path, "external edit during staging").unwrap()),
+            )
+            .await
             .unwrap();
 
         let conflict = report.conflict.expect("the late external edit must be durable");
-        assert_eq!(conflict.state, PlanMaterializationState::Conflict.as_str());
+        assert_eq!(conflict.state, PlanMaterializationState::Conflict);
         let path = store.path_for(&appended.document).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "external edit during staging");
     }
 
-    #[test]
-    fn reconcile_all_recovers_later_documents_before_returning_the_first_stable_error() {
+    #[tokio::test]
+    async fn reconcile_all_recovers_later_documents_before_returning_the_first_stable_error() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
+        let db = sea_test_db().await;
         let mut plans = [
-            pending_plan(&mut conn, "conv-1", "# One\n"),
-            pending_plan(&mut conn, "conv-2", "# Two\n"),
-            pending_plan(&mut conn, "conv-3", "# Three\n"),
+            pending_plan(&db, "conv-1", "# One\n").await,
+            pending_plan(&db, "conv-2", "# Two\n").await,
+            pending_plan(&db, "conv-3", "# Three\n").await,
         ];
         plans.sort_by(|left, right| left.document.id.cmp(&right.document.id));
         let bad_revision_id = plans[0].revision.id.clone();
-        diesel::update(crate::db::schema::plan_revisions::table.find(&bad_revision_id))
-            .set(crate::db::schema::plan_revisions::content_markdown.eq("corrupt bytes"))
-            .execute(&mut conn)
-            .unwrap();
+        execute_for_tests(
+            &db,
+            &format!("UPDATE plan_revisions SET content_markdown = 'corrupt bytes' WHERE id = '{bad_revision_id}'"),
+        )
+        .await
+        .unwrap();
 
-        let error = store.reconcile_all(&mut conn, 4).unwrap_err();
+        let error = store.reconcile_all(&db, 4).await.unwrap_err();
         assert!(matches!(
             error,
             PlanFileError::CorruptRevision { revision_id } if revision_id == bad_revision_id
         ));
         for plan in &plans[1..] {
-            let snapshot = store.read_document(&mut conn, &plan.document.id).unwrap().unwrap();
+            let snapshot = store.read_document(&db, &plan.document.id).await.unwrap().unwrap();
             assert_eq!(snapshot.content, plan.revision.content_markdown);
             assert_eq!(
-                plan_review::latest_materialization(&mut conn, &plan.document.id)
+                plan_review::latest_materialization(&db, &plan.document.id)
+                    .await
                     .unwrap()
                     .unwrap()
                     .state,
-                PlanMaterializationState::Applied.as_str()
+                PlanMaterializationState::Applied
             );
         }
 
-        let second_error = store.reconcile_all(&mut conn, 5).unwrap_err();
+        let second_error = store.reconcile_all(&db, 5).await.unwrap_err();
         assert!(matches!(
             second_error,
             PlanFileError::CorruptRevision { revision_id } if revision_id == bad_revision_id
         ));
     }
 
-    #[test]
-    fn desired_bytes_before_database_ack_are_only_acknowledged() {
+    #[tokio::test]
+    async fn desired_bytes_before_database_ack_are_only_acknowledged() {
         let dir = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(dir.path());
-        let pool = crate::db::diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        let appended = pending_plan(&mut conn, "conv-1", "# Already renamed\n");
+        let db = sea_test_db().await;
+        let appended = pending_plan(&db, "conv-1", "# Already renamed\n").await;
         let path = store.path_for(&appended.document).unwrap();
         atomic_replace(&path, "# Already renamed\n").unwrap();
 
-        let report = store.reconcile_document(&mut conn, &appended.document.id, 4).unwrap();
+        let report = store.reconcile_document(&db, &appended.document.id, 4).await.unwrap();
         assert_eq!(report.applied.len(), 1);
         assert!(report.conflict.is_none());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "# Already renamed\n");

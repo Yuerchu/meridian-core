@@ -9,16 +9,15 @@
 //! and with no turn running there is nothing to hand it to — so [`pump`] starts
 //! one, through the `StartTurn` the shell registered.
 
-use diesel::prelude::*;
-use diesel::sqlite::SqliteConnection;
-
 use crate::agent::engine::{Steered, SteeredOrigin, Steering};
-use crate::db::DbPool;
-use crate::db::models::message::MessageInsert;
+use crate::db::entity::message;
 use crate::db::models::queue::Delivery;
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops::{conversation as conversation_ops, queue as queue_ops};
 use crate::events::EventBus;
 use crate::services::Services;
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 /// Give the next item a turn of its own, if there is one and nothing is running.
 ///
@@ -44,7 +43,7 @@ pub(super) async fn pump(services: &Services, conversation_id: &str) {
     // have broken — it is something that happened, which the model is owed
     // before anything typed after it is answered.
     #[cfg(not(target_os = "android"))]
-    if crate::background::has_wake(&services.sea, conversation_id).await {
+    if crate::background::has_wake(&services.db, conversation_id).await {
         if let Err(e) = starter.start_unprompted(conversation_id).await {
             tracing::warn!(error = %e, conversation_id, "a background task's turn failed");
         }
@@ -67,15 +66,15 @@ pub(super) async fn pump(services: &Services, conversation_id: &str) {
 /// Built per turn, because both ids are: a row written here belongs to the turn
 /// it interrupted, which is where the model reads it.
 pub struct Interjections {
-    pool: DbPool,
+    db: Db,
     conversation_id: String,
     turn_id: String,
 }
 
 impl Interjections {
-    pub fn new(pool: DbPool, conversation_id: String, turn_id: String) -> Self {
+    pub fn new(db: Db, conversation_id: String, turn_id: String) -> Self {
         Self {
-            pool,
+            db,
             conversation_id,
             turn_id,
         }
@@ -92,45 +91,25 @@ impl Steering for Interjections {
     /// never come — a turn that answers without calling another tool has no
     /// more.
     async fn drain(&self) -> Vec<Steered> {
-        let pool = self.pool.clone();
-        let conversation_id = self.conversation_id.clone();
-        let turn_id = self.turn_id.clone();
-
-        let taken = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let mut out = Vec::new();
-            loop {
-                // One instant per item: the row's `created_at` and the live
-                // message's `received_at` are the same value by construction.
-                let now = now_ms();
-                match take_one(&mut conn, &conversation_id, &turn_id, now) {
-                    Ok(Some((row, text))) => out.push((row, text, now)),
-                    Ok(None) => break,
-                    // Stop rather than skip. The queue is a sequence, and the
-                    // right response to not being able to read it is to deliver
-                    // nothing this round — whatever is in there is still in
-                    // there, and the next boundary asks again.
-                    Err(e) => {
-                        tracing::warn!(error = %e, conversation_id, "could not take from the queue");
-                        break;
-                    }
+        let conversation_id = self.conversation_id.as_str();
+        let mut taken = Vec::new();
+        loop {
+            // One instant per item: the row's `created_at` and the live
+            // message's `received_at` are the same value by construction.
+            let now = now_ms();
+            match take_one(&self.db, conversation_id, &self.turn_id, now).await {
+                Ok(Some((row, text))) => taken.push((row, text, now)),
+                Ok(None) => break,
+                // Stop rather than skip. The queue is a sequence, and the
+                // right response to not being able to read it is to deliver
+                // nothing this round — whatever is in there is still in
+                // there, and the next boundary asks again.
+                Err(e) => {
+                    tracing::warn!(error = %e, conversation_id, "could not take from the queue");
+                    break;
                 }
             }
-            Ok::<_, String>(out)
-        })
-        .await;
-
-        let taken = match taken {
-            Ok(Ok(items)) => items,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "the queue could not be reached mid-turn");
-                Vec::new()
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "taking from the queue panicked");
-                Vec::new()
-            }
-        };
+        }
 
         taken
             .into_iter()
@@ -195,84 +174,63 @@ impl Steering for Announcing {
 /// turn that *is* the loop's cursor — every row the engine writes goes through
 /// `append_message`, which moves the head — so this stays on one path without
 /// the port having to be told where the turn has got to.
-fn take_one(
-    conn: &mut SqliteConnection,
-    conversation_id: &str,
-    turn_id: &str,
-    now: i64,
-) -> QueryResult<Option<(String, String)>> {
-    // Immediate: this is the transaction that spans the peek and the take, so
-    // it is the one that has to hold the write lock across both. Deferred, it
-    // takes the lock at the first write — after the peek — and two drains could
-    // read the same item.
-    conn.immediate_transaction(|conn| {
-        let Some(item) = crate::db::ops::queue::next_deliverable(conn, conversation_id, Delivery::Interject)? else {
+async fn take_one(db: &Db, conversation_id: &str, turn_id: &str, now: i64) -> Result<Option<(String, String)>, DbErr> {
+    // `Db::write` is IMMEDIATE, and this is the transaction that spans the
+    // peek and the take, so it is the one that has to hold the write lock
+    // across both. Deferred, it takes the lock at the first write — after the
+    // peek — and two drains could read the same item.
+    db.write(async |tx| {
+        let Some(item) = queue_ops::next_deliverable(tx, conversation_id, Delivery::Interject).await? else {
             return Ok(None);
         };
-        let head = crate::db::ops::conversation::get_conversation(conn, conversation_id)
-            .ok()
+        let head = conversation_ops::get_conversation(tx, conversation_id)
+            .await?
             .and_then(|c| c.head_message_id);
         let message_id = uuid::Uuid::new_v4().to_string();
 
-        let row = MessageInsert {
-            id: &message_id,
-            conversation_id,
-            role: "user",
-            content: &item.content,
-            provider_id: None,
-            model_id: None,
-            input_tokens: None,
-            output_tokens: None,
-            tool_calls: None,
-            tool_call_id: None,
-            sort_order: 0,
-            created_at: now,
-            reasoning_content: None,
-            rating: None,
-            schema_version: 2,
-            is_compact_summary: 0,
-            sender_id: None,
-            parent_id: None,
-            compact_anchor_id: None,
-            source: None,
+        let row = message::Model {
             // The turn it interrupted, not a turn of its own. That is where the
             // model reads it, so a reader who found it filed elsewhere would be
             // looking at a different conversation than the model was.
-            turn_id: Some(turn_id),
-            tool_outcome: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            server_tool_calls: None,
-            provider_name: None,
-            response_model_id: None,
+            turn_id: Some(turn_id.to_owned()),
+            ..crate::db::sea::ops::message::new_row(&message_id, conversation_id, "user", &item.content, now)
         };
 
-        let taken = crate::db::ops::queue::take_next(
-            conn,
+        let taken = queue_ops::take_next(
+            tx,
             conversation_id,
             Delivery::Interject,
             turn_id,
-            &row,
+            row,
             head.as_deref(),
             now,
-        )?;
+        )
+        .await?;
         Ok(taken.map(|_| (message_id, item.content)))
     })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::diesel_test_db;
-    use crate::db::ops::queue::{enqueue, list};
+    use crate::db::sea::sea_test_db;
 
-    fn conversation(conn: &mut SqliteConnection, id: &str) {
-        crate::db::ops::conversation::create_conversation(conn, id, Some("q"), None, None, 0).unwrap();
+    async fn conversation(db: &Db, id: &str) {
+        db.write(async |tx| conversation_ops::create_conversation(tx, id, Some("q"), None, None, 0).await)
+            .await
+            .unwrap();
     }
 
-    fn add(conn: &mut SqliteConnection, text: &str, delivery: Delivery) {
+    async fn add(db: &Db, text: &str, delivery: Delivery) {
         let id = uuid::Uuid::new_v4().to_string();
-        enqueue(conn, &id, "c1", text, delivery, 0).unwrap();
+        db.write(async |tx| queue_ops::enqueue(tx, &id, "c1", text, delivery, 0).await)
+            .await
+            .unwrap();
+    }
+
+    async fn messages(db: &Db) -> Vec<message::Model> {
+        crate::db::sea::ops::message::list_messages(db, "c1").await.unwrap()
     }
 
     /// Counts what reached the window, per channel.
@@ -297,21 +255,15 @@ mod tests {
     /// screen either, since the transcript is only re-read when the turn ends.
     #[tokio::test]
     async fn taking_an_interjection_tells_the_window_and_an_empty_round_does_not() {
-        let pool = diesel_test_db();
-        {
-            let mut conn = pool.get().unwrap();
-            conversation(&mut conn, "c1");
-            add(&mut conn, "actually, stop", Delivery::Interject);
-        }
+        let db = sea_test_db().await;
+        conversation(&db, "c1").await;
+        add(&db, "actually, stop", Delivery::Interject).await;
 
         let events = EventBus::new();
         let heard = std::sync::Arc::new(Heard::default());
         events.register(heard.clone(), false);
 
-        let port = Announcing::wrap(
-            events.clone(),
-            Interjections::new(pool.clone(), "c1".into(), "t1".into()),
-        );
+        let port = Announcing::wrap(events.clone(), Interjections::new(db.clone(), "c1".into(), "t1".into()));
 
         assert_eq!(port.drain().await.len(), 1);
         {
@@ -335,16 +287,13 @@ mod tests {
     /// and a follow-up behind them stays where it is.
     #[tokio::test]
     async fn interjections_arrive_written_and_a_follow_up_waits() {
-        let pool = diesel_test_db();
-        {
-            let mut conn = pool.get().unwrap();
-            conversation(&mut conn, "c1");
-            add(&mut conn, "actually, stop", Delivery::Interject);
-            add(&mut conn, "and check the tests", Delivery::Interject);
-            add(&mut conn, "then write it up", Delivery::FollowUp);
-        }
+        let db = sea_test_db().await;
+        conversation(&db, "c1").await;
+        add(&db, "actually, stop", Delivery::Interject).await;
+        add(&db, "and check the tests", Delivery::Interject).await;
+        add(&db, "then write it up", Delivery::FollowUp).await;
 
-        let port = Interjections::new(pool.clone(), "c1".into(), "t1".into());
+        let port = Interjections::new(db.clone(), "c1".into(), "t1".into());
         let drained = port.drain().await;
 
         assert_eq!(drained.len(), 2, "both interjections, and not the follow-up");
@@ -357,14 +306,14 @@ mod tests {
 
         // The rows are really there, on the conversation's path, under the turn
         // they interrupted.
-        let mut conn = pool.get().unwrap();
-        let rows = crate::db::ops::message::list_messages(&mut conn, "c1").unwrap();
+        let rows = messages(&db).await;
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.turn_id.as_deref() == Some("t1")));
         assert_eq!(rows[1].parent_id.as_deref(), Some(rows[0].id.as_str()), "one path");
 
         // And the follow-up is untouched.
-        let left: Vec<_> = list(&mut conn, "c1")
+        let left: Vec<_> = queue_ops::list(&db, "c1")
+            .await
             .unwrap()
             .into_iter()
             .filter(|i| i.settled_at.is_none())
@@ -377,32 +326,23 @@ mod tests {
     /// spent in the transaction that wrote its row.
     #[tokio::test]
     async fn a_second_drain_in_the_same_turn_finds_nothing() {
-        let pool = diesel_test_db();
-        {
-            let mut conn = pool.get().unwrap();
-            conversation(&mut conn, "c1");
-            add(&mut conn, "once", Delivery::Interject);
-        }
+        let db = sea_test_db().await;
+        conversation(&db, "c1").await;
+        add(&db, "once", Delivery::Interject).await;
 
-        let port = Interjections::new(pool.clone(), "c1".into(), "t1".into());
+        let port = Interjections::new(db.clone(), "c1".into(), "t1".into());
         assert_eq!(port.drain().await.len(), 1);
         assert!(port.drain().await.is_empty());
-        assert_eq!(
-            crate::db::ops::message::list_messages(&mut pool.get().unwrap(), "c1")
-                .unwrap()
-                .len(),
-            1,
-            "and exactly one row exists for it"
-        );
+        assert_eq!(messages(&db).await.len(), 1, "and exactly one row exists for it");
     }
 
     /// An empty queue costs one read and produces nothing, which is what
     /// happens between every round of every desktop turn.
     #[tokio::test]
     async fn an_empty_queue_is_silent() {
-        let pool = diesel_test_db();
-        conversation(&mut pool.get().unwrap(), "c1");
-        let port = Interjections::new(pool, "c1".into(), "t1".into());
+        let db = sea_test_db().await;
+        conversation(&db, "c1").await;
+        let port = Interjections::new(db, "c1".into(), "t1".into());
         assert!(port.drain().await.is_empty());
     }
 }

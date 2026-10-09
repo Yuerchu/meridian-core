@@ -18,9 +18,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::agent::provider_secret_name;
-use crate::db::models::assistant::{AssistantChangeset, AssistantInsert};
-use crate::db::models::provider::ProviderInsert;
+use crate::db::entity::assistant::{self as assistant_entity, AssistantChangeset};
+use crate::db::entity::provider as provider_entity;
+use crate::db::sea::DbErr;
+use crate::db::types::SqlBool;
 use crate::events::EventBus;
+use crate::provider::registry::{ApiFormat, CredentialKind, ProviderType, TransportProfile};
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
 use crate::services::{Paths, Services, ServicesInner};
 use crate::sleep_inhibitor::AppSleepInhibitor;
@@ -83,40 +86,36 @@ pub async fn bootstrap_with_secrets(
             "bridged the database to the SeaORM baseline"
         );
     }
-    let pool = db::init_db(db_path.to_str().expect("invalid db path"));
     let plan_files = Arc::new(crate::plan_files::PlanFileStore::new(&data_dir));
     let sea = db::sea::open(&db_path)
         .await
         .map_err(|error| format!("could not open the database through SeaORM: {error}"))?;
-    startup_recovery(&pool, &sea, &plan_files).await;
+    startup_recovery(&sea, &plan_files).await;
     // The preference lives in the database, so the first few lines above
     // are recorded at the default level.
     crate::logging::apply_saved_level(&sea).await?;
 
     // Create default assistant on first run
-    {
-        let mut conn = pool.get().expect("db connection");
-        if db::ops::assistant::get_default_assistant(&mut conn)
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            let id = uuid::Uuid::new_v4().to_string();
+    let seeded = sea
+        .write(async |tx| {
+            if db::sea::ops::assistant::get_default_assistant(tx).await?.is_some() {
+                return Ok(());
+            }
             let now = now_ms();
-            let _ = db::ops::assistant::create_assistant(
-                &mut conn,
-                &AssistantInsert {
-                    id: &id,
-                    name: "Default",
+            db::sea::ops::assistant::create_assistant(
+                tx,
+                assistant_entity::Model {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: "Default".into(),
                     description: None,
                     avatar: None,
-                    system_prompt: "You are a helpful assistant.",
+                    system_prompt: "You are a helpful assistant.".into(),
                     provider_id: None,
                     model_id: None,
                     temperature: None,
                     top_p: None,
                     max_tokens: None,
-                    is_default: 1,
+                    is_default: SqlBool::TRUE,
                     sort_order: 0,
                     created_at: now,
                     updated_at: now,
@@ -126,24 +125,27 @@ pub async fn bootstrap_with_secrets(
                     context_limit: 0,
                     compact_keep_recent: 10,
                     enabled_tools: None,
-                    thinking_enabled: 0,
+                    thinking_enabled: SqlBool::FALSE,
                     thinking_budget: None,
                     tool_preset_id: None,
-                    auto_compact_enabled: 0,
+                    auto_compact_enabled: SqlBool::FALSE,
                 },
-            );
-        }
+            )
+            .await
+            .map(|_| ())
+        })
+        .await;
+    if let Err(error) = seeded {
+        tracing::warn!(error = %error, "could not create the default assistant");
     }
 
-    // Migrate legacy secrets-based provider to DB
+    // Migrate legacy secrets-based provider to DB: only into a database with
+    // no providers, which the write below checks under its own lock.
     {
-        let mut conn = pool.get().expect("db connection");
-        let count = db::ops::provider::count_providers(&mut conn).unwrap_or(0);
-        if count == 0
-            && let Some(api_key) = mgr
-                .get(&SecretScope::Global, &SecretName::new("API_KEY").unwrap())
-                .ok()
-                .flatten()
+        if let Some(api_key) = mgr
+            .get(&SecretScope::Global, &SecretName::new("API_KEY").unwrap())
+            .ok()
+            .flatten()
         {
             let provider_type = mgr
                 .get(&SecretScope::Global, &SecretName::new("PROVIDER_TYPE").unwrap())
@@ -160,47 +162,62 @@ pub async fn bootstrap_with_secrets(
                 .ok()
                 .flatten();
 
-            let pid = uuid::Uuid::new_v4().to_string();
             let now = now_ms();
-            if let Ok(provider) = db::ops::provider::create_provider(
-                &mut conn,
-                &ProviderInsert {
-                    id: &pid,
-                    name: "Default",
-                    provider_type: &provider_type,
-                    base_url: &base_url,
-                    is_enabled: 1,
-                    sort_order: 0,
-                    created_at: now,
-                    updated_at: now,
-                    api_format: "chat_completions",
-                    // Both of these came out of environment variables, so this
-                    // is as likely to be a relay as the vendor itself.
-                    // `identify` answers only when it is certain.
-                    catalog_id: crate::provider::catalog::identify(&provider_type, &base_url),
-                    // The variables this row is migrated from only ever carried
-                    // an API key against an ordinary endpoint.
-                    credential_kind: "api_key",
-                    transport_profile: "standard",
-                    // No choice was made, so the mark follows whatever
-                    // `identify` decided this row is.
-                    icon: None,
-                    // `chat_completions` above has no Codex shape to follow,
-                    // and nothing here has said the address is a relay for one.
-                    codex_request_shape: 0,
-                },
-            ) {
-                let key_name = provider_secret_name(&provider.id);
-                let _ = mgr.set(&SecretScope::Global, &SecretName::new(&key_name).unwrap(), &api_key);
-                // Link default assistant to this provider
-                if let Ok(Some(default_assistant)) = db::ops::assistant::get_default_assistant(&mut conn) {
-                    let changeset = AssistantChangeset {
-                        provider_id: Some(Some(provider.id.clone())),
-                        model_id: model.map(Some),
-                        updated_at: Some(now),
-                        ..Default::default()
+            match ProviderType::parse(&provider_type) {
+                Err(error) => tracing::warn!(error = %error, "skipped migrating the legacy provider"),
+                Ok(provider_type_value) => {
+                    let row = provider_entity::Model {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: "Default".into(),
+                        provider_type: provider_type_value,
+                        base_url: base_url.clone(),
+                        is_enabled: SqlBool::TRUE,
+                        sort_order: 0,
+                        created_at: now,
+                        updated_at: now,
+                        api_format: ApiFormat::ChatCompletions,
+                        // Both of these came out of environment variables, so this
+                        // is as likely to be a relay as the vendor itself.
+                        // `identify` answers only when it is certain.
+                        catalog_id: crate::provider::catalog::identify(&provider_type, &base_url).map(str::to_owned),
+                        // The variables this row is migrated from only ever carried
+                        // an API key against an ordinary endpoint.
+                        credential_kind: CredentialKind::ApiKey,
+                        transport_profile: TransportProfile::Standard,
+                        // No choice was made, so the mark follows whatever
+                        // `identify` decided this row is.
+                        icon: None,
+                        // `chat_completions` above has no Codex shape to follow,
+                        // and nothing here has said the address is a relay for one.
+                        codex_request_shape: SqlBool::FALSE,
                     };
-                    let _ = db::ops::assistant::update_assistant(&mut conn, &default_assistant.id, &changeset);
+                    // The row and the default assistant pointed at it, together.
+                    let written = sea
+                        .write(async |tx| {
+                            if !db::sea::ops::provider::list_providers(tx).await?.is_empty() {
+                                return Ok(None);
+                            }
+                            let provider = db::sea::ops::provider::create_provider(tx, row).await?;
+                            if let Some(default_assistant) = db::sea::ops::assistant::get_default_assistant(tx).await? {
+                                let changeset = AssistantChangeset {
+                                    provider_id: Some(Some(provider.id.clone())),
+                                    model_id: model.clone().map(Some),
+                                    updated_at: Some(now),
+                                    ..Default::default()
+                                };
+                                db::sea::ops::assistant::update_assistant(tx, &default_assistant.id, changeset).await?;
+                            }
+                            Ok::<_, DbErr>(Some(provider))
+                        })
+                        .await;
+                    match written {
+                        Ok(None) => {}
+                        Ok(Some(provider)) => {
+                            let key_name = provider_secret_name(&provider.id);
+                            let _ = mgr.set(&SecretScope::Global, &SecretName::new(&key_name).unwrap(), &api_key);
+                        }
+                        Err(error) => tracing::warn!(error = %error, "could not migrate the legacy provider"),
+                    }
                 }
             }
         }
@@ -256,8 +273,7 @@ pub async fn bootstrap_with_secrets(
     }
 
     Ok(Services::new(ServicesInner {
-        db: pool,
-        sea,
+        db: sea,
         secrets: mgr,
         tools: Arc::new(registry),
         mcp: mcp::McpRegistry::new(),
@@ -437,17 +453,16 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
 /// A list, not a loop over anything, so a change of order or a dropped item
 /// shows up in review; `a_turn_killed_by_a_crash_holds_its_queue_at_the_next_start`
 /// fails if the interrupted-turn reconciliation stops running at startup.
-pub(crate) async fn startup_recovery(
-    pool: &db::DbPool,
-    sea: &db::sea::cap::Db,
-    plan_files: &crate::plan_files::PlanFileStore,
-) {
-    let mut conn = pool.get().expect("db connection");
+pub(crate) async fn startup_recovery(sea: &db::sea::cap::Db, plan_files: &crate::plan_files::PlanFileStore) {
+    use db::sea::ops::plan_review as plan_ops;
     let now = now_ms();
 
     // Memories no longer hang off projects by foreign key, and migrations run
     // with foreign keys off anyway, so a table rebuild can leave orphans behind.
-    match db::ops::plan_review::backfill_legacy_artifacts(&mut conn, now) {
+    match sea
+        .write(async |tx| plan_ops::backfill_legacy_artifacts(tx, now).await)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => tracing::info!(documents = n, "backfilled legacy plan artifacts"),
         // The old rows remain readable through their existing path, so this is
@@ -455,7 +470,10 @@ pub(crate) async fn startup_recovery(
         // unavailable. The next startup retries the idempotent backfill.
         Err(error) => tracing::error!(error = %error, "could not backfill legacy plan artifacts"),
     }
-    match db::ops::plan_review::reconcile_dispatched_deliveries(&mut conn, now) {
+    match sea
+        .write(async |tx| plan_ops::reconcile_dispatched_deliveries(tx, now).await)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => tracing::warn!(deliveries = n, "reconciled plan review deliveries after restart"),
         Err(error) => tracing::error!(error = %error, "could not reconcile plan review deliveries"),
@@ -508,14 +526,17 @@ pub(crate) async fn startup_recovery(
     // still marked running was killed rather than finished. This is the only
     // moment that fact is knowable — after this the row would just look like a
     // turn that has been going for a very long time.
-    match db::ops::turn::reconcile_interrupted(&mut conn, now) {
+    match sea
+        .write(async |tx| db::sea::ops::turn::reconcile_interrupted(tx, now).await)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => tracing::info!(turns = n, "turns left running by the previous session"),
         // Not fatal: it costs the diagnosis, not the conversation.
         Err(e) => tracing::error!(error = %e, "could not reconcile interrupted turns"),
     }
 
-    match plan_files.reconcile_all(&mut conn, now_ms()) {
+    match plan_files.reconcile_all(sea, now_ms()).await {
         Ok(reports) => {
             let conflicts = reports.iter().filter(|(_, report)| report.conflict.is_some()).count();
             if conflicts > 0 {
@@ -534,7 +555,7 @@ pub(crate) async fn startup_recovery(
 /// idempotence is what stops this and a hand-clicked Connect from starting two
 /// processes for one server.
 pub async fn reconnect_mcp(services: Services) {
-    let servers = match db::sea::ops::mcp_server::list_enabled_mcp_servers(&services.sea).await {
+    let servers = match db::sea::ops::mcp_server::list_enabled_mcp_servers(&services.db).await {
         Ok(servers) => servers,
         // A row that does not decode fails the whole list, and with it every
         // auto-connect; said here, since nobody is looking at the settings
@@ -573,20 +594,14 @@ pub async fn reconnect_mcp(services: Services) {
 /// continuation turn, so leaving them behind would let a later direct prompt
 /// overtake the already queued follow-up.
 pub async fn resume_completed_plan_review_queues(services: Services) {
-    let pool = services.db.clone();
-    let resumes = tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::plan_review::list_startup_queue_resumes(&mut conn).map_err(|error| error.to_string())
-    })
-    .await;
+    let resumes = services
+        .db
+        .read(async |tx| crate::db::sea::ops::plan_review::list_startup_queue_resumes(tx).await)
+        .await;
     let resumes = match resumes {
-        Ok(Ok(resumes)) => resumes,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "could not read plan-review queue resumes at startup");
-            return;
-        }
+        Ok(resumes) => resumes,
         Err(error) => {
-            tracing::warn!(%error, "reading plan-review queue resumes panicked");
+            tracing::warn!(%error, "could not read plan-review queue resumes at startup");
             return;
         }
     };
@@ -610,14 +625,13 @@ pub async fn resume_completed_plan_review_queues(services: Services) {
             tracing::warn!(conversation_id, "plan-review queue resume made no durable progress");
             continue;
         }
-        let pool = services.db.clone();
-        let cleared = tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().map_err(|error| error.to_string())?;
-            crate::db::ops::plan_review::finish_startup_queue_resume(&mut conn, &delivery_id, now_ms())
-                .map_err(|error| error.to_string())
-        })
-        .await;
-        if !matches!(cleared, Ok(Ok(true))) {
+        let cleared = services
+            .db
+            .write(async |tx| {
+                crate::db::sea::ops::plan_review::finish_startup_queue_resume(tx, &delivery_id, now_ms()).await
+            })
+            .await;
+        if !matches!(cleared, Ok(true)) {
             tracing::warn!(
                 conversation_id,
                 "could not clear a completed plan-review queue resume marker"
@@ -627,16 +641,10 @@ pub async fn resume_completed_plan_review_queues(services: Services) {
 }
 
 async fn next_pending_queue_id(services: &Services, conversation_id: &str) -> Result<Option<String>, String> {
-    let pool = services.db.clone();
-    let conversation_id = conversation_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        crate::db::ops::queue::next_pending(&mut conn, &conversation_id)
-            .map(|row| row.map(|row| row.id))
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    crate::db::sea::ops::queue::next_pending(&services.db, conversation_id)
+        .await
+        .map(|row| row.map(|row| row.id))
+        .map_err(|error| error.to_string())
 }
 
 fn queue_resume_progressed(before: Option<&str>, after: Option<&str>) -> bool {
@@ -667,8 +675,7 @@ mod tests {
     async fn a_turn_killed_by_a_crash_holds_its_queue_at_the_next_start() {
         use std::sync::Arc;
 
-        use crate::db::models::queue::{Delivery, QueueState};
-        use crate::db::ops::{conversation, queue, turn};
+        use crate::db::models::queue::QueueState;
         use crate::keyring::SuppliedPassphraseStore;
         use crate::secrets::SecretsManager;
 
@@ -682,14 +689,17 @@ mod tests {
             // the process was killed. Today's start has to bridge the file
             // before it can reconcile it.
             let path = dir.path().join("meridian.db");
-            crate::db::sea::bridge::previous_release_file(&path, crate::db::sea::legacy::LEGACY.len())
-                .await
-                .unwrap();
-            let pool = crate::db::init_db(path.to_str().unwrap());
-            let mut conn = pool.get().unwrap();
-            conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1000).unwrap();
-            turn::begin(&mut conn, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).unwrap();
-            queue::enqueue(&mut conn, "q1", "c1", "now rename it", Delivery::FollowUp, 1).unwrap();
+            crate::db::sea::bridge::previous_release_file_with(
+                &path,
+                crate::db::sea::legacy::LEGACY.len(),
+                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c1', 't', 1000, 1000);
+                 INSERT INTO turns (id, conversation_id, origin, status, phase, started_at, updated_at)
+                     VALUES ('t1', 'c1', 'desktop', 'running', 'streaming', 1000, 1000);
+                 INSERT INTO queued_prompts (id, conversation_id, content, delivery, position, created_at)
+                     VALUES ('q1', 'c1', 'now rename it', 'follow_up', 0, 1)",
+            )
+            .await
+            .unwrap();
         }
 
         let store = SuppliedPassphraseStore::new("a passphrase for the test only", "test").unwrap();
@@ -701,11 +711,70 @@ mod tests {
             .await
             .unwrap();
 
-        let mut conn = services.db.get().unwrap();
-        assert_eq!(queue::list(&mut conn, "c1").unwrap()[0].state(), QueueState::Held);
+        let queued = crate::db::sea::ops::queue::list(&services.db, "c1").await.unwrap();
+        assert_eq!(queued[0].state(), QueueState::Held);
         assert!(
-            queue::next_pending(&mut conn, "c1").unwrap().is_none(),
+            crate::db::sea::ops::queue::next_pending(&services.db, "c1")
+                .await
+                .unwrap()
+                .is_none(),
             "nothing is delivered on the premise of a turn that never finished",
+        );
+    }
+
+    /// A first start with the old environment-variable key becomes one
+    /// provider, the default assistant pointed at it and the key stored; a
+    /// second start finds a provider and adds nothing.
+    #[tokio::test]
+    async fn the_legacy_key_becomes_one_provider_once() {
+        use std::sync::Arc;
+
+        use crate::keyring::SuppliedPassphraseStore;
+        use crate::secrets::{SecretName, SecretScope, SecretsManager};
+
+        crate::logging::init_early();
+        let dir = tempfile::tempdir().unwrap();
+        let start = || async {
+            let store = SuppliedPassphraseStore::new("a passphrase for the test only", "test").unwrap();
+            let secrets = Arc::new(SecretsManager::new_with_keyring_store(
+                dir.path().to_path_buf(),
+                Arc::new(store),
+            ));
+            secrets
+                .set(&SecretScope::Global, &SecretName::new("API_KEY").unwrap(), "sk-legacy")
+                .unwrap();
+            secrets
+                .set(&SecretScope::Global, &SecretName::new("MODEL").unwrap(), "gpt-legacy")
+                .unwrap();
+            super::bootstrap_with_secrets(dir.path().to_path_buf(), crate::events::EventBus::new(), secrets)
+                .await
+                .unwrap()
+        };
+
+        let services = start().await;
+        let providers = crate::db::sea::ops::provider::list_providers(&services.db)
+            .await
+            .unwrap();
+        assert_eq!(providers.len(), 1);
+        let assistant = crate::db::sea::ops::assistant::get_default_assistant(&services.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(assistant.provider_id.as_deref(), Some(providers[0].id.as_str()));
+        assert_eq!(assistant.model_id.as_deref(), Some("gpt-legacy"));
+        assert_eq!(
+            crate::agent::get_provider_api_key(&services.secrets, &providers[0].id).as_deref(),
+            Some("sk-legacy")
+        );
+        drop(services);
+
+        let again = start().await;
+        assert_eq!(
+            crate::db::sea::ops::provider::list_providers(&again.db)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 

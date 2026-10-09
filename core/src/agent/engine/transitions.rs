@@ -23,10 +23,9 @@ use std::collections::HashSet;
 
 use crate::agent::modes::ModeSpec;
 use crate::agent::turn_config::TurnConfig;
-use crate::db;
-use crate::db::DbPool;
+
 use crate::provider::{ChatMessage, ToolDefinition};
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 use super::{ApprovalDecision, Emit};
 
@@ -241,7 +240,7 @@ pub(crate) fn replace_system_prompt(chat_messages: &mut [ChatMessage], prompt: &
 /// decision arrives already made — there is no work on the near side of the
 /// question to get the order wrong.
 pub(crate) async fn enter(
-    pool: &DbPool,
+    db: &crate::db::sea::cap::Db,
     transitions: &dyn Transitions,
     emit: Option<&dyn Emit>,
     conversation_id: &str,
@@ -274,7 +273,7 @@ pub(crate) async fn enter(
         }
     }
 
-    let rebuilt = match store_mode(pool, conversation_id, Some(target.id)).await? {
+    let rebuilt = match store_mode(db, conversation_id, Some(target.id)).await? {
         Err(e) => Err(e),
         Ok(()) => transitions.rebuild(target).await?,
     };
@@ -313,19 +312,19 @@ pub(crate) async fn submit(
     transitions.submit_plan(request).await
 }
 
+/// The outer `Result` is kept for the shape the caller already matches on:
+/// an inner error is a refused write, reported to the model as a failed
+/// switch rather than ending the turn.
 async fn store_mode(
-    pool: &DbPool,
+    db: &crate::db::sea::cap::Db,
     conversation_id: &str,
     mode: Option<&'static str>,
 ) -> Result<Result<(), String>, String> {
-    let pool = pool.clone();
-    let conv_id = conversation_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        db::ops::conversation::update_mode(&mut conn, &conv_id, mode, now_ms()).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())
+    Ok(db
+        .write(async |tx| crate::db::sea::ops::conversation::update_mode(tx, conversation_id, mode, now_ms()).await)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string()))
 }
 
 /// The toolbar reads the mode off the conversation row, which just changed.
@@ -343,7 +342,6 @@ fn announce(emit: Option<&dyn Emit>, conversation_id: &str) {
 mod tests {
     use super::*;
     use crate::agent::modes::{PLAN_MODE, WORK_MODE};
-    use crate::db::diesel_test_db;
     use crate::provider::ChatMessage;
     use std::sync::Mutex;
 
@@ -355,14 +353,21 @@ mod tests {
         crate::agent::modes::resolve(Some(WORK_MODE)).unwrap()
     }
 
-    fn conversation(pool: &DbPool) {
-        let mut conn = pool.get().unwrap();
-        db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
+    async fn conversation(pool: &crate::db::sea::cap::Db) {
+        crate::db::sea::execute_for_tests(
+            pool,
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c1', 't', 1, 1)",
+        )
+        .await
+        .unwrap();
     }
 
-    fn stored_mode(pool: &DbPool) -> Option<String> {
-        let mut conn = pool.get().unwrap();
-        db::ops::conversation::get_conversation(&mut conn, "c1").unwrap().mode
+    async fn stored_mode(pool: &crate::db::sea::cap::Db) -> Option<String> {
+        crate::db::sea::ops::conversation::get_conversation(pool, "c1")
+            .await
+            .unwrap()
+            .unwrap()
+            .mode
     }
 
     fn def(name: &str) -> ToolDefinition {
@@ -483,8 +488,8 @@ mod tests {
     /// The whole reason the effect is one value: all four move, or none do.
     #[tokio::test]
     async fn entering_moves_the_mode_the_tools_the_authorisation_and_the_prompt() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let rebuild = FakeRebuild::giving("# Plan mode\n\nyou are planning", &["read_file"]);
         let emit = Recorder::default();
         let mut state = Loop::in_work();
@@ -510,7 +515,7 @@ mod tests {
             state.messages[1].content, "do the thing",
             "and nothing else in the history"
         );
-        assert_eq!(stored_mode(&pool).as_deref(), Some(PLAN_MODE));
+        assert_eq!(stored_mode(&pool).await.as_deref(), Some(PLAN_MODE));
         assert_eq!(*rebuild.asked.lock().unwrap(), [PLAN_MODE]);
         assert_eq!(*emit.0.lock().unwrap(), ["conversation-updated"]);
     }
@@ -520,8 +525,8 @@ mod tests {
     /// the top of the next iteration.
     #[tokio::test]
     async fn the_next_request_carries_the_new_tools_without_asking_again() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let rebuild = FakeRebuild::giving("planning", &["read_file", "run_command"]);
         let mut state = Loop::in_work();
 
@@ -552,8 +557,8 @@ mod tests {
     /// does not have.
     #[tokio::test]
     async fn a_switch_that_only_half_happened_does_not_move_the_tool_set() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let rebuild = FakeRebuild::refusing();
         let emit = Recorder::default();
         let mut state = Loop::in_work();
@@ -581,13 +586,13 @@ mod tests {
         assert_eq!(state.messages[0].content, "you are helpful");
         assert!(emit.0.lock().unwrap().is_empty(), "nothing to tell the window about");
         // The row did move, which is the whole reason this case exists.
-        assert_eq!(stored_mode(&pool).as_deref(), Some(PLAN_MODE));
+        assert_eq!(stored_mode(&pool).await.as_deref(), Some(PLAN_MODE));
     }
 
     #[tokio::test]
     async fn a_refused_entry_carries_the_reason_back_and_changes_nothing() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let rebuild = FakeRebuild::giving("planning", &["read_file"]);
         let mut state = Loop::in_work();
 
@@ -606,7 +611,11 @@ mod tests {
         assert_eq!(outcome, "denied");
         assert!(result.contains("just do it"));
         assert_eq!(state.mode.id, WORK_MODE);
-        assert_eq!(stored_mode(&pool), None, "the row is not touched before the answer");
+        assert_eq!(
+            stored_mode(&pool).await,
+            None,
+            "the row is not touched before the answer"
+        );
         assert!(rebuild.asked.lock().unwrap().is_empty());
     }
 
@@ -614,15 +623,15 @@ mod tests {
     /// not be read as one that said yes.
     #[tokio::test]
     async fn an_unanswered_entry_is_a_refusal() {
-        let pool = diesel_test_db();
-        conversation(&pool);
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
         let rebuild = FakeRebuild::giving("planning", &["read_file"]);
 
         let effect = enter(&pool, &rebuild, None, "c1", plan_mode(), None).await.unwrap();
 
         assert_eq!(effect.outcome, "denied");
         assert!(!effect.moves());
-        assert_eq!(stored_mode(&pool), None);
+        assert_eq!(stored_mode(&pool).await, None);
     }
 
     #[tokio::test]

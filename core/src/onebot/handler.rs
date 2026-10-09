@@ -232,7 +232,10 @@ async fn handle_text_message(
     // run_agent_turn will hit the cache for the same key.
     let (_, conversation_id, model_override) = {
         let mut sessions = state.sessions.lock().await;
-        match sessions.get_or_create(&session_key, &title, state.config.assistant_id.as_deref()) {
+        match sessions
+            .get_or_create(&session_key, &title, state.config.assistant_id.as_deref())
+            .await
+        {
             Ok((pid, cid)) => {
                 let ovr = sessions.get_model_override(&session_key);
                 (pid, cid, ovr)
@@ -378,7 +381,7 @@ async fn handle_text_message(
     // Before anything renders or stores it, and for the steered path as much as
     // the first: `IncomingMessage` carries this string either way.
     let user_content = if has_stickers {
-        match crate::agent::freeze_sticker_parts(&state.services.sea, &user_content).await {
+        match crate::agent::freeze_sticker_parts(&state.services.db, &user_content).await {
             Ok(frozen) => frozen,
             Err(e) => {
                 tracing::warn!(error = %e, "could not record what a message's stickers were; message not handled");
@@ -562,7 +565,10 @@ pub(super) async fn run_agent_turn(
     // ordinary message this costs nothing; the poke path pays one lookup.
     let (project_id, conversation_id, model_override) = {
         let mut sessions = state.sessions.lock().await;
-        match sessions.get_or_create(session_key, title, state.config.assistant_id.as_deref()) {
+        match sessions
+            .get_or_create(session_key, title, state.config.assistant_id.as_deref())
+            .await
+        {
             Ok((pid, cid)) => {
                 let ovr = sessions.get_model_override(session_key);
                 (pid, cid, ovr)
@@ -587,7 +593,7 @@ pub(super) async fn run_agent_turn(
         let scope_id = sender.scope_id();
         let touched = state
             .services
-            .sea
+            .db
             .write(async |tx| {
                 crate::db::sea::ops::memory::touch_subject(
                     tx,
@@ -704,7 +710,6 @@ pub(super) async fn run_agent_turn(
 
         let outcome = agent::headless_chat(
             &state.services.db,
-            &state.services.sea,
             &state.services.secrets,
             &state.services.tools,
             &state.services.mcp,
@@ -1009,7 +1014,7 @@ async fn run_extraction_pass(
         };
         state
             .services
-            .sea
+            .db
             .read(async |tx| {
                 Ok::<_, crate::db::sea::DbErr>(extract::existing_for_extraction(tx, &facts_ref, &subjects).await)
             })
@@ -1036,7 +1041,7 @@ async fn run_extraction_pass(
         }
     };
 
-    let proposals = match extract::run_extraction(&state.services.sea, &raw, facts).await {
+    let proposals = match extract::run_extraction(&state.services.db, &raw, facts).await {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!("memory extraction produced nothing usable: {e}");
@@ -1052,7 +1057,7 @@ async fn run_extraction_pass(
     // person. The notice goes to the operator privately, wherever it came from.
     let mut summaries = Vec::new();
     for id in &proposals {
-        if let Ok(Some(p)) = crate::db::sea::ops::memory::get_proposal(&state.services.sea, *id).await {
+        if let Ok(Some(p)) = crate::db::sea::ops::memory::get_proposal(&state.services.db, *id).await {
             summaries.push(format!("M{} {}: {}", p.id, p.key, p.content));
         }
     }
@@ -1108,7 +1113,7 @@ async fn dispatch_decision(
         command::DecisionTarget::MemoryProposal(id) => id,
     };
 
-    let db = &state.services.sea;
+    let db = &state.services.db;
     let outcome = match super::extract::is_known_proposal(db, id).await {
         None => format!("没有找到编号 M{id} 的提议。"),
         // The approval and the reject each check `pending` inside their own
@@ -1314,7 +1319,7 @@ async fn dispatch_memory(
     // write nothing (each says so where it reads); the forget arms act on ids
     // from an earlier listing, which is the contract of a numbered list, and the
     // soft delete skips rows already gone.
-    let db = &state.services.sea;
+    let db = &state.services.db;
     let now = crate::util::now_ms();
     // An operator's note or rule, as the two `add` commands write it.
     let note = |scope: MemoryScope, scope_id: &str, key: String, content: String, memory_type, visibility| {
@@ -1534,6 +1539,7 @@ async fn dispatch_memory(
                 let mut sessions = state.sessions.lock().await;
                 sessions
                     .get_or_create(session_key, "", state.config.assistant_id.as_deref())
+                    .await
                     .ok()
                     .map(|(pid, _)| pid)
             };
@@ -1772,7 +1778,10 @@ async fn dispatch_new(
 ) -> Vec<OneBotAction> {
     let conversation_id = {
         let mut sessions = state.sessions.lock().await;
-        match sessions.get_or_create(session_key, title, state.config.assistant_id.as_deref()) {
+        match sessions
+            .get_or_create(session_key, title, state.config.assistant_id.as_deref())
+            .await
+        {
             Ok((_, cid)) => cid,
             Err(e) => return build_reply(event, &format!("内部错误: {e}"), reply_to),
         }
@@ -1791,12 +1800,14 @@ async fn dispatch_new(
     };
 
     let mut sessions = state.sessions.lock().await;
-    let reset = sessions.reset_conversation(
-        session_key,
-        title,
-        state.config.assistant_id.as_deref(),
-        &conversation_id,
-    );
+    let reset = sessions
+        .reset_conversation(
+            session_key,
+            title,
+            state.config.assistant_id.as_deref(),
+            &conversation_id,
+        )
+        .await;
     match reset {
         Ok(_) => build_reply(event, "已重置对话。新的对话已创建。", reply_to),
         Err(e) => build_reply(event, &format!("重置失败: {e}"), reply_to),
@@ -1815,7 +1826,10 @@ async fn dispatch_compact(
 
     let (_, conversation_id) = {
         let mut sessions = state.sessions.lock().await;
-        match sessions.get_or_create(session_key, title, state.config.assistant_id.as_deref()) {
+        match sessions
+            .get_or_create(session_key, title, state.config.assistant_id.as_deref())
+            .await
+        {
             Ok(ids) => ids,
             Err(e) => return build_reply(event, &format!("内部错误: {e}"), reply_to),
         }
@@ -1839,7 +1853,6 @@ async fn dispatch_compact(
         }
     };
 
-    let pool = &state.services.db;
     let secrets = &state.services.secrets;
     match crate::agent::queue::has_plan_review_barrier(&state.services, &conversation_id).await {
         Ok(false) => {}
@@ -1849,30 +1862,16 @@ async fn dispatch_compact(
             return build_reply(event, "无法确认计划审阅状态，暂未压缩对话。", reply_to);
         }
     }
-    let (assistant, keep_recent) = {
-        let pool = pool.clone();
-        let conv_id = conversation_id.clone();
-        match tokio::task::spawn_blocking(move || {
-            let mut conn = crate::util::get_conn(&pool)?;
-            let conv =
-                crate::db::ops::conversation::get_conversation(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-            let assistant = conv
-                .assistant_id
-                .as_deref()
-                .and_then(|aid| crate::db::ops::assistant::get_assistant(&mut conn, aid).ok());
+    let (assistant, keep_recent) = match conversation_and_assistant(state, &conversation_id, None).await {
+        Ok((_, assistant)) => {
             let keep_recent = assistant.as_ref().map(|a| a.compact_keep_recent as usize).unwrap_or(10);
-            Ok::<_, String>((assistant, keep_recent))
-        })
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return build_reply(event, &format!("Compact 失败: {e}"), reply_to),
-            Err(e) => return build_reply(event, &format!("Compact 失败: {e}"), reply_to),
+            (assistant, keep_recent)
         }
+        Err(e) => return build_reply(event, &format!("Compact 失败: {e}"), reply_to),
     };
 
     match crate::agent::do_compact(
-        pool,
+        &state.services.db,
         secrets,
         &conversation_id,
         assistant.as_ref(),
@@ -1897,7 +1896,10 @@ async fn dispatch_model(
     // Ensure session exists, get conversation_id and current override
     let (conversation_id, model_override) = {
         let mut sessions = state.sessions.lock().await;
-        let (_, cid) = match sessions.get_or_create(session_key, title, state.config.assistant_id.as_deref()) {
+        let (_, cid) = match sessions
+            .get_or_create(session_key, title, state.config.assistant_id.as_deref())
+            .await
+        {
             Ok(ids) => ids,
             Err(e) => return build_reply(event, &format!("内部错误: {e}"), reply_to),
         };
@@ -1921,25 +1923,18 @@ async fn dispatch_model(
     };
 
     // Show current model info
-    let pool = pool_clone(&state.services.db);
-    let assistant_id = state.config.assistant_id.clone();
-    let conv_id = conversation_id;
-    let info = tokio::task::spawn_blocking(move || {
-        let mut conn = crate::util::get_conn(&pool)?;
-        let conv = crate::db::ops::conversation::get_conversation(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-        let effective_aid = assistant_id.as_deref().or(conv.assistant_id.as_deref());
-        let assistant = effective_aid.and_then(|aid| crate::db::ops::assistant::get_assistant(&mut conn, aid).ok());
-        let model = assistant
-            .as_ref()
-            .and_then(|a| a.model_id.clone())
-            .unwrap_or_else(|| "未配置".into());
-        let name = assistant.as_ref().map(|a| a.name.clone());
-        Ok::<_, String>((model, name))
-    })
-    .await;
+    let info = conversation_and_assistant(state, &conversation_id, state.config.assistant_id.as_deref())
+        .await
+        .map(|(_, assistant)| {
+            let model = assistant
+                .as_ref()
+                .and_then(|a| a.model_id.clone())
+                .unwrap_or_else(|| "未配置".into());
+            (model, assistant.map(|a| a.name))
+        });
 
     match info {
-        Ok(Ok((default_model, assistant_name))) => {
+        Ok((default_model, assistant_name)) => {
             let reply = if let Some(ref ovr) = model_override {
                 format!(
                     "当前模型: {} (手动切换)\n助手默认: {}\n发送 /model reset 恢复默认",
@@ -1953,7 +1948,6 @@ async fn dispatch_model(
             };
             build_reply(event, &reply, reply_to)
         }
-        Ok(Err(e)) => build_reply(event, &format!("获取模型信息失败: {e}"), reply_to),
         Err(e) => build_reply(event, &format!("获取模型信息失败: {e}"), reply_to),
     }
 }
@@ -1968,7 +1962,10 @@ async fn dispatch_status(
 ) -> Vec<OneBotAction> {
     let (conversation_id, model_override) = {
         let mut sessions = state.sessions.lock().await;
-        let (_, cid) = match sessions.get_or_create(session_key, title, state.config.assistant_id.as_deref()) {
+        let (_, cid) = match sessions
+            .get_or_create(session_key, title, state.config.assistant_id.as_deref())
+            .await
+        {
             Ok(ids) => ids,
             Err(e) => return build_reply(event, &format!("内部错误: {e}"), reply_to),
         };
@@ -1976,50 +1973,10 @@ async fn dispatch_status(
         (cid, ovr)
     };
 
-    let pool = pool_clone(&state.services.db);
-    let assistant_id = state.config.assistant_id.clone();
-    let conv_id = conversation_id;
-    let info = tokio::task::spawn_blocking(move || {
-        let mut conn = crate::util::get_conn(&pool)?;
-        let conv = crate::db::ops::conversation::get_conversation(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-        let effective_aid = assistant_id.as_deref().or(conv.assistant_id.as_deref());
-        let assistant = effective_aid.and_then(|aid| crate::db::ops::assistant::get_assistant(&mut conn, aid).ok());
-        let assistant_name = assistant
-            .as_ref()
-            .map(|a| a.name.clone())
-            .unwrap_or_else(|| "未配置".into());
-        let model = assistant
-            .as_ref()
-            .and_then(|a| a.model_id.clone())
-            .unwrap_or_else(|| "未配置".into());
-        // 0 is "the model's own window", not a window of zero; an absent
-        // assistant has no override at all. Neither is a number to print.
-        let context_limit = match assistant.as_ref().map(|a| a.context_limit) {
-            Some(limit) if limit > 0 => limit.to_string(),
-            Some(_) => "跟随模型".to_string(),
-            None => "未配置".to_string(),
-        };
-        // The active path, not every row: counting branches the user has
-        // switched away from would not describe the conversation /status is
-        // reporting on.
-        let msg_count = crate::db::ops::message::list_messages(&mut conn, &conv_id)
-            .map(|history| {
-                crate::db::ops::message::active_context(&history, conv.head_message_id.as_deref())
-                    .path
-                    .iter()
-                    // Injected background is not a message anybody sent.
-                    .filter(|m| m.role != "context")
-                    .count() as i64
-            })
-            // A failed read is reported as a failure, not as an empty
-            // conversation.
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>((assistant_name, model, context_limit, msg_count))
-    })
-    .await;
+    let info = status_of(state, &conversation_id).await;
 
     match info {
-        Ok(Ok((assistant_name, default_model, context_limit, msg_count))) => {
+        Ok((assistant_name, default_model, context_limit, msg_count)) => {
             let model_display = model_override
                 .map(|ovr| format!("{} (手动切换)", ovr))
                 .unwrap_or(default_model);
@@ -2034,7 +1991,6 @@ async fn dispatch_status(
             );
             build_reply(event, &reply, reply_to)
         }
-        Ok(Err(e)) => build_reply(event, &format!("获取状态失败: {e}"), reply_to),
         Err(e) => build_reply(event, &format!("获取状态失败: {e}"), reply_to),
     }
 }
@@ -2043,8 +1999,96 @@ async fn dispatch_status(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn pool_clone(pool: &crate::db::DbPool) -> crate::db::DbPool {
-    pool.clone()
+/// A conversation and the assistant answering in it: `preferred` when the
+/// connection names one, otherwise the conversation's own. An assistant that
+/// cannot be read is no assistant, as before.
+async fn conversation_and_assistant(
+    state: &SharedState,
+    conversation_id: &str,
+    preferred: Option<&str>,
+) -> Result<
+    (
+        crate::db::entity::conversation::Model,
+        Option<crate::db::entity::assistant::Model>,
+    ),
+    String,
+> {
+    state
+        .services
+        .db
+        .read(async |tx| {
+            Ok::<_, crate::db::sea::DbErr>(conversation_and_assistant_in(tx, conversation_id, preferred).await)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+async fn conversation_and_assistant_in(
+    tx: &crate::db::sea::cap::ReadTx,
+    conversation_id: &str,
+    preferred: Option<&str>,
+) -> Result<
+    (
+        crate::db::entity::conversation::Model,
+        Option<crate::db::entity::assistant::Model>,
+    ),
+    String,
+> {
+    let conv = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {conversation_id} not found"))?;
+    let assistant = match preferred.or(conv.assistant_id.as_deref()) {
+        Some(aid) => crate::db::sea::ops::assistant::get_assistant(tx, aid)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    Ok((conv, assistant))
+}
+
+/// What `/status` reports, read in one snapshot.
+async fn status_of(state: &SharedState, conversation_id: &str) -> Result<(String, String, String, i64), String> {
+    let preferred = state.config.assistant_id.as_deref();
+    state
+        .services
+        .db
+        .read(async |tx| {
+            let (conv, assistant) = match conversation_and_assistant_in(tx, conversation_id, preferred).await {
+                Ok(found) => found,
+                Err(e) => return Ok(Err(e)),
+            };
+            let assistant_name = assistant
+                .as_ref()
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "未配置".into());
+            let model = assistant
+                .as_ref()
+                .and_then(|a| a.model_id.clone())
+                .unwrap_or_else(|| "未配置".into());
+            // 0 is "the model's own window", not a window of zero; an absent
+            // assistant has no override at all. Neither is a number to print.
+            let context_limit = match assistant.as_ref().map(|a| a.context_limit) {
+                Some(limit) if limit > 0 => limit.to_string(),
+                Some(_) => "跟随模型".to_string(),
+                None => "未配置".to_string(),
+            };
+            // The active path, not every row: counting branches the user has
+            // switched away from would not describe the conversation /status is
+            // reporting on. A failed read is reported as a failure, not as an
+            // empty conversation.
+            let history = crate::db::sea::ops::message::list_messages(tx, conversation_id).await?;
+            let msg_count = crate::db::sea::ops::message::active_context(&history, conv.head_message_id.as_deref())
+                .path
+                .iter()
+                // Injected background is not a message anybody sent.
+                .filter(|m| m.role != "context")
+                .count() as i64;
+            Ok::<_, crate::db::sea::DbErr>(Ok((assistant_name, model, context_limit, msg_count)))
+        })
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// 把这条消息里的语音交给采集通道，或者认出它不该被采集。

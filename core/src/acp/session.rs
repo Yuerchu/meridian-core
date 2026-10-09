@@ -27,9 +27,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::engine::transcript::{append_tool_result, begin_assistant, complete_assistant, write_steering};
 use crate::agent::tool_calls::serialize_tool_calls_openai;
-use crate::db::models::acp_session_notice::AcpSessionNoticeInsert;
+use crate::db::entity::queued_prompt;
 use crate::db::models::message::MessageUsage;
-use crate::db::models::queue::QueuedPromptRow;
 use crate::db::models::turn::{TurnPhase, TurnStatus};
 use crate::events::{
     AcpNoticeSeverity, AcpSessionNoticeEvent, ChatStopReason, ChatStreamEvent, ToolCallDiff, ToolOutcome,
@@ -37,7 +36,7 @@ use crate::events::{
 use crate::provider;
 use crate::services::Services;
 use crate::turn::{TurnOrigin, TurnTrigger};
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 use super::mapping::{self, Effect};
 use super::peer::{Handler, Peer, PeerError};
@@ -771,23 +770,19 @@ impl Shared {
             Some(Some(message_id)) => Some(message_id),
             _ => match self.with_turn(|t| t.turn_id.clone()) {
                 Some(turn_id) => {
-                    let pool = self.services.db.clone();
-                    let (turn_id, call_id, hunks) = (turn_id, call_id.clone(), diffs.clone());
-                    let found = tokio::task::spawn_blocking(move || {
-                        let mut conn = get_conn(&pool)?;
-                        crate::db::ops::message::record_tool_diffs_for_call(&mut conn, &turn_id, &call_id, &hunks)
-                            .map_err(|e| e.to_string())
-                    })
-                    .await;
+                    let found = self
+                        .services
+                        .db
+                        .write(async |tx| {
+                            crate::db::sea::ops::message::record_tool_diffs_for_call(tx, &turn_id, &call_id, &diffs)
+                                .await
+                        })
+                        .await;
                     // Logged, never fatal: what is lost is one card's gutter.
                     match found {
-                        Ok(Ok(row)) => row,
-                        Ok(Err(e)) => {
-                            tracing::debug!(error = %e, "could not store an ACP tool diff");
-                            None
-                        }
+                        Ok(row) => row,
                         Err(e) => {
-                            tracing::debug!(error = %e, "storing an ACP tool diff panicked");
+                            tracing::debug!(error = %e, "could not store an ACP tool diff");
                             None
                         }
                     }
@@ -817,43 +812,32 @@ impl Shared {
     /// is the adapter repeating itself, and the frontend already holds it.
     /// Held back during an import, where the conversation does not exist yet.
     async fn record_notice(&self, record: mapping::SessionNoticeRecord, turn_id: Option<String>) {
-        let pool = self.services.db.clone();
-        let conversation_id = self.conversation_id.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let actions = serde_json::to_string(&record.actions).map_err(|e| e.to_string())?;
-            let id = uuid::Uuid::new_v4().to_string();
-            let now = now_ms();
-            crate::db::ops::acp_session_notice::upsert_if_newer(
-                &mut conn,
-                AcpSessionNoticeInsert {
-                    id: &id,
-                    conversation_id: &conversation_id,
-                    turn_id: turn_id.as_deref(),
-                    notice_id: &record.notice_id,
-                    revision: i32::try_from(record.revision).unwrap_or(i32::MAX),
-                    category: record.category.as_str(),
-                    severity: record.severity.as_str(),
-                    title: &record.title,
-                    details: record.details.as_deref(),
-                    reason: record.reason.as_deref(),
-                    actions: &actions,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .map_err(|e| e.to_string())
-        })
-        .await;
+        let now = now_ms();
+        let notice = crate::db::entity::acp_session_notice::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: self.conversation_id.clone(),
+            turn_id,
+            notice_id: record.notice_id,
+            revision: i32::try_from(record.revision).unwrap_or(i32::MAX),
+            category: record.category,
+            severity: record.severity,
+            title: record.title,
+            details: record.details,
+            reason: record.reason,
+            actions: crate::db::types::Json(record.actions),
+            created_at: now,
+            updated_at: now,
+        };
+        let written = self
+            .services
+            .db
+            .write(async |tx| crate::db::sea::ops::acp_session_notice::upsert_if_newer(tx, notice).await)
+            .await;
         let row = match written {
-            Ok(Ok(Some(row))) => row,
-            Ok(Ok(None)) => return,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not record an ACP notice");
-                return;
-            }
+            Ok(Some(row)) => row,
+            Ok(None) => return,
             Err(error) => {
-                tracing::warn!(%error, conversation_id = %self.conversation_id, "recording an ACP notice panicked");
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not record an ACP notice");
                 return;
             }
         };
@@ -897,36 +881,36 @@ impl Shared {
             .ok()
             .and_then(|mut slot| slot.replace(title.clone()));
         let placeholder = self.placeholder_title.clone();
-        let pool = self.services.db.clone();
-        let conversation_id = self.conversation_id.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let current = crate::db::ops::conversation::get_conversation(&mut conn, &conversation_id)
-                .map_err(|e| e.to_string())?
-                .title;
-            let nobodys = match current.as_deref() {
-                None => true,
-                Some(current) => current == placeholder || Some(current) == previous.as_deref(),
-            };
-            if !nobodys || current.as_deref() == Some(title.as_str()) {
-                return Ok::<bool, String>(false);
-            }
-            crate::db::ops::conversation::update_title(&mut conn, &conversation_id, &title, now_ms())
-                .map_err(|e| e.to_string())?;
-            Ok(true)
-        })
-        .await;
+        // The current title read under the lock the new one is written under.
+        let conversation_id = &self.conversation_id;
+        let written = self
+            .services
+            .db
+            .write(async |tx| {
+                let Some(current) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await?
+                else {
+                    return Ok(false);
+                };
+                let current = current.title;
+                let nobodys = match current.as_deref() {
+                    None => true,
+                    Some(current) => current == placeholder || Some(current) == previous.as_deref(),
+                };
+                if !nobodys || current.as_deref() == Some(title.as_str()) {
+                    return Ok::<bool, crate::db::sea::DbErr>(false);
+                }
+                crate::db::sea::ops::conversation::update_title(tx, conversation_id, &title, now_ms()).await?;
+                Ok(true)
+            })
+            .await;
         match written {
-            Ok(Ok(true)) => {
+            Ok(true) => {
                 tracing::info!(conversation_id = %self.conversation_id, "adopted the agent's title");
                 let _ = self.services.events.emit_conversation_updated(&self.conversation_id);
             }
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not adopt the agent's title")
-            }
+            Ok(false) => {}
             Err(error) => {
-                tracing::warn!(%error, conversation_id = %self.conversation_id, "adopting the agent's title panicked")
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not adopt the agent's title")
             }
         }
     }
@@ -971,22 +955,18 @@ impl Shared {
         // card's gutter and the pre-overwrite text of a diff — logged, not
         // counted against the turn, the same class as a stored revision.
         if !row.diffs.is_empty() {
-            let pool = self.services.db.clone();
-            let message_id = row.message_id.clone();
-            let diffs = row.diffs.clone();
-            let written = tokio::task::spawn_blocking(move || {
-                let mut conn = get_conn(&pool)?;
-                for (call_id, hunks) in &diffs {
-                    crate::db::ops::message::record_tool_diffs(&mut conn, &message_id, call_id, hunks)
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok::<(), String>(())
-            })
-            .await;
-            match written {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(error = %e, "could not store an ACP row's tool diffs"),
-                Err(e) => tracing::warn!(error = %e, "storing an ACP row's tool diffs panicked"),
+            let written = self
+                .services
+                .db
+                .write(async |tx| {
+                    for (call_id, hunks) in &row.diffs {
+                        crate::db::sea::ops::message::record_tool_diffs(tx, &row.message_id, call_id, hunks).await?;
+                    }
+                    Ok::<(), crate::db::sea::DbErr>(())
+                })
+                .await;
+            if let Err(e) = written {
+                tracing::warn!(error = %e, "could not store an ACP row's tool diffs");
             }
         }
 
@@ -1035,15 +1015,11 @@ impl Shared {
             .await
             {
                 Ok(id) => {
-                    let pool = self.services.db.clone();
-                    let queue_id = item.queue_id.clone();
-                    let message_id = id.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let mut conn = get_conn(&pool)?;
-                        crate::db::ops::queue::attach_message(&mut conn, &queue_id, &message_id)
-                            .map_err(|e| e.to_string())
-                    })
-                    .await;
+                    let _ = self
+                        .services
+                        .db
+                        .write(async |tx| crate::db::sea::ops::queue::attach_message(tx, &item.queue_id, &id).await)
+                        .await;
                     self.emit(ChatStreamEvent::UserMessage {
                         message_id: id.clone(),
                         content: item.text.clone(),
@@ -1151,21 +1127,16 @@ impl Shared {
         let Some(turn_id) = self.with_turn(|t| t.turn_id.clone()) else {
             return;
         };
-        let pool = self.services.db.clone();
-        let tool = tool.map(str::to_string);
-        let written = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::turn::set_phase(&mut conn, &turn_id, phase, tool.as_deref(), now_ms())
-                .map_err(|e| e.to_string())
-        })
-        .await;
+        let written = self
+            .services
+            .db
+            .write(async |tx| crate::db::sea::ops::turn::set_phase(tx, &turn_id, phase, tool, now_ms()).await)
+            .await;
         // Logged, never fatal. A phase that did not land costs a vaguer warning
         // after a crash that may not happen; a turn ended over it costs the
         // answer somebody is reading.
-        match written {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!(error = %e, "could not record an ACP turn phase"),
-            Err(e) => tracing::debug!(error = %e, "recording an ACP turn phase panicked"),
+        if let Err(e) = written {
+            tracing::debug!(error = %e, "could not record an ACP turn phase");
         }
     }
 
@@ -1237,26 +1208,20 @@ impl Shared {
         tool_name: Option<&str>,
         arguments: Option<&str>,
     ) -> Option<(String, String, String)> {
-        let pool = self.services.db.clone();
-        let (turn_id, call_id) = (turn_id.to_string(), call_id.to_string());
-        let (name, args) = (tool_name.map(str::to_string), arguments.map(str::to_string));
-        let found = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::message::revise_tool_call(&mut conn, &turn_id, &call_id, name.as_deref(), args.as_deref())
-                .map_err(|e| e.to_string())
-        })
-        .await;
+        let found = self
+            .services
+            .db
+            .write(async |tx| {
+                crate::db::sea::ops::message::revise_tool_call(tx, turn_id, call_id, tool_name, arguments).await
+            })
+            .await;
 
         // Logged, never fatal. What is lost is the arguments on one card, which
         // is what was already lost before this path existed.
         match found {
-            Ok(Ok(row)) => row,
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, "could not fill in a stored ACP tool call");
-                None
-            }
+            Ok(row) => row,
             Err(e) => {
-                tracing::debug!(error = %e, "filling in a stored ACP tool call panicked");
+                tracing::debug!(error = %e, "could not fill in a stored ACP tool call");
                 None
             }
         }
@@ -1269,10 +1234,8 @@ impl Shared {
     /// step is done, and an ACP session has no plan of this app's to retire.
     async fn write_plan(&self, items: Vec<mapping::PlanItem>) {
         use crate::db::models::todo::ItemStatus;
-        use crate::db::ops::todo::TodoItemSpec;
+        use crate::db::sea::ops::todo::TodoItemSpec;
 
-        let pool = self.services.db.clone();
-        let conversation_id = self.conversation_id.clone();
         let items: Vec<TodoItemSpec> = items
             .into_iter()
             .map(|item| TodoItemSpec {
@@ -1288,16 +1251,22 @@ impl Shared {
             return;
         }
 
-        let written = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::todo::replace_active_list(&mut conn, &conversation_id, "Claude Code", &items, now_ms())
-                .map_err(|e| e.to_string())
-        })
-        .await;
-        match written {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "could not store the agent's plan"),
-            Err(e) => tracing::warn!(error = %e, "could not store the agent's plan (the write panicked)"),
+        let written = self
+            .services
+            .db
+            .write(async |tx| {
+                crate::db::sea::ops::todo::replace_active_list(
+                    tx,
+                    &self.conversation_id,
+                    "Claude Code",
+                    &items,
+                    now_ms(),
+                )
+                .await
+            })
+            .await;
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "could not store the agent's plan");
         }
     }
 
@@ -1405,7 +1374,7 @@ impl Shared {
         // Hung off the head, as a prompt's row would be. A conversation with no
         // head has had no prompt, so there is nothing for the agent to be
         // carrying on from — and nothing sensible to hang a row off.
-        let head = crate::db::sea::ops::conversation::get_conversation(&self.services.sea, &self.conversation_id)
+        let head = crate::db::sea::ops::conversation::get_conversation(&self.services.db, &self.conversation_id)
             .await
             .map(|conversation| conversation.and_then(|c| c.head_message_id))
             .map_err(|e| e.to_string());
@@ -1770,7 +1739,7 @@ const MAX_ACP_PENDING_SHELL_ITEMS: usize = 4;
 const MAX_ACP_PENDING_SHELL_BYTES: usize = 128 * 1024;
 
 fn bounded_pending_shell_context(
-    candidates: &[crate::db::models::message_context_item::MessageContextItemRow],
+    candidates: &[crate::db::entity::message_context_item::Model],
 ) -> Result<Option<PendingShellContext>, String> {
     let mut item_ids = Vec::new();
     let mut rendered = Vec::new();
@@ -1780,12 +1749,12 @@ fn bounded_pending_shell_context(
             break;
         }
         let body = crate::workspace::reference::render_context_item(
-            crate::workspace::reference::MessageContextKind::parse(&item.kind)?,
+            item.kind,
             item.display_path.as_deref(),
             item.line_start,
             item.line_end,
             &item.content,
-            item.truncated != 0,
+            item.truncated.get(),
         );
         let message = provider::ChatMessage::user_provided_context(&body);
         let wire = provider::render_message(&message, provider::SenderRendering::Prefix)
@@ -1990,18 +1959,15 @@ impl Owed {
             crate::agent::queue::confirm_reported(services, report).await;
         }
         if let Some(shell) = self.shell {
-            let pool = services.db.clone();
             let count = shell.item_ids.len();
-            let settled = tokio::task::spawn_blocking(move || {
-                let mut conn = get_conn(&pool)?;
-                crate::db::ops::acp_context_delivery::mark_delivered(&mut conn, &shell.item_ids, now_ms())
-                    .map_err(|e| e.to_string())
-            })
-            .await;
-            match settled {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::warn!(error = %error, count, "could not settle ACP shell context"),
-                Err(error) => tracing::warn!(error = %error, count, "ACP shell-context settlement task failed"),
+            let settled = services
+                .db
+                .write(async |tx| {
+                    crate::db::sea::ops::acp_context_delivery::mark_delivered(tx, &shell.item_ids, now_ms()).await
+                })
+                .await;
+            if let Err(error) = settled {
+                tracing::warn!(error = %error, count, "could not settle ACP shell context");
             }
         }
         if self.memory_lost
@@ -2278,16 +2244,11 @@ impl AcpSession {
         let project_id = match project {
             ProjectOf::Known(project_id) => project_id.map(str::to_string),
             ProjectOf::Stored => {
-                let pool = services.db.clone();
-                let id = conversation_id.to_string();
-                tokio::task::spawn_blocking(move || {
-                    let mut conn = get_conn(&pool)?;
-                    crate::db::ops::conversation::get_conversation(&mut conn, &id)
-                        .map(|c| c.project_id)
-                        .map_err(|e| e.to_string())
-                })
-                .await
-                .map_err(|e| e.to_string())??
+                crate::db::sea::ops::conversation::get_conversation(&services.db, conversation_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("conversation {conversation_id} not found"))?
+                    .project_id
             }
         };
 
@@ -2843,18 +2804,16 @@ impl AcpSession {
             Err(error) => Outcome::Held(error),
         };
         if matches!(outcome, Outcome::Acknowledged) {
-            let pool = services.db.clone();
             let turn_id = delivery.submitting_turn_id;
-            let written = tokio::task::spawn_blocking(move || {
-                let mut conn = get_conn(&pool)?;
-                crate::db::ops::turn::finish_waiting_review(&mut conn, &turn_id, TurnStatus::Done, None, now_ms())
-                    .map_err(|error| error.to_string())
-            })
-            .await;
-            match written {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "could not settle resumed ACP review turn"),
-                Err(error) => tracing::warn!(%error, "settling resumed ACP review turn panicked"),
+            let written = services
+                .db
+                .write(async |tx| {
+                    crate::db::sea::ops::turn::finish_waiting_review(tx, &turn_id, TurnStatus::Done, None, now_ms())
+                        .await
+                })
+                .await;
+            if let Err(error) = written {
+                tracing::warn!(%error, "could not settle resumed ACP review turn");
             }
         }
         outcome
@@ -3063,15 +3022,10 @@ impl AcpSession {
     /// *recorded turn*, which either answers or is written down as having
     /// failed. Marking it in doubt instead would warn the next agent about a
     /// message sitting in plain sight a few rows above.
-    pub async fn deliver_queued(&self, services: &Services, item: &QueuedPromptRow) -> Result<(), String> {
-        let pool = services.db.clone();
-        let queue_id = item.id.clone();
-        let context = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::queued_prompt_context_item::list_prepared(&mut conn, &queue_id).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+    pub async fn deliver_queued(&self, services: &Services, item: &queued_prompt::Model) -> Result<(), String> {
+        let context = crate::db::sea::ops::queued_prompt_context_item::list_prepared(&services.db, &item.id)
+            .await
+            .map_err(|e| e.to_string())?;
         // Checked before the turn as well as inside it, for what a refusal
         // does here. A direct send hands the refusal to the person who pressed
         // send; a queued item has nobody waiting on it, and returned as an
@@ -3369,50 +3323,50 @@ impl AcpSession {
     /// a pipe failure or a stop before first poll leaves them for the next
     /// prompt instead of spending them on nobody.
     async fn pending_shell_context(&self, services: &Services) -> Result<Option<PendingShellContext>, String> {
-        let pool = services.db.clone();
-        let conversation_id = self.conversation_id.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<PendingShellContext>, String> {
-            let mut conn = get_conn(&pool)?;
-            let conversation = crate::db::ops::conversation::get_conversation(&mut conn, &conversation_id)
-                .map_err(|e| e.to_string())?;
-            let history =
-                crate::db::ops::message::list_messages(&mut conn, &conversation_id).map_err(|e| e.to_string())?;
-            let context = crate::db::ops::message::active_context(&history, conversation.head_message_id.as_deref());
-            let message_ids = context.path.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-            let mut by_message = crate::db::ops::message_context_item::list_for_messages(&mut conn, &message_ids)
-                .map_err(|e| e.to_string())?;
+        use crate::db::sea::ops::{acp_context_delivery, conversation, message, message_context_item};
+        use crate::workspace::reference::MessageContextKind;
 
-            // Match native context construction: a denied sandbox attempt and
-            // its approved host retry are both retained for diagnosis, but only
-            // the final attempt is evidence for the next model turn.
-            let mut candidates = Vec::new();
-            for message in &context.path {
-                let Some(items) = by_message.remove(&message.id) else {
-                    continue;
-                };
-                for item in &items {
-                    crate::workspace::reference::MessageContextKind::parse(&item.kind)?;
-                }
-                if let Some(item) = items
-                    .into_iter()
-                    .filter(|item| item.kind == "shell_output")
-                    .max_by_key(|item| item.position)
-                {
-                    candidates.push(item);
-                }
-            }
-            let ids = candidates.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-            let delivered =
-                crate::db::ops::acp_context_delivery::delivered(&mut conn, &ids).map_err(|e| e.to_string())?;
-            candidates.retain(|item| !delivered.contains(&item.id));
-            if candidates.is_empty() {
-                return Ok(None);
-            }
+        // One snapshot: the branch, its items and the receipts describe one moment.
+        let candidates = services
+            .db
+            .read(async |tx| {
+                let conversation = conversation::get_conversation(tx, &self.conversation_id)
+                    .await?
+                    .ok_or_else(|| {
+                        crate::db::sea::DbErr::RecordNotFound(format!("conversation {}", self.conversation_id))
+                    })?;
+                let history = message::list_messages(tx, &self.conversation_id).await?;
+                let context = message::active_context(&history, conversation.head_message_id.as_deref());
+                let message_ids = context.path.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+                let mut by_message = message_context_item::list_for_messages(tx, &message_ids).await?;
 
-            bounded_pending_shell_context(&candidates)
-        })
-        .await
-        .map_err(|error| format!("ACP shell-context load task failed: {error}"))?
+                // Match native context construction: a denied sandbox attempt and
+                // its approved host retry are both retained for diagnosis, but only
+                // the final attempt is evidence for the next model turn.
+                let mut candidates = Vec::new();
+                for message in &context.path {
+                    let Some(items) = by_message.remove(&message.id) else {
+                        continue;
+                    };
+                    if let Some(item) = items
+                        .into_iter()
+                        .filter(|item| item.kind == MessageContextKind::ShellOutput)
+                        .max_by_key(|item| item.position)
+                    {
+                        candidates.push(item);
+                    }
+                }
+                let ids = candidates.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+                let delivered = acp_context_delivery::delivered(tx, &ids).await?;
+                candidates.retain(|item| !delivered.contains(&item.id));
+                Ok::<_, crate::db::sea::DbErr>(candidates)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        bounded_pending_shell_context(&candidates)
     }
 
     /// Write the user's row and the turn record — and, when this prompt came
@@ -3430,112 +3384,41 @@ impl AcpSession {
         queued: Option<&str>,
         context: &[crate::workspace::reference::PreparedContextItem],
     ) -> Result<String, String> {
-        use crate::db::models::message::MessageInsert;
-        use diesel::Connection;
-
-        let pool = services.db.clone();
-        let conversation_id = self.conversation_id.clone();
-        let turn_id = turn_id.to_string();
+        let conversation_id = self.conversation_id.as_str();
         let message_id = uuid::Uuid::new_v4().to_string();
-        let returned = message_id.clone();
-        let content = text.to_string();
-        let queued = queued.map(str::to_string);
-        let context = context.to_vec();
+        let now = now_ms();
 
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let now = now_ms();
-            conn.transaction::<_, diesel::result::Error, _>(|conn| {
-                let head = crate::db::ops::conversation::get_conversation(conn, &conversation_id)
-                    .ok()
+        services
+            .db
+            .write(async |tx| {
+                let head = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+                    .await?
                     .and_then(|c| c.head_message_id);
+                let row = crate::db::entity::message::Model {
+                    turn_id: Some(turn_id.to_string()),
+                    ..crate::db::sea::ops::message::new_row(&message_id, conversation_id, "user", text, now)
+                };
+                crate::db::sea::ops::message::append_message(tx, row, head.as_deref()).await?;
+                crate::db::sea::ops::message_context_item::insert_prepared(tx, &message_id, context, now).await?;
 
-                crate::db::ops::message::append_message(
-                    conn,
-                    &MessageInsert {
-                        id: &message_id,
-                        conversation_id: &conversation_id,
-                        role: "user",
-                        content: &content,
-                        provider_id: None,
-                        model_id: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        sort_order: 0,
-                        created_at: now,
-                        reasoning_content: None,
-                        rating: None,
-                        schema_version: 2,
-                        is_compact_summary: 0,
-                        sender_id: None,
-                        parent_id: head.as_deref(),
-                        compact_anchor_id: None,
-                        source: None,
-                        turn_id: Some(&turn_id),
-                        tool_outcome: None,
-                        cache_read_tokens: None,
-                        cache_write_tokens: None,
-                        server_tool_calls: None,
-                        provider_name: None,
-                        response_model_id: None,
-                    },
-                    head.as_deref(),
-                )?;
-
-                let context_rows = context
-                    .iter()
-                    .enumerate()
-                    .map(
-                        |(position, item)| crate::db::models::message_context_item::MessageContextItemInsert {
-                            id: &item.id,
-                            message_id: &message_id,
-                            position: position as i32,
-                            kind: item.kind.as_str(),
-                            content: &item.content,
-                            display_path: item.display_path.as_deref(),
-                            line_start: item.line_start,
-                            line_end: item.line_end,
-                            content_hash: &item.content_hash,
-                            byte_count: item.byte_count,
-                            line_count: item.line_count,
-                            token_count: item.token_count,
-                            truncated: item.truncated,
-                            metadata: item.metadata.as_deref(),
-                            created_at: now,
-                        },
-                    )
-                    .collect::<Vec<_>>();
-                crate::db::ops::message_context_item::insert_many(conn, &context_rows)?;
-
-                crate::db::ops::turn::begin(conn, &turn_id, &conversation_id, TurnOrigin::ClaudeCode, None, now)?;
-                if let Some(queued) = &queued {
+                crate::db::sea::ops::turn::begin(tx, turn_id, conversation_id, TurnOrigin::ClaudeCode, None, now)
+                    .await?;
+                if let Some(queued) = queued {
                     // Refuses an item somebody has already taken, and rolls the
                     // whole thing back rather than writing a second row for it.
                     // The turn lease makes that all but impossible — two pumps
                     // cannot both hold the conversation — and "all but" is the
                     // wrong guarantee for a message that says "delete the old
-                    // migration".
-                    // `None`: this is a turn of its own, and with nothing
-                    // running every mode is deliverable — an `interject` left
-                    // over from a turn that has ended is still the next thing
-                    // the user meant to happen.
-                    if crate::db::ops::queue::mark_dispatched(conn, &conversation_id, queued, None, &turn_id, now)? == 0
-                    {
-                        return Err(diesel::result::Error::RollbackTransaction);
-                    }
-                    crate::db::ops::queue::mark_settled(conn, queued, Some(&message_id), now)?;
-                    crate::db::ops::queued_prompt_context_item::delete_for_queue(conn, queued)?;
+                    // migration". An `interject` left over from a turn that has
+                    // ended is still the next thing the user meant to happen.
+                    crate::db::sea::ops::queue::spend(tx, conversation_id, queued, turn_id, &message_id, now).await?;
                 }
                 Ok(())
             })
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+            .await
+            .map_err(|e: crate::db::sea::DbErr| e.to_string())?;
 
-        Ok(returned)
+        Ok(message_id)
     }
 
     /// Land the transcript and report how the turn ended.
@@ -3666,20 +3549,17 @@ impl AcpSession {
         let (status, reason, error) = incomplete_unless_whole(status, reason, error, lost, unwritten);
 
         if review_boundary.is_some() {
-            let pool = services.db.clone();
-            let id = turn_id.to_string();
-            let stored_error = error.clone();
-            let written = tokio::task::spawn_blocking(move || {
-                let mut conn = get_conn(&pool)?;
-                crate::db::ops::turn::finish_waiting_review(&mut conn, &id, status, stored_error.as_deref(), now_ms())
-                    .map_err(|error| error.to_string())
-            })
-            .await;
+            let written = services
+                .db
+                .write(async |tx| {
+                    crate::db::sea::ops::turn::finish_waiting_review(tx, turn_id, status, error.as_deref(), now_ms())
+                        .await
+                })
+                .await;
             match written {
-                Ok(Ok(1)) => {}
-                Ok(Ok(_)) => tracing::warn!(turn_id, "ACP review decision found no waiting turn to settle"),
-                Ok(Err(error)) => tracing::warn!(%error, turn_id, "could not settle ACP waiting review turn"),
-                Err(error) => tracing::warn!(%error, turn_id, "settling ACP waiting review turn panicked"),
+                Ok(1) => {}
+                Ok(_) => tracing::warn!(turn_id, "ACP review decision found no waiting turn to settle"),
+                Err(error) => tracing::warn!(%error, turn_id, "could not settle ACP waiting review turn"),
             }
         } else {
             crate::agent::turn_record::finish(&services.db, turn_id, status, error.as_deref()).await;
@@ -4136,25 +4016,32 @@ mod tests {
     /// explained goes in front of the message rather than beside it — and when
     /// there is nothing to explain, the message is passed through untouched
     /// rather than wrapped in an empty frame.
-    #[test]
-    fn what_is_owed_goes_in_front_of_the_message_and_nothing_else_does() {
+    #[tokio::test]
+    async fn what_is_owed_goes_in_front_of_the_message_and_nothing_else_does() {
         let plain = Owed::default();
         assert!(plain.is_empty());
         assert_eq!(plain.in_front_of("do the thing"), "do the thing");
 
-        let mut conn = crate::db::diesel_test_db().get().unwrap();
-        crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();
-        crate::db::ops::turn::begin(&mut conn, "dead", "c1", crate::turn::TurnOrigin::ClaudeCode, None, 1000).unwrap();
-        crate::db::ops::turn::set_phase(&mut conn, "dead", TurnPhase::RunningTool, Some("Bash"), 1001).unwrap();
+        let db = crate::db::sea::sea_test_db().await;
+        crate::db::sea::execute_for_tests(
+            &db,
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c1', 't', 0, 0)",
+        )
+        .await
+        .unwrap();
+        db.write(async |tx| {
+            use crate::db::sea::ops::turn;
+            turn::begin(tx, "dead", "c1", crate::turn::TurnOrigin::ClaudeCode, None, 1000).await?;
+            turn::set_phase(tx, "dead", TurnPhase::RunningTool, Some("Bash"), 1001).await
+        })
+        .await
+        .unwrap();
+        let coordinator = std::sync::Arc::new(crate::turn::TurnCoordinator::new());
 
         let owed = Owed {
-            turns: crate::agent::interrupted::block(
-                &mut conn,
-                &crate::turn::TurnCoordinator::new(),
-                "c1",
-                Some("asking"),
-            )
-            .unwrap(),
+            turns: crate::agent::interrupted::load_block(&db, &coordinator, "c1", "asking")
+                .await
+                .unwrap(),
             queued: None,
             shell: None,
             memory_lost: false,
@@ -4175,13 +4062,9 @@ mod tests {
         // this one says it is following none of it, which changes how the rest
         // should be read.
         let blind = Owed {
-            turns: crate::agent::interrupted::block(
-                &mut conn,
-                &crate::turn::TurnCoordinator::new(),
-                "c1",
-                Some("asking"),
-            )
-            .unwrap(),
+            turns: crate::agent::interrupted::load_block(&db, &coordinator, "c1", "asking")
+                .await
+                .unwrap(),
             queued: None,
             shell: None,
             memory_lost: true,
@@ -4548,11 +4431,11 @@ mod tests {
 
     #[test]
     fn pending_shell_context_batches_items_and_receipts_only_what_was_injected() {
-        let item = |id: &str, content: String| crate::db::models::message_context_item::MessageContextItemRow {
+        let item = |id: &str, content: String| crate::db::entity::message_context_item::Model {
             id: id.into(),
             message_id: format!("message-{id}"),
             position: 0,
-            kind: "shell_output".into(),
+            kind: crate::workspace::reference::MessageContextKind::ShellOutput,
             content,
             display_path: None,
             line_start: None,
@@ -4561,7 +4444,7 @@ mod tests {
             byte_count: 0,
             line_count: 1,
             token_count: 1,
-            truncated: 0,
+            truncated: crate::db::types::SqlBool::FALSE,
             metadata: None,
             created_at: 1,
         };
@@ -4664,8 +4547,8 @@ mod tests {
         // and `{}` left there is indistinguishable from a call that took no
         // arguments — in the transcript and in the audit copy alike.
         let stored = {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::message::list_messages(&mut conn, "c1")
+            crate::db::sea::ops::message::list_messages(&services.db, "c1")
+                .await
                 .unwrap()
                 .into_iter()
                 .filter_map(|m| m.tool_calls)
@@ -4753,11 +4636,14 @@ mod tests {
     /// out.
     pub(super) async fn live_turn(dir: &std::path::Path) -> Shared {
         let services = bare_services(dir).await;
-        {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();
-            crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).unwrap();
-        }
+        services
+            .db
+            .write(async |tx| {
+                crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("t"), None, None, 0).await?;
+                crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).await
+            })
+            .await
+            .unwrap();
         let first = begin_assistant(
             &services.db,
             "c1",
@@ -4808,6 +4694,50 @@ mod tests {
         })
     }
 
+    /// The agent names the conversation only while nobody else has: a title
+    /// the user chose is kept, the placeholder and the agent's own earlier
+    /// title are replaced.
+    #[tokio::test]
+    async fn the_agents_title_never_replaces_the_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = live_turn(dir.path()).await;
+        let sea = shared.services.db.clone();
+        let title = async || {
+            crate::db::sea::ops::conversation::get_conversation(&sea, "c1")
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+        };
+        let rename = async |to: &str| {
+            sea.write(async |tx| crate::db::sea::ops::conversation::update_title(tx, "c1", to, 5).await)
+                .await
+                .unwrap();
+        };
+
+        // `live_turn` names the conversation "t", which is nobody's placeholder.
+        shared.adopt_title("agent one".into()).await;
+        assert_eq!(title().await.as_deref(), Some("t"), "a title somebody chose is kept");
+
+        rename("").await;
+        shared.adopt_title("agent two".into()).await;
+        assert_eq!(
+            title().await.as_deref(),
+            Some("agent two"),
+            "the placeholder is replaced"
+        );
+        shared.adopt_title("agent three".into()).await;
+        assert_eq!(
+            title().await.as_deref(),
+            Some("agent three"),
+            "and so is the agent's own"
+        );
+
+        rename("mine").await;
+        shared.adopt_title("agent four".into()).await;
+        assert_eq!(title().await.as_deref(), Some("mine"), "a rename by the user stands");
+    }
+
     /// The adapter's `memory_recall`: one `tool_call`, already `completed`,
     /// never updated. Read as a bare call it was a round that could not settle,
     /// so the prose after it — the whole rest of the turn — joined the row that
@@ -4837,8 +4767,8 @@ mod tests {
             "the prose opened a round of its own"
         );
         let answered = {
-            let mut conn = shared.services.db.get().unwrap();
-            crate::db::ops::message::list_messages(&mut conn, "c1")
+            crate::db::sea::ops::message::list_messages(&shared.services.db, "c1")
+                .await
                 .unwrap()
                 .into_iter()
                 .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("M"))
@@ -5085,18 +5015,18 @@ mod unprompted {
         })
     }
 
-    fn turns(shared: &Shared) -> Vec<crate::db::models::turn::TurnRow> {
-        let mut conn = shared.services.db.get().unwrap();
-        crate::db::ops::turn::list_for_conversation(&mut conn, "c1")
+    async fn turns(shared: &Shared) -> Vec<crate::db::entity::turn::Model> {
+        crate::db::sea::ops::turn::list_for_conversation(&shared.services.db, "c1")
+            .await
             .unwrap()
             .into_iter()
             .filter(|t| t.id != "t1")
             .collect()
     }
 
-    fn rows(shared: &Shared, turn_id: &str) -> Vec<crate::db::models::message::MessageRow> {
-        let mut conn = shared.services.db.get().unwrap();
-        crate::db::ops::message::list_messages(&mut conn, "c1")
+    async fn rows(shared: &Shared, turn_id: &str) -> Vec<crate::db::entity::message::Model> {
+        crate::db::sea::ops::message::list_messages(&shared.services.db, "c1")
+            .await
             .unwrap()
             .into_iter()
             .filter(|m| m.turn_id.as_deref() == Some(turn_id))
@@ -5133,22 +5063,23 @@ mod unprompted {
         assert!(shared.with_turn(|_| ()).is_none(), "idle ends it");
         assert!(lease_is_free(&shared), "and gives the conversation back");
 
-        let turns = turns(&shared);
+        let turns = turns(&shared).await;
         assert_eq!(turns.len(), 1, "one turn for the whole cycle");
         let turn = &turns[0];
-        assert_eq!(turn.trigger, "task_completion");
+        assert_eq!(turn.trigger.as_str(), "task_completion");
         assert_eq!(
             turn.trigger_ref.as_deref(),
             Some("bg273fiw8"),
             "and it names what woke it"
         );
-        assert_eq!(turn.status, "done");
+        assert_eq!(turn.status.as_str(), "done");
         assert_eq!(
-            turn.origin, "claude_code",
+            turn.origin.as_str(),
+            "claude_code",
             "still Claude Code's turn, for billing and blame"
         );
 
-        let rows = rows(&shared, &turn.id);
+        let rows = rows(&shared, &turn.id).await;
         let assistants: Vec<_> = rows.iter().filter(|m| m.role == "assistant").collect();
         assert_eq!(assistants.len(), 2, "round by round, as a prompted turn is written");
         assert_eq!(
@@ -5225,14 +5156,14 @@ mod unprompted {
             "the card belongs to that turn"
         );
         assert_eq!(
-            turns(&shared)[0].trigger,
+            turns(&shared).await[0].trigger.as_str(),
             "agent_autonomous",
             "nothing said what woke it"
         );
 
         shared.close_unprompted(Ending::Stopped, None).await;
         asking.await.unwrap().unwrap();
-        assert_eq!(turns(&shared)[0].status, "cancelled");
+        assert_eq!(turns(&shared).await[0].status.as_str(), "cancelled");
     }
 
     /// A prompted turn's own `idle` comes after its reply, while `finish` is
@@ -5273,7 +5204,7 @@ mod unprompted {
             .unwrap();
         update(&shared, text("hello")).await;
         assert!(shared.with_turn(|_| ()).is_none());
-        assert!(turns(&shared).is_empty(), "no record of a turn that never ran");
+        assert!(turns(&shared).await.is_empty(), "no record of a turn that never ran");
         drop(held);
     }
 
@@ -5286,13 +5217,13 @@ mod unprompted {
         sdk(&shared, task_notification("bg-silent")).await;
         state(&shared, "running").await;
         state(&shared, "idle").await;
-        assert!(turns(&shared).is_empty(), "a cycle with no output is no turn");
+        assert!(turns(&shared).await.is_empty(), "a cycle with no output is no turn");
 
         update(&shared, text("something else")).await;
         state(&shared, "idle").await;
-        let turns = turns(&shared);
+        let turns = turns(&shared).await;
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].trigger, "agent_autonomous");
+        assert_eq!(turns[0].trigger.as_str(), "agent_autonomous");
         assert_eq!(turns[0].trigger_ref, None);
     }
 
@@ -5305,6 +5236,6 @@ mod unprompted {
         shared.set_replay(Replay::Discard);
         update(&shared, text("said long ago")).await;
         assert!(shared.with_turn(|_| ()).is_none());
-        assert!(turns(&shared).is_empty());
+        assert!(turns(&shared).await.is_empty());
     }
 }

@@ -120,8 +120,7 @@ mod tests {
             conversation_id: None,
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
-            sea: None,
+            db: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]
@@ -166,11 +165,11 @@ mod tests {
         use crate::db::entity::journal_version::VersionOp;
         use crate::db::sea::ops::journal as journal_ops;
         let real_b = crate::tools::verified::resolve_root(&dir.path().join("b.txt")).unwrap();
-        let file_b = journal_ops::file_by_path(&journal.sea, &crate::journal::norm_path(&real_b).unwrap())
+        let file_b = journal_ops::file_by_path(&journal.db, &crate::journal::norm_path(&real_b).unwrap())
             .await
             .unwrap()
             .expect("destination chain");
-        let chain_b = journal_ops::chain(&journal.sea, &file_b.id).await.unwrap();
+        let chain_b = journal_ops::chain(&journal.db, &file_b.id).await.unwrap();
         assert_eq!(chain_b.len(), 1);
         assert_eq!(chain_b[0].op, VersionOp::RenameTo);
         let from_id = chain_b[0]
@@ -180,11 +179,11 @@ mod tests {
 
         // The pointer names the rename_from version on the old path's chain.
         let real_a_norm = crate::journal::norm_path(&real_a).unwrap();
-        let file_a = journal_ops::file_by_path(&journal.sea, &real_a_norm)
+        let file_a = journal_ops::file_by_path(&journal.db, &real_a_norm)
             .await
             .unwrap()
             .expect("source chain");
-        let chain_a = journal_ops::chain(&journal.sea, &file_a.id).await.unwrap();
+        let chain_a = journal_ops::chain(&journal.db, &file_a.id).await.unwrap();
         assert_eq!(chain_a.len(), 1);
         assert_eq!(chain_a[0].op, VersionOp::RenameFrom);
         assert_eq!(chain_a[0].id, from_id);

@@ -214,12 +214,12 @@ fn sweep_stray_files(known: &HashSet<PathBuf>, app_data_dir: &Path) -> usize {
 mod tests {
     use super::*;
     use crate::db::entity::voice_blob::{VoiceBlobStatus, VoiceCorpusSourceType};
-    use crate::db::sea::shared_test_db;
+    use crate::db::sea::file_test_db;
 
     /// 一个数据目录、一个库文件：行和 key 都走 SeaORM。
     async fn fixture() -> (tempfile::TempDir, Db, Vec<u8>) {
         let dir = tempfile::tempdir().unwrap();
-        let (_diesel, sea) = shared_test_db(dir.path()).await;
+        let sea = file_test_db(dir.path()).await;
         let key = super::super::storage_key(&sea).await.unwrap();
         (dir, sea, key)
     }

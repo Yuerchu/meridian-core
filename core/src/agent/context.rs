@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::db::models::message::MessageRow;
-use crate::db::models::message_context_item::MessageContextItemRow;
-use crate::db::ops::message::ActiveContext;
+use crate::db::entity::message as message_entity;
+use crate::db::entity::message_context_item;
+use crate::db::sea::ops::message::ActiveContext;
 use crate::provider::{self, ChatMessage, SenderRef};
 
 use super::tokenizer::{TokenBudget, TokenCounter, TokenizerKind};
@@ -48,14 +48,14 @@ pub fn build_messages_with_senders(
 }
 
 /// Build provider history while replaying the frozen context items attached to
-/// each user row. Keeping the map separate from `MessageRow` means raw snapshots
+/// each user row. Keeping the map separate from `message_entity::Model` means raw snapshots
 /// never cross the transcript DTO or audit boundary.
 pub fn build_messages_with_context_items(
     system_prompt: &str,
     context: &ActiveContext,
     trailing: Vec<ChatMessage>,
     sender_names: &SenderNames,
-    context_items: &HashMap<String, Vec<MessageContextItemRow>>,
+    context_items: &HashMap<String, Vec<message_context_item::Model>>,
 ) -> Result<Vec<ChatMessage>, String> {
     let mut msgs = Vec::new();
     if !system_prompt.is_empty() {
@@ -135,8 +135,8 @@ pub(crate) fn sender_ref(user_id: i64, names: &SenderNames) -> SenderRef {
 /// Last known nickname per platform user, read off the subject table. Both the
 /// history replay and the live turn resolve a speaker through this one map, so
 /// the same person renders the same way on both sides of a turn boundary.
-pub fn load_sender_names(conn: &mut diesel::SqliteConnection) -> Result<SenderNames, String> {
-    let subjects = crate::db::ops::memory::list_subjects(conn).map_err(|e| e.to_string())?;
+pub async fn load_sender_names(db: &impl crate::db::sea::cap::Read) -> Result<SenderNames, crate::db::sea::DbErr> {
+    let subjects = crate::db::sea::ops::memory::list_subjects(db).await?;
     Ok(subjects
         .into_iter()
         .filter_map(|s| {
@@ -174,9 +174,9 @@ pub fn persisted_user_message(
 
 fn push_history_message(
     msgs: &mut Vec<ChatMessage>,
-    m: &MessageRow,
+    m: &message_entity::Model,
     names: &SenderNames,
-    context_items: Option<&[MessageContextItemRow]>,
+    context_items: Option<&[message_context_item::Model]>,
 ) -> Result<(), String> {
     use crate::db::models::message::MessageRole;
 
@@ -276,7 +276,7 @@ fn push_history_message(
     Ok(())
 }
 
-fn push_message_context(msgs: &mut Vec<ChatMessage>, items: &[MessageContextItemRow]) -> Result<(), String> {
+fn push_message_context(msgs: &mut Vec<ChatMessage>, items: &[message_context_item::Model]) -> Result<(), String> {
     for rendered in render_message_context_items(items)? {
         msgs.push(ChatMessage::user_provided_context(&rendered));
     }
@@ -287,32 +287,30 @@ fn push_message_context(msgs: &mut Vec<ChatMessage>, items: &[MessageContextItem
 /// history replay does. Compaction uses the same projection so a summary does
 /// not silently replace an `@` marker or `!` command with none of the evidence
 /// the original turn received.
-pub(super) fn render_message_context_items(items: &[MessageContextItemRow]) -> Result<Vec<String>, String> {
-    for item in items {
-        crate::workspace::reference::MessageContextKind::parse(&item.kind)?;
-    }
+pub(super) fn render_message_context_items(items: &[message_context_item::Model]) -> Result<Vec<String>, String> {
+    use crate::workspace::reference::MessageContextKind;
     // A shell retry stores every attempt for diagnosis, but only the final one
     // is evidence for the next model turn. File and directory references all
     // remain in request order.
     let final_shell = items
         .iter()
-        .filter(|item| item.kind == "shell_output")
+        .filter(|item| item.kind == MessageContextKind::ShellOutput)
         .max_by_key(|item| item.position)
         .map(|item| item.id.as_str());
-    items
+    Ok(items
         .iter()
-        .filter(|item| item.kind != "shell_output" || final_shell == Some(item.id.as_str()))
+        .filter(|item| item.kind != MessageContextKind::ShellOutput || final_shell == Some(item.id.as_str()))
         .map(|item| {
-            Ok(crate::workspace::reference::render_context_item(
-                crate::workspace::reference::MessageContextKind::parse(&item.kind)?,
+            crate::workspace::reference::render_context_item(
+                item.kind,
                 item.display_path.as_deref(),
                 item.line_start,
                 item.line_end,
                 &item.content,
-                item.truncated != 0,
-            ))
+                item.truncated.get(),
+            )
         })
-        .collect()
+        .collect())
 }
 
 fn has_stored_user_content(message: &ChatMessage) -> bool {
@@ -744,8 +742,8 @@ mod tests {
     use super::*;
     use provider::ToolCall;
 
-    fn msg(id: &str, role: &str, content: &str) -> MessageRow {
-        MessageRow {
+    fn msg(id: &str, role: &str, content: &str) -> message_entity::Model {
+        message_entity::Model {
             id: id.into(),
             conversation_id: "c".into(),
             role: role.into(),
@@ -761,7 +759,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -794,9 +792,13 @@ mod tests {
     }
 
     /// A linear conversation with nothing compacted — what these tests are about.
-    fn ctx(history: &[MessageRow]) -> ActiveContext {
+    fn ctx(history: &[message_entity::Model]) -> ActiveContext {
         ActiveContext {
-            path: history.iter().filter(|m| m.is_compact_summary == 0).cloned().collect(),
+            path: history
+                .iter()
+                .filter(|m| !m.is_compact_summary.get())
+                .cloned()
+                .collect(),
             summary: None,
             anchor_index: None,
             head_id: history.last().map(|m| m.id.clone()),
@@ -1316,8 +1318,8 @@ mod injected_context_tests {
     }
 
     /// A stored row carrying an injection frozen by an earlier turn.
-    fn frozen_row(content: &str, source: &str) -> MessageRow {
-        MessageRow {
+    fn frozen_row(content: &str, source: &str) -> message_entity::Model {
+        message_entity::Model {
             id: "m1".into(),
             conversation_id: "c".into(),
             role: "context".into(),
@@ -1333,7 +1335,7 @@ mod injected_context_tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -1481,11 +1483,11 @@ mod injected_context_tests {
 
     #[test]
     fn only_the_final_shell_attempt_enters_native_history() {
-        let item = |id: &str, position: i32, content: &str| MessageContextItemRow {
+        let item = |id: &str, position: i32, content: &str| crate::db::entity::message_context_item::Model {
             id: id.into(),
             message_id: "m".into(),
             position,
-            kind: "shell_output".into(),
+            kind: crate::workspace::reference::MessageContextKind::ShellOutput,
             content: content.into(),
             display_path: None,
             line_start: None,
@@ -1494,7 +1496,7 @@ mod injected_context_tests {
             byte_count: content.len() as i32,
             line_count: 1,
             token_count: 1,
-            truncated: 0,
+            truncated: crate::db::types::SqlBool::FALSE,
             metadata: None,
             created_at: 1,
         };
@@ -1597,7 +1599,7 @@ mod injected_context_tests {
     /// accumulate one copy per compaction.
     #[test]
     fn compaction_summaries_are_not_treated_as_injected() {
-        let history = [crate::db::models::message::MessageRow {
+        let history = [crate::db::entity::message::Model {
             id: "s".into(),
             conversation_id: "c".into(),
             role: "user".into(),
@@ -1613,7 +1615,7 @@ mod injected_context_tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 1,
+            is_compact_summary: crate::db::types::SqlBool::TRUE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -1629,7 +1631,7 @@ mod injected_context_tests {
             tool_diffs: None,
             response_model_id: None,
         }];
-        let context = crate::db::ops::message::ActiveContext {
+        let context = crate::db::sea::ops::message::ActiveContext {
             path: Vec::new(),
             summary: Some(history[0].clone()),
             anchor_index: None,

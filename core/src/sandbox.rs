@@ -260,22 +260,24 @@ pub enum CommandSettings {
 }
 
 impl CommandSettings {
-    /// Reads both preferences on an open connection.
+    /// Reads both preferences in one snapshot. A failed read is
+    /// `Unreadable`.
     ///
     /// `Err` is a value that *was* read and is not one of ours — an unknown
     /// shell or execution mode. That is a contract violation and fails like
     /// one, rather than becoming a question for the user: they did choose
     /// something, and it is the stored data that is wrong.
-    pub fn read_on(conn: &mut diesel::sqlite::SqliteConnection) -> Result<Self, String> {
-        let read = |conn: &mut diesel::sqlite::SqliteConnection, key: &str| {
-            crate::db::ops::preference::get_preference(conn, key)
+    pub async fn read_in(db: &impl crate::db::sea::cap::Snapshot) -> Result<Self, String> {
+        let read = async |key: &str| {
+            crate::db::sea::ops::preference::get_preference(db, key)
+                .await
                 .map_err(|error| format!("could not read the `{key}` preference: {error}"))
         };
-        let shell = match read(conn, "shell") {
+        let shell = match read("shell").await {
             Ok(value) => value,
             Err(error) => return Ok(Self::Unreadable(error)),
         };
-        let mode = match read(conn, "sandbox.enabled") {
+        let mode = match read("sandbox.enabled").await {
             Ok(value) => value,
             Err(error) => return Ok(Self::Unreadable(error)),
         };
@@ -288,11 +290,14 @@ impl CommandSettings {
         })
     }
 
-    /// Reads both preferences, counting a pool that cannot hand out a
-    /// connection as a failed read. Blocking.
-    pub fn read(pool: &crate::db::DbPool) -> Result<Self, String> {
-        match pool.get() {
-            Ok(mut conn) => Self::read_on(&mut conn),
+    /// [`read_in`](Self::read_in) in a read of its own, counting a database
+    /// that cannot open one as a failed read.
+    pub async fn load(db: &crate::db::sea::cap::Db) -> Result<Self, String> {
+        match db
+            .read(async |tx| Ok::<_, crate::db::sea::DbErr>(Self::read_in(tx).await))
+            .await
+        {
+            Ok(settings) => settings,
             Err(error) => Ok(Self::Unreadable(format!(
                 "could not open the database to read the shell and sandbox preferences: {error}"
             ))),
@@ -1519,18 +1524,19 @@ mod tests {
     /// commands on the host.
     mod command_settings {
         use super::super::*;
-        use diesel::RunQueryDsl;
+        use crate::db::sea::cap::Db;
 
-        fn set(pool: &crate::db::DbPool, key: &str, value: &str) {
-            let mut conn = pool.get().unwrap();
-            crate::db::ops::preference::set_preference(&mut conn, key, value, 1).unwrap();
+        async fn set(db: &Db, key: &str, value: &str) {
+            db.write(async |tx| crate::db::sea::ops::preference::set_preference(tx, key, value, 1).await)
+                .await
+                .unwrap();
         }
 
-        #[test]
-        fn absent_preferences_are_the_documented_defaults() {
-            let pool = crate::db::diesel_test_db();
+        #[tokio::test]
+        async fn absent_preferences_are_the_documented_defaults() {
+            let db = crate::db::sea::sea_test_db().await;
             assert_eq!(
-                CommandSettings::read(&pool),
+                CommandSettings::load(&db).await,
                 Ok(CommandSettings::Read {
                     shell: crate::tools::ShellType::default_for_platform(),
                     mode: ExecutionMode::Auto,
@@ -1538,13 +1544,13 @@ mod tests {
             );
         }
 
-        #[test]
-        fn stored_preferences_are_read_as_stored() {
-            let pool = crate::db::diesel_test_db();
-            set(&pool, "shell", "powershell");
-            set(&pool, "sandbox.enabled", "container");
+        #[tokio::test]
+        async fn stored_preferences_are_read_as_stored() {
+            let db = crate::db::sea::sea_test_db().await;
+            set(&db, "shell", "powershell").await;
+            set(&db, "sandbox.enabled", "container").await;
             assert_eq!(
-                CommandSettings::read(&pool),
+                CommandSettings::load(&db).await,
                 Ok(CommandSettings::Read {
                     shell: crate::tools::ShellType::PowerShell,
                     mode: ExecutionMode::Container,
@@ -1555,15 +1561,15 @@ mod tests {
         /// **The defect.** A database that fails to answer is not a user who
         /// chose nothing; it becomes `Unreadable` carrying the error, never
         /// `Read { mode: Auto }`.
-        #[test]
-        fn a_failed_read_is_unreadable_and_never_the_default() {
-            let pool = crate::db::diesel_test_db();
-            set(&pool, "sandbox.enabled", "container");
-            diesel::sql_query("DROP TABLE preferences")
-                .execute(&mut pool.get().unwrap())
+        #[tokio::test]
+        async fn a_failed_read_is_unreadable_and_never_the_default() {
+            let db = crate::db::sea::sea_test_db().await;
+            set(&db, "sandbox.enabled", "container").await;
+            crate::db::sea::execute_for_tests(&db, "DROP TABLE preferences")
+                .await
                 .unwrap();
 
-            match CommandSettings::read(&pool) {
+            match CommandSettings::load(&db).await {
                 Ok(CommandSettings::Unreadable(error)) => {
                     assert!(error.contains("preference"), "{error}");
                 }
@@ -1571,31 +1577,29 @@ mod tests {
             }
         }
 
-        /// A pool with no connection to give is the other realistic cause,
-        /// and gets the same answer.
-        #[test]
-        fn a_pool_that_cannot_hand_out_a_connection_is_unreadable() {
-            let manager = diesel::r2d2::ConnectionManager::<diesel::sqlite::SqliteConnection>::new(":memory:");
-            let pool = diesel::r2d2::Pool::builder()
-                .max_size(1)
-                .connection_timeout(Duration::from_millis(50))
-                .build(manager)
+        /// A database that will not open a read is the other realistic
+        /// cause, and gets the same answer. Asked from inside a read on the
+        /// same task, the second read is refused at once.
+        #[tokio::test]
+        async fn a_database_that_cannot_open_a_read_is_unreadable() {
+            let db = crate::db::sea::sea_test_db().await;
+            let settings = db
+                .read(async |_tx| Ok::<_, crate::db::sea::DbErr>(CommandSettings::load(&db).await))
+                .await
                 .unwrap();
-            let _held = pool.get().unwrap();
-
             assert!(
-                matches!(CommandSettings::read(&pool), Ok(CommandSettings::Unreadable(_))),
-                "an exhausted pool must not read as unset"
+                matches!(settings, Ok(CommandSettings::Unreadable(_))),
+                "a database that cannot answer must not read as unset: {settings:?}"
             );
         }
 
         /// A value that *was* read and is not ours is a broken contract, not a
         /// question for the user: they chose something, and the data is wrong.
-        #[test]
-        fn a_stored_value_that_is_not_ours_fails_loudly() {
-            let pool = crate::db::diesel_test_db();
-            set(&pool, "sandbox.enabled", "docker");
-            assert!(CommandSettings::read(&pool).is_err());
+        #[tokio::test]
+        async fn a_stored_value_that_is_not_ours_fails_loudly() {
+            let db = crate::db::sea::sea_test_db().await;
+            set(&db, "sandbox.enabled", "docker").await;
+            assert!(CommandSettings::load(&db).await.is_err());
         }
 
         /// Unreadable goes through resolution untouched: no mode is picked,

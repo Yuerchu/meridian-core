@@ -17,23 +17,21 @@
 
 use std::sync::Arc;
 
-use diesel::Connection;
 use hyper::StatusCode;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::engine::{self, ApprovalDecision, Approvals};
 use crate::agent::turn_record;
-use crate::db;
-use crate::db::DbPool;
-use crate::db::models::assistant::AssistantRow;
-use crate::db::models::conversation::ConversationInsert;
-use crate::db::models::message::MessageInsert;
+use crate::db::entity::{assistant, conversation};
 use crate::db::models::turn::TurnStatus;
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops as sea_ops;
 use crate::events::ChatStreamEvent;
 use crate::provider::ToolCall;
 use crate::tools::{FileAccess, ShellType, ToolContext};
 use crate::turn::TurnOrigin;
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 use super::SharedState;
 use super::protocol::{Kind, ReviewJob, ReviewResponse};
@@ -169,7 +167,7 @@ pub(crate) async fn run(state: Arc<SharedState>, job: ReviewJob) -> Result<Revie
     // Nothing to undo on failure: the id was never handed out, so the client
     // still holds whatever it held before and the next round validates it the
     // same way. A half-written conversation is caught by the transaction.
-    let user_message_id = write_round(state, &conversation_id, &turn_id, &job, &assistant, is_new)
+    let user_message_id = write_round(&state.services.db, &conversation_id, &turn_id, &job, &assistant, is_new)
         .await
         .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -249,7 +247,7 @@ async fn effective_assistant(
     model: &str,
     cwd: &str,
     job: &ReviewJob,
-) -> Result<AssistantRow, Refused> {
+) -> Result<assistant::Model, Refused> {
     let (provider_id, model_id) = model.split_once(':').ok_or_else(|| {
         refuse(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -257,19 +255,17 @@ async fn effective_assistant(
         )
     })?;
 
-    let pool = state.services.db.clone();
-    let wanted = state.config.assistant_id.clone();
-    let base = tokio::task::spawn_blocking(move || -> Result<AssistantRow, String> {
-        let mut conn = get_conn(&pool)?;
-        match wanted {
-            Some(id) => db::ops::assistant::get_assistant(&mut conn, &id).map_err(|e| e.to_string()),
-            None => db::ops::assistant::get_default_assistant(&mut conn)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "there is no assistant to base the review on".to_string()),
-        }
-    })
-    .await
-    .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    let sea = &state.services.db;
+    let base = match state.config.assistant_id.as_deref() {
+        Some(id) => sea_ops::assistant::get_assistant(sea, id)
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|found| found.ok_or_else(|| format!("assistant `{id}` not found"))),
+        None => sea_ops::assistant::get_default_assistant(sea)
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|found| found.ok_or_else(|| "there is no assistant to base the review on".to_string())),
+    }
     .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
 
     // What the client says it will allow, not what we would allow: it is the
@@ -282,55 +278,49 @@ async fn effective_assistant(
         Kind::Plan => verdict::prompt(cwd, round, max_rounds, job.stagnant, &tools),
         Kind::Implementation => verdict::implementation_prompt(cwd, round, max_rounds, job.stagnant, &tools),
     };
-    Ok(AssistantRow {
+    Ok(assistant::Model {
         provider_id: Some(provider_id.to_string()),
         model_id: Some(model_id.to_string()),
         context_limit: 0,
         max_tokens: None,
         tool_preset_id: None,
-        enabled_tools: serde_json::to_string(&tools).ok(),
+        enabled_tools: Some(crate::db::types::Json(
+            tools.iter().map(|name| name.to_string()).collect(),
+        )),
         system_prompt,
         ..base
     })
 }
 
-async fn resolve_params(state: &SharedState, assistant: &AssistantRow) -> Result<crate::agent::TurnParams, Refused> {
-    let pool = state.services.db.clone();
-    let secrets = state.services.secrets.clone();
-    let a = assistant.clone();
-    let resolved = {
-        let pool = pool.clone();
-        tokio::task::spawn_blocking(move || crate::agent::resolve_with_overrides(&secrets, &pool, Some(&a), None, None))
+async fn resolve_params(
+    state: &SharedState,
+    assistant: &assistant::Model,
+) -> Result<crate::agent::TurnParams, Refused> {
+    let resolved =
+        crate::agent::resolve_with_overrides(&state.services.secrets, &state.services.db, Some(assistant), None, None)
             .await
-            .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?
-    };
+            .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
 
-    let assistant = assistant.clone();
-    let provider_id = assistant.provider_id.clone();
     // A missing `model_configs` row is an error rather than a fallback: this
     // project's rule is that turn parameters are configured, never invented.
-    let mut params = tokio::task::spawn_blocking(move || {
-        crate::agent::resolve_turn_params(
-            &pool,
-            crate::agent::TurnParamsResolveRequest {
-                assistant: Some(&assistant),
-                provider_id: provider_id.as_deref(),
-                provider_type: &resolved.provider_type,
-                api_format: &resolved.api_format,
+    let mut params = crate::agent::resolve_turn_params(
+        &state.services.db,
+        crate::agent::TurnParamsResolveRequest {
+            assistant: Some(assistant),
+            provider_id: assistant.provider_id.as_deref(),
+            provider_type: &resolved.provider_type,
+            api_format: &resolved.api_format,
 
-                transport_profile: &resolved.transport_profile,
-                codex_request_shape: resolved.codex_request_shape,
-                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
-                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Hook,
-                model: &resolved.model,
-                thinking_level: None,
-                fast: false,
-            },
-        )
-    })
+            transport_profile: &resolved.transport_profile,
+            codex_request_shape: resolved.codex_request_shape,
+            codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Review,
+            codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Hook,
+            model: &resolved.model,
+            thinking_level: None,
+            fast: false,
+        },
+    )
     .await
-    .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
 
     // `max_tokens` here is the model's own maximum, not the baseline assistant's
@@ -363,29 +353,23 @@ async fn resolve_params(state: &SharedState, assistant: &AssistantRow) -> Result
 /// caller could name one of the user's own conversations and have the reviewer
 /// append to it. So the row has to exist *and* be one this feature created.
 /// Anything else is treated as if no id had been sent at all.
-/// Takes the pool rather than the whole `SharedState` because that is all it
+/// Takes the database rather than the whole `SharedState` because that is all it
 /// uses — and because the wider signature was the entire reason this went
 /// untested: standing up `secrets`/`tools`/`mcp`/`coordinator` to check one
 /// boolean is enough friction that nobody does it. Never returns an error:
 /// an id it cannot vouch for means "open a new one", not "refuse the request".
-async fn open_or_reuse(pool: &DbPool, job: &ReviewJob) -> (String, bool) {
+async fn open_or_reuse(db: &Db, job: &ReviewJob) -> (String, bool) {
     if let Some(claimed) = job.conversation_id.clone().filter(|id| !id.trim().is_empty()) {
-        let pool = pool.clone();
-        let id = claimed.clone();
         // Matched against *this* kind, so the two gates cannot be handed each
         // other's transcripts: an implementation review continuing in a plan
         // review's conversation would inherit an intention it was meant to
         // judge without.
         let wanted = job.kind.agent_kind();
-        let ours = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool).ok()?;
-            let conversation = db::ops::conversation::get_conversation(&mut conn, &id).ok()?;
-            Some(conversation.agent_kind.as_deref() == Some(wanted))
-        })
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(false);
+        let ours = sea_ops::conversation::get_conversation(db, &claimed)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|conversation| conversation.agent_kind.as_deref() == Some(wanted));
 
         if ours {
             return (claimed, false);
@@ -410,16 +394,13 @@ async fn open_or_reuse(pool: &DbPool, job: &ReviewJob) -> (String, bool) {
 /// startup reconciliation cannot see; a turn row without its conversation is a
 /// report about somewhere the user cannot go.
 async fn write_round(
-    state: &SharedState,
+    db: &Db,
     conversation_id: &str,
     turn_id: &str,
     job: &ReviewJob,
-    assistant: &AssistantRow,
+    assistant: &assistant::Model,
     is_new: bool,
 ) -> Result<String, String> {
-    let pool = state.services.db.clone();
-    let conversation_id = conversation_id.to_string();
-    let turn_id = turn_id.to_string();
     let message_id = uuid::Uuid::new_v4().to_string();
     let returned = message_id.clone();
     let prompt = round_prompt(job);
@@ -431,113 +412,58 @@ async fn write_round(
         Kind::Plan => TurnOrigin::PlanReview,
         Kind::Implementation => TurnOrigin::ImplReview,
     };
-    let cwd = job.cwd.clone();
-    let (assistant_id, provider_id, model_id) = (
-        assistant.id.clone(),
-        assistant.provider_id.clone(),
-        assistant.model_id.clone(),
-    );
+    let cwd = job.cwd.as_str();
 
-    tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        let now = now_ms();
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            // File the review under the project that owns this directory, when
-            // there is one. Two reasons, and the second is the load-bearing one:
-            // otherwise every repository's reviews pile into the ungrouped list,
-            // and — because a desktop turn takes its working directory from
-            // `conversation.project_id -> project.path` (`chat.rs:380`) — a
-            // conversation with no project has no working directory the moment
-            // anyone types into it. The review sets its own root out of band, so
-            // without this the transcript is only readable, not continuable.
-            //
-            // No project for this path just means null, as before. Inventing one
-            // would put a row in a list the user curates.
-            let project_id = if is_new {
-                db::ops::project::find_project_by_path(conn, &cwd)?.map(|p| p.id)
-            } else {
-                None
-            };
-
-            if is_new {
-                db::ops::conversation::insert(
-                    conn,
-                    ConversationInsert {
-                        id: &conversation_id,
-                        title: Some(&title),
-                        assistant_id: Some(&assistant_id),
-                        is_pinned: 0,
-                        is_archived: 0,
-                        created_at: now,
-                        updated_at: now,
-                        project_id: project_id.as_deref(),
-                        // Left null on purpose: a review is meant to be visible
-                        // in the sidebar. `parent_conversation_id` is what hides
-                        // a sub-agent's transcript, and hiding this one would
-                        // put the reviewer's reasoning somewhere with no way in.
-                        parent_conversation_id: None,
-                        spawned_by_message_id: None,
-                        spawned_by_call_id: None,
-                        spawned_turn_id: None,
-                        agent_kind: Some(agent_kind),
-                        agent_provider_id: provider_id.as_deref(),
-                        agent_model_id: model_id.as_deref(),
-                    },
-                )?;
-            }
-
-            let head = if is_new {
-                None
-            } else {
-                db::ops::conversation::get_conversation(conn, &conversation_id)
-                    .ok()
-                    .and_then(|c| c.head_message_id)
-            };
-
-            db::ops::message::append_message(
-                conn,
-                &MessageInsert {
-                    id: &message_id,
-                    conversation_id: &conversation_id,
-                    role: "user",
-                    content: &prompt,
-                    provider_id: None,
-                    model_id: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    sort_order: 0,
-                    created_at: now,
-                    reasoning_content: None,
-                    rating: None,
-                    schema_version: 2,
-                    is_compact_summary: 0,
-                    sender_id: None,
-                    parent_id: head.as_deref(),
-                    compact_anchor_id: None,
-                    source: None,
-                    turn_id: Some(&turn_id),
-                    tool_outcome: None,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
-                    server_tool_calls: None,
-                    provider_name: None,
-                    response_model_id: None,
+    let now = now_ms();
+    db.write(async |tx| {
+        // File the review under the project that owns this directory, when
+        // there is one. Two reasons, and the second is the load-bearing one:
+        // otherwise every repository's reviews pile into the ungrouped list,
+        // and — because a desktop turn takes its working directory from
+        // `conversation.project_id -> project.path` — a conversation with no
+        // project has no working directory the moment anyone types into it.
+        // The review sets its own root out of band, so without this the
+        // transcript is only readable, not continuable.
+        //
+        // No project for this path just means null, as before. Inventing one
+        // would put a row in a list the user curates.
+        let head = if is_new {
+            let project_id = sea_ops::project::find_project_by_path(tx, cwd).await?.map(|p| p.id);
+            sea_ops::conversation::insert(
+                tx,
+                conversation::Model {
+                    title: Some(title),
+                    assistant_id: Some(assistant.id.clone()),
+                    project_id,
+                    // Left null on purpose: a review is meant to be visible
+                    // in the sidebar. `parent_conversation_id` is what hides
+                    // a sub-agent's transcript, and hiding this one would
+                    // put the reviewer's reasoning somewhere with no way in.
+                    parent_conversation_id: None,
+                    agent_kind: Some(agent_kind.to_string()),
+                    agent_provider_id: assistant.provider_id.clone(),
+                    agent_model_id: assistant.model_id.clone(),
+                    ..sea_ops::conversation::new_row(conversation_id, now)
                 },
-                None,
-            )?;
+            )
+            .await?;
+            None
+        } else {
+            sea_ops::conversation::get_conversation(tx, conversation_id)
+                .await?
+                .and_then(|c| c.head_message_id)
+        };
 
-            // The synchronous op rather than `turn_record::begin`: that one
-            // opens its own blocking task and so its own connection, which
-            // would put this row outside the transaction the other two are in.
-            db::ops::turn::begin(conn, &turn_id, &conversation_id, origin, None, now)?;
-            Ok(())
-        })
-        .map_err(|e| e.to_string())
+        let row = crate::db::entity::message::Model {
+            turn_id: Some(turn_id.to_string()),
+            ..sea_ops::message::new_row(&message_id, conversation_id, "user", &prompt, now)
+        };
+        sea_ops::message::append_message(tx, row, head.as_deref()).await?;
+        sea_ops::turn::begin(tx, turn_id, conversation_id, origin, None, now).await?;
+        Ok::<_, DbErr>(())
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())?;
 
     Ok(returned)
 }
@@ -582,7 +508,7 @@ fn round_prompt(job: &ReviewJob) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn run_turn(
     state: &SharedState,
-    assistant: &AssistantRow,
+    assistant: &assistant::Model,
     params: &crate::agent::TurnParams,
     conversation_id: &str,
     turn_id: &str,
@@ -619,13 +545,7 @@ async fn run_turn(
     );
     budget.update_estimate(&chat_messages);
 
-    let tool_secrets = {
-        let pool = state.services.db.clone();
-        let secrets = state.services.secrets.clone();
-        tokio::task::spawn_blocking(move || crate::agent::build_tool_secrets(&secrets, &pool))
-            .await
-            .unwrap_or_default()
-    };
+    let tool_secrets = crate::agent::build_tool_secrets(&state.services.secrets, &state.services.db).await;
 
     let tool_context = ToolContext {
         // The one field the whole review depends on. See the module header.
@@ -636,8 +556,7 @@ async fn run_turn(
         conversation_id: Some(conversation_id.to_string()),
         turn_id: Some(turn_id.to_string()),
         assistant_id: Some(assistant.id.clone()),
-        db_pool: Some(state.services.db.clone()),
-        sea: Some(state.services.sea.clone()),
+        db: Some(state.services.db.clone()),
         #[cfg(not(target_os = "android"))]
         sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
         #[cfg(not(target_os = "android"))]
@@ -694,7 +613,7 @@ async fn run_turn(
     };
 
     let services = engine::TurnServices {
-        pool: &state.services.db,
+        db: &state.services.db,
         tools: &state.services.tools,
         mcp: &state.services.mcp,
         redaction: &state.services.redaction,
@@ -715,32 +634,34 @@ async fn run_turn(
     }
 }
 
-async fn load_history(state: &SharedState, conversation_id: &str) -> db::ops::message::ActiveContext {
-    let pool = state.services.db.clone();
-    let id = conversation_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool).ok()?;
-        let conversation = db::ops::conversation::get_conversation(&mut conn, &id).ok()?;
-        let messages = db::ops::message::list_messages(&mut conn, &id).ok()?;
-        Some(db::ops::message::active_context(
-            &messages,
-            conversation.head_message_id.as_deref(),
-        ))
-    })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(db::ops::message::ActiveContext {
-        path: Vec::new(),
-        summary: None,
-        anchor_index: None,
-        head_id: None,
-    })
+async fn load_history(state: &SharedState, conversation_id: &str) -> sea_ops::message::ActiveContext {
+    state
+        .services
+        .db
+        .read(async |tx| {
+            let Some(conversation) = sea_ops::conversation::get_conversation(tx, conversation_id).await? else {
+                return Ok(None);
+            };
+            let messages = sea_ops::message::list_messages(tx, conversation_id).await?;
+            Ok::<_, DbErr>(Some(sea_ops::message::active_context(
+                &messages,
+                conversation.head_message_id.as_deref(),
+            )))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(sea_ops::message::ActiveContext {
+            path: Vec::new(),
+            summary: None,
+            anchor_index: None,
+            head_id: None,
+        })
 }
 
 async fn build_config(
     state: &SharedState,
-    assistant: &AssistantRow,
+    assistant: &assistant::Model,
     conversation_id: &str,
     params: &crate::agent::TurnParams,
 ) -> Result<crate::agent::turn_config::TurnConfig, String> {
@@ -763,28 +684,16 @@ async fn build_config(
         // No shell either — see `hook-gates.md`.
         command_shell: None,
     };
-    let pool = state.services.db.clone();
-    let tools = state.services.tools.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = get_conn(&pool)?;
-        crate::agent::turn_config::resolve(&mut conn, &tools, input)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    crate::agent::turn_config::resolve_on(&state.services.db, &state.services.tools, input).await
 }
 
 async fn build_provider(
     state: &SharedState,
-    assistant: &AssistantRow,
+    assistant: &assistant::Model,
 ) -> Result<(Box<dyn crate::provider::ChatProvider>, crate::agent::ResolvedProvider), String> {
-    let pool = state.services.db.clone();
-    let secrets = state.services.secrets.clone();
-    let a = assistant.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        crate::agent::resolve_with_overrides(&secrets, &pool, Some(&a), None, None)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let resolved =
+        crate::agent::resolve_with_overrides(&state.services.secrets, &state.services.db, Some(assistant), None, None)
+            .await?;
     let provider = crate::provider::registry::create_provider(resolved.wire())?;
     Ok((provider, resolved))
 }
@@ -810,29 +719,50 @@ mod tests {
 
     /// A conversation row with a chosen `agent_kind`, which the convenience
     /// helper `create_conversation` cannot set.
-    fn conversation(pool: &DbPool, id: &str, agent_kind: Option<&str>) {
-        let mut conn = pool.get().unwrap();
-        db::ops::conversation::insert(
-            &mut conn,
-            ConversationInsert {
-                id,
-                title: Some("t"),
-                assistant_id: None,
-                is_pinned: 0,
-                is_archived: 0,
-                created_at: 1,
-                updated_at: 1,
-                project_id: None,
-                parent_conversation_id: None,
-                spawned_by_message_id: None,
-                spawned_by_call_id: None,
-                spawned_turn_id: None,
-                agent_kind,
-                agent_provider_id: None,
-                agent_model_id: None,
-            },
-        )
-        .unwrap();
+    async fn conversation(db: &Db, id: &str, agent_kind: Option<&str>) {
+        let row = conversation::Model {
+            title: Some("t".into()),
+            agent_kind: agent_kind.map(str::to_owned),
+            ..sea_ops::conversation::new_row(id, 1)
+        };
+        db.write(async |tx| sea_ops::conversation::insert(tx, row).await)
+            .await
+            .unwrap();
+    }
+
+    /// A later round is written under the earlier one, so the reviewer's
+    /// transcript is one path. The row used to name the head in its own
+    /// `parent_id` while `append_message` was handed `None`, and the
+    /// parameter won: every round after the first started a new root, and
+    /// the active path held only the latest round.
+    #[tokio::test]
+    async fn a_later_round_continues_the_earlier_one() {
+        let db = crate::db::sea::sea_test_db().await;
+        let reviewer = sea_ops::assistant::tests::assistant_row("a1", 0);
+        db.write(async |tx| sea_ops::assistant::create_assistant(tx, reviewer.clone()).await)
+            .await
+            .unwrap();
+        let first = job(Kind::Plan, 1, vec![]);
+        let one = write_round(&db, "rev", "t1", &first, &reviewer, true).await.unwrap();
+        db.write(async |tx| sea_ops::turn::finish(tx, "t1", TurnStatus::Done, None, 2).await)
+            .await
+            .unwrap();
+        let two = write_round(&db, "rev", "t2", &job(Kind::Plan, 2, vec![]), &reviewer, false)
+            .await
+            .unwrap();
+
+        let second = sea_ops::message::get_message(&db, &two).await.unwrap().unwrap();
+        assert_eq!(second.parent_id.as_deref(), Some(one.as_str()));
+        let conversation = sea_ops::conversation::get_conversation(&db, "rev")
+            .await
+            .unwrap()
+            .unwrap();
+        let history = sea_ops::message::list_messages(&db, "rev").await.unwrap();
+        let path = sea_ops::message::active_context(&history, conversation.head_message_id.as_deref()).path;
+        assert_eq!(
+            path.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            [one.as_str(), two.as_str()]
+        );
     }
 
     fn claiming(id: Option<&str>) -> ReviewJob {
@@ -848,30 +778,30 @@ mod tests {
     /// conversations would get the reviewer to append to it.
     #[tokio::test]
     async fn a_users_own_conversation_is_never_written_to() {
-        let pool = crate::db::diesel_test_db();
-        conversation(&pool, "private", None);
+        let db = crate::db::sea::sea_test_db().await;
+        conversation(&db, "private", None).await;
 
-        let (id, is_new) = open_or_reuse(&pool, &claiming(Some("private"))).await;
+        let (id, is_new) = open_or_reuse(&db, &claiming(Some("private"))).await;
         assert_ne!(id, "private", "must not write into a conversation that is not ours");
         assert!(is_new);
     }
 
     #[tokio::test]
     async fn a_sub_agent_conversation_is_not_ours_either() {
-        let pool = crate::db::diesel_test_db();
-        conversation(&pool, "delegated", Some("sub_agent"));
+        let db = crate::db::sea::sea_test_db().await;
+        conversation(&db, "delegated", Some("sub_agent")).await;
 
-        let (id, is_new) = open_or_reuse(&pool, &claiming(Some("delegated"))).await;
+        let (id, is_new) = open_or_reuse(&db, &claiming(Some("delegated"))).await;
         assert_ne!(id, "delegated");
         assert!(is_new);
     }
 
     #[tokio::test]
     async fn a_plan_review_conversation_is_reused() {
-        let pool = crate::db::diesel_test_db();
-        conversation(&pool, "ours", Some(Kind::Plan.agent_kind()));
+        let db = crate::db::sea::sea_test_db().await;
+        conversation(&db, "ours", Some(Kind::Plan.agent_kind())).await;
 
-        let (id, is_new) = open_or_reuse(&pool, &claiming(Some("ours"))).await;
+        let (id, is_new) = open_or_reuse(&db, &claiming(Some("ours"))).await;
         assert_eq!(id, "ours");
         assert!(!is_new, "an existing conversation must not be written again");
     }
@@ -882,14 +812,14 @@ mod tests {
     /// exactly the independence the split was for.
     #[tokio::test]
     async fn the_two_gates_do_not_share_a_conversation() {
-        let pool = crate::db::diesel_test_db();
-        conversation(&pool, "planning", Some(Kind::Plan.agent_kind()));
+        let db = crate::db::sea::sea_test_db().await;
+        conversation(&db, "planning", Some(Kind::Plan.agent_kind())).await;
 
         let asking = ReviewJob {
             conversation_id: Some("planning".into()),
             ..job(Kind::Implementation, 1, vec![])
         };
-        let (id, is_new) = open_or_reuse(&pool, &asking).await;
+        let (id, is_new) = open_or_reuse(&db, &asking).await;
         assert_ne!(id, "planning");
         assert!(is_new);
     }
@@ -899,17 +829,17 @@ mod tests {
     /// beats no review.
     #[tokio::test]
     async fn an_unknown_id_opens_a_new_conversation() {
-        let pool = crate::db::diesel_test_db();
-        let (id, is_new) = open_or_reuse(&pool, &claiming(Some("gone"))).await;
+        let db = crate::db::sea::sea_test_db().await;
+        let (id, is_new) = open_or_reuse(&db, &claiming(Some("gone"))).await;
         assert_ne!(id, "gone");
         assert!(is_new);
     }
 
     #[tokio::test]
     async fn nothing_claimed_opens_a_new_conversation() {
-        let pool = crate::db::diesel_test_db();
+        let db = crate::db::sea::sea_test_db().await;
         for claimed in [None, Some(""), Some("   ")] {
-            let (id, is_new) = open_or_reuse(&pool, &claiming(claimed)).await;
+            let (id, is_new) = open_or_reuse(&db, &claiming(claimed)).await;
             assert!(!id.is_empty());
             assert!(is_new, "claimed = {claimed:?}");
         }

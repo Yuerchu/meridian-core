@@ -507,7 +507,7 @@ fn like_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::db::sea::cap::Db;
-    use crate::db::sea::{sea_test_db, shared_test_db};
+    use crate::db::sea::{file_test_db, sea_test_db};
     use crate::journal::blobs::StoredBlob;
 
     fn blob(content: &str) -> StoredBlob {
@@ -649,7 +649,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_appends_do_not_collide_on_seq() {
         let dir = tempfile::tempdir().unwrap();
-        let (_diesel, db) = shared_test_db(dir.path()).await;
+        let db = file_test_db(dir.path()).await;
         let a = blob("v1");
         append(&db, "c:/p/a.rs", None, Some(&a), Some("conv"), 1).await;
 

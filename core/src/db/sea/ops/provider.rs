@@ -1,10 +1,5 @@
 //! Reading and writing `providers`.
 //!
-//! The shell's provider commands run on these; the provider reads inside
-//! core's Diesel work (turn configuration, the sub-agent catalog, balance
-//! notifications, first-run seeding, meridiand) still use `db::ops::provider`,
-//! and the pairs are listed in `docs/dual-impl.md`.
-//!
 //! No function here opens a transaction of its own: a write takes the caller's
 //! `WriteTx`, and the caller's `Db::write` is the `BEGIN IMMEDIATE`.
 

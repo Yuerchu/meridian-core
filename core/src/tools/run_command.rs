@@ -381,8 +381,7 @@ mod tests {
             conversation_id: Some("c-1".into()),
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
-            sea: None,
+            db: None,
             sandbox_policy: crate::sandbox::CommandSandbox::Unreadable("database is locked".into()),
             #[cfg(not(target_os = "android"))]
             background: None,
@@ -480,8 +479,7 @@ mod tests {
             conversation_id: Some("c-1".into()),
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
-            sea: None,
+            db: None,
             sandbox_policy: crate::sandbox::CommandSandbox::Resolved(Some(crate::sandbox::SandboxPolicy {
                 project_dir: Some(std::path::PathBuf::from("/the/project")),
                 backend: SandboxBackend::Container,
@@ -541,7 +539,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let services = crate::services::bare_services(dir.path()).await;
         crate::db::sea::execute_for_tests(
-            &services.sea,
+            &services.db,
             "INSERT INTO conversations (id, title, is_pinned, is_archived, message_count, created_at, updated_at, fast_mode)
              VALUES ('c-1', 't', 0, 0, 0, 0, 0, 0)",
         )

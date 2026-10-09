@@ -31,25 +31,24 @@ mod schema_drift;
 use std::path::Path;
 use std::time::Duration;
 
+use sea_orm::SqlxSqliteConnector;
 /// The error every op answers with, re-exported so a caller that does not
 /// depend on sea-orm itself (the shell) can name it — as the return type of a
 /// function it runs inside `Db::read` or `Db::write`.
-pub use sea_orm::DbErr;
-use sea_orm::SqlxSqliteConnector;
+pub use sea_orm::{DbErr, SqlErr};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Connection};
 
 use self::cap::Db;
 use super::{BUSY_TIMEOUT_MS, POOL_ACQUIRE_TIMEOUT};
 
-/// The figures the Diesel pool uses (`max_size(5)`, see `init_db` for why that
-/// number has no measurement behind it yet). Built by hand rather than through
-/// `Database::connect`, which caps an SQLite pool at one connection unless told
-/// otherwise.
+/// Five connections: a capacity figure with no measurement behind it yet, and
+/// the acquire timeout is what turns exhaustion into a visible, logged failure.
+/// Built by hand rather than through `Database::connect`, which caps an SQLite
+/// pool at one connection unless told otherwise.
 const MAX_CONNECTIONS: u32 = 5;
 
-/// Pragmas sqlx applies to every connection it opens, which is what Diesel's
-/// `ConnectionCustomizer` does by hand: `busy_timeout` first, so a connection
+/// Pragmas sqlx applies to every connection it opens: `busy_timeout` first, so a connection
 /// meeting a held lock waits instead of failing on the spot, and foreign keys
 /// on, because SQLite leaves them off per connection.
 ///
@@ -71,7 +70,7 @@ fn connection_error(error: sqlx::Error) -> DbErr {
 /// Opens the database file as the SeaORM pool. Migrations are not run here:
 /// `bridge::migrate_file` does that first, on a connection of its own.
 ///
-/// WAL is set once, on a connection of its own, as `init_db` does, and the
+/// WAL is set once, on a connection of its own, and the
 /// pool's connections do not ask for it. The mode is stored in the file and
 /// every later connection inherits it. Asking again on each new connection is
 /// a no-op while the file is WAL, and the file cannot leave WAL while any
@@ -138,17 +137,16 @@ pub async fn memory_connection() -> sea_orm::DatabaseConnection {
     SqlxSqliteConnector::from_sqlx_sqlite_pool(pool)
 }
 
-/// One migrated file in `dir`, open through both pools, for tests that need a
-/// Diesel transaction and a SeaORM one to meet on the same database.
+/// One migrated file in `dir`, opened through the production pool: for tests
+/// that need several connections at once (races, locks), which the
+/// single-connection `sea_test_db` cannot give.
 #[cfg(any(test, feature = "test-support"))]
-pub async fn shared_test_db(dir: &Path) -> (super::DbPool, Db) {
+pub async fn file_test_db(dir: &Path) -> Db {
     let path = dir.join("shared.sqlite");
     bridge::migrate_file(&path)
         .await
-        .expect("failed to migrate the shared test database");
-    let diesel = super::init_db(path.to_str().expect("a UTF-8 temp path"));
-    let sea = open(&path).await.expect("failed to open the shared test database");
-    (diesel, sea)
+        .expect("failed to migrate the test database file");
+    open(&path).await.expect("failed to open the test database file")
 }
 
 /// Runs one raw statement on the pool, for tests that need to break the

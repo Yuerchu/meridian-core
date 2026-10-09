@@ -133,7 +133,7 @@ impl Tool for AddRedactionRuleTool {
 
         crate::redaction::rule::validate_spec(&spec)?;
 
-        let db = context.sea.as_ref().ok_or("no database available")?;
+        let db = context.db.as_ref().ok_or("no database available")?;
         let now = crate::util::now_ms();
         let row = redaction_rule::Model {
             id: uuid::Uuid::new_v4().to_string(),
@@ -308,7 +308,7 @@ impl Tool for RemoveRedactionRuleTool {
             ));
         }
 
-        let db = context.sea.as_ref().ok_or("no database available")?;
+        let db = context.db.as_ref().ok_or("no database available")?;
         let refused = db
             .write(async |tx| {
                 let Some(row) = rule_ops::get_rule_by_name(tx, scope, &scope_id, name).await? else {
@@ -354,8 +354,7 @@ mod tests {
             conversation_id: Some("c1".into()),
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
-            sea: Some(db.clone()),
+            db: Some(db.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]

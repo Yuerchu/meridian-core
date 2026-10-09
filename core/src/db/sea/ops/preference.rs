@@ -1,10 +1,6 @@
 //! The `preferences` table through SeaORM.
 //!
-//! The twin of `db::ops::preference` for the transaction roots that have moved
-//! over, under the same names on purpose: the transaction-graph checker pairs
-//! a `db/sea/ops` function with the `db/ops` function of the same name and
-//! keeps `docs/dual-impl.md` honest about how many Diesel callers the old one
-//! still has. The Diesel version goes when that number reaches zero.
+//! Reads take any `Read`; writes take the caller's `WriteTx`.
 
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::OnConflict;
@@ -50,9 +46,28 @@ pub async fn delete_preference(tx: &WriteTx, key: &str) -> Result<(), DbErr> {
     Ok(())
 }
 
+pub fn parse_bool_preference(key: &str, value: Option<&str>, default: bool) -> Result<bool, String> {
+    match value {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(value) => Err(format!("preference `{key}` must be `true` or `false`, got `{value}`")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::EntityTrait;
+
+    #[test]
+    fn bool_preferences_are_closed_but_keep_the_missing_default() {
+        assert!(parse_bool_preference("feature.enabled", None, true).unwrap());
+        assert!(!parse_bool_preference("feature.enabled", None, false).unwrap());
+        assert!(parse_bool_preference("feature.enabled", Some("true"), false).unwrap());
+        assert!(!parse_bool_preference("feature.enabled", Some("false"), true).unwrap());
+        assert!(parse_bool_preference("feature.enabled", Some("1"), true).is_err());
+        assert!(parse_bool_preference("feature.enabled", Some("TRUE"), true).is_err());
+    }
 
     use super::*;
     use crate::db::sea::sea_test_db;

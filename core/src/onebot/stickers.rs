@@ -53,7 +53,7 @@ async fn ensure_pack(state: &SharedState, account_id: &str) -> Result<String, St
     let assistant_id = state.config.assistant_id.clone();
     state
         .services
-        .sea
+        .db
         .write(async |tx| {
             if let Some(pack) = pack_ops::get_by_source_account(tx, account_id).await? {
                 return Ok(pack.id);
@@ -91,7 +91,7 @@ async fn record_new(state: &SharedState, row: emoji::Model, hint: Option<&str>, 
     let key = row.source_key.clone().unwrap_or_default();
     state
         .services
-        .sea
+        .db
         .write(async |tx| {
             if let Some(existing) = emoji_ops::find_by_source_key(tx, &row.pack_id, row.source, &key).await? {
                 emoji_ops::mark_seen(tx, &existing.id, crate::util::now_ms()).await?;
@@ -127,7 +127,7 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
         tracing::warn!(%error, "could not create OneBot sticker directory");
         return vec![None; stickers.len()];
     }
-    let sea = &state.services.sea;
+    let sea = &state.services.db;
 
     let mut captured = Vec::with_capacity(stickers.len());
     for sticker in stickers {
@@ -241,7 +241,7 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
 }
 
 async fn evict_candidates(state: &SharedState, pack_id: &str, data_dir: &std::path::Path) {
-    let sea = &state.services.sea;
+    let sea = &state.services.db;
     // pool-read-before-write: eviction is best effort. Each delete is its own
     // write, and a sticker some message still shows is refused by
     // `message_stickers`' ON DELETE RESTRICT whatever this list said.
@@ -320,11 +320,11 @@ mod tests {
         assert!(a[0].is_some(), "{a:?}");
         assert_eq!(a, b, "both captures name the same sticker");
 
-        let pack = crate::db::sea::ops::emoji_pack::get_by_source_account(&state.services.sea, "42")
+        let pack = crate::db::sea::ops::emoji_pack::get_by_source_account(&state.services.db, "42")
             .await
             .unwrap()
             .unwrap();
-        let rows = emoji_ops::list_by_pack(&state.services.sea, &pack.id).await.unwrap();
+        let rows = emoji_ops::list_by_pack(&state.services.db, &pack.id).await.unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].seen_count, 2);
         assert_eq!(rows[0].name, "微笑");
@@ -371,7 +371,7 @@ mod tests {
         );
         assert!(a.is_some() && b.is_some(), "{a:?} {b:?}");
         assert_eq!(a, b);
-        let rows = emoji_ops::list_by_pack(&state.services.sea, &pack_id).await.unwrap();
+        let rows = emoji_ops::list_by_pack(&state.services.db, &pack_id).await.unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].seen_count, 2);
     }

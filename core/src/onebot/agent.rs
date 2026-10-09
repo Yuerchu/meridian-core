@@ -8,14 +8,12 @@ use crate::agent::engine::{self};
 use crate::agent::{
     TokenBudget, build_messages_with_senders, microcompact, resolve_provider_config, trim_to_context_limit,
 };
-use crate::db::DbPool;
-use crate::db::models::message::MessageInsert;
 use crate::db::models::turn::TurnPhase;
 use crate::mcp::McpRegistry;
 use crate::provider::{self, ChatMessage, ToolCall};
 use crate::secrets::SecretsManager;
 use crate::tools::{self, ToolRegistry};
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 static DISABLED_REDACTION: std::sync::LazyLock<crate::redaction::RedactionEngine> =
     std::sync::LazyLock::new(crate::redaction::RedactionEngine::disabled);
@@ -146,7 +144,7 @@ impl crate::agent::engine::Emit for BestEffortEmit {
 /// turn typing into authorisation to run a command.
 struct ChatApprovals<'a> {
     approval_fn: &'a ApprovalFn,
-    pool: DbPool,
+    db: crate::db::sea::cap::Db,
     turn_id: String,
 }
 
@@ -172,7 +170,7 @@ impl crate::agent::engine::Approvals for ChatApprovals<'_> {
         // minute, so this is a window the process can easily be killed in — and
         // dying here means nothing ran, which is worth being able to say.
         let said = engine::in_phase(
-            &self.pool,
+            &self.db,
             &self.turn_id,
             TurnPhase::AwaitingApproval,
             Some(&call.name),
@@ -338,25 +336,26 @@ pub(super) async fn oneshot_completion(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
-    let assistant = {
-        let pool = state.services.db.clone();
-        let conv_id = conversation_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let conv =
-                crate::db::ops::conversation::get_conversation(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-            Ok::<_, String>(
-                conv.assistant_id
-                    .and_then(|id| crate::db::ops::assistant::get_assistant(&mut conn, &id).ok()),
-            )
+    let sea = &state.services.db;
+    let assistant = sea
+        .read(async |tx| {
+            let Some(conv) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? else {
+                return Ok(Err(format!("conversation {conversation_id} not found")));
+            };
+            // An assistant that cannot be read leaves the pass on the default
+            // provider, as before.
+            let assistant = match conv.assistant_id {
+                Some(id) => crate::db::sea::ops::assistant::get_assistant(tx, &id)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            Ok::<_, crate::db::sea::DbErr>(Ok(assistant))
         })
         .await
-        .map_err(|e| e.to_string())??
-    };
+        .map_err(|e| e.to_string())??;
 
-    // Both resolutions take a pooled connection, and the first also reads the OS
-    // credential store, so they run off the async thread.
-    //
     // The turn parameters are resolved like any other turn: an extraction
     // request that invents its own temperature is rejected by models the chat
     // path already talks to.
@@ -373,56 +372,50 @@ pub(super) async fn oneshot_completion(
         provider_name,
         model,
     ) = {
-        let pool2 = state.services.db.clone();
-        let secrets2 = state.services.secrets.clone();
-        let assistant2 = assistant.clone();
-        tokio::task::spawn_blocking(move || {
-            let crate::agent::ResolvedProvider {
-                provider_id,
-                provider_name,
-                provider_type,
-                base_url,
-                credential,
-                model,
-                api_format,
-                transport_profile,
-                codex_request_shape,
-                codex_client_version,
-            } = resolve_provider_config(&secrets2, &pool2, assistant2.as_ref())?;
-            let effective_model = assistant2.as_ref().and_then(|a| a.model_id.clone()).unwrap_or(model);
-            let turn = crate::agent::resolve_turn_params(
-                &pool2,
-                crate::agent::TurnParamsResolveRequest {
-                    assistant: assistant2.as_ref(),
-                    provider_id: assistant2.as_ref().and_then(|a| a.provider_id.as_deref()),
-                    provider_type: &provider_type,
-                    api_format: &api_format,
+        let crate::agent::ResolvedProvider {
+            provider_id,
+            provider_name,
+            provider_type,
+            base_url,
+            credential,
+            model,
+            api_format,
+            transport_profile,
+            codex_request_shape,
+            codex_client_version,
+        } = resolve_provider_config(&state.services.secrets, sea, assistant.as_ref()).await?;
+        let effective_model = assistant.as_ref().and_then(|a| a.model_id.clone()).unwrap_or(model);
+        let turn = crate::agent::resolve_turn_params(
+            sea,
+            crate::agent::TurnParamsResolveRequest {
+                assistant: assistant.as_ref(),
+                provider_id: assistant.as_ref().and_then(|a| a.provider_id.as_deref()),
+                provider_type: &provider_type,
+                api_format: &api_format,
 
-                    transport_profile: &transport_profile,
-                    codex_request_shape,
-                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
-                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
-                    model: &effective_model,
-                    thinking_level: None,
-                    fast: false,
-                },
-            )?;
-            Ok::<_, String>((
-                provider_type,
-                base_url,
-                credential,
-                api_format,
-                transport_profile,
+                transport_profile: &transport_profile,
                 codex_request_shape,
-                codex_client_version,
-                turn,
-                provider_id,
-                provider_name,
-                effective_model,
-            ))
-        })
-        .await
-        .map_err(|e| e.to_string())??
+                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
+                model: &effective_model,
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await?;
+        (
+            provider_type,
+            base_url,
+            credential,
+            api_format,
+            transport_profile,
+            codex_request_shape,
+            codex_client_version,
+            turn,
+            provider_id,
+            provider_name,
+            effective_model,
+        )
     };
     let provider = provider::registry::create_provider(provider::registry::ProviderWire {
         provider_type: &provider_type,
@@ -459,41 +452,43 @@ pub(super) async fn oneshot_completion(
         .map_err(|e| e.to_string())?;
 
     if let Some(usage) = answer.usage {
-        let pool = state.services.db.clone();
-        let conv_id = conversation_id.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let Some(message_id) = crate::db::ops::conversation::get_conversation(&mut conn, &conv_id)
-                .ok()
-                .and_then(|c| c.head_message_id)
-            else {
-                tracing::warn!("could not record what the extraction cost: no message to file it against");
-                return Ok(());
-            };
-            let cost = crate::db::ops::audit::SideRequestCost {
-                role: crate::db::ops::audit::EXTRACTION_ROLE,
-                message_id: &message_id,
-                conversation_id: &conv_id,
-                turn_id: None,
-                provider_id: Some(&provider_id),
-                provider_name: Some(&provider_name),
-                model_id: Some(&model),
-                usage: crate::db::models::message::MessageUsage {
-                    input_tokens: usage.prompt_tokens,
-                    output_tokens: usage.completion_tokens,
-                    cache_read_tokens: usage.cache_read_tokens,
-                    cache_write_tokens: usage.cache_write_tokens,
-                    server_tool_calls: usage.billable_tool_calls,
-                },
-                peak_prompt_tokens: usage.prompt_tokens,
-                summary: "extraction",
-            };
-            if let Err(e) = crate::db::ops::audit::record_side_request(&mut conn, cost) {
-                tracing::warn!(error = %e, "could not record what the extraction cost");
-            }
-            Ok::<_, String>(())
-        })
-        .await;
+        // Filed against the conversation's head, read under the same lock the
+        // cost is written under.
+        let written = state
+            .services
+            .db
+            .write(async |tx| {
+                let head = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+                    .await?
+                    .and_then(|c| c.head_message_id);
+                let Some(message_id) = head else {
+                    tracing::warn!("could not record what the extraction cost: no message to file it against");
+                    return Ok(());
+                };
+                let cost = crate::db::sea::ops::audit::SideRequestCost {
+                    role: crate::db::sea::ops::audit::EXTRACTION_ROLE,
+                    message_id: &message_id,
+                    conversation_id,
+                    turn_id: None,
+                    provider_id: Some(&provider_id),
+                    provider_name: Some(&provider_name),
+                    model_id: Some(&model),
+                    usage: crate::db::models::message::MessageUsage {
+                        input_tokens: usage.prompt_tokens,
+                        output_tokens: usage.completion_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
+                        server_tool_calls: usage.billable_tool_calls,
+                    },
+                    peak_prompt_tokens: usage.prompt_tokens,
+                    summary: "extraction",
+                };
+                crate::db::sea::ops::audit::record_side_request(tx, cost).await
+            })
+            .await;
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "could not record what the extraction cost");
+        }
     }
 
     Ok(answer.text)
@@ -509,7 +504,6 @@ pub(super) async fn oneshot_completion(
 /// handed back in `TurnProgress` instead — see it for why.
 #[allow(clippy::too_many_arguments)]
 pub async fn headless_chat(
-    pool: &DbPool,
     sea: &crate::db::sea::cap::Db,
     secrets: &Arc<SecretsManager>,
     tool_registry: &Arc<ToolRegistry>,
@@ -535,7 +529,6 @@ pub async fn headless_chat(
     // anywhere and still leave the caller enough to close the turn out.
     let mut progress = TurnProgress::default();
     let reply = headless_chat_inner(
-        pool,
         sea,
         secrets,
         tool_registry,
@@ -562,7 +555,6 @@ pub async fn headless_chat(
 
 #[allow(clippy::too_many_arguments)]
 async fn headless_chat_inner(
-    pool: &DbPool,
     sea: &crate::db::sea::cap::Db,
     // The `Arc` rather than a plain reference: provider resolution is handed to
     // `spawn_blocking`, which needs an owned handle.
@@ -603,48 +595,42 @@ async fn headless_chat_inner(
     // is no longer an error on that path, only on the one that acts on it.
     let _sleep_guard = match services {
         Some(s) => {
-            let stored = crate::db::sea::ops::preference::get_preference(&s.sea, "sleep_inhibitor.enabled")
+            let stored = crate::db::sea::ops::preference::get_preference(&s.db, "sleep_inhibitor.enabled")
                 .await
                 .map_err(|error| error.to_string())?;
-            let enabled =
-                crate::db::ops::preference::parse_bool_preference("sleep_inhibitor.enabled", stored.as_deref(), true)?;
+            let enabled = crate::db::sea::ops::preference::parse_bool_preference(
+                "sleep_inhibitor.enabled",
+                stored.as_deref(),
+                true,
+            )?;
             enabled.then(|| s.sleep.begin_turn())
         }
         None => None,
     };
 
-    // Load assistant + the conversation's active path
-    let (assistant, ctx) = {
-        let pool = pool.clone();
-        let conv_id = conversation_id.to_string();
-        let aid = assistant_id.map(String::from);
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let conv =
-                crate::db::ops::conversation::get_conversation(&mut conn, &conv_id).map_err(|e| e.to_string())?;
-            let effective_aid = aid.as_deref().or(conv.assistant_id.as_deref());
-            let assistant = effective_aid.and_then(|aid| crate::db::ops::assistant::get_assistant(&mut conn, aid).ok());
-            let history = crate::db::ops::message::list_messages(&mut conn, &conv_id).map_err(|e| e.to_string())?;
+    // Load assistant + the conversation's active path, in one snapshot.
+    let (assistant, ctx) = sea
+        .read(async |tx| {
+            let Some(conv) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? else {
+                return Ok(Err(format!("conversation {conversation_id} not found")));
+            };
+            let assistant = match assistant_id.or(conv.assistant_id.as_deref()) {
+                Some(aid) => crate::db::sea::ops::assistant::get_assistant(tx, aid)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let history = crate::db::sea::ops::message::list_messages(tx, conversation_id).await?;
             // Resolved once and carried for the turn; see the desktop loop for
             // why the head is not re-read per row.
-            let ctx = crate::db::ops::message::active_context(&history, conv.head_message_id.as_deref());
-            Ok::<_, String>((assistant, ctx))
+            let ctx = crate::db::sea::ops::message::active_context(&history, conv.head_message_id.as_deref());
+            Ok::<_, crate::db::sea::DbErr>(Ok((assistant, ctx)))
         })
         .await
-        .map_err(|e| e.to_string())??
-    };
+        .map_err(|e| e.to_string())??;
 
-    // Resolve provider off the async thread: it takes a pooled connection and
-    // reads the OS credential store, either of which can block for as long as
-    // the pool's acquire timeout.
-    let resolved = {
-        let pool2 = pool.clone();
-        let secrets2 = secrets.clone();
-        let assistant2 = assistant.clone();
-        tokio::task::spawn_blocking(move || resolve_provider_config(&secrets2, &pool2, assistant2.as_ref()))
-            .await
-            .map_err(|e| e.to_string())??
-    };
+    let resolved = resolve_provider_config(secrets, sea, assistant.as_ref()).await?;
     let provider = provider::registry::create_provider(resolved.wire())?;
     let crate::agent::ResolvedProvider {
         provider_type,
@@ -699,49 +685,34 @@ async fn headless_chat_inner(
         .to_string();
     // Same resolution as the desktop chat command, so a per-model config the
     // user wrote applies here too. No per-request tier: OneBot turns run off
-    // the assistant's stored defaults. Off the async thread because it takes a
-    // pooled connection.
+    // the assistant's stored defaults.
     //
     // Ahead of the tool set because what the model can be sent at all — whether
     // it takes a tools field — decides what that set may contain.
-    let mut turn_params = {
-        let pool2 = pool.clone();
-        let assistant2 = assistant.clone();
-        let pt = provider_type.clone();
-        let af = api_format.clone();
-        let tp = transport_profile.clone();
-        let crs = codex_request_shape;
-        let em = effective_model.clone();
-        // The provider this turn actually resolved to, not the assistant's
-        // stored field. They differ whenever the assistant names none and the
-        // fallback picked the first enabled one — and with the assistant's
-        // empty field there is no `model_configs` row to find, so that turn
-        // silently loses its context window, its prices, its capability
-        // overrides and its provider-side tools. The desktop has always passed
-        // the resolved id.
-        let pid = provider_id.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::agent::resolve_turn_params(
-                &pool2,
-                crate::agent::TurnParamsResolveRequest {
-                    assistant: assistant2.as_ref(),
-                    provider_id: Some(pid.as_str()),
-                    provider_type: &pt,
-                    api_format: &af,
+    // The provider this turn actually resolved to, not the assistant's stored
+    // field. They differ whenever the assistant names none and the fallback
+    // picked the first enabled one — and with the assistant's empty field there
+    // is no `model_configs` row to find, so that turn silently loses its context
+    // window, its prices, its capability overrides and its provider-side tools.
+    // The desktop has always passed the resolved id.
+    let mut turn_params = crate::agent::resolve_turn_params(
+        sea,
+        crate::agent::TurnParamsResolveRequest {
+            assistant: assistant.as_ref(),
+            provider_id: Some(provider_id.as_str()),
+            provider_type: &provider_type,
+            api_format: &api_format,
 
-                    transport_profile: &tp,
-                    codex_request_shape: crs,
-                    codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
-                    codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
-                    model: &em,
-                    thinking_level: None,
-                    fast: false,
-                },
-            )
-        })
-        .await
-        .map_err(|e| e.to_string())??
-    };
+            transport_profile: &transport_profile,
+            codex_request_shape,
+            codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
+            codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
+            model: &effective_model,
+            thinking_level: None,
+            fast: false,
+        },
+    )
+    .await?;
     // The same reasoning as the desktop path: one room, one stable prefix, one
     // server holding it. Worth more here than there, since a group's prefix is
     // long and every message in it is another turn against the same one.
@@ -763,12 +734,7 @@ async fn headless_chat_inner(
     // QQ by `ChatApprovals`, because nobody there may answer it. Read here,
     // ahead of the turn config, because the prompt says which shell commands
     // run under — the same decision `run_command` executes.
-    let command_settings = {
-        let pool2 = pool.clone();
-        tokio::task::spawn_blocking(move || crate::sandbox::CommandSettings::read(&pool2))
-            .await
-            .map_err(|e| e.to_string())??
-    };
+    let command_settings = crate::sandbox::CommandSettings::load(sea).await?;
     // Headless sessions have no project directory. A requested container is
     // therefore refused explicitly instead of being downgraded to the platform
     // default; there is no honest answer to what the container should mount.
@@ -789,8 +755,6 @@ async fn headless_chat_inner(
     let command_shell = None;
 
     let turn = {
-        let pool2 = pool.clone();
-        let registry = tool_registry.clone();
         let input = crate::agent::turn_config::TurnConfigResolveRequest {
             server_tools: turn_params.params.server_tools.clone(),
             assistant: assistant.clone(),
@@ -834,12 +798,7 @@ async fn headless_chat_inner(
             session_tools: qq_tools.filter(|_| supports_tools).map(|q| q.session_tools()),
             command_shell,
         };
-        tokio::task::spawn_blocking(move || {
-            let mut conn = pool2.get().map_err(|e| e.to_string())?;
-            crate::agent::turn_config::resolve(&mut conn, &registry, input)
-        })
-        .await
-        .map_err(|e| e.to_string())??
+        crate::agent::turn_config::resolve_on(sea, tool_registry, input).await?
     };
     let tool_defs = turn.tool_defs;
     let system_prompt = turn.system_prompt;
@@ -872,7 +831,7 @@ async fn headless_chat_inner(
     let injection = crate::agent::plan_injection_async(sea, memory_request, ctx.live().to_vec(), t0).await?;
     // The checklist, frozen the same way and placed right after memory. A QQ
     // group never has one and this is a no-op there; a private admin chat can.
-    let todo = crate::agent::plan_todo_injection_async(pool, conversation_id.to_string(), ctx.live().to_vec()).await?;
+    let todo = crate::agent::plan_todo_injection(sea, conversation_id, ctx.live()).await?;
     let keep_recent = assistant.as_ref().map(|a| a.compact_keep_recent as usize).unwrap_or(10);
 
     let budget = TokenBudget::new(
@@ -886,6 +845,7 @@ async fn headless_chat_inner(
     // Nicknames are not on the message row (they change), so history is
     // re-attributed from the subject table.
     // Cosmetic: a failed read renders speakers by number for one turn.
+    // pool-read-before-write: display names for rendering; the row writes below do not depend on them.
     let sender_names = crate::db::sea::ops::memory::list_subjects(sea)
         .await
         .map(|subjects| {
@@ -905,7 +865,7 @@ async fn headless_chat_inner(
     // Emptied by the first reply read to the end, not by reading the record and
     // not by getting a request away.
     let interrupted = match coordinator {
-        Some(c) => crate::agent::interrupted::load_block(pool, c, conversation_id, turn_id).await?,
+        Some(c) => crate::agent::interrupted::load_block(sea, c, conversation_id, turn_id).await?,
         None => None,
     };
 
@@ -940,7 +900,7 @@ async fn headless_chat_inner(
     let data_dir = services.map(|s| s.paths.data_dir.as_path());
     crate::agent::resolve_sticker_parts_in_messages(
         &mut chat_messages,
-        services.map(|s| &s.sea),
+        services.map(|s| &s.db),
         data_dir,
         supports_images,
     )
@@ -996,66 +956,34 @@ async fn headless_chat_inner(
     // turn has to find it.
     if let Some(ref injection) = injection {
         parent_cursor =
-            crate::agent::persist_injection(pool, injection, conversation_id, turn_id, parent_cursor, now).await;
+            crate::agent::persist_injection(sea, injection, conversation_id, turn_id, parent_cursor, now).await;
     }
     // After memory, before the messages: the order `trailing` sent them in.
     if let Some(ref todo) = todo {
         parent_cursor =
-            crate::agent::persist_todo_injection(pool, todo, conversation_id, turn_id, parent_cursor, now).await;
+            crate::agent::persist_todo_injection(sea, todo, conversation_id, turn_id, parent_cursor, now).await;
     }
     {
-        let pool = pool.clone();
-        let conv_id = conversation_id.to_string();
         let mut parent = parent_cursor.clone();
         parent_cursor = rows.last().map(|r| r.id.clone()).or(parent_cursor);
-        let turn = turn_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
+        // One write for the lot: a group turn opening with three messages
+        // either has all three on the path or none of them.
+        sea.write(async |tx| {
             for row in &rows {
-                crate::db::ops::message::append_message(
-                    &mut conn,
-                    &MessageInsert {
-                        id: &row.id,
-                        conversation_id: &conv_id,
-                        role: "user",
-                        content: &row.text,
-                        provider_id: None,
-                        model_id: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        sort_order: 0,
-                        created_at: row.created_at,
-                        reasoning_content: None,
-                        rating: None,
-                        schema_version: 2,
-                        is_compact_summary: 0,
-                        sender_id: row.sender_id,
-                        parent_id: None,
-                        compact_anchor_id: None,
-                        source: None,
-                        turn_id: Some(&turn),
-                        tool_outcome: None,
-                        // What someone said cost no tokens and came from no upstream.
-                        cache_read_tokens: None,
-                        cache_write_tokens: None,
-                        server_tool_calls: None,
-                        provider_name: None,
-                        response_model_id: None,
-                    },
-                    parent.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
-                crate::db::ops::emoji::link_stickers_in_content(&mut conn, &row.id, &row.text)
-                    .map_err(|e| e.to_string())?;
+                let model = crate::db::entity::message::Model {
+                    sender_id: row.sender_id,
+                    turn_id: Some(turn_id.to_string()),
+                    ..crate::db::sea::ops::message::new_row(&row.id, conversation_id, "user", &row.text, row.created_at)
+                };
+                crate::db::sea::ops::message::append_message(tx, model, parent.as_deref()).await?;
+                crate::db::sea::ops::emoji::link_stickers_in_content(tx, &row.id, &row.text).await?;
                 // Queued messages chain to each other, not all to the same parent.
                 parent = Some(row.id.clone());
             }
-            Ok::<_, String>(())
+            Ok::<_, crate::db::sea::DbErr>(())
         })
         .await
-        .map_err(|e| e.to_string())??;
+        .map_err(|e| e.to_string())?;
     }
 
     // Build tool context. The command settings and the sandbox policy were
@@ -1071,8 +999,7 @@ async fn headless_chat_inner(
         conversation_id: Some(conversation_id.to_string()),
         turn_id: Some(turn_id.to_string()),
         assistant_id: assistant_id.map(|s| s.to_string()),
-        db_pool: Some(pool.clone()),
-        sea: services.map(|s| s.sea.clone()),
+        db: Some(sea.clone()),
         // No journal: the empty root set above refuses every file write at the
         // validation layer, so there is nothing a journal here could ever
         // record — wiring one would be dead code asserting otherwise.
@@ -1081,13 +1008,7 @@ async fn headless_chat_inner(
         sandbox_policy,
         #[cfg(not(target_os = "android"))]
         background: None,
-        tool_secrets: {
-            let pool2 = pool.clone();
-            let secrets2 = secrets.clone();
-            tokio::task::spawn_blocking(move || crate::agent::build_tool_secrets(&secrets2, &pool2))
-                .await
-                .map_err(|e| e.to_string())?
-        },
+        tool_secrets: crate::agent::build_tool_secrets(secrets, sea).await,
         cancel: cancel.clone(),
     };
 
@@ -1098,7 +1019,7 @@ async fn headless_chat_inner(
     // things and only the caller knows which one is ending.
     let asker = ChatApprovals {
         approval_fn,
-        pool: pool.clone(),
+        db: sea.clone(),
         turn_id: turn_id.to_string(),
     };
     // `unattended`: a QQ approval is a message in a chat that nobody may be
@@ -1107,30 +1028,33 @@ async fn headless_chat_inner(
     // there is nobody to ask. Needs `services`, which the tests do not build;
     // without it the asker is left exactly as it was.
     let approvals = match services {
-        Some(services) => crate::agent::auto_review::AutoReviewed::wrap(
-            &asker,
-            crate::agent::auto_review::Context {
-                services: services.clone(),
-                conversation_id: conversation_id.to_string(),
-                turn_id: turn_id.to_string(),
-                // A QQ session's file access is an empty root set, so there is
-                // no project for a path to be inside of. Saying so is what
-                // stops the reviewer reading "outside the project" as the
-                // finding it would be on the desktop.
-                working_directory: None,
-                // The same empty root set the turn itself runs under. The
-                // escalating pass gets no more of the disk than the turn had,
-                // which here is none of it.
-                file_access: tools::FileAccess::Roots(vec![]),
-                // Only a group is. A private chat has one counterpart and they
-                // are why the turn is running — treating them as a bystander
-                // because they are not an admin would have the reviewer see a
-                // task nobody asked for and refuse everything.
-                multi_party: qq_tools
-                    .is_some_and(|q| matches!(q.session_kind(), crate::onebot::session::SessionKind::Group)),
-                unattended: true,
-            },
-        )?,
+        Some(services) => {
+            crate::agent::auto_review::AutoReviewed::wrap(
+                &asker,
+                crate::agent::auto_review::Context {
+                    services: services.clone(),
+                    conversation_id: conversation_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    // A QQ session's file access is an empty root set, so there is
+                    // no project for a path to be inside of. Saying so is what
+                    // stops the reviewer reading "outside the project" as the
+                    // finding it would be on the desktop.
+                    working_directory: None,
+                    // The same empty root set the turn itself runs under. The
+                    // escalating pass gets no more of the disk than the turn had,
+                    // which here is none of it.
+                    file_access: tools::FileAccess::Roots(vec![]),
+                    // Only a group is. A private chat has one counterpart and they
+                    // are why the turn is running — treating them as a bystander
+                    // because they are not an admin would have the reviewer see a
+                    // task nobody asked for and refuse everything.
+                    multi_party: qq_tools
+                        .is_some_and(|q| matches!(q.session_kind(), crate::onebot::session::SessionKind::Group)),
+                    unattended: true,
+                },
+            )
+            .await?
+        }
         None => crate::agent::auto_review::AutoReviewed::inert(&asker),
     };
     // Outermost, so it sees the reviewer's own refusals as well as the ones a
@@ -1151,7 +1075,7 @@ async fn headless_chat_inner(
 
     let outcome = engine::run_turn(
         &engine::TurnServices {
-            pool,
+            db: sea,
             tools: tool_registry,
             mcp: mcp_registry,
             redaction: services.map(|s| &*s.redaction).unwrap_or(&DISABLED_REDACTION),
@@ -1197,7 +1121,7 @@ async fn headless_chat_inner(
             // rather than only in the setup above.
             files_root,
             stickers: services.map(|s| engine::StickerRendering {
-                db: s.sea.clone(),
+                db: s.db.clone(),
                 data_dir: s.paths.data_dir.clone(),
                 supports_images,
             }),
@@ -1291,7 +1215,7 @@ mod tests {
         );
 
         for row in &rows {
-            let stored = crate::db::models::message::MessageRow {
+            let stored = crate::db::entity::message::Model {
                 id: row.id.clone(),
                 conversation_id: "c".into(),
                 role: "user".into(),
@@ -1307,7 +1231,7 @@ mod tests {
                 reasoning_content: None,
                 rating: None,
                 schema_version: 2,
-                is_compact_summary: 0,
+                is_compact_summary: crate::db::types::SqlBool::FALSE,
                 sender_id: row.sender_id,
                 parent_id: None,
                 compact_anchor_id: None,
@@ -1323,7 +1247,7 @@ mod tests {
                 tool_diffs: None,
                 response_model_id: None,
             };
-            let replay = crate::db::ops::message::ActiveContext {
+            let replay = crate::db::sea::ops::message::ActiveContext {
                 path: vec![stored],
                 summary: None,
                 anchor_index: None,
@@ -1416,26 +1340,38 @@ mod tests {
     mod approvals {
         use super::*;
         use crate::agent::engine::{ApprovalDecision, Approvals};
-        use crate::db::diesel_test_db;
         use crate::turn::TurnOrigin;
 
         /// `said` of `None` is nobody answering: the minute ran out, or the turn
         /// was swept out from under the question.
         fn asked(said: Option<&str>, tool: &str) -> Option<ApprovalDecision> {
             let said = said.map(str::to_string);
-            let pool = diesel_test_db();
-            {
-                let mut conn = pool.get().unwrap();
-                crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 1).unwrap();
-                crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::OneBot, None, 1000).unwrap();
-            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let db = runtime.block_on(async {
+                let db = crate::db::sea::sea_test_db().await;
+                crate::db::sea::execute_for_tests(
+                    &db,
+                    "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c1', 't', 1, 1)",
+                )
+                .await
+                .unwrap();
+                db.write(async |tx| {
+                    crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::OneBot, None, 1000).await
+                })
+                .await
+                .unwrap();
+                db
+            });
             let approval_fn: ApprovalFn = Box::new(move |_, _| {
                 let said = said.clone();
                 Box::pin(async move { Ok(said) })
             });
             let adapter = ChatApprovals {
                 approval_fn: &approval_fn,
-                pool: pool.clone(),
+                db,
                 turn_id: "t1".into(),
             };
             let call = ToolCall {
@@ -1443,12 +1379,7 @@ mod tests {
                 name: tool.into(),
                 arguments: "{}".into(),
             };
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(adapter.ask("m1", &call, None))
-                .unwrap()
+            runtime.block_on(adapter.ask("m1", &call, None)).unwrap()
         }
 
         /// **A QQ chat never answers "run it with nothing known about where".**
@@ -1459,7 +1390,11 @@ mod tests {
         #[test]
         fn unreadable_settings_are_refused_without_asking_the_chat() {
             let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let pool = diesel_test_db();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let db = runtime.block_on(crate::db::sea::sea_test_db());
             let counter = asked.clone();
             let approval_fn: ApprovalFn = Box::new(move |_, _| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1467,7 +1402,7 @@ mod tests {
             });
             let adapter = ChatApprovals {
                 approval_fn: &approval_fn,
-                pool,
+                db,
                 turn_id: "t1".into(),
             };
             let call = ToolCall {
@@ -1479,12 +1414,7 @@ mod tests {
                 kind: crate::events::ApprovalRetryKind::SettingsUnreadable,
                 reason: "database is locked",
             };
-            let decision = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(adapter.ask("m1", &call, Some(escalation)))
-                .unwrap();
+            let decision = runtime.block_on(adapter.ask("m1", &call, Some(escalation))).unwrap();
 
             match decision {
                 Some(ApprovalDecision::Denied(Some(reason))) => {

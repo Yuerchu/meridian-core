@@ -136,7 +136,7 @@ pub struct WorkspaceReferenceProbe {
 /// excerpts are frozen through the same carrier as `@` references so they
 /// share the queue's freeze cycle and the transaction that lands them, while
 /// never being a workspace reference themselves.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedContextItem {
     pub id: String,
     pub kind: MessageContextKind,
@@ -1219,8 +1219,7 @@ mod tests {
             conversation_id: None,
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
-            sea: None,
+            db: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
             #[cfg(not(target_os = "android"))]

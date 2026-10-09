@@ -10,24 +10,20 @@
 //! source, or next to it. On the copy, the bridge runs as it would at the next
 //! start, and then four things are checked: the schema is the one the baseline
 //! builds, every table has the row count it had, SQLite's integrity and
-//! foreign-key checks say what they said before, and the previous release's
-//! Diesel harness finds nothing left to run. Any difference is a non-zero exit.
+//! foreign-key checks say what they said before, and the Diesel ledger holds
+//! every version the previous release embeds, so its harness would find
+//! nothing left to run. Any difference is a non-zero exit.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use diesel::Connection as _;
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use meridian_core::db::sea::bridge::{Ledger, migrate_file};
 use meridian_core::db::sea::introspect::Schema;
 use meridian_core::db::sea::{memory_connection, migration};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, SqlxSqliteConnector, Statement};
 use sea_orm_migration::MigratorTrait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-
-/// What the previous release embedded, for the downgrade check.
-const DIESEL_MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[tokio::main]
 async fn main() {
@@ -95,15 +91,13 @@ async fn main() {
         failures.push(format!("the SeaORM ledger reads {:?}", after.sea_versions));
     }
 
-    let pending = {
-        let path = copy.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
-            conn.pending_migrations(DIESEL_MIGRATIONS).unwrap().len()
-        })
-        .await
-        .unwrap()
-    };
+    // What the previous release's harness would run: the versions it embeds
+    // (exactly `LEGACY`'s) that the ledger does not list.
+    let pending = meridian_core::db::sea::legacy::LEGACY
+        .iter()
+        .map(|(name, _)| name.split('_').next().unwrap())
+        .filter(|version| !after.diesel_versions.iter().any(|recorded| recorded == version))
+        .count();
     if matches!(ledger, Ledger::Diesel { .. }) && pending != 0 {
         failures.push(format!(
             "the previous release would still want to run {pending} migrations on this database"

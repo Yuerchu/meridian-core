@@ -16,12 +16,15 @@
 //! conversation quotes third parties, and "who said this" is part of what the
 //! excerpt is evidence of.
 
-use diesel::sqlite::SqliteConnection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::agent::truncate::{approx_token_count, truncate_middle_with_token_budget};
-use crate::db::models::message::{MessageRole, MessageRow};
+use crate::db::entity::message as message_entity;
+use crate::db::models::message::MessageRole;
+use crate::db::sea::DbErr;
+use crate::db::sea::cap::Db;
+use crate::db::sea::ops as sea_ops;
 use crate::workspace::reference::{MessageContextKind, PreparedContextItem};
 
 /// Per-entry ceilings, the same shape as the reviewer's: generous for a
@@ -43,15 +46,15 @@ fn cap(text: &str, tokens: usize) -> String {
 }
 
 /// One transcript line, or nothing when the row carries nothing worth a line.
-fn line(msg: &MessageRow) -> Result<Option<String>, String> {
+fn line(msg: &message_entity::Model) -> Result<Option<String>, String> {
     let role = MessageRole::parse(&msg.role).map_err(|error| format!("message {}: {error}", msg.id))?;
     // The frozen memory block. It is background this app injected, not part of
     // the conversation being excerpted, and it may carry memories from scopes
     // wider than this thread.
-    if role == MessageRole::Context && msg.is_compact_summary == 0 {
+    if role == MessageRole::Context && !msg.is_compact_summary.get() {
         return Ok(None);
     }
-    if msg.is_compact_summary != 0 {
+    if msg.is_compact_summary.get() {
         return Ok(Some(
             json!({ "summary_of_earlier_messages": cap(&msg.content, MAX_MESSAGE_TOKENS) }).to_string(),
         ));
@@ -104,7 +107,7 @@ fn line(msg: &MessageRow) -> Result<Option<String>, String> {
 /// `history` is the referenced conversation's active path — the caller reads
 /// it with `active_context(...).live()`, so branches not on the head and
 /// anything a compaction already replaced stay out.
-pub fn render_excerpt(history: &[MessageRow], budget_tokens: usize) -> Result<(String, bool), String> {
+pub fn render_excerpt(history: &[message_entity::Model], budget_tokens: usize) -> Result<(String, bool), String> {
     let mut kept: Vec<String> = Vec::new();
     let mut spent = 0usize;
     let mut truncated = false;
@@ -164,8 +167,21 @@ pub fn referenced_conversation_id(metadata: Option<&str>) -> Result<Option<Strin
 /// `budget_tokens` is what is left of the per-turn context budget after the
 /// workspace references took their share, so the two kinds are accounted
 /// together rather than each assuming it is alone.
-pub fn freeze_conversation_refs(
-    conn: &mut SqliteConnection,
+///
+/// Every referenced thread is read in one snapshot.
+pub async fn freeze_conversation_refs(
+    db: &Db,
+    current_conversation_id: &str,
+    ids: &[String],
+    budget_tokens: usize,
+) -> Result<Vec<PreparedContextItem>, String> {
+    db.read(async |tx| Ok::<_, DbErr>(freeze_in(tx, current_conversation_id, ids, budget_tokens).await))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+async fn freeze_in(
+    db: &impl crate::db::sea::cap::Snapshot,
     current_conversation_id: &str,
     ids: &[String],
     budget_tokens: usize,
@@ -185,11 +201,14 @@ pub fn freeze_conversation_refs(
         if !seen.insert(id.as_str()) {
             continue;
         }
-        let conversation = crate::db::ops::conversation::get_conversation(conn, id)
-            .map_err(|_| format!("referenced conversation {id} does not exist"))?;
-        let history =
-            crate::db::ops::message::list_messages(conn, id).map_err(|error| format!("reading {id}: {error}"))?;
-        let context = crate::db::ops::message::active_context(&history, conversation.head_message_id.as_deref());
+        let conversation = sea_ops::conversation::get_conversation(db, id)
+            .await
+            .map_err(|error| format!("reading {id}: {error}"))?
+            .ok_or_else(|| format!("referenced conversation {id} does not exist"))?;
+        let history = sea_ops::message::list_messages(db, id)
+            .await
+            .map_err(|error| format!("reading {id}: {error}"))?;
+        let context = sea_ops::message::active_context(&history, conversation.head_message_id.as_deref());
         let per_ref = FROZEN_EXCERPT_TOKENS.min(remaining);
         let (content, truncated) = render_excerpt(context.live(), per_ref)?;
         let token_count = approx_token_count(&content);
@@ -220,8 +239,8 @@ pub fn freeze_conversation_refs(
 mod tests {
     use super::*;
 
-    fn row(id: &str, role: &str, content: &str) -> MessageRow {
-        MessageRow {
+    fn row(id: &str, role: &str, content: &str) -> message_entity::Model {
+        message_entity::Model {
             id: id.into(),
             conversation_id: "c-src".into(),
             role: role.into(),
@@ -237,7 +256,7 @@ mod tests {
             reasoning_content: None,
             rating: None,
             schema_version: 2,
-            is_compact_summary: 0,
+            is_compact_summary: crate::db::types::SqlBool::FALSE,
             sender_id: None,
             parent_id: None,
             compact_anchor_id: None,
@@ -293,52 +312,25 @@ mod tests {
         assert!(out.lines().count() > 1);
     }
 
-    fn seed(pool: &crate::db::DbPool) {
-        let mut conn = pool.get().unwrap();
-        crate::db::ops::conversation::create_conversation(&mut conn, "c-cur", Some("当前"), None, None, 1).unwrap();
-        crate::db::ops::conversation::create_conversation(&mut conn, "c-ref", Some("被引线程"), None, None, 1).unwrap();
-        crate::db::ops::message::append_message(
-            &mut conn,
-            &crate::db::models::message::MessageInsert {
-                id: "m-1",
-                conversation_id: "c-ref",
-                role: "user",
-                content: "被引线程里说过的话",
-                provider_id: None,
-                model_id: None,
-                input_tokens: None,
-                output_tokens: None,
-                tool_calls: None,
-                tool_call_id: None,
-                sort_order: 0,
-                created_at: 2,
-                reasoning_content: None,
-                rating: None,
-                schema_version: 2,
-                is_compact_summary: 0,
-                sender_id: None,
-                parent_id: None,
-                compact_anchor_id: None,
-                source: None,
-                turn_id: None,
-                tool_outcome: None,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                server_tool_calls: None,
-                provider_name: None,
-                response_model_id: None,
-            },
-            None,
-        )
+    async fn seeded() -> Db {
+        let db = crate::db::sea::sea_test_db().await;
+        db.write(async |tx| {
+            sea_ops::conversation::create_conversation(tx, "c-cur", Some("当前"), None, None, 1).await?;
+            sea_ops::conversation::create_conversation(tx, "c-ref", Some("被引线程"), None, None, 1).await?;
+            let row = sea_ops::message::new_row("m-1", "c-ref", "user", "被引线程里说过的话", 2);
+            sea_ops::message::append_message(tx, row, None).await
+        })
+        .await
         .unwrap();
+        db
     }
 
-    #[test]
-    fn freezing_carries_title_id_and_excerpt() {
-        let pool = crate::db::diesel_test_db();
-        seed(&pool);
-        let mut conn = pool.get().unwrap();
-        let out = freeze_conversation_refs(&mut conn, "c-cur", &["c-ref".to_string()], 4_000).unwrap();
+    #[tokio::test]
+    async fn freezing_carries_title_id_and_excerpt() {
+        let db = seeded().await;
+        let out = freeze_conversation_refs(&db, "c-cur", &["c-ref".to_string()], 4_000)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         let item = &out[0];
         assert_eq!(item.kind, MessageContextKind::Conversation);
@@ -351,32 +343,35 @@ mod tests {
         assert!(item.line_start.is_none() && item.line_end.is_none());
     }
 
-    #[test]
-    fn freezing_refuses_self_reference_and_missing_threads() {
-        let pool = crate::db::diesel_test_db();
-        seed(&pool);
-        let mut conn = pool.get().unwrap();
-        let self_ref = freeze_conversation_refs(&mut conn, "c-cur", &["c-cur".to_string()], 4_000).unwrap_err();
+    #[tokio::test]
+    async fn freezing_refuses_self_reference_and_missing_threads() {
+        let db = seeded().await;
+        let self_ref = freeze_conversation_refs(&db, "c-cur", &["c-cur".to_string()], 4_000)
+            .await
+            .unwrap_err();
         assert!(self_ref.contains("itself"), "{self_ref}");
-        let missing = freeze_conversation_refs(&mut conn, "c-cur", &["c-none".to_string()], 4_000).unwrap_err();
+        let missing = freeze_conversation_refs(&db, "c-cur", &["c-none".to_string()], 4_000)
+            .await
+            .unwrap_err();
         assert!(missing.contains("does not exist"), "{missing}");
     }
 
-    #[test]
-    fn freezing_deduplicates_and_caps_the_count() {
-        let pool = crate::db::diesel_test_db();
-        seed(&pool);
-        let mut conn = pool.get().unwrap();
+    #[tokio::test]
+    async fn freezing_deduplicates_and_caps_the_count() {
+        let db = seeded().await;
         let twice = vec!["c-ref".to_string(), "c-ref".to_string()];
         assert_eq!(
-            freeze_conversation_refs(&mut conn, "c-cur", &twice, 4_000)
+            freeze_conversation_refs(&db, "c-cur", &twice, 4_000)
+                .await
                 .unwrap()
                 .len(),
             1
         );
 
         let too_many: Vec<String> = (0..=MAX_CONVERSATION_REFS).map(|i| format!("c-{i}")).collect();
-        let refused = freeze_conversation_refs(&mut conn, "c-cur", &too_many, 4_000).unwrap_err();
+        let refused = freeze_conversation_refs(&db, "c-cur", &too_many, 4_000)
+            .await
+            .unwrap_err();
         assert!(refused.contains("at most"), "{refused}");
     }
 
@@ -392,7 +387,7 @@ mod tests {
     fn memory_context_rows_stay_out_and_summaries_stay_in() {
         let memory = row("m1", "context", "injected memory block");
         let mut summary = row("m2", "context", "earlier talk, summarised");
-        summary.is_compact_summary = 1;
+        summary.is_compact_summary = crate::db::types::SqlBool::TRUE;
         let (out, _) = render_excerpt(&[memory, summary], 1_000).unwrap();
         assert!(!out.contains("injected memory block"));
         assert!(out.contains("summary_of_earlier_messages"));

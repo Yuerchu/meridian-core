@@ -298,24 +298,36 @@ async fn migrate_file_leaves_a_wal_file_and_no_open_connection() {
 
 /// The downgrade that is promised: the previous release opens a bridged
 /// database, finds all 65 migrations recorded, and runs none.
+///
+/// What that release's harness does is compare the versions it embeds with
+/// the versions in `__diesel_schema_migrations` and run the difference; the
+/// versions it embeds are exactly `LEGACY`'s. So the ledger holding every one
+/// of them is the whole of the claim. (This used to run the harness itself;
+/// the Diesel crate went with Phase 5.)
 #[tokio::test]
 async fn the_previous_release_finds_nothing_pending_on_a_bridged_database() {
-    use diesel::Connection;
-    use diesel_migrations::MigrationHarness;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.sqlite");
     previous_release_file(&path, 60).await.unwrap();
 
     assert_eq!(migrate_file(&path).await.unwrap(), Ledger::Diesel { applied: 60 });
 
-    let pending = tokio::task::spawn_blocking(move || {
-        let mut conn = diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
-        let pending = conn.pending_migrations(crate::db::MIGRATIONS).unwrap().len();
-        let ran = conn.run_pending_migrations(crate::db::MIGRATIONS).unwrap().len();
-        (pending, ran)
-    })
-    .await
-    .unwrap();
-    assert_eq!(pending, (0, 0));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(super::options(&path))
+        .await
+        .unwrap();
+    let conn = sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+    let mut recorded = strings(&conn, &format!("SELECT version FROM {DIESEL_LEDGER} ORDER BY version")).await;
+    recorded.dedup();
+    let mut embedded: Vec<String> = super::legacy::LEGACY
+        .iter()
+        .map(|(name, _)| name.split('_').next().unwrap().to_string())
+        .collect();
+    embedded.sort();
+    assert_eq!(
+        recorded, embedded,
+        "every migration the previous release embeds is on record"
+    );
+    conn.close().await.unwrap();
 }
