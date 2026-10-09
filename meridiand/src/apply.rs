@@ -11,15 +11,17 @@
 //! way to achieve that, and it is worse: a mistyped id would quietly destroy an
 //! endpoint's delivery history, while a disabled row can be turned back on.
 
-use meridian_core::db::DbPool;
 use meridian_core::db::entity::notification_webhook::{
     self, BodyTemplate, NotificationEvents, NotificationWebhookChangeset,
 };
-use meridian_core::db::models::provider::{ProviderChangeset, ProviderInsert};
-use meridian_core::db::ops;
+use meridian_core::db::entity::provider::{self as provider_entity, ProviderChangeset};
+use meridian_core::db::sea::DbErr;
 use meridian_core::db::sea::cap::Db;
-use meridian_core::db::sea::ops::notification as notification_ops;
+use meridian_core::db::sea::ops::{
+    notification as notification_ops, preference as preference_ops, provider as provider_ops,
+};
 use meridian_core::db::types::SqlBool;
+use meridian_core::provider::registry::{ApiFormat, CredentialKind, ProviderType, TransportProfile};
 use meridian_core::secrets::{SecretName, SecretScope, SecretsManager};
 use meridian_core::util::now_ms;
 
@@ -58,41 +60,36 @@ fn from_env(kind: &str, owner: &str, var: &str) -> Result<String, String> {
 }
 
 /// Refuse to converge somebody else's data directory.
-fn claim_data_dir(pool: &DbPool) -> Result<(), String> {
-    let mut conn = pool.get().map_err(|error| format!("db connection: {error}"))?;
-    let claimed = ops::preference::get_preference(&mut conn, OWNERSHIP_KEY)
-        .map_err(|error| format!("could not read {OWNERSHIP_KEY}: {error}"))?;
-    if claimed.is_some() {
-        return Ok(());
-    }
-
-    // An unclaimed directory is only safe to take over if there is nothing in
-    // it to lose. `providers` is the right thing to count: it is what this
-    // daemon manages, it exists in every install, and a desktop install that
-    // has ever been configured has at least one.
-    let providers =
-        ops::provider::count_providers(&mut conn).map_err(|error| format!("could not count providers: {error}"))?;
-    if providers > 0 {
-        return Err(format!(
-            "this data directory already holds {providers} provider(s) and is not marked as the daemon's. \
-             Applying a configuration here would switch off everything the file does not name. \
-             Point --data-dir somewhere of its own, or set `{OWNERSHIP_KEY}` if this really is the daemon's directory."
-        ));
-    }
-    ops::preference::set_preference(&mut conn, OWNERSHIP_KEY, "true", now_ms())
-        .map_err(|error| format!("could not claim the data directory: {error}"))?;
-    Ok(())
+///
+/// The check and the claim are one IMMEDIATE write: two daemons starting on
+/// one empty directory cannot both find it empty and both take it.
+async fn claim_data_dir(sea: &Db) -> Result<(), String> {
+    sea.write(async |tx| {
+        let claimed = preference_ops::get_preference(tx, OWNERSHIP_KEY).await?;
+        if claimed.is_some() {
+            return Ok(Ok(()));
+        }
+        // An unclaimed directory is only safe to take over if there is nothing
+        // in it to lose. `providers` is the right thing to count: it is what
+        // this daemon manages, it exists in every install, and a desktop
+        // install that has ever been configured has at least one.
+        let providers = provider_ops::list_providers(tx).await?.len();
+        if providers > 0 {
+            return Ok(Err(format!(
+                "this data directory already holds {providers} provider(s) and is not marked as the daemon's. \
+                 Applying a configuration here would switch off everything the file does not name. \
+                 Point --data-dir somewhere of its own, or set `{OWNERSHIP_KEY}` if this really is the daemon's directory."
+            )));
+        }
+        preference_ops::set_preference(tx, OWNERSHIP_KEY, "true", now_ms()).await?;
+        Ok::<_, DbErr>(Ok(()))
+    })
+    .await
+    .map_err(|error| format!("could not claim the data directory: {error}"))?
 }
 
-/// `async` for the SeaORM half: the webhook rows and `notify::save_config`.
-/// The provider rows are still written through Diesel, inline.
-pub async fn apply(
-    pool: &DbPool,
-    sea: &Db,
-    secrets: &SecretsManager,
-    config: &DaemonConfig,
-) -> Result<ApplyReport, String> {
-    claim_data_dir(pool)?;
+pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) -> Result<ApplyReport, String> {
+    claim_data_dir(sea).await?;
 
     // Every secret is read before anything is written. A file naming a variable
     // that is not set should leave the previous configuration running rather
@@ -110,7 +107,6 @@ pub async fn apply(
         });
     }
 
-    let mut conn = pool.get().map_err(|error| format!("db connection: {error}"))?;
     let now = now_ms();
     let mut report = ApplyReport {
         providers_written: 0,
@@ -120,7 +116,6 @@ pub async fn apply(
     };
 
     for (provider, api_key) in config.provider.iter().zip(&provider_keys) {
-        let existing = ops::provider::get_provider(&mut conn, &provider.id).ok();
         // Two sources and no third: what the file says, then what the address
         // says. **Never what the row already holds.**
         //
@@ -160,14 +155,18 @@ pub async fn apply(
                 "no balance can be read for this provider; the daemon can watch it for nothing"
             );
         }
-        let enabled = i32::from(provider.enabled);
-        if existing.is_some() {
-            ops::provider::update_provider(
-                &mut conn,
+        let provider_type = ProviderType::parse(&provider.provider_type)
+            .map_err(|error| format!("provider `{}`: {error}", provider.id))?;
+        let enabled = SqlBool::from(provider.enabled);
+        // The existence check and the write are one transaction, so a second
+        // apply racing this one cannot both see "absent" and both insert.
+        sea.write(async |tx| match provider_ops::get_provider(tx, &provider.id).await? {
+            Some(_) => provider_ops::update_provider(
+                tx,
                 &provider.id,
-                &ProviderChangeset {
+                ProviderChangeset {
                     name: Some(provider.name.clone()),
-                    provider_type: Some(provider.provider_type.clone()),
+                    provider_type: Some(provider_type),
                     base_url: Some(provider.base_url.clone()),
                     // Written every time, cleared included. Adding `vendor` to
                     // an entry has to take effect on the next apply, and so
@@ -180,33 +179,36 @@ pub async fn apply(
                     ..Default::default()
                 },
             )
-            .map_err(|error| format!("could not update provider `{}`: {error}", provider.id))?;
-        } else {
-            ops::provider::create_provider(
-                &mut conn,
-                &ProviderInsert {
-                    id: &provider.id,
-                    name: &provider.name,
-                    provider_type: &provider.provider_type,
-                    base_url: &provider.base_url,
+            .await
+            .map(|_| ()),
+            None => provider_ops::create_provider(
+                tx,
+                provider_entity::Model {
+                    id: provider.id.clone(),
+                    name: provider.name.clone(),
+                    provider_type,
+                    base_url: provider.base_url.clone(),
                     is_enabled: enabled,
                     sort_order: 0,
                     created_at: now,
                     updated_at: now,
-                    api_format: "chat_completions",
-                    catalog_id: catalog_id.as_deref(),
-                    credential_kind: "api_key",
-                    transport_profile: "standard",
+                    api_format: ApiFormat::ChatCompletions,
+                    catalog_id: catalog_id.clone(),
+                    credential_kind: CredentialKind::ApiKey,
+                    transport_profile: TransportProfile::Standard,
                     // A declarative provider names no logo; the mark
                     // follows whichever vendor the catalog identified.
                     icon: None,
                     // Nor a request shape: `chat_completions` above has none
                     // to follow.
-                    codex_request_shape: 0,
+                    codex_request_shape: SqlBool::FALSE,
                 },
             )
-            .map_err(|error| format!("could not create provider `{}`: {error}", provider.id))?;
-        }
+            .await
+            .map(|_| ()),
+        })
+        .await
+        .map_err(|error| format!("could not write provider `{}`: {error}", provider.id))?;
 
         let name = SecretName::new(&meridian_core::agent::provider_secret_name(&provider.id))
             .map_err(|error| format!("provider `{}`: {error}", provider.id))?;
@@ -216,28 +218,36 @@ pub async fn apply(
         report.providers_written += 1;
     }
 
+    // What the file no longer names, switched off in one write: the list and
+    // the updates under one lock.
     let named: Vec<&str> = config.provider.iter().map(|provider| provider.id.as_str()).collect();
-    for row in ops::provider::list_providers(&mut conn).map_err(|error| error.to_string())? {
-        if named.contains(&row.id.as_str()) || row.is_enabled == 0 {
-            continue;
-        }
-        ops::provider::update_provider(
-            &mut conn,
-            &row.id,
-            &ProviderChangeset {
-                is_enabled: Some(0),
-                updated_at: Some(now),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("could not disable provider `{}`: {error}", row.id))?;
-        tracing::info!(provider = %row.id, "disabled: the configuration no longer names it");
-        report.providers_disabled += 1;
+    let disabled = sea
+        .write(async |tx| {
+            let mut disabled = Vec::new();
+            for row in provider_ops::list_providers(tx).await? {
+                if named.contains(&row.id.as_str()) || !row.is_enabled.get() {
+                    continue;
+                }
+                provider_ops::update_provider(
+                    tx,
+                    &row.id,
+                    ProviderChangeset {
+                        is_enabled: Some(SqlBool::FALSE),
+                        updated_at: Some(now),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                disabled.push(row.id);
+            }
+            Ok::<_, DbErr>(disabled)
+        })
+        .await
+        .map_err(|error| format!("could not disable providers: {error}"))?;
+    for id in &disabled {
+        tracing::info!(provider = %id, "disabled: the configuration no longer names it");
     }
-
-    // The Diesel connection goes back before the SeaORM half: the two pools
-    // share one file, and the test pool hands out a single connection.
-    drop(conn);
+    report.providers_disabled += disabled.len();
 
     for (webhook, secret) in config.webhook.iter().zip(&webhook_secrets) {
         // Already validated at config parse; typed here, encoded by the row.
@@ -326,7 +336,11 @@ pub async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::db::diesel_test_db;
+    use meridian_core::db::sea::sea_test_db;
+
+    async fn provider_count(sea: &Db) -> usize {
+        provider_ops::list_providers(sea).await.unwrap().len()
+    }
 
     fn secrets(dir: &std::path::Path) -> SecretsManager {
         use meridian_core::keyring::SuppliedPassphraseStore;
@@ -364,17 +378,16 @@ mod tests {
         // SAFETY: single-threaded test; the variable is read by `apply` below.
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let (pool, sea) = meridian_core::db::sea::shared_test_db(dir.path()).await;
+        let sea = sea_test_db().await;
         let secrets = secrets(dir.path());
         let config = DaemonConfig::parse(ONE_OF_EACH).unwrap();
 
-        let first = apply(&pool, &sea, &secrets, &config).await.unwrap();
+        let first = apply(&sea, &secrets, &config).await.unwrap();
         assert_eq!((first.providers_written, first.webhooks_written), (1, 1));
-        let second = apply(&pool, &sea, &secrets, &config).await.unwrap();
+        let second = apply(&sea, &secrets, &config).await.unwrap();
         assert_eq!((second.providers_written, second.webhooks_written), (1, 1));
 
-        let mut conn = pool.get().unwrap();
-        assert_eq!(ops::provider::count_providers(&mut conn).unwrap(), 1);
+        assert_eq!(provider_count(&sea).await, 1);
         assert_eq!(notification_ops::list_webhooks(&sea).await.unwrap().len(), 1);
         assert_eq!(
             meridian_core::agent::get_provider_api_key(&secrets, "ds").as_deref(),
@@ -388,10 +401,10 @@ mod tests {
     async fn what_the_file_stops_naming_is_switched_off_but_kept() {
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let (pool, sea) = meridian_core::db::sea::shared_test_db(dir.path()).await;
+        let sea = sea_test_db().await;
         let secrets = secrets(dir.path());
 
-        apply(&pool, &sea, &secrets, &DaemonConfig::parse(ONE_OF_EACH).unwrap())
+        apply(&sea, &secrets, &DaemonConfig::parse(ONE_OF_EACH).unwrap())
             .await
             .unwrap();
         let narrowed = DaemonConfig::parse(
@@ -408,17 +421,14 @@ mod tests {
         "#,
         )
         .unwrap();
-        let report = apply(&pool, &sea, &secrets, &narrowed).await.unwrap();
+        let report = apply(&sea, &secrets, &narrowed).await.unwrap();
         assert_eq!(report.webhooks_disabled, 1);
 
         let rows = notification_ops::list_webhooks(&sea).await.unwrap();
         assert_eq!(rows.len(), 1, "disabled, not deleted — the history is worth keeping");
         assert_eq!(rows[0].is_enabled, SqlBool::FALSE);
         // And a second pass does not count it again.
-        assert_eq!(
-            apply(&pool, &sea, &secrets, &narrowed).await.unwrap().webhooks_disabled,
-            0
-        );
+        assert_eq!(apply(&sea, &secrets, &narrowed).await.unwrap().webhooks_disabled, 0);
     }
 
     /// Moving an entry's address re-derives its vendor, and a vendor carried
@@ -439,7 +449,7 @@ mod tests {
 
         unsafe { std::env::set_var("TEST_DS_KEY", "sk-test") };
         let dir = tempfile::tempdir().unwrap();
-        let (pool, sea) = meridian_core::db::sea::shared_test_db(dir.path()).await;
+        let sea = sea_test_db().await;
         let secrets = secrets(dir.path());
 
         let entry = |vendor: &str, url: &str| {
@@ -449,44 +459,42 @@ mod tests {
             ))
             .unwrap()
         };
-        let vendor_of = |pool: &DbPool| {
-            let mut conn = pool.get().unwrap();
-            let row = ops::provider::get_provider(&mut conn, "p1").unwrap();
+        let vendor_of = async |sea: &Db| {
+            let row = provider_ops::get_provider(sea, "p1").await.unwrap().unwrap();
             balance_vendor(ProviderIdentity::new(
                 row.catalog_id.as_deref(),
-                &row.provider_type,
+                row.provider_type.as_str(),
                 &row.base_url,
             ))
             .map(|vendor| vendor.catalog_id().to_string())
         };
 
         apply(
-            &pool,
             &sea,
             &secrets,
             &entry("vendor = \"moonshot\"\n", "https://api.moonshot.cn/v1"),
         )
         .await
         .unwrap();
-        assert_eq!(vendor_of(&pool).as_deref(), Some("moonshot"));
+        assert_eq!(vendor_of(&sea).await.as_deref(), Some("moonshot"));
 
         // Pointed at a relay with no `vendor`: the address names nobody, so the
         // row must name nobody either.
-        apply(&pool, &sea, &secrets, &entry("", "https://codex-api.example/v1"))
+        apply(&sea, &secrets, &entry("", "https://codex-api.example/v1"))
             .await
             .unwrap();
         assert_eq!(
-            vendor_of(&pool),
+            vendor_of(&sea).await,
             None,
             "a relay inherited the previous entry's identity"
         );
 
         // And moved to a different vendor's own address, it becomes that one
         // rather than staying unresolved or reverting to the first.
-        apply(&pool, &sea, &secrets, &entry("", "https://api.siliconflow.cn/v1"))
+        apply(&sea, &secrets, &entry("", "https://api.siliconflow.cn/v1"))
             .await
             .unwrap();
-        assert_eq!(vendor_of(&pool).as_deref(), Some("siliconflow"));
+        assert_eq!(vendor_of(&sea).await.as_deref(), Some("siliconflow"));
     }
 
     /// A half-applied configuration leaves a provider with no key, which
@@ -495,7 +503,7 @@ mod tests {
     async fn a_missing_environment_variable_writes_nothing_at_all() {
         unsafe { std::env::remove_var("TEST_ABSENT_KEY") };
         let dir = tempfile::tempdir().unwrap();
-        let (pool, sea) = meridian_core::db::sea::shared_test_db(dir.path()).await;
+        let sea = sea_test_db().await;
         let secrets = secrets(dir.path());
         let config = DaemonConfig::parse(
             r#"
@@ -509,11 +517,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = apply(&pool, &sea, &secrets, &config).await.unwrap_err();
+        let error = apply(&sea, &secrets, &config).await.unwrap_err();
         assert!(error.contains("TEST_ABSENT_KEY"), "{error}");
-        let mut conn = pool.get().unwrap();
         assert_eq!(
-            ops::provider::count_providers(&mut conn).unwrap(),
+            provider_count(&sea).await,
             0,
             "nothing may be written before every secret is in hand"
         );
@@ -528,51 +535,46 @@ mod tests {
 
     /// Pointing the daemon at a desktop install would switch off everything the
     /// file does not name.
-    #[test]
-    fn a_populated_unclaimed_data_directory_is_refused() {
-        let pool = diesel_test_db();
-        {
-            let mut conn = pool.get().unwrap();
-            ops::provider::create_provider(
-                &mut conn,
-                &ProviderInsert {
-                    id: "desktop-one",
-                    name: "Configured on the desktop",
-                    provider_type: "openai",
-                    base_url: "https://api.openai.com/v1",
-                    is_enabled: 1,
+    #[tokio::test]
+    async fn a_populated_unclaimed_data_directory_is_refused() {
+        let sea = sea_test_db().await;
+        sea.write(async |tx| {
+            provider_ops::create_provider(
+                tx,
+                provider_entity::Model {
+                    id: "desktop-one".into(),
+                    name: "Configured on the desktop".into(),
+                    provider_type: ProviderType::Openai,
+                    base_url: "https://api.openai.com/v1".into(),
+                    is_enabled: SqlBool::TRUE,
                     sort_order: 0,
                     created_at: 1,
                     updated_at: 1,
-                    api_format: "chat_completions",
+                    api_format: ApiFormat::ChatCompletions,
                     catalog_id: None,
-                    credential_kind: "api_key",
-                    transport_profile: "standard",
-                    // A declarative provider names no logo; the mark
-                    // follows whichever vendor the catalog identified.
+                    credential_kind: CredentialKind::ApiKey,
+                    transport_profile: TransportProfile::Standard,
                     icon: None,
-                    // Nor a request shape: `chat_completions` above has none
-                    // to follow.
-                    codex_request_shape: 0,
+                    codex_request_shape: SqlBool::FALSE,
                 },
             )
-            .unwrap();
-        }
-        let error = claim_data_dir(&pool).unwrap_err();
+            .await
+        })
+        .await
+        .unwrap();
+        let error = claim_data_dir(&sea).await.unwrap_err();
         assert!(error.contains("not marked as the daemon's"), "{error}");
 
         // An empty one is claimed, and stays claimed once it has rows.
-        let fresh = diesel_test_db();
-        claim_data_dir(&fresh).unwrap();
-        {
-            let mut conn = fresh.get().unwrap();
-            assert_eq!(
-                ops::preference::get_preference(&mut conn, OWNERSHIP_KEY)
-                    .unwrap()
-                    .as_deref(),
-                Some("true")
-            );
-        }
-        claim_data_dir(&fresh).unwrap();
+        let fresh = sea_test_db().await;
+        claim_data_dir(&fresh).await.unwrap();
+        assert_eq!(
+            preference_ops::get_preference(&fresh, OWNERSHIP_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        claim_data_dir(&fresh).await.unwrap();
     }
 }

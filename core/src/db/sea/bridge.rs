@@ -244,3 +244,18 @@ pub async fn previous_release_file(path: &Path, applied: usize) -> Result<(), Db
     replay_as_diesel(&conn, applied).await?;
     conn.close().await
 }
+
+/// [`previous_release_file`] with rows in it, written as plain SQL against
+/// that release's schema — the way the release that wrote them left them.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn previous_release_file_with(path: &Path, applied: usize, rows: &str) -> Result<(), DbErr> {
+    previous_release_file(path, applied).await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(super::options(path))
+        .await
+        .map_err(super::connection_error)?;
+    let conn = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+    conn.execute_unprepared(rows).await?;
+    conn.close().await
+}

@@ -6,11 +6,7 @@ pub mod conversation;
 pub mod message;
 pub mod model_config;
 pub mod plan;
-pub mod preference;
 pub mod project;
-pub mod provider;
-pub mod queue;
-pub mod queued_prompt_context_item;
 pub mod todo;
 pub mod turn;
 

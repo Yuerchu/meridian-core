@@ -2,7 +2,7 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
 use crate::db::entity::assistant;
-use crate::db::models::assistant::{AssistantChangeset, AssistantInsert, AssistantRow};
+use crate::db::models::assistant::AssistantRow;
 use crate::db::schema::assistants;
 
 /// A Diesel row as the entity model; a bad flag or tool list fails the read.
@@ -17,101 +17,4 @@ pub fn get_default_assistant(conn: &mut SqliteConnection) -> QueryResult<Option<
         .optional()?
         .map(model)
         .transpose()
-}
-
-pub fn create_assistant(conn: &mut SqliteConnection, new: &AssistantInsert) -> QueryResult<assistant::Model> {
-    diesel::insert_into(assistants::table).values(new).execute(conn)?;
-    assistants::table
-        .find(new.id)
-        .first::<AssistantRow>(conn)
-        .and_then(model)
-}
-
-pub fn update_assistant(
-    conn: &mut SqliteConnection,
-    id: &str,
-    changeset: &AssistantChangeset,
-) -> QueryResult<assistant::Model> {
-    diesel::update(assistants::table.find(id))
-        .set(changeset)
-        .execute(conn)?;
-    assistants::table.find(id).first::<AssistantRow>(conn).and_then(model)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::diesel_test_db;
-
-    fn make_new_assistant<'a>(id: &'a str, name: &'a str, sort_order: i32) -> AssistantInsert<'a> {
-        AssistantInsert {
-            id,
-            name,
-            description: None,
-            avatar: None,
-            system_prompt: "You are helpful",
-            provider_id: None,
-            model_id: None,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            is_default: 0,
-            sort_order,
-            created_at: 1000,
-            updated_at: 1000,
-            context_limit: 128000,
-            compact_keep_recent: 5,
-            enabled_tools: None,
-            thinking_enabled: 0,
-            thinking_budget: None,
-            tool_preset_id: None,
-            auto_compact_enabled: 0,
-        }
-    }
-
-    #[test]
-    fn test_create_and_get() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        let new = make_new_assistant("a1", "Test Assistant", 0);
-        let created = create_assistant(&mut conn, &new).unwrap();
-        assert_eq!(created.id, "a1");
-        assert_eq!(created.name, "Test Assistant");
-    }
-
-    #[test]
-    fn test_get_default() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        let mut new = make_new_assistant("a1", "Default One", 0);
-        new.is_default = 1;
-        create_assistant(&mut conn, &new).unwrap();
-
-        let default = get_default_assistant(&mut conn).unwrap();
-        assert!(default.is_some());
-        assert_eq!(default.unwrap().name, "Default One");
-    }
-
-    #[test]
-    fn test_get_default_returns_none_when_empty() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        assert!(get_default_assistant(&mut conn).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_update() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_assistant(&mut conn, &make_new_assistant("a1", "Old Name", 0)).unwrap();
-
-        let changeset = AssistantChangeset {
-            name: Some("New Name".into()),
-            system_prompt: Some("Updated prompt".into()),
-            ..Default::default()
-        };
-        let updated = update_assistant(&mut conn, "a1", &changeset).unwrap();
-        assert_eq!(updated.name, "New Name");
-        assert_eq!(updated.system_prompt, "Updated prompt");
-    }
 }

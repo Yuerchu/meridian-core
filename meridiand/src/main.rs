@@ -146,7 +146,7 @@ fn run() -> Result<(), String> {
         secrets.clone(),
     ))?;
 
-    let report = runtime.block_on(apply::apply(&services.db, &services.sea, &services.secrets, &config))?;
+    let report = runtime.block_on(apply::apply(&services.sea, &services.secrets, &config))?;
     tracing::info!(
         providers = report.providers_written,
         providers_disabled = report.providers_disabled,
@@ -206,10 +206,7 @@ async fn send_test(services: &meridian_core::services::Services, id: &str) -> Re
 /// nothing could read it without opening the file by hand, which is a diagnosis
 /// nobody makes at three in the morning.
 async fn print_status(services: &meridian_core::services::Services) -> Result<(), String> {
-    {
-        let mut conn = services.db.get().map_err(|error| format!("db connection: {error}"))?;
-        print_provider_status(&mut conn)?;
-    }
+    print_provider_status(&services.sea).await?;
     // A subscription that will not decode fails this read, and the error
     // names the row: it is why an endpoint is silent, and it is invisible
     // everywhere else.
@@ -264,24 +261,26 @@ async fn print_status(services: &meridian_core::services::Services) -> Result<()
 /// catalog does not recognise is watched for nothing. That failure is
 /// completely silent otherwise — the daemon runs, the endpoints are healthy,
 /// and no alert was ever going to be raised.
-fn print_provider_status(conn: &mut meridian_core::db::PooledConn) -> Result<(), String> {
+async fn print_provider_status(sea: &meridian_core::db::sea::cap::Db) -> Result<(), String> {
     use meridian_core::provider::balance::{ProviderIdentity, balance_vendor};
 
-    let providers = meridian_core::db::ops::provider::list_providers(conn).map_err(|error| error.to_string())?;
+    let providers = meridian_core::db::sea::ops::provider::list_providers(sea)
+        .await
+        .map_err(|error| error.to_string())?;
     if providers.is_empty() {
         println!("meridiand: no providers are configured");
     }
     for provider in &providers {
         let vendor = balance_vendor(ProviderIdentity::new(
             provider.catalog_id.as_deref(),
-            &provider.provider_type,
+            provider.provider_type.as_str(),
             &provider.base_url,
         ));
         println!(
             "{}  {}  {}  {}",
-            if provider.is_enabled != 0 { "on " } else { "off" },
+            if provider.is_enabled.get() { "on " } else { "off" },
             provider.id,
-            provider.provider_type,
+            provider.provider_type.as_str(),
             provider.base_url,
         );
         match vendor {
