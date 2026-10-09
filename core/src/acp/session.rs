@@ -28,7 +28,6 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::engine::transcript::{append_tool_result, begin_assistant, complete_assistant, write_steering};
 use crate::agent::tool_calls::serialize_tool_calls_openai;
 use crate::db::entity::queued_prompt;
-use crate::db::models::acp_session_notice::AcpSessionNoticeInsert;
 use crate::db::models::message::MessageUsage;
 use crate::db::models::turn::{TurnPhase, TurnStatus};
 use crate::events::{
@@ -37,7 +36,7 @@ use crate::events::{
 use crate::provider;
 use crate::services::Services;
 use crate::turn::{TurnOrigin, TurnTrigger};
-use crate::util::{get_conn, now_ms};
+use crate::util::now_ms;
 
 use super::mapping::{self, Effect};
 use super::peer::{Handler, Peer, PeerError};
@@ -771,23 +770,19 @@ impl Shared {
             Some(Some(message_id)) => Some(message_id),
             _ => match self.with_turn(|t| t.turn_id.clone()) {
                 Some(turn_id) => {
-                    let pool = self.services.db.clone();
-                    let (turn_id, call_id, hunks) = (turn_id, call_id.clone(), diffs.clone());
-                    let found = tokio::task::spawn_blocking(move || {
-                        let mut conn = get_conn(&pool)?;
-                        crate::db::ops::message::record_tool_diffs_for_call(&mut conn, &turn_id, &call_id, &hunks)
-                            .map_err(|e| e.to_string())
-                    })
-                    .await;
+                    let found = self
+                        .services
+                        .sea
+                        .write(async |tx| {
+                            crate::db::sea::ops::message::record_tool_diffs_for_call(tx, &turn_id, &call_id, &diffs)
+                                .await
+                        })
+                        .await;
                     // Logged, never fatal: what is lost is one card's gutter.
                     match found {
-                        Ok(Ok(row)) => row,
-                        Ok(Err(e)) => {
-                            tracing::debug!(error = %e, "could not store an ACP tool diff");
-                            None
-                        }
+                        Ok(row) => row,
                         Err(e) => {
-                            tracing::debug!(error = %e, "storing an ACP tool diff panicked");
+                            tracing::debug!(error = %e, "could not store an ACP tool diff");
                             None
                         }
                     }
@@ -817,43 +812,32 @@ impl Shared {
     /// is the adapter repeating itself, and the frontend already holds it.
     /// Held back during an import, where the conversation does not exist yet.
     async fn record_notice(&self, record: mapping::SessionNoticeRecord, turn_id: Option<String>) {
-        let pool = self.services.db.clone();
-        let conversation_id = self.conversation_id.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let actions = serde_json::to_string(&record.actions).map_err(|e| e.to_string())?;
-            let id = uuid::Uuid::new_v4().to_string();
-            let now = now_ms();
-            crate::db::ops::acp_session_notice::upsert_if_newer(
-                &mut conn,
-                AcpSessionNoticeInsert {
-                    id: &id,
-                    conversation_id: &conversation_id,
-                    turn_id: turn_id.as_deref(),
-                    notice_id: &record.notice_id,
-                    revision: i32::try_from(record.revision).unwrap_or(i32::MAX),
-                    category: record.category.as_str(),
-                    severity: record.severity.as_str(),
-                    title: &record.title,
-                    details: record.details.as_deref(),
-                    reason: record.reason.as_deref(),
-                    actions: &actions,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .map_err(|e| e.to_string())
-        })
-        .await;
+        let now = now_ms();
+        let notice = crate::db::entity::acp_session_notice::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: self.conversation_id.clone(),
+            turn_id,
+            notice_id: record.notice_id,
+            revision: i32::try_from(record.revision).unwrap_or(i32::MAX),
+            category: record.category,
+            severity: record.severity,
+            title: record.title,
+            details: record.details,
+            reason: record.reason,
+            actions: crate::db::types::Json(record.actions),
+            created_at: now,
+            updated_at: now,
+        };
+        let written = self
+            .services
+            .sea
+            .write(async |tx| crate::db::sea::ops::acp_session_notice::upsert_if_newer(tx, notice).await)
+            .await;
         let row = match written {
-            Ok(Ok(Some(row))) => row,
-            Ok(Ok(None)) => return,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not record an ACP notice");
-                return;
-            }
+            Ok(Some(row)) => row,
+            Ok(None) => return,
             Err(error) => {
-                tracing::warn!(%error, conversation_id = %self.conversation_id, "recording an ACP notice panicked");
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not record an ACP notice");
                 return;
             }
         };
@@ -897,36 +881,36 @@ impl Shared {
             .ok()
             .and_then(|mut slot| slot.replace(title.clone()));
         let placeholder = self.placeholder_title.clone();
-        let pool = self.services.db.clone();
-        let conversation_id = self.conversation_id.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            let current = crate::db::ops::conversation::get_conversation(&mut conn, &conversation_id)
-                .map_err(|e| e.to_string())?
-                .title;
-            let nobodys = match current.as_deref() {
-                None => true,
-                Some(current) => current == placeholder || Some(current) == previous.as_deref(),
-            };
-            if !nobodys || current.as_deref() == Some(title.as_str()) {
-                return Ok::<bool, String>(false);
-            }
-            crate::db::ops::conversation::update_title(&mut conn, &conversation_id, &title, now_ms())
-                .map_err(|e| e.to_string())?;
-            Ok(true)
-        })
-        .await;
+        // The current title read under the lock the new one is written under.
+        let conversation_id = &self.conversation_id;
+        let written = self
+            .services
+            .sea
+            .write(async |tx| {
+                let Some(current) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await?
+                else {
+                    return Ok(false);
+                };
+                let current = current.title;
+                let nobodys = match current.as_deref() {
+                    None => true,
+                    Some(current) => current == placeholder || Some(current) == previous.as_deref(),
+                };
+                if !nobodys || current.as_deref() == Some(title.as_str()) {
+                    return Ok::<bool, crate::db::sea::DbErr>(false);
+                }
+                crate::db::sea::ops::conversation::update_title(tx, conversation_id, &title, now_ms()).await?;
+                Ok(true)
+            })
+            .await;
         match written {
-            Ok(Ok(true)) => {
+            Ok(true) => {
                 tracing::info!(conversation_id = %self.conversation_id, "adopted the agent's title");
                 let _ = self.services.events.emit_conversation_updated(&self.conversation_id);
             }
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not adopt the agent's title")
-            }
+            Ok(false) => {}
             Err(error) => {
-                tracing::warn!(%error, conversation_id = %self.conversation_id, "adopting the agent's title panicked")
+                tracing::warn!(%error, conversation_id = %self.conversation_id, "could not adopt the agent's title")
             }
         }
     }
@@ -971,22 +955,18 @@ impl Shared {
         // card's gutter and the pre-overwrite text of a diff — logged, not
         // counted against the turn, the same class as a stored revision.
         if !row.diffs.is_empty() {
-            let pool = self.services.db.clone();
-            let message_id = row.message_id.clone();
-            let diffs = row.diffs.clone();
-            let written = tokio::task::spawn_blocking(move || {
-                let mut conn = get_conn(&pool)?;
-                for (call_id, hunks) in &diffs {
-                    crate::db::ops::message::record_tool_diffs(&mut conn, &message_id, call_id, hunks)
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok::<(), String>(())
-            })
-            .await;
-            match written {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(error = %e, "could not store an ACP row's tool diffs"),
-                Err(e) => tracing::warn!(error = %e, "storing an ACP row's tool diffs panicked"),
+            let written = self
+                .services
+                .sea
+                .write(async |tx| {
+                    for (call_id, hunks) in &row.diffs {
+                        crate::db::sea::ops::message::record_tool_diffs(tx, &row.message_id, call_id, hunks).await?;
+                    }
+                    Ok::<(), crate::db::sea::DbErr>(())
+                })
+                .await;
+            if let Err(e) = written {
+                tracing::warn!(error = %e, "could not store an ACP row's tool diffs");
             }
         }
 
@@ -1147,21 +1127,16 @@ impl Shared {
         let Some(turn_id) = self.with_turn(|t| t.turn_id.clone()) else {
             return;
         };
-        let pool = self.services.db.clone();
-        let tool = tool.map(str::to_string);
-        let written = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::turn::set_phase(&mut conn, &turn_id, phase, tool.as_deref(), now_ms())
-                .map_err(|e| e.to_string())
-        })
-        .await;
+        let written = self
+            .services
+            .sea
+            .write(async |tx| crate::db::sea::ops::turn::set_phase(tx, &turn_id, phase, tool, now_ms()).await)
+            .await;
         // Logged, never fatal. A phase that did not land costs a vaguer warning
         // after a crash that may not happen; a turn ended over it costs the
         // answer somebody is reading.
-        match written {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!(error = %e, "could not record an ACP turn phase"),
-            Err(e) => tracing::debug!(error = %e, "recording an ACP turn phase panicked"),
+        if let Err(e) = written {
+            tracing::debug!(error = %e, "could not record an ACP turn phase");
         }
     }
 
@@ -1233,26 +1208,20 @@ impl Shared {
         tool_name: Option<&str>,
         arguments: Option<&str>,
     ) -> Option<(String, String, String)> {
-        let pool = self.services.db.clone();
-        let (turn_id, call_id) = (turn_id.to_string(), call_id.to_string());
-        let (name, args) = (tool_name.map(str::to_string), arguments.map(str::to_string));
-        let found = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::message::revise_tool_call(&mut conn, &turn_id, &call_id, name.as_deref(), args.as_deref())
-                .map_err(|e| e.to_string())
-        })
-        .await;
+        let found = self
+            .services
+            .sea
+            .write(async |tx| {
+                crate::db::sea::ops::message::revise_tool_call(tx, turn_id, call_id, tool_name, arguments).await
+            })
+            .await;
 
         // Logged, never fatal. What is lost is the arguments on one card, which
         // is what was already lost before this path existed.
         match found {
-            Ok(Ok(row)) => row,
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, "could not fill in a stored ACP tool call");
-                None
-            }
+            Ok(row) => row,
             Err(e) => {
-                tracing::debug!(error = %e, "filling in a stored ACP tool call panicked");
+                tracing::debug!(error = %e, "could not fill in a stored ACP tool call");
                 None
             }
         }
@@ -1265,10 +1234,8 @@ impl Shared {
     /// step is done, and an ACP session has no plan of this app's to retire.
     async fn write_plan(&self, items: Vec<mapping::PlanItem>) {
         use crate::db::models::todo::ItemStatus;
-        use crate::db::ops::todo::TodoItemSpec;
+        use crate::db::sea::ops::todo::TodoItemSpec;
 
-        let pool = self.services.db.clone();
-        let conversation_id = self.conversation_id.clone();
         let items: Vec<TodoItemSpec> = items
             .into_iter()
             .map(|item| TodoItemSpec {
@@ -1284,16 +1251,22 @@ impl Shared {
             return;
         }
 
-        let written = tokio::task::spawn_blocking(move || {
-            let mut conn = get_conn(&pool)?;
-            crate::db::ops::todo::replace_active_list(&mut conn, &conversation_id, "Claude Code", &items, now_ms())
-                .map_err(|e| e.to_string())
-        })
-        .await;
-        match written {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "could not store the agent's plan"),
-            Err(e) => tracing::warn!(error = %e, "could not store the agent's plan (the write panicked)"),
+        let written = self
+            .services
+            .sea
+            .write(async |tx| {
+                crate::db::sea::ops::todo::replace_active_list(
+                    tx,
+                    &self.conversation_id,
+                    "Claude Code",
+                    &items,
+                    now_ms(),
+                )
+                .await
+            })
+            .await;
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "could not store the agent's plan");
         }
     }
 
@@ -2271,16 +2244,11 @@ impl AcpSession {
         let project_id = match project {
             ProjectOf::Known(project_id) => project_id.map(str::to_string),
             ProjectOf::Stored => {
-                let pool = services.db.clone();
-                let id = conversation_id.to_string();
-                tokio::task::spawn_blocking(move || {
-                    let mut conn = get_conn(&pool)?;
-                    crate::db::ops::conversation::get_conversation(&mut conn, &id)
-                        .map(|c| c.project_id)
-                        .map_err(|e| e.to_string())
-                })
-                .await
-                .map_err(|e| e.to_string())??
+                crate::db::sea::ops::conversation::get_conversation(&services.sea, conversation_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("conversation {conversation_id} not found"))?
+                    .project_id
             }
         };
 
@@ -2836,18 +2804,16 @@ impl AcpSession {
             Err(error) => Outcome::Held(error),
         };
         if matches!(outcome, Outcome::Acknowledged) {
-            let pool = services.db.clone();
             let turn_id = delivery.submitting_turn_id;
-            let written = tokio::task::spawn_blocking(move || {
-                let mut conn = get_conn(&pool)?;
-                crate::db::ops::turn::finish_waiting_review(&mut conn, &turn_id, TurnStatus::Done, None, now_ms())
-                    .map_err(|error| error.to_string())
-            })
-            .await;
-            match written {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "could not settle resumed ACP review turn"),
-                Err(error) => tracing::warn!(%error, "settling resumed ACP review turn panicked"),
+            let written = services
+                .sea
+                .write(async |tx| {
+                    crate::db::sea::ops::turn::finish_waiting_review(tx, &turn_id, TurnStatus::Done, None, now_ms())
+                        .await
+                })
+                .await;
+            if let Err(error) = written {
+                tracing::warn!(%error, "could not settle resumed ACP review turn");
             }
         }
         outcome
@@ -3588,20 +3554,17 @@ impl AcpSession {
         let (status, reason, error) = incomplete_unless_whole(status, reason, error, lost, unwritten);
 
         if review_boundary.is_some() {
-            let pool = services.db.clone();
-            let id = turn_id.to_string();
-            let stored_error = error.clone();
-            let written = tokio::task::spawn_blocking(move || {
-                let mut conn = get_conn(&pool)?;
-                crate::db::ops::turn::finish_waiting_review(&mut conn, &id, status, stored_error.as_deref(), now_ms())
-                    .map_err(|error| error.to_string())
-            })
-            .await;
+            let written = services
+                .sea
+                .write(async |tx| {
+                    crate::db::sea::ops::turn::finish_waiting_review(tx, turn_id, status, error.as_deref(), now_ms())
+                        .await
+                })
+                .await;
             match written {
-                Ok(Ok(1)) => {}
-                Ok(Ok(_)) => tracing::warn!(turn_id, "ACP review decision found no waiting turn to settle"),
-                Ok(Err(error)) => tracing::warn!(%error, turn_id, "could not settle ACP waiting review turn"),
-                Err(error) => tracing::warn!(%error, turn_id, "settling ACP waiting review turn panicked"),
+                Ok(1) => {}
+                Ok(_) => tracing::warn!(turn_id, "ACP review decision found no waiting turn to settle"),
+                Err(error) => tracing::warn!(%error, turn_id, "could not settle ACP waiting review turn"),
             }
         } else {
             crate::agent::turn_record::finish(&services.sea, turn_id, status, error.as_deref()).await;
@@ -4589,8 +4552,8 @@ mod tests {
         // and `{}` left there is indistinguishable from a call that took no
         // arguments — in the transcript and in the audit copy alike.
         let stored = {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::message::list_messages(&mut conn, "c1")
+            crate::db::sea::ops::message::list_messages(&services.sea, "c1")
+                .await
                 .unwrap()
                 .into_iter()
                 .filter_map(|m| m.tool_calls)
@@ -4678,11 +4641,14 @@ mod tests {
     /// out.
     pub(super) async fn live_turn(dir: &std::path::Path) -> Shared {
         let services = bare_services(dir).await;
-        {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::conversation::create_conversation(&mut conn, "c1", Some("t"), None, None, 0).unwrap();
-            crate::db::ops::turn::begin(&mut conn, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).unwrap();
-        }
+        services
+            .sea
+            .write(async |tx| {
+                crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("t"), None, None, 0).await?;
+                crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).await
+            })
+            .await
+            .unwrap();
         let first = begin_assistant(
             &services.sea,
             "c1",
@@ -4733,6 +4699,50 @@ mod tests {
         })
     }
 
+    /// The agent names the conversation only while nobody else has: a title
+    /// the user chose is kept, the placeholder and the agent's own earlier
+    /// title are replaced.
+    #[tokio::test]
+    async fn the_agents_title_never_replaces_the_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = live_turn(dir.path()).await;
+        let sea = shared.services.sea.clone();
+        let title = async || {
+            crate::db::sea::ops::conversation::get_conversation(&sea, "c1")
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+        };
+        let rename = async |to: &str| {
+            sea.write(async |tx| crate::db::sea::ops::conversation::update_title(tx, "c1", to, 5).await)
+                .await
+                .unwrap();
+        };
+
+        // `live_turn` names the conversation "t", which is nobody's placeholder.
+        shared.adopt_title("agent one".into()).await;
+        assert_eq!(title().await.as_deref(), Some("t"), "a title somebody chose is kept");
+
+        rename("").await;
+        shared.adopt_title("agent two".into()).await;
+        assert_eq!(
+            title().await.as_deref(),
+            Some("agent two"),
+            "the placeholder is replaced"
+        );
+        shared.adopt_title("agent three".into()).await;
+        assert_eq!(
+            title().await.as_deref(),
+            Some("agent three"),
+            "and so is the agent's own"
+        );
+
+        rename("mine").await;
+        shared.adopt_title("agent four".into()).await;
+        assert_eq!(title().await.as_deref(), Some("mine"), "a rename by the user stands");
+    }
+
     /// The adapter's `memory_recall`: one `tool_call`, already `completed`,
     /// never updated. Read as a bare call it was a round that could not settle,
     /// so the prose after it — the whole rest of the turn — joined the row that
@@ -4762,8 +4772,8 @@ mod tests {
             "the prose opened a round of its own"
         );
         let answered = {
-            let mut conn = shared.services.db.get().unwrap();
-            crate::db::ops::message::list_messages(&mut conn, "c1")
+            crate::db::sea::ops::message::list_messages(&shared.services.sea, "c1")
+                .await
                 .unwrap()
                 .into_iter()
                 .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("M"))
@@ -5010,18 +5020,18 @@ mod unprompted {
         })
     }
 
-    fn turns(shared: &Shared) -> Vec<crate::db::entity::turn::Model> {
-        let mut conn = shared.services.db.get().unwrap();
-        crate::db::ops::turn::list_for_conversation(&mut conn, "c1")
+    async fn turns(shared: &Shared) -> Vec<crate::db::entity::turn::Model> {
+        crate::db::sea::ops::turn::list_for_conversation(&shared.services.sea, "c1")
+            .await
             .unwrap()
             .into_iter()
             .filter(|t| t.id != "t1")
             .collect()
     }
 
-    fn rows(shared: &Shared, turn_id: &str) -> Vec<crate::db::entity::message::Model> {
-        let mut conn = shared.services.db.get().unwrap();
-        crate::db::ops::message::list_messages(&mut conn, "c1")
+    async fn rows(shared: &Shared, turn_id: &str) -> Vec<crate::db::entity::message::Model> {
+        crate::db::sea::ops::message::list_messages(&shared.services.sea, "c1")
+            .await
             .unwrap()
             .into_iter()
             .filter(|m| m.turn_id.as_deref() == Some(turn_id))
@@ -5058,7 +5068,7 @@ mod unprompted {
         assert!(shared.with_turn(|_| ()).is_none(), "idle ends it");
         assert!(lease_is_free(&shared), "and gives the conversation back");
 
-        let turns = turns(&shared);
+        let turns = turns(&shared).await;
         assert_eq!(turns.len(), 1, "one turn for the whole cycle");
         let turn = &turns[0];
         assert_eq!(turn.trigger.as_str(), "task_completion");
@@ -5074,7 +5084,7 @@ mod unprompted {
             "still Claude Code's turn, for billing and blame"
         );
 
-        let rows = rows(&shared, &turn.id);
+        let rows = rows(&shared, &turn.id).await;
         let assistants: Vec<_> = rows.iter().filter(|m| m.role == "assistant").collect();
         assert_eq!(assistants.len(), 2, "round by round, as a prompted turn is written");
         assert_eq!(
@@ -5151,14 +5161,14 @@ mod unprompted {
             "the card belongs to that turn"
         );
         assert_eq!(
-            turns(&shared)[0].trigger.as_str(),
+            turns(&shared).await[0].trigger.as_str(),
             "agent_autonomous",
             "nothing said what woke it"
         );
 
         shared.close_unprompted(Ending::Stopped, None).await;
         asking.await.unwrap().unwrap();
-        assert_eq!(turns(&shared)[0].status.as_str(), "cancelled");
+        assert_eq!(turns(&shared).await[0].status.as_str(), "cancelled");
     }
 
     /// A prompted turn's own `idle` comes after its reply, while `finish` is
@@ -5199,7 +5209,7 @@ mod unprompted {
             .unwrap();
         update(&shared, text("hello")).await;
         assert!(shared.with_turn(|_| ()).is_none());
-        assert!(turns(&shared).is_empty(), "no record of a turn that never ran");
+        assert!(turns(&shared).await.is_empty(), "no record of a turn that never ran");
         drop(held);
     }
 
@@ -5212,11 +5222,11 @@ mod unprompted {
         sdk(&shared, task_notification("bg-silent")).await;
         state(&shared, "running").await;
         state(&shared, "idle").await;
-        assert!(turns(&shared).is_empty(), "a cycle with no output is no turn");
+        assert!(turns(&shared).await.is_empty(), "a cycle with no output is no turn");
 
         update(&shared, text("something else")).await;
         state(&shared, "idle").await;
-        let turns = turns(&shared);
+        let turns = turns(&shared).await;
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].trigger.as_str(), "agent_autonomous");
         assert_eq!(turns[0].trigger_ref, None);
@@ -5231,6 +5241,6 @@ mod unprompted {
         shared.set_replay(Replay::Discard);
         update(&shared, text("said long ago")).await;
         assert!(shared.with_turn(|_| ()).is_none());
-        assert!(turns(&shared).is_empty());
+        assert!(turns(&shared).await.is_empty());
     }
 }

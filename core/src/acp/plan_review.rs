@@ -586,13 +586,22 @@ mod tests {
     async fn an_acp_snapshot_becomes_a_materialized_waiting_review() {
         let dir = tempfile::tempdir().unwrap();
         let services = bare_services(dir.path()).await;
-        {
-            let mut conn = services.db.get().unwrap();
-            crate::db::ops::conversation::create_conversation(&mut conn, "conversation-1", Some("plan"), None, None, 1)
-                .unwrap();
-            crate::db::ops::turn::begin(&mut conn, "turn-1", "conversation-1", TurnOrigin::ClaudeCode, None, 2)
-                .unwrap();
-        }
+        services
+            .sea
+            .write(async |tx| {
+                crate::db::sea::ops::conversation::create_conversation(
+                    tx,
+                    "conversation-1",
+                    Some("plan"),
+                    None,
+                    None,
+                    1,
+                )
+                .await?;
+                crate::db::sea::ops::turn::begin(tx, "turn-1", "conversation-1", TurnOrigin::ClaudeCode, None, 2).await
+            })
+            .await
+            .unwrap();
 
         let submitted = submit(
             &services,

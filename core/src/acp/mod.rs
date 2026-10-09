@@ -331,26 +331,21 @@ impl AcpConfig {
 /// conversation that starts fresh next time, which is what it did before this
 /// table existed.
 async fn remember_session(services: &crate::services::Services, session: &AcpSession) {
-    let pool = services.db.clone();
-    let conversation_id = session.conversation_id.clone();
-    let acp_session_id = session.acp_session_id.clone();
-    let cwd = session.cwd.clone();
-    let written = tokio::task::spawn_blocking(move || {
-        let mut conn = crate::util::get_conn(&pool)?;
-        crate::db::ops::acp_session::upsert(
-            &mut conn,
-            &conversation_id,
-            Some(&acp_session_id),
-            &cwd,
-            crate::util::now_ms(),
-        )
-        .map_err(|e| e.to_string())
-    })
-    .await;
-    match written {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "could not record which agent session this conversation is"),
-        Err(e) => tracing::warn!(error = %e, "recording the agent session panicked"),
+    let written = services
+        .sea
+        .write(async |tx| {
+            crate::db::sea::ops::acp_session::upsert(
+                tx,
+                &session.conversation_id,
+                Some(&session.acp_session_id),
+                &session.cwd,
+                crate::util::now_ms(),
+            )
+            .await
+        })
+        .await;
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "could not record which agent session this conversation is");
     }
 }
 
@@ -370,16 +365,13 @@ pub async fn open_session(services: &crate::services::Services, cwd: &str) -> Re
     // Same reasoning as a review conversation: file it under the project that
     // owns this directory when there is one, and leave it ungrouped rather than
     // inventing a project the user did not ask for.
-    let pool = services.db.clone();
-    let path = cwd.to_string();
-    let project_id = tokio::task::spawn_blocking(move || {
-        let mut conn = crate::util::get_conn(&pool)?;
-        crate::db::ops::project::find_project_by_path(&mut conn, &path)
-            .map(|p| p.map(|p| p.id))
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    // pool-read-before-write: the directory's project is decided before the
+    // adapter starts, which takes seconds and holds no lock; the row written
+    // after it files the conversation under what was decided here.
+    let project_id = crate::db::sea::ops::project::find_project_by_path(&services.sea, cwd)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|p| p.id);
 
     let session = AcpSession::open(
         services.clone(),
@@ -429,26 +421,31 @@ pub async fn reopen_session(
         return Ok(existing);
     }
 
-    let pool = services.db.clone();
-    let id = conversation_id.to_string();
-    // Both facts in one read, because they are one row. `head_message_id`
-    // answers the third question — whether there is anything above for the
-    // agent to be blind to — and a conversation opened and never used has
-    // nothing, so telling it would be noise.
-    let (cwd, resume, transcript_above) = tokio::task::spawn_blocking(move || {
-        let mut conn = crate::util::get_conn(&pool)?;
-        let row = crate::db::ops::acp_session::get(&mut conn, &id)
-            .map_err(|e| e.to_string())?
-            .filter(|row| !row.cwd.trim().is_empty())
-            .ok_or("this conversation has no recorded working directory; start a new session")?;
-        let has_messages = crate::db::ops::conversation::get_conversation(&mut conn, &id)
-            .ok()
-            .and_then(|c| c.head_message_id)
-            .is_some();
-        Ok::<_, String>((row.cwd, row.acp_session_id, has_messages))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    // Both facts in one snapshot. `head_message_id` answers the third
+    // question — whether there is anything above for the agent to be blind to —
+    // and a conversation opened and never used has nothing, so telling it
+    // would be noise.
+    let (cwd, resume, transcript_above) = services
+        .sea
+        .read(async |tx| {
+            let Some(row) = crate::db::sea::ops::acp_session::get(tx, conversation_id)
+                .await?
+                .filter(|row| !row.cwd.trim().is_empty())
+            else {
+                return Ok(Err(
+                    "this conversation has no recorded working directory; start a new session".to_string(),
+                ));
+            };
+            let has_messages = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|c| c.head_message_id)
+                .is_some();
+            Ok::<_, crate::db::sea::DbErr>(Ok((row.cwd, row.acp_session_id, has_messages)))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
 
     let config = AcpConfig::load(&services.sea).await?;
     let session = AcpSession::reopen(
@@ -484,56 +481,38 @@ async fn write_conversation_row(
     cwd: &str,
     project_id: Option<&str>,
 ) -> Result<(), String> {
-    use crate::db::models::conversation::ConversationInsert;
-    use diesel::Connection;
-
-    let pool = services.db.clone();
-    let conversation_id = conversation_id.to_string();
-    let cwd = cwd.to_string();
-    let title = title_for(&cwd);
-    let project_id = project_id.map(str::to_string);
-
-    tokio::task::spawn_blocking(move || {
-        let mut conn = crate::util::get_conn(&pool)?;
-        let now = crate::util::now_ms();
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            let assistant_id = crate::db::ops::assistant::get_default_assistant(conn)
+    let now = crate::util::now_ms();
+    let title = title_for(cwd);
+    services
+        .sea
+        .write(async |tx| {
+            // An assistant that cannot be read leaves the row with none, as
+            // before.
+            let assistant_id = crate::db::sea::ops::assistant::get_default_assistant(tx)
+                .await
                 .ok()
                 .flatten()
                 .map(|a| a.id);
-
-            crate::db::ops::conversation::insert(
-                conn,
-                ConversationInsert {
-                    id: &conversation_id,
-                    title: Some(&title),
-                    assistant_id: assistant_id.as_deref(),
-                    is_pinned: 0,
-                    is_archived: 0,
-                    created_at: now,
-                    updated_at: now,
-                    project_id: project_id.as_deref(),
-                    parent_conversation_id: None,
-                    spawned_by_message_id: None,
-                    spawned_by_call_id: None,
-                    spawned_turn_id: None,
-                    agent_kind: Some(AGENT_KIND),
-                    agent_provider_id: None,
-                    agent_model_id: None,
+            crate::db::sea::ops::conversation::insert(
+                tx,
+                crate::db::entity::conversation::Model {
+                    title: Some(title),
+                    assistant_id,
+                    project_id: project_id.map(str::to_owned),
+                    agent_kind: Some(AGENT_KIND.to_string()),
+                    ..crate::db::sea::ops::conversation::new_row(conversation_id, now)
                 },
-            )?;
+            )
+            .await?;
             // The directory, in the same transaction as the row it belongs to.
             // No session id yet — the adapter has one by now, but this write
             // happens before `adopt` decides which session won, and a row
             // naming the loser is a row naming a process being killed. It
             // arrives a moment later through `remember_session`.
-            crate::db::ops::acp_session::upsert(conn, &conversation_id, None, &cwd, now)?;
-            Ok(())
+            crate::db::sea::ops::acp_session::upsert(tx, conversation_id, None, cwd, now).await
         })
+        .await
         .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 /// What `conversations.agent_kind` says for a hosted session. The sidebar reads

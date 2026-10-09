@@ -14,21 +14,11 @@
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
-use crate::db::entity::turn;
-use crate::db::models::turn::{TurnInsert, TurnPhase, TurnRow, TurnStatus};
+#[cfg(test)]
+use crate::db::models::turn::TurnRow;
+use crate::db::models::turn::{TurnInsert, TurnPhase, TurnStatus};
 use crate::db::schema::turns;
 use crate::turn::{TurnOrigin, TurnTrigger};
-
-/// A Diesel row as the entity model; a stored value this build cannot read
-/// fails the read, as it does on the SeaORM side.
-pub(super) fn model(row: TurnRow) -> QueryResult<turn::Model> {
-    turn::Model::try_from(row).map_err(|error| {
-        diesel::result::Error::DeserializationError(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            error,
-        )))
-    })
-}
 
 /// Record a turn that is starting. Called once the conversation has actually
 /// been taken, so a refused turn leaves nothing behind.
@@ -83,53 +73,6 @@ fn begin_triggered(
         .execute(conn)
 }
 
-/// Say what the turn is about to do. Must be committed *before* the thing it
-/// names, or the window it was meant to cover is still uncovered.
-///
-/// `tool` names the call `phase` refers to, and is cleared when it does not.
-pub fn set_phase(
-    conn: &mut SqliteConnection,
-    id: &str,
-    phase: TurnPhase,
-    tool: Option<&str>,
-    now: i64,
-) -> QueryResult<usize> {
-    diesel::update(running(id))
-        .set((
-            turns::phase.eq(phase.as_str()),
-            turns::phase_tool.eq(tool),
-            turns::updated_at.eq(now),
-        ))
-        .execute(conn)
-}
-
-/// Settle a durable review boundary after its transcript tool result has been
-/// committed. Callers may wrap both writes in one outer transaction.
-pub fn finish_waiting_review(
-    conn: &mut SqliteConnection,
-    id: &str,
-    status: TurnStatus,
-    error: Option<&str>,
-    now: i64,
-) -> QueryResult<usize> {
-    assert!(
-        matches!(status, TurnStatus::Done | TurnStatus::Cancelled | TurnStatus::Failed),
-        "a waiting review may only move to a terminal status"
-    );
-    diesel::update(
-        turns::table
-            .find(id)
-            .filter(turns::status.eq(TurnStatus::WaitingReview.as_str())),
-    )
-    .set((
-        turns::status.eq(status.as_str()),
-        turns::error.eq(error),
-        turns::ended_at.eq(Some(now)),
-        turns::updated_at.eq(now),
-    ))
-    .execute(conn)
-}
-
 /// Close a turn out. Only the paths that actually reach an ending call this —
 /// everything else is left for `reconcile_interrupted`.
 pub fn finish(
@@ -170,31 +113,6 @@ fn running(
 }
 
 pub use crate::db::sea::ops::turn::{InterruptedCandidate, Ledger};
-
-/// Tie-break for turns that started in the same millisecond.
-///
-/// One conversation's turns are strictly sequential — the coordinator sees to
-/// that — but a turn refused by its provider can begin and end inside a
-/// millisecond, so two of them sharing a `started_at` is reachable. `id` cannot
-/// break the tie: it is a uuid, and its ordering has nothing to do with when
-/// the row was written. SQLite's rowid does, being assigned on insert — and
-/// both readers here care which turn came first: one caps its answer by
-/// recency, the other narrates the interruptions in the order they happened.
-fn insertion_order() -> diesel::expression::SqlLiteral<diesel::sql_types::BigInt> {
-    diesel::dsl::sql::<diesel::sql_types::BigInt>("rowid")
-}
-
-/// Every turn of a conversation, oldest first. For the transcript snapshot,
-/// which is what lets the UI say which turn was cut off rather than guessing.
-pub fn list_for_conversation(conn: &mut SqliteConnection, conversation_id: &str) -> QueryResult<Vec<turn::Model>> {
-    turns::table
-        .filter(turns::conversation_id.eq(conversation_id))
-        .order((turns::started_at.asc(), insertion_order().asc()))
-        .load::<TurnRow>(conn)?
-        .into_iter()
-        .map(model)
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -267,33 +185,6 @@ mod tests {
         assert!(t.ended_at.is_none());
     }
 
-    /// The phase is the diagnosis, so it has to track what the turn is really
-    /// doing — including going back to streaming once a tool returns.
-    #[test]
-    fn the_phase_follows_the_turn() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-
-        set_phase(&mut conn, "t1", TurnPhase::AwaitingApproval, Some("run_command"), 1001).unwrap();
-        let t = get(&mut conn, "t1");
-        assert_eq!(t.phase().unwrap(), Some(TurnPhase::AwaitingApproval));
-        assert_eq!(t.phase_tool.as_deref(), Some("run_command"));
-
-        set_phase(&mut conn, "t1", TurnPhase::RunningTool, Some("run_command"), 1002).unwrap();
-        assert_eq!(get(&mut conn, "t1").phase().unwrap(), Some(TurnPhase::RunningTool));
-
-        // Back to the model, and the tool is no longer what it is doing.
-        set_phase(&mut conn, "t1", TurnPhase::Streaming, None, 1003).unwrap();
-        let t = get(&mut conn, "t1");
-        assert_eq!(t.phase().unwrap(), Some(TurnPhase::Streaming));
-        assert!(
-            t.phase_tool.is_none(),
-            "a phase that names no tool must not keep the last one"
-        );
-    }
-
     #[test]
     fn a_failed_turn_keeps_what_went_wrong() {
         let pool = diesel_test_db();
@@ -306,31 +197,6 @@ mod tests {
         let t = get(&mut conn, "t1");
         assert_eq!(t.status().unwrap(), TurnStatus::Failed);
         assert_eq!(t.error.as_deref(), Some("API Key not set"));
-    }
-
-    /// The lifecycle is one-way, enforced in SQL rather than by call order.
-    /// A phase write that lands after the turn ended would leave a finished row
-    /// claiming to be inside a tool — and "inside a tool" is the reading that
-    /// says side effects may have happened.
-    #[test]
-    fn a_finished_turn_no_longer_moves() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        finish(&mut conn, "t1", TurnStatus::Done, None, 1500).unwrap();
-        let ended = get(&mut conn, "t1");
-
-        assert_eq!(
-            set_phase(&mut conn, "t1", TurnPhase::RunningTool, Some("edit_file"), 2000).unwrap(),
-            0,
-            "a late phase write must find nothing to update",
-        );
-
-        let after = get(&mut conn, "t1");
-        assert_eq!(after.phase, ended.phase);
-        assert_eq!(after.phase_tool, ended.phase_tool);
-        assert_eq!(after.updated_at, ended.updated_at);
     }
 
     /// A second ending cannot overwrite the first. Reachable today: the desktop
@@ -376,41 +242,6 @@ mod tests {
         let t = get(&mut conn, "t1");
         assert_eq!(t.status().unwrap(), TurnStatus::Failed);
         assert_eq!(t.error.as_deref(), Some("loop_detected"));
-    }
-
-    /// The desktop's turn ids arrive from the front end, so a replayed one is
-    /// reachable without anything being malicious — a retry, a double
-    /// dispatch. It must not be able to reopen a turn that has already ended:
-    /// the insert conflicts, but everything after it is an update by primary
-    /// key and would rewrite that turn's ending while the new turn's messages
-    /// filed themselves under it.
-    #[test]
-    fn a_second_turn_cannot_claim_an_id_that_is_already_on_record() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        conv(&mut conn, "c1");
-        begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 1000).unwrap();
-        set_phase(&mut conn, "t1", TurnPhase::RunningTool, Some("edit_file"), 1001).unwrap();
-        finish(&mut conn, "t1", TurnStatus::Done, None, 1500).unwrap();
-
-        let replayed = begin(&mut conn, "t1", "c1", TurnOrigin::Desktop, None, 2000);
-
-        assert!(
-            matches!(
-                replayed,
-                Err(diesel::result::Error::DatabaseError(
-                    diesel::result::DatabaseErrorKind::UniqueViolation,
-                    _
-                ))
-            ),
-            "a replayed id must be refused by the database, not merged into the old row",
-        );
-        // And the finished turn is exactly as it was.
-        let t = get(&mut conn, "t1");
-        assert_eq!(t.status().unwrap(), TurnStatus::Done);
-        assert_eq!(t.started_at, 1000);
-        assert_eq!(t.ended_at, Some(1500));
-        assert_eq!(list_for_conversation(&mut conn, "c1").unwrap().len(), 1);
     }
 
     /// A status this build does not know is a contract error rather than a

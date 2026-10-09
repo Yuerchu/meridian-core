@@ -165,70 +165,6 @@ fn get_message(conn: &mut SqliteConnection, id: &str) -> QueryResult<message::Mo
         .and_then(model)
 }
 
-/// Fill in one tool call inside a row that has already been stored.
-///
-/// For the case an in-memory patch cannot reach: a hosted adapter announces a
-/// call twice, from two sources that can arrive in either order, and the first
-/// announcement is routinely a placeholder with no arguments. If the round
-/// holding it closes before the second one lands — a result and the next call
-/// are enough to do that — the row is already in the database and the real
-/// arguments have nowhere to go. Left there, the transcript and the audit copy
-/// keep `{}` for ever, which is worse than a card that reads "Terminal": a
-/// reader cannot tell a call whose arguments were never recorded from one that
-/// genuinely took none.
-///
-/// Scoped by turn because that is what the caller has and it bounds the scan;
-/// within an ACP session a `toolCallId` is unique anyway. Rows are few and each
-/// carries at most a handful of calls, so this is a scan rather than a JSON
-/// query — SQLite's `json_each` would tie the storage format to the query.
-///
-/// `None` for either field leaves it alone. This only ever *adds* information:
-/// the adapter sends plain progress beats on the same shape, and taking them at
-/// face value would blank arguments already recorded.
-///
-/// Answers with the row it landed on, or `None` when no row in this turn holds
-/// the call.
-pub fn revise_tool_call(
-    conn: &mut SqliteConnection,
-    turn_id: &str,
-    call_id: &str,
-    tool_name: Option<&str>,
-    arguments: Option<&str>,
-) -> QueryResult<Option<(String, String, String)>> {
-    let rows: Vec<(String, Option<String>)> = messages::table
-        .filter(messages::turn_id.eq(turn_id))
-        .filter(messages::tool_calls.is_not_null())
-        // Newest first: a late revision belongs to a round that closed a moment
-        // ago far more often than to one at the top of the turn.
-        .order(messages::sort_order.desc())
-        .select((messages::id, messages::tool_calls))
-        .load(conn)?;
-
-    for (id, json) in rows {
-        let mut calls = crate::agent::tool_calls::parse_openai_tool_calls(json.as_deref()).map_err(|error| {
-            diesel::result::Error::DeserializationError(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("message {id} has invalid persisted tool_calls: {error}"),
-            )))
-        })?;
-        let Some(call) = calls.iter_mut().find(|c| c.id == call_id) else {
-            continue;
-        };
-        if let Some(name) = tool_name {
-            call.name = name.to_string();
-        }
-        if let Some(args) = arguments {
-            call.arguments = args.to_string();
-        }
-        let found = (call.name.clone(), call.arguments.clone());
-        diesel::update(messages::table.find(&id))
-            .set(messages::tool_calls.eq(Some(crate::agent::tool_calls::serialize_tool_calls_openai(&calls))))
-            .execute(conn)?;
-        return Ok(Some((id, found.0, found.1)));
-    }
-    Ok(None)
-}
-
 // `update_tokens` was here, and had no callers. It wrote the same two columns
 // `update_assistant_message` writes, from nowhere, which meant a second answer
 // to "how does a row get its token counts" that could drift from the first. The
@@ -273,38 +209,6 @@ pub fn record_tool_diffs(
         .set(messages::tool_diffs.eq(Some(encoded)))
         .execute(conn)?;
     Ok(())
-}
-
-/// [`record_tool_diffs`] for a call whose row is not known: find it among the
-/// turn's stored rows the way [`revise_tool_call`] does, and say which row it
-/// landed on. `None` when no row of this turn made the call.
-pub fn record_tool_diffs_for_call(
-    conn: &mut SqliteConnection,
-    turn_id: &str,
-    call_id: &str,
-    diffs: &[crate::events::ToolCallDiff],
-) -> QueryResult<Option<String>> {
-    let rows: Vec<(String, Option<String>)> = messages::table
-        .filter(messages::turn_id.eq(turn_id))
-        .filter(messages::tool_calls.is_not_null())
-        .order(messages::sort_order.desc())
-        .select((messages::id, messages::tool_calls))
-        .load(conn)?;
-
-    for (id, json) in rows {
-        let calls = crate::agent::tool_calls::parse_openai_tool_calls(json.as_deref()).map_err(|error| {
-            diesel::result::Error::DeserializationError(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("message {id} has invalid persisted tool_calls: {error}"),
-            )))
-        })?;
-        if !calls.iter().any(|c| c.id == call_id) {
-            continue;
-        }
-        record_tool_diffs(conn, &id, call_id, diffs)?;
-        return Ok(Some(id));
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -401,27 +305,6 @@ mod tests {
             get_message(&mut conn, "m1").unwrap().tool_diffs.as_deref(),
             Some("not json")
         );
-    }
-
-    /// Finding the row by the call it made, bounded by the turn: a refinement
-    /// for a call in another turn is not this turn's to file.
-    #[test]
-    fn record_tool_diffs_for_call_finds_the_row_within_the_turn() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-        let mut with_call = row("m1", "c1", "assistant");
-        with_call.turn_id = Some("t1");
-        with_call.tool_calls =
-            Some(r#"[{"id":"call-a","type":"function","function":{"name":"Write","arguments":"{}"}}]"#);
-        append_message(&mut conn, &with_call, None).unwrap();
-
-        let landed = record_tool_diffs_for_call(&mut conn, "t1", "call-a", &[hunk(None, "x", None)]).unwrap();
-        assert_eq!(landed.as_deref(), Some("m1"));
-        assert!(get_message(&mut conn, "m1").unwrap().tool_diffs.is_some());
-
-        let elsewhere = record_tool_diffs_for_call(&mut conn, "t2", "call-a", &[hunk(None, "x", None)]).unwrap();
-        assert_eq!(elsewhere, None);
     }
 
     /// Editing a message on a turn that also froze a memory block must still

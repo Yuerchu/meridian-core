@@ -58,13 +58,6 @@ pub fn insert(conn: &mut SqliteConnection, new: ConversationInsert<'_>) -> Query
         .and_then(model)
 }
 
-pub fn update_title(conn: &mut SqliteConnection, id: &str, title: &str, now: i64) -> QueryResult<()> {
-    diesel::update(conversations::table.find(id))
-        .set((conversations::title.eq(title), conversations::updated_at.eq(now)))
-        .execute(conn)?;
-    Ok(())
-}
-
 /// Flip the pin and hand back the row as it is after the flip.
 ///
 /// `immediate_transaction`, because a read followed by a write on autocommit
