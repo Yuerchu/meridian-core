@@ -66,11 +66,11 @@ pub struct GitDiffResult {
     pub truncated: bool,
 }
 
-struct GitOutput {
-    status: i32,
-    stdout: String,
-    stderr: String,
-    truncated: bool,
+pub(crate) struct GitOutput {
+    pub(crate) status: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) truncated: bool,
 }
 
 /// Whether `git` answers at all, asked of the OS once per process.
@@ -226,6 +226,13 @@ async fn untracked_diff(root: &Path, rel: &str) -> Result<GitDiffResult, String>
 }
 
 async fn run_in(root: &Path, args: &[&str]) -> Result<GitOutput, String> {
+    run_in_with(root, args, GIT_TIMEOUT).await
+}
+
+/// `run_in` with a deadline of the caller's. Everything in this module only
+/// reads; the writes — adding and removing worktrees — are `crate::worktree`'s,
+/// and take longer than ten seconds on a large checkout.
+pub(crate) async fn run_in_with(root: &Path, args: &[&str], timeout: Duration) -> Result<GitOutput, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(root)
@@ -266,9 +273,9 @@ async fn run_in(root: &Path, args: &[&str]) -> Result<GitOutput, String> {
         })
     };
 
-    tokio::time::timeout(GIT_TIMEOUT, run)
+    tokio::time::timeout(timeout, run)
         .await
-        .map_err(|_| "`git` did not answer within 10s".to_string())?
+        .map_err(|_| format!("`git` did not answer within {}s", timeout.as_secs()))?
 }
 
 /// Read a pipe to EOF, keeping only the first `cap` bytes.

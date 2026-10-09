@@ -56,3 +56,5 @@ pub mod util;
 pub mod voice;
 pub mod voice_corpus;
 pub mod workspace;
+#[cfg(not(target_os = "android"))]
+pub mod worktree;
