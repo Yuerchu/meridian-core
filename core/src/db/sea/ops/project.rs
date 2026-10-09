@@ -56,6 +56,28 @@ pub async fn update_project(tx: &WriteTx, id: &str, changeset: ProjectChangeset)
 /// write: memories reach a project by a polymorphic scope id, not a foreign
 /// key, so nothing would cascade on its own. Conversations in it keep their
 /// rows with no project. How many projects went: 0 for an id already gone.
+/// The project whose directory this is, however the two sides spelled it
+/// (`db::ops::project::normalize_path`). Most recently touched first, so of
+/// two spellings of one directory the live project wins.
+pub async fn find_project_by_path(db: &impl Read, path: &str) -> Result<Option<project::Model>, DbErr> {
+    let wanted = crate::db::ops::project::normalize_path(path);
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    Ok(project::Entity::find()
+        .order_by_desc(project::Column::UpdatedAt)
+        .all(db.conn()?)
+        .await?
+        .into_iter()
+        .find(|p| {
+            p.path
+                .as_deref()
+                .map(crate::db::ops::project::normalize_path)
+                .as_deref()
+                == Some(wanted.as_str())
+        }))
+}
+
 pub async fn delete_project(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
     memory::delete_project_memories(tx, id).await?;
     Ok(project::Entity::delete_by_id(id).exec(tx.conn()?).await?.rows_affected)
@@ -79,6 +101,58 @@ mod tests {
             created_at: 1,
             updated_at,
         }
+    }
+
+    async fn with_path(db: &crate::db::sea::cap::Db, id: &str, path: Option<&str>) {
+        let row = project::Model {
+            path: path.map(str::to_owned),
+            ..project_row(id, 1)
+        };
+        db.write(async |tx| create_project(tx, row).await).await.unwrap();
+    }
+
+    /// The two sides are typed by different programs, so they agree on the
+    /// directory without agreeing on the string. The separator and case halves
+    /// only exist on Windows, so the spellings tried are the platform's own.
+    #[tokio::test]
+    async fn a_path_matches_despite_separators_and_trailing_slash() {
+        let db = sea_test_db().await;
+        let (stored, asked): (&str, Vec<&str>) = if cfg!(windows) {
+            (
+                r"C:\Users\me\Code\repo",
+                vec![
+                    r"C:\Users\me\Code\repo",
+                    "C:/Users/me/Code/repo",
+                    "C:/Users/me/Code/repo/",
+                    "  C:/Users/me/Code/repo  ",
+                    "c:/users/me/code/repo",
+                ],
+            )
+        } else {
+            (
+                "/home/me/Code/repo",
+                vec!["/home/me/Code/repo", "/home/me/Code/repo/", "  /home/me/Code/repo  "],
+            )
+        };
+        with_path(&db, "p1", Some(stored)).await;
+
+        for asked in asked {
+            let found = find_project_by_path(&db, asked).await.unwrap();
+            assert_eq!(found.map(|p| p.id), Some("p1".into()), "asked `{asked}`");
+        }
+    }
+
+    /// A different directory, a prefix of one, and a project with no path at
+    /// all are none of them a match.
+    #[tokio::test]
+    async fn only_the_same_directory_matches() {
+        let db = sea_test_db().await;
+        with_path(&db, "p1", Some("C:/Code/repo")).await;
+        with_path(&db, "p2", None).await;
+
+        assert!(find_project_by_path(&db, "C:/Code/other").await.unwrap().is_none());
+        assert!(find_project_by_path(&db, "C:/Code").await.unwrap().is_none());
+        assert!(find_project_by_path(&db, "").await.unwrap().is_none());
     }
 
     /// Listed newest first; an update writes only what it names and clears

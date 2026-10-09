@@ -72,12 +72,12 @@ pub async fn delete_assistant(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::sea::sea_test_db;
     use crate::db::types::{Json, SqlBool};
 
-    fn assistant_row(id: &str, sort_order: i32) -> assistant::Model {
+    pub(crate) fn assistant_row(id: &str, sort_order: i32) -> assistant::Model {
         assistant::Model {
             id: id.into(),
             name: id.to_uppercase(),

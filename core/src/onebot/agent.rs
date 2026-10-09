@@ -1027,30 +1027,33 @@ async fn headless_chat_inner(
     // there is nobody to ask. Needs `services`, which the tests do not build;
     // without it the asker is left exactly as it was.
     let approvals = match services {
-        Some(services) => crate::agent::auto_review::AutoReviewed::wrap(
-            &asker,
-            crate::agent::auto_review::Context {
-                services: services.clone(),
-                conversation_id: conversation_id.to_string(),
-                turn_id: turn_id.to_string(),
-                // A QQ session's file access is an empty root set, so there is
-                // no project for a path to be inside of. Saying so is what
-                // stops the reviewer reading "outside the project" as the
-                // finding it would be on the desktop.
-                working_directory: None,
-                // The same empty root set the turn itself runs under. The
-                // escalating pass gets no more of the disk than the turn had,
-                // which here is none of it.
-                file_access: tools::FileAccess::Roots(vec![]),
-                // Only a group is. A private chat has one counterpart and they
-                // are why the turn is running — treating them as a bystander
-                // because they are not an admin would have the reviewer see a
-                // task nobody asked for and refuse everything.
-                multi_party: qq_tools
-                    .is_some_and(|q| matches!(q.session_kind(), crate::onebot::session::SessionKind::Group)),
-                unattended: true,
-            },
-        )?,
+        Some(services) => {
+            crate::agent::auto_review::AutoReviewed::wrap(
+                &asker,
+                crate::agent::auto_review::Context {
+                    services: services.clone(),
+                    conversation_id: conversation_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    // A QQ session's file access is an empty root set, so there is
+                    // no project for a path to be inside of. Saying so is what
+                    // stops the reviewer reading "outside the project" as the
+                    // finding it would be on the desktop.
+                    working_directory: None,
+                    // The same empty root set the turn itself runs under. The
+                    // escalating pass gets no more of the disk than the turn had,
+                    // which here is none of it.
+                    file_access: tools::FileAccess::Roots(vec![]),
+                    // Only a group is. A private chat has one counterpart and they
+                    // are why the turn is running — treating them as a bystander
+                    // because they are not an admin would have the reviewer see a
+                    // task nobody asked for and refuse everything.
+                    multi_party: qq_tools
+                        .is_some_and(|q| matches!(q.session_kind(), crate::onebot::session::SessionKind::Group)),
+                    unattended: true,
+                },
+            )
+            .await?
+        }
         None => crate::agent::auto_review::AutoReviewed::inert(&asker),
     };
     // Outermost, so it sees the reviewer's own refusals as well as the ones a

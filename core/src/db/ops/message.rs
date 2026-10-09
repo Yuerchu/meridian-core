@@ -234,51 +234,6 @@ pub fn revise_tool_call(
 // to "how does a row get its token counts" that could drift from the first. The
 // cache columns would have doubled that surface for nothing.
 
-/// File one automatic-review verdict against the call it judged.
-///
-/// Merged into whatever is already there rather than overwriting it: one
-/// assistant message can carry several tool calls, each reviewed separately and
-/// at a different moment, and the last one to finish must not erase the rest.
-///
-/// A row that has gone (the conversation was deleted while the reviewer ran) is
-/// not an error. The verdict was about a message nobody can open any more, and
-/// failing here would take down a turn over bookkeeping.
-pub fn record_auto_review(
-    conn: &mut SqliteConnection,
-    message_id: &str,
-    call_id: &str,
-    verdict: &crate::events::AutoReviewVerdict,
-) -> QueryResult<()> {
-    if call_id.is_empty() {
-        return Err(diesel::result::Error::SerializationError(Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "auto-review call id must not be empty",
-            ),
-        )));
-    }
-    let existing: Option<String> = messages::table
-        .find(message_id)
-        .select(messages::auto_review)
-        .first::<Option<String>>(conn)
-        .optional()?
-        .flatten();
-
-    let mut all = match existing.as_deref() {
-        Some(raw) => serde_json::from_str::<std::collections::BTreeMap<String, crate::events::AutoReviewVerdict>>(raw)
-            .map_err(|error| diesel::result::Error::DeserializationError(Box::new(error)))?,
-        None => std::collections::BTreeMap::new(),
-    };
-    all.insert(call_id.to_string(), verdict.clone());
-
-    let encoded =
-        serde_json::to_string(&all).map_err(|error| diesel::result::Error::SerializationError(Box::new(error)))?;
-    diesel::update(messages::table.find(message_id))
-        .set(messages::auto_review.eq(Some(encoded)))
-        .execute(conn)?;
-    Ok(())
-}
-
 /// Keep the diff a hosted agent reported for one call, beside the row that
 /// made the call.
 ///
@@ -390,18 +345,6 @@ mod tests {
         }
     }
 
-    fn auto_review_verdict() -> crate::events::AutoReviewVerdict {
-        crate::events::AutoReviewVerdict {
-            outcome: crate::events::AutoReviewOutcome::Allow,
-            risk: None,
-            authorization: None,
-            rationale: None,
-            stage: None,
-            model: None,
-            evidence: Vec::new(),
-        }
-    }
-
     fn hunk(old_text: Option<&str>, new_text: &str, line: Option<u32>) -> crate::events::ToolCallDiff {
         crate::events::ToolCallDiff {
             path: "src/lib.rs".into(),
@@ -479,86 +422,6 @@ mod tests {
 
         let elsewhere = record_tool_diffs_for_call(&mut conn, "t2", "call-a", &[hunk(None, "x", None)]).unwrap();
         assert_eq!(elsewhere, None);
-    }
-
-    #[test]
-    fn record_auto_review_rejects_corrupt_stored_json_without_overwriting_it() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-        append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
-        diesel::update(messages::table.find("m1"))
-            .set(messages::auto_review.eq(Some("not json")))
-            .execute(&mut conn)
-            .unwrap();
-
-        let result = record_auto_review(&mut conn, "m1", "call-1", &auto_review_verdict());
-
-        assert!(result.is_err());
-        let stored = get_message(&mut conn, "m1").unwrap();
-        assert_eq!(stored.auto_review.as_deref(), Some("not json"));
-    }
-
-    #[test]
-    fn record_auto_review_rejects_noncanonical_nested_verdicts_without_overwriting_them() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-        append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
-
-        for raw in [
-            r#"{"old":{"outcome":"allow"}}"#,
-            r#"{"old":{"outcome":"allow","risk":null,"authorization":null,"rationale":null,"stage":null,"model":null,"evidence":[],"future":true}}"#,
-        ] {
-            diesel::update(messages::table.find("m1"))
-                .set(messages::auto_review.eq(Some(raw)))
-                .execute(&mut conn)
-                .unwrap();
-
-            let result = record_auto_review(&mut conn, "m1", "call-1", &auto_review_verdict());
-
-            assert!(result.is_err());
-            let stored = get_message(&mut conn, "m1").unwrap();
-            assert_eq!(stored.auto_review.as_deref(), Some(raw));
-        }
-    }
-
-    #[test]
-    fn record_auto_review_writes_the_typed_required_null_shape() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-        append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
-
-        record_auto_review(&mut conn, "m1", "call-1", &auto_review_verdict()).unwrap();
-
-        let stored = get_message(&mut conn, "m1").unwrap().auto_review.unwrap();
-        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
-        assert_eq!(
-            value["call-1"],
-            serde_json::json!({
-                "outcome": "allow",
-                "risk": null,
-                "authorization": null,
-                "rationale": null,
-                "stage": null,
-                "model": null,
-                "evidence": [],
-            })
-        );
-    }
-
-    #[test]
-    fn record_auto_review_rejects_an_empty_call_id() {
-        let pool = diesel_test_db();
-        let mut conn = pool.get().unwrap();
-        create_conversation(&mut conn, "c1", None, None, None, 1).unwrap();
-        append_message(&mut conn, &row("m1", "c1", "assistant"), None).unwrap();
-
-        let result = record_auto_review(&mut conn, "m1", "", &auto_review_verdict());
-
-        assert!(result.is_err());
-        assert!(get_message(&mut conn, "m1").unwrap().auto_review.is_none());
     }
 
     /// Editing a message on a turn that also froze a memory block must still

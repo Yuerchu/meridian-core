@@ -86,7 +86,18 @@ pub fn new_row(id: &str, conversation_id: &str, role: &str, content: &str, creat
 
 /// Insert `new` under `parent` and move the conversation's head onto it.
 /// `sort_order` 0 is left for `trg_messages_sort_order` to assign.
+///
+/// `parent` is the only say on where the row goes. A row that names a
+/// different parent of its own is refused rather than overridden: the hook
+/// reviewer once named the head on the row and passed `None` here, and the
+/// parameter quietly won — every round after the first became a new root.
 async fn link(tx: &WriteTx, new: message::Model, parent: Option<&str>) -> Result<message::Model, DbErr> {
+    if new.parent_id.is_some() && new.parent_id.as_deref() != parent {
+        return Err(DbErr::Custom(format!(
+            "message `{}` names parent {:?} on the row but {:?} as the link",
+            new.id, new.parent_id, parent
+        )));
+    }
     let id = new.id.clone();
     let conversation_id = new.conversation_id.clone();
     let mut row = new.into_active_model();
@@ -846,6 +857,30 @@ mod tests {
             (None, Some("a"), Some("b"))
         );
         assert_eq!(head(&db, "c1").await.as_deref(), Some("c"));
+    }
+
+    /// The link is the parameter's alone: a row naming a different parent of
+    /// its own is refused and nothing is written, the head included. Naming
+    /// the same parent is harmless.
+    #[tokio::test]
+    async fn a_row_that_names_another_parent_is_refused() {
+        let db = with_conversations(&["c1"]).await;
+        let a = append(&db, row("a", "c1", "user"), None).await;
+        let stray = message::Model {
+            parent_id: Some(a.id.clone()),
+            ..row("b", "c1", "user")
+        };
+        let refused = db.write(async |tx| append_message(tx, stray, None).await).await;
+        assert!(matches!(refused, Err(DbErr::Custom(_))), "{refused:?}");
+        assert!(get_message(&db, "b").await.unwrap().is_none());
+        assert_eq!(head(&db, "c1").await.as_deref(), Some("a"));
+
+        let agreeing = message::Model {
+            parent_id: Some(a.id.clone()),
+            ..row("b", "c1", "user")
+        };
+        let b = append(&db, agreeing, Some(&a.id)).await;
+        assert_eq!(b.parent_id.as_deref(), Some("a"));
     }
 
     /// Two answers to the same question are siblings, and the head follows
