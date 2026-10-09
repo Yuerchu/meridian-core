@@ -96,33 +96,25 @@ fn no_two_migrations_claim_the_same_version() {
     assert_eq!(versions.len(), total, "duplicate migration version among {versions:?}");
 }
 
-/// Selecting the model checks every column the schema declares, so this
-/// fails if `schema.rs` and the schema the baseline builds have drifted apart
-/// — which is otherwise a runtime error rather than a compile one.
-#[test]
-fn a_conversation_starts_out_asking_about_every_edit() {
-    use diesel::connection::SimpleConnection;
-    use diesel::prelude::*;
-
-    use crate::db::models::conversation::ConversationRow;
-    use crate::db::schema::conversations::dsl::*;
-
-    let pool = crate::db::diesel_test_db();
-    let mut conn = pool.get().unwrap();
-    conn.batch_execute(
+/// A row written before the column existed reads back asking about every
+/// edit: the column's default is "ask".
+#[tokio::test]
+async fn a_conversation_starts_out_asking_about_every_edit() {
+    let db = super::sea_test_db().await;
+    super::execute_for_tests(
+        &db,
         "INSERT INTO conversations
              (id, is_pinned, is_archived, message_count, created_at, updated_at)
          VALUES ('c1', 0, 0, 0, 1, 1)",
     )
+    .await
     .unwrap();
-
-    let c: ConversationRow = conversations
-        .find("c1")
-        .select(ConversationRow::as_select())
-        .first(&mut conn)
+    let c = super::ops::conversation::get_conversation(&db, "c1")
+        .await
+        .unwrap()
         .unwrap();
-    assert_eq!(
-        c.accept_edits, 0,
+    assert!(
+        !c.accept_edits.get(),
         "a conversation that predates the column must keep asking"
     );
 }

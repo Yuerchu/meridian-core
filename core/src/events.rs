@@ -516,39 +516,6 @@ pub struct AcpSessionNoticeEvent {
     pub updated_at: i64,
 }
 
-impl TryFrom<crate::db::models::acp_session_notice::AcpSessionNoticeRow> for AcpSessionNoticeEvent {
-    type Error = String;
-
-    fn try_from(row: crate::db::models::acp_session_notice::AcpSessionNoticeRow) -> Result<Self, String> {
-        let actions: Vec<String> = serde_json::from_str(&row.actions).map_err(|e| {
-            format!(
-                "acp_session_notices.actions for `{}` is not a JSON array of strings: {e}",
-                row.id
-            )
-        })?;
-        let actions = actions
-            .iter()
-            .map(|a| AcpNoticeAction::parse(a))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            id: row.id,
-            conversation_id: row.conversation_id,
-            turn_id: row.turn_id,
-            notice_id: row.notice_id,
-            revision: u32::try_from(row.revision)
-                .map_err(|_| "acp_session_notices.revision is negative".to_string())?,
-            category: AcpNoticeCategory::parse(&row.category)?,
-            severity: AcpNoticeSeverity::parse(&row.severity)?,
-            title: row.title,
-            details: row.details,
-            reason: row.reason,
-            actions,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        })
-    }
-}
-
 impl TryFrom<crate::db::entity::acp_session_notice::Model> for AcpSessionNoticeEvent {
     type Error = String;
 
@@ -1211,28 +1178,6 @@ mod tests {
         let mut absent = payload.clone();
         absent["diffs"][0].as_object_mut().unwrap().remove("line");
         assert!(serde_json::from_value::<ChatStreamEvent>(absent).is_err());
-    }
-
-    /// A stored row with an unreadable action list is an error, not an
-    /// incident that recommends nothing.
-    #[test]
-    fn a_notice_row_with_bad_actions_does_not_become_an_event() {
-        let row = crate::db::models::acp_session_notice::AcpSessionNoticeRow {
-            id: "n1".into(),
-            conversation_id: "c1".into(),
-            turn_id: None,
-            notice_id: "x".into(),
-            revision: 1,
-            category: "limit".into(),
-            severity: "error".into(),
-            title: "t".into(),
-            details: None,
-            reason: None,
-            actions: r#"["retry", "teleport"]"#.into(),
-            created_at: 1,
-            updated_at: 1,
-        };
-        assert!(AcpSessionNoticeEvent::try_from(row).is_err());
     }
 
     #[test]
