@@ -125,4 +125,20 @@ mod tests {
             allowed_by_check("board_tasks", "agent_kind")
         );
     }
+
+    /// A request names a column or an agent in the stored spelling; anything
+    /// else is refused, not read as some default.
+    #[test]
+    fn a_request_names_them_in_the_stored_spelling_and_nothing_else() {
+        assert_eq!(
+            serde_json::from_str::<BoardStage>("\"review\"").unwrap(),
+            BoardStage::Review
+        );
+        assert_eq!(
+            serde_json::from_str::<BoardAgentKind>("\"claude_code\"").unwrap(),
+            BoardAgentKind::ClaudeCode
+        );
+        assert!(serde_json::from_str::<BoardStage>("\"Review\"").is_err());
+        assert!(serde_json::from_str::<BoardStage>("\"archived\"").is_err());
+    }
 }

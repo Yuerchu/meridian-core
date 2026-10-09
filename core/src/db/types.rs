@@ -289,6 +289,10 @@ pub(crate) use text_enum_column;
 /// variant because `DeriveActiveEnum` needs them as attributes; the entity's
 /// tests hold them to strum's spelling and to the schema's `CHECK`.
 ///
+/// `Deserialize` too, in the same snake_case spelling, so a command's request
+/// can name one directly (a board card's column, the agent that works it);
+/// a spelling the list does not have is a refused request, never a default.
+///
 /// `parse` keeps the message the Diesel-era `stored_enum!` gave, since the
 /// plan-review code still reports it.
 macro_rules! checked_text_enum {
@@ -304,6 +308,7 @@ macro_rules! checked_text_enum {
             PartialEq,
             Eq,
             serde::Serialize,
+            serde::Deserialize,
             strum::IntoStaticStr,
             strum::EnumString,
             sea_orm::EnumIter,
