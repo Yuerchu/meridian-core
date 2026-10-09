@@ -17,20 +17,6 @@ fn model(row: ConversationRow) -> QueryResult<conversation::Model> {
     })
 }
 
-/// The user's own conversations, newest first.
-///
-/// Sub-agent transcripts are excluded here rather than by archiving them: the
-/// archive flag is a user's decision and can be undone, and the project view
-/// deliberately concatenates archived rows onto active ones, which would spill
-/// them back into the list. Being spawned is not a decision anyone can reverse.
-/// Every conversation id — archived and delegated runs included, unlike the
-/// sidebar queries below. For reconciling external resources keyed by id: a
-/// container judged an orphan against a *filtered* list is one an archived
-/// conversation was still counting on.
-pub fn all_ids(conn: &mut SqliteConnection) -> QueryResult<Vec<String>> {
-    conversations::table.select(conversations::id).load(conn)
-}
-
 pub fn get_conversation(conn: &mut SqliteConnection, id: &str) -> QueryResult<conversation::Model> {
     conversations::table
         .find(id)

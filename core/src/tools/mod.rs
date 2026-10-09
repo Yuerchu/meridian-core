@@ -97,10 +97,8 @@ pub struct ToolContext {
     /// Needed to resolve which skills are bound for this turn; skill bindings
     /// are anchored on the assistant as well as the project.
     pub assistant_id: Option<String>,
-    pub db_pool: Option<crate::db::DbPool>,
-    /// The same database through SeaORM, beside `db_pool` while both exist: a
-    /// tool whose tables have moved reads and writes here. Every runner with
-    /// services sets both; a test of a tool that has not moved leaves this
+    /// The database, for the tools that read or write it. Every runner with
+    /// services sets it; a test of a tool that touches no table leaves it
     /// `None`.
     pub sea: Option<crate::db::sea::cap::Db>,
     /// What confines commands this turn — or that the setting could not be
@@ -703,7 +701,6 @@ mod tests {
             conversation_id: None,
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
             sea: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
@@ -742,7 +739,6 @@ mod tests {
             conversation_id: None,
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
             sea: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,

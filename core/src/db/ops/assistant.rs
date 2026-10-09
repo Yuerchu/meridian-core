@@ -10,10 +10,6 @@ fn model(row: AssistantRow) -> QueryResult<assistant::Model> {
     assistant::Model::try_from(row).map_err(super::contract_violation)
 }
 
-pub fn get_assistant(conn: &mut SqliteConnection, id: &str) -> QueryResult<assistant::Model> {
-    assistants::table.find(id).first::<AssistantRow>(conn).and_then(model)
-}
-
 pub fn get_default_assistant(conn: &mut SqliteConnection) -> QueryResult<Option<assistant::Model>> {
     assistants::table
         .filter(assistants::is_default.eq(1))
@@ -81,9 +77,6 @@ mod tests {
         let created = create_assistant(&mut conn, &new).unwrap();
         assert_eq!(created.id, "a1");
         assert_eq!(created.name, "Test Assistant");
-
-        let fetched = get_assistant(&mut conn, "a1").unwrap();
-        assert_eq!(fetched.name, "Test Assistant");
     }
 
     #[test]

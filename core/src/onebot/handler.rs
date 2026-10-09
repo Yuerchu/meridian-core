@@ -709,7 +709,6 @@ pub(super) async fn run_agent_turn(
         );
 
         let outcome = agent::headless_chat(
-            &state.services.db,
             &state.services.sea,
             &state.services.secrets,
             &state.services.tools,

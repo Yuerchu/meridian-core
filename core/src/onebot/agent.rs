@@ -8,7 +8,6 @@ use crate::agent::engine::{self};
 use crate::agent::{
     TokenBudget, build_messages_with_senders, microcompact, resolve_provider_config, trim_to_context_limit,
 };
-use crate::db::DbPool;
 use crate::db::models::turn::TurnPhase;
 use crate::mcp::McpRegistry;
 use crate::provider::{self, ChatMessage, ToolCall};
@@ -505,7 +504,6 @@ pub(super) async fn oneshot_completion(
 /// handed back in `TurnProgress` instead — see it for why.
 #[allow(clippy::too_many_arguments)]
 pub async fn headless_chat(
-    pool: &DbPool,
     sea: &crate::db::sea::cap::Db,
     secrets: &Arc<SecretsManager>,
     tool_registry: &Arc<ToolRegistry>,
@@ -531,7 +529,6 @@ pub async fn headless_chat(
     // anywhere and still leave the caller enough to close the turn out.
     let mut progress = TurnProgress::default();
     let reply = headless_chat_inner(
-        pool,
         sea,
         secrets,
         tool_registry,
@@ -558,7 +555,6 @@ pub async fn headless_chat(
 
 #[allow(clippy::too_many_arguments)]
 async fn headless_chat_inner(
-    pool: &DbPool,
     sea: &crate::db::sea::cap::Db,
     // The `Arc` rather than a plain reference: provider resolution is handed to
     // `spawn_blocking`, which needs an owned handle.
@@ -602,8 +598,11 @@ async fn headless_chat_inner(
             let stored = crate::db::sea::ops::preference::get_preference(&s.sea, "sleep_inhibitor.enabled")
                 .await
                 .map_err(|error| error.to_string())?;
-            let enabled =
-                crate::db::ops::preference::parse_bool_preference("sleep_inhibitor.enabled", stored.as_deref(), true)?;
+            let enabled = crate::db::sea::ops::preference::parse_bool_preference(
+                "sleep_inhibitor.enabled",
+                stored.as_deref(),
+                true,
+            )?;
             enabled.then(|| s.sleep.begin_turn())
         }
         None => None,
@@ -1000,7 +999,6 @@ async fn headless_chat_inner(
         conversation_id: Some(conversation_id.to_string()),
         turn_id: Some(turn_id.to_string()),
         assistant_id: assistant_id.map(|s| s.to_string()),
-        db_pool: Some(pool.clone()),
         sea: Some(sea.clone()),
         // No journal: the empty root set above refuses every file write at the
         // validation layer, so there is nothing a journal here could ever

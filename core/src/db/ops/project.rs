@@ -6,10 +6,6 @@ use crate::db::models::project::ProjectRow;
 use crate::db::schema::projects;
 use crate::db::sea::ops::project::normalize_path;
 
-pub fn get_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<ProjectRow> {
-    projects::table.find(id).first::<ProjectRow>(conn)
-}
-
 /// The project whose working directory is `path`, if there is one.
 ///
 /// Compared in Rust over the whole (small) table rather than in SQL, because

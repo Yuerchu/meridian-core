@@ -376,66 +376,6 @@ pub struct SideRequestCost<'a> {
     pub summary: &'a str,
 }
 
-/// Record what a review spent.
-///
-/// Separate from `record` because a review has no message row to copy — but it
-/// takes the same snapshot, prices at the same moment against the same table,
-/// and lands in the same place. Two ledgers would disagree the first time
-/// somebody changed a rate.
-pub fn record_side_request(conn: &mut SqliteConnection, cost: SideRequestCost<'_>) -> QueryResult<()> {
-    let snap = snapshot_of(
-        conn,
-        Subject {
-            conversation_id: cost.conversation_id,
-            turn_id: cost.turn_id,
-            // A review is something the app did, never something a person in a
-            // chat said, so it is attributed to nobody.
-            sender_id: None,
-            provider_id: cost.provider_id,
-            model_id: cost.model_id,
-            // The biggest round's prompt, never the sum of all of them — see
-            // `ReviewCost::peak_prompt_tokens`.
-            prompt_tokens: cost.peak_prompt_tokens,
-        },
-    )?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_ms();
-    diesel::insert_into(audit_messages::table)
-        .values(&AuditMessageInsert {
-            id: &id,
-            recorded_at: now,
-            message_id: cost.message_id,
-            conversation_id: cost.conversation_id,
-            turn_id: cost.turn_id,
-            source_type: snap.source_type.as_deref(),
-            source_id: snap.source_id.as_deref(),
-            turn_origin: snap.turn_origin.as_deref(),
-            role: cost.role,
-            content: cost.summary,
-            sender_id: None,
-            sender_name: None,
-            provider_id: cost.provider_id,
-            provider_name: cost.provider_name,
-            model_id: cost.model_id,
-            input_tokens: cost.usage.input_tokens,
-            output_tokens: cost.usage.output_tokens,
-            cache_read_tokens: cost.usage.cache_read_tokens,
-            cache_write_tokens: cost.usage.cache_write_tokens,
-            server_tool_calls: cost.usage.server_tool_calls,
-            created_at: now,
-            input_price: snap.prices.input_price,
-            output_price: snap.prices.output_price,
-            cache_read_price: snap.prices.cache_read_price,
-            cache_write_price: snap.prices.cache_write_price,
-            server_tool_price: snap.prices.server_tool_price,
-            self_id: snap.self_id,
-            billing_mode: snap.billing_mode.as_str(),
-            response_model_id: None,
-        })
-        .execute(conn)?;
-    Ok(())
-}
-
 /// Newest first. Test-only: production reads the table through `db::ops::usage`,
 /// but the tests that verify audit writes need the rows back verbatim.
 #[cfg(test)]

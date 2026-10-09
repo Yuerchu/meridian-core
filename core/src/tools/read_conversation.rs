@@ -226,7 +226,6 @@ mod tests {
             conversation_id: conversation_id.map(str::to_string),
             turn_id: None,
             assistant_id: None,
-            db_pool: None,
             sea: Some(db),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,

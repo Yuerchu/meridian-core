@@ -561,7 +561,6 @@ impl Bridge {
             conversation_id: Some(self.conversation_id.clone()),
             turn_id: Some(turn.turn_id.clone()),
             assistant_id: turn.assistant_id.clone(),
-            db_pool: Some(self.services.db.clone()),
             sea: Some(self.services.sea.clone()),
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
@@ -952,7 +951,6 @@ mod tests {
             conversation_id: None,
             turn_id: Some("t-1".into()),
             assistant_id: None,
-            db_pool: None,
             sea: None,
             #[cfg(not(target_os = "android"))]
             sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
