@@ -86,7 +86,6 @@ pub async fn bootstrap_with_secrets(
             "bridged the database to the SeaORM baseline"
         );
     }
-    let pool = db::init_db(db_path.to_str().expect("invalid db path"));
     let plan_files = Arc::new(crate::plan_files::PlanFileStore::new(&data_dir));
     let sea = db::sea::open(&db_path)
         .await
@@ -274,7 +273,6 @@ pub async fn bootstrap_with_secrets(
     }
 
     Ok(Services::new(ServicesInner {
-        db: pool,
         sea,
         secrets: mgr,
         tools: Arc::new(registry),

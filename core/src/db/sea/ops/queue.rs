@@ -922,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_enqueues_take_distinct_positions() {
         let dir = tempfile::tempdir().unwrap();
-        let (_pool, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let db = crate::db::sea::file_test_db(dir.path()).await;
         execute_for_tests(
             &db,
             "INSERT INTO conversations (id, created_at, updated_at) VALUES ('c1', 0, 0)",

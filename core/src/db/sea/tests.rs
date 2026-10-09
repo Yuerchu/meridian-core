@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use diesel::RunQueryDsl;
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 
 use super::cap::sealed::Access;
@@ -26,49 +25,6 @@ fn every_migration_directory_is_embedded() {
         let file = std::fs::read_to_string(dir.join(name).join("up.sql")).unwrap();
         assert_eq!(*sql, file, "{name} embeds a different file");
     }
-}
-
-#[derive(diesel::QueryableByName, Debug, PartialEq)]
-struct SchemaObject {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    kind: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    name: String,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-    sql: Option<String>,
-}
-
-const SCHEMA: &str = "SELECT type AS kind, name, sql FROM sqlite_master \
-     WHERE name NOT LIKE 'sqlite_%' AND name NOT IN ('__diesel_schema_migrations', 'seaql_migrations') \n     ORDER BY type, name";
-
-/// The replay goes through sqlx, the migrations through Diesel: the two must
-/// leave the same schema, every trigger and partial index included. This is
-/// what notices a replay that stops short of the end of a file.
-#[tokio::test]
-async fn sea_test_db_has_the_schema_diesel_builds() {
-    let diesel = crate::db::diesel_test_db();
-    let expected: Vec<SchemaObject> = diesel::sql_query(SCHEMA).load(&mut diesel.get().unwrap()).unwrap();
-
-    let db = sea_test_db().await;
-    let actual: Vec<SchemaObject> = db
-        .conn()
-        .unwrap()
-        .query_all_raw(raw(SCHEMA))
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| SchemaObject {
-            kind: row.try_get("", "kind").unwrap(),
-            name: row.try_get("", "name").unwrap(),
-            sql: row.try_get("", "sql").unwrap(),
-        })
-        .collect();
-
-    assert!(
-        expected.iter().any(|o| o.kind == "trigger"),
-        "the comparison covers triggers"
-    );
-    assert_eq!(actual, expected);
 }
 
 /// Every connection the production pool hands out carries the pragmas, not

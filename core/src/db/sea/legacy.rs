@@ -275,8 +275,8 @@ pub const LEGACY: &[(&str, &str)] = &[
 /// Runs every embedded migration in order on `conn`.
 ///
 /// Each file holds several statements, triggers among them; `execute_unprepared`
-/// runs them all, and `sea_test_db_has_the_schema_diesel_builds` is what would
-/// notice if a file stopped short. The caller decides the foreign-key
+/// runs them all, and the bridge tests (a replayed file ends at the baseline
+/// schema) are what would notice if a file stopped short. The caller decides the foreign-key
 /// pragma: table rebuilds must not fire `ON DELETE` actions, so production and
 /// `sea_test_db` both replay with foreign keys off.
 pub async fn replay_all(conn: &impl ConnectionTrait) -> Result<(), DbErr> {

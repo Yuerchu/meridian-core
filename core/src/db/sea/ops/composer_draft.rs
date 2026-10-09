@@ -321,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn racing_saves_of_one_revision_apply_once() {
         let dir = tempfile::tempdir().unwrap();
-        let (_diesel, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let db = crate::db::sea::file_test_db(dir.path()).await;
         conversation(&db, "c1").await;
         let (slot, a, b) = (slot("c1"), text("a"), text("b"));
         let (a, b) = tokio::join!(write(&db, &slot, &a, 1, 100), write(&db, &slot, &b, 1, 100));

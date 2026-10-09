@@ -1156,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn racing_writers_cannot_overfill_a_scope() {
         let dir = tempfile::tempdir().unwrap();
-        let (_diesel, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let db = crate::db::sea::file_test_db(dir.path()).await;
         for i in 0..MAX_ONEBOT_GLOBAL_MEMORIES - 1 {
             let key = format!("k{i}");
             write(

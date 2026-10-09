@@ -926,7 +926,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_toggles_are_each_applied() {
         let dir = tempfile::tempdir().unwrap();
-        let (_pool, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let db = crate::db::sea::file_test_db(dir.path()).await;
         conversations(&db, vec![new_row("c1", 1)]).await;
         const ROUNDS: i64 = 200;
         let workers: Vec<_> = (0..4)

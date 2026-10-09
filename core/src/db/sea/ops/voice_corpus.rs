@@ -781,7 +781,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn on_the_pool_a_capture_between_two_reads_is_half_visible() {
         let dir = tempfile::tempdir().unwrap();
-        let (_diesel, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let db = crate::db::sea::file_test_db(dir.path()).await;
 
         let blobs_before = all_blobs(&db).await.unwrap();
         capture_elsewhere(&db, "aa", "b1", "c1").await;
@@ -802,7 +802,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inside_a_read_transaction_both_reads_see_one_moment() {
         let dir = tempfile::tempdir().unwrap();
-        let (_diesel, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let db = crate::db::sea::file_test_db(dir.path()).await;
         ready_blob(&db, "00", "b0").await;
         // The capture's own handle on the pool, standing for another task's.
         let capturer = db.clone();

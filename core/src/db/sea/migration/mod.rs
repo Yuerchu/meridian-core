@@ -10,9 +10,8 @@
 //! marked `backend: sqlite-only` where it appears; a PostgreSQL build renders
 //! the builders for PostgreSQL and supplies its own text for the rest.
 //!
-//! Every migration exposes the SQLite statements it would run, and
-//! `diesel_test_db` executes that same list: for as long as both ORMs are in
-//! the tree there is one source for the schema and two readers of it.
+//! Every migration exposes the SQLite statements it would run, which is what
+//! its `up` executes on SQLite and what the tests can run on their own.
 
 pub mod m0001_baseline;
 pub mod m0002_skill_keys;
@@ -80,9 +79,7 @@ impl MigrationTrait for M0001Baseline {
     }
 }
 
-/// Every statement this build's migrations run on SQLite, in order: what
-/// `diesel_test_db` executes, so the Diesel tests see the schema the SeaORM
-/// migrator builds.
+/// Every statement this build's migrations run on SQLite, in order.
 pub fn sqlite_statements() -> Vec<String> {
     let mut all = m0001_baseline::sqlite_statements();
     all.extend(m0002_skill_keys::sqlite_statements());

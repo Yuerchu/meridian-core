@@ -1,7 +1,5 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::db::{self, DbPool};
-
 pub fn take_bytes_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -19,10 +17,6 @@ pub fn take_bytes_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
-}
-
-pub fn get_conn(pool: &DbPool) -> Result<db::PooledConn, String> {
-    pool.get().map_err(|e| format!("db connection error: {e}"))
 }
 
 /// The balanced `{...}` starting at `start`, or `None` if it never closes.

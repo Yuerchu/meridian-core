@@ -11,12 +11,6 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 use std::str::FromStr;
 
 use bigdecimal::{BigDecimal, Signed, Zero};
-use diesel::FromSqlRow;
-use diesel::deserialize::{self, FromSql};
-use diesel::expression::AsExpression;
-use diesel::serialize::{self, IsNull, Output, ToSql};
-use diesel::sql_types::Text;
-use diesel::sqlite::{Sqlite, SqliteValue};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// Database/API monetary values follow the same NUMERIC(38, 18) contract as
@@ -30,8 +24,7 @@ pub const DECIMAL_INTEGER_DIGITS: usize = DECIMAL_PRECISION - DECIMAL_SCALE;
 /// The inner library has no NaN or infinity states. `FromStr` normalizes plain
 /// base-10 input for internal and migration use; serde accepts only the
 /// canonical spelling emitted by [`Decimal::canonical`].
-#[derive(Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash, AsExpression, FromSqlRow)]
-#[diesel(sql_type = Text)]
+#[derive(Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Decimal(BigDecimal);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,29 +232,11 @@ impl Mul for Decimal {
     }
 }
 
-impl ToSql<Text, Sqlite> for Decimal {
-    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Sqlite>) -> serialize::Result {
-        out.set_value(self.canonical());
-        Ok(IsNull::No)
-    }
-}
-
-impl FromSql<Text, Sqlite> for Decimal {
-    fn from_sql(value: SqliteValue<'_, '_, '_>) -> deserialize::Result<Self> {
-        let pointer = <*const str as FromSql<Text, Sqlite>>::from_sql(value)?;
-        // Diesel documents this pointer specifically for custom SQLite Text
-        // mappings. It remains valid for this call; parse copies the digits into
-        // the Decimal value before the SQLite row can move again.
-        let raw = unsafe { &*pointer };
-        Decimal::from_canonical_str(raw).map_err(|error| Box::new(error) as _)
-    }
-}
-
-// The same TEXT contract for SeaORM, written by hand rather than through its
+// The TEXT contract for SeaORM, written by hand rather than through its
 // `with-bigdecimal` feature: on SQLite that feature binds a string but reads the
 // column back as `f64`, which keeps the first fifteen-odd digits of a price and
 // says nothing about the rest. Reading goes through `String` instead, and a
-// value that is not canonical fails the row exactly as the Diesel mapping does.
+// value that is not canonical fails the row.
 
 impl From<Decimal> for sea_orm::Value {
     fn from(value: Decimal) -> Self {

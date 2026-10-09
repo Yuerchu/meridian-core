@@ -83,7 +83,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_first_uses_mint_one_id() {
         let dir = tempfile::tempdir().unwrap();
-        let (_pool, db) = crate::db::sea::shared_test_db(dir.path()).await;
+        let db = crate::db::sea::file_test_db(dir.path()).await;
         let ids = futures::future::join_all((0..8).map(|_| {
             let db = db.clone();
             tokio::spawn(async move { installation_id(&db).await })
