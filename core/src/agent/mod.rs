@@ -69,8 +69,7 @@ pub use provider_config::{
     provider_secret_name, resolve_max_tokens, resolve_provider_config, resolve_turn_params, resolve_with_overrides,
 };
 pub(crate) use stream::{
-    MAX_STREAM_RETRIES, STREAM_RETRY_BASE, StreamResult, is_context_window_error, is_retryable_stream_error,
-    parse_retry_after,
+    RetryLadder, StreamResult, is_context_window_error, is_retryable_stream_error, parse_retry_after,
 };
 pub use todo_context::{TODO_CLEARED_MARKER, TodoInjection, TodoKind, persist_todo_injection, plan_todo_injection};
 pub use tokenizer::{TokenBudget, TokenCounter, TokenizerKind};
