@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use super::openai_responses::{StreamState, parse_responses_event};
 use super::{
-    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, ToolDefinition,
+    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, ToolCall,
+    ToolDefinition,
 };
 use crate::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
 use crate::codex_auth::{AuthError, Bearer, Manager};
@@ -413,51 +414,95 @@ impl ChatProvider for CodexProvider {
     }
 
     async fn chat(&self, messages: Vec<ChatMessage>, params: ChatParams) -> Result<String, ProviderError> {
-        let resp = self
-            .send(|bearer| {
-                let req = self.build_request(&bearer, &messages, None, &params, false);
-                async move { self.transport.execute(req?).await.map_err(ProviderError::from) }
-            })
-            .await?;
-
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&resp.body).map_err(|e| ProviderError::Parse(e.to_string()))?;
-
-        let mut text = String::new();
-        for item in parsed["output"].as_array().into_iter().flatten() {
-            if item["type"].as_str() != Some("message") {
-                continue;
-            }
-            for part in item["content"].as_array().into_iter().flatten() {
-                if part["type"].as_str() == Some("output_text")
-                    && let Some(t) = part["text"].as_str()
-                {
-                    text.push_str(t);
-                }
-            }
-        }
-
-        if text.is_empty() {
+        let response = self.chat_with_tools(messages, Vec::new(), params).await?;
+        if response.text.is_empty() {
             Err(ProviderError::Parse("no content in response".into()))
         } else {
-            Ok(text)
+            Ok(response.text)
         }
     }
 
+    /// The stream, drained. The backend refuses `stream: false`, and the side
+    /// requests — the summariser, the title, the reviewer — call this rather
+    /// than `chat` for the usage it hands back. Folding the one stream parser
+    /// keeps the reasoning capture in a single implementation.
     async fn chat_with_tools(
         &self,
-        _messages: Vec<ChatMessage>,
-        _tools: Vec<ToolDefinition>,
-        _params: ChatParams,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        params: ChatParams,
     ) -> Result<AgentResponse, ProviderError> {
-        // The non-streaming tool path has no callers anywhere in this app; the
-        // turn loop streams. Refusing beats a second, untested implementation of
-        // the reasoning capture that would silently diverge from the streaming
-        // one.
-        Err(ProviderError::Parse(
-            "the Codex transport is only used through streaming".into(),
-        ))
+        let stream = self.stream_chat_with_tools(messages, tools, params).await?;
+        fold_stream(stream).await
     }
+}
+
+/// One streamed response as the non-streaming shape.
+///
+/// A stream that ends without its terminal event is an error rather than an
+/// answer: a summary cut off mid-sentence would otherwise replace the history
+/// it was meant to stand for.
+async fn fold_stream(mut stream: ChatStream) -> Result<AgentResponse, ProviderError> {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut calls: std::collections::BTreeMap<usize, ToolCall> = std::collections::BTreeMap::new();
+    let mut state = super::state::ProviderStateAccumulator::default();
+    let mut usage = None;
+    let mut stopped = false;
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::Text { content } => text.push_str(&content),
+            StreamEvent::Reasoning { content } => reasoning.push_str(&content),
+            StreamEvent::ToolCallStart { index, id, name } => {
+                calls.insert(
+                    index,
+                    ToolCall {
+                        id,
+                        name,
+                        arguments: String::new(),
+                    },
+                );
+            }
+            StreamEvent::ToolCallDelta { index, arguments } => {
+                if let Some(call) = calls.get_mut(&index) {
+                    call.arguments.push_str(&arguments);
+                }
+            }
+            StreamEvent::ToolCallDone { index, arguments } => {
+                if let Some(call) = calls.get_mut(&index) {
+                    call.arguments = arguments;
+                }
+            }
+            StreamEvent::ProviderStateUpdate { update } => state.apply(update).map_err(ProviderError::Parse)?,
+            StreamEvent::UsageUpdate { usage: u } => usage = Some(u),
+            StreamEvent::Stop { usage: u, .. } => {
+                if u.is_some() {
+                    usage = u;
+                }
+                stopped = true;
+            }
+            StreamEvent::Error { message } => return Err(ProviderError::Upstream(message)),
+            StreamEvent::MessageStart { .. }
+            | StreamEvent::CompactionResult { .. }
+            | StreamEvent::ServerToolCall(_)
+            | StreamEvent::ResponseModel { .. } => {}
+        }
+    }
+
+    if !stopped {
+        return Err(ProviderError::Parse(
+            "the stream ended before the response completed".into(),
+        ));
+    }
+
+    Ok(AgentResponse {
+        text,
+        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+        tool_calls: calls.into_values().collect(),
+        usage,
+        provider_state: state.finish(),
+    })
 }
 
 #[cfg(test)]
@@ -724,6 +769,89 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Wire events through the same parser and reasoning capture the turn uses.
+    fn parsed_stream(events: &[(&str, serde_json::Value)]) -> ChatStream {
+        let mut state = StreamState::default();
+        let mut out = Vec::new();
+        for (event, data) in events {
+            let data = data.to_string();
+            if *event == "response.output_item.done"
+                && let Some(captured) = reasoning_update(&data, "gpt-5.6")
+            {
+                out.push(Ok(captured));
+            }
+            out.extend(parse_responses_event(event, &data, &mut state));
+        }
+        Box::pin(futures::stream::iter(out))
+    }
+
+    /// The summariser, the title and the reviewer reach this transport through
+    /// `chat_with_tools`, which used to refuse outright — so compaction failed
+    /// for every Codex conversation.
+    #[tokio::test]
+    async fn a_drained_stream_carries_the_answer_the_calls_the_reasoning_and_the_usage() {
+        let response = fold_stream(parsed_stream(&[
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "blob" }
+                }),
+            ),
+            (
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index": 1,
+                    "item": { "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file" }
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                serde_json::json!({ "item_id": "fc_1", "delta": "{\"pa" }),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                        "name": "read_file", "arguments": "{\"path\":\"a\"}"
+                    }
+                }),
+            ),
+            ("response.output_text.delta", serde_json::json!({ "delta": "summary" })),
+            (
+                "response.completed",
+                serde_json::json!({
+                    "response": { "usage": { "input_tokens": 120, "output_tokens": 30, "total_tokens": 150 } }
+                }),
+            ),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(response.text, "summary");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].arguments, "{\"path\":\"a\"}");
+        assert_eq!(response.usage.unwrap().prompt_tokens, Some(120));
+        assert!(
+            response
+                .provider_state
+                .as_ref()
+                .and_then(|s| s.codex_reasoning_for("gpt-5.6"))
+                .is_some_and(|items| items.len() == 1),
+            "the reasoning is kept exactly as the streaming path keeps it"
+        );
+    }
+
+    /// Half a summary would replace the history it was meant to stand for.
+    #[tokio::test]
+    async fn a_stream_cut_off_before_completion_is_an_error() {
+        let cut = parsed_stream(&[("response.output_text.delta", serde_json::json!({ "delta": "half a" }))]);
+        assert!(fold_stream(cut).await.is_err());
     }
 
     fn test_bearer(is_fedramp: bool) -> Bearer {

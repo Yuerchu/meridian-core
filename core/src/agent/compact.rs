@@ -545,6 +545,7 @@ async fn send_summary(
     msgs: Vec<ChatMessage>,
     params: provider::ChatParams,
 ) -> Result<provider::AgentResponse, provider::ProviderError> {
+    const LADDER: super::RetryLadder = super::RetryLadder::new(MAX_SUMMARY_TRANSIENT_RETRIES, SUMMARY_RETRY_BASE);
     let mut attempt = 0u32;
     loop {
         // `chat_with_tools` rather than `chat`, for the usage it returns and
@@ -554,10 +555,11 @@ async fn send_summary(
         let sent = provider.chat_with_tools(msgs.clone(), Vec::new(), params.clone()).await;
         match sent {
             Err(ref e)
-                if attempt < MAX_SUMMARY_TRANSIENT_RETRIES && super::is_retryable_stream_error(&e.to_string()) =>
+                if super::is_retryable_stream_error(&e.to_string())
+                    && attempt < LADDER.for_error(&e.to_string()).max_retries =>
             {
                 attempt += 1;
-                let delay = crate::client::backoff(SUMMARY_RETRY_BASE, attempt as u64);
+                let delay = LADDER.for_error(&e.to_string()).delay(attempt);
                 // No error body: a gateway's 502 page has been known to echo
                 // the request back, and this is a summary of a conversation.
                 tracing::warn!(attempt, "summarisation request failed; retrying");

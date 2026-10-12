@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::modes::ModeSpec;
 use crate::agent::tokenizer::MIN_REPLY_TOKENS;
-use crate::agent::{MAX_STREAM_RETRIES, STREAM_RETRY_BASE, is_context_window_error, is_retryable_stream_error};
+use crate::agent::{RetryLadder, StreamResult, is_context_window_error, is_retryable_stream_error};
 use crate::agent::{TokenBudget, serialize_tool_calls_openai};
 use crate::db::models::message::MessageUsage;
 use crate::db::models::turn::TurnPhase;
@@ -633,11 +633,12 @@ async fn run(
         let result = {
             let mut attempt = 0u32;
             let mut retry_delay: Option<std::time::Duration> = None;
+            // Chosen by the latest failure: an overload waits minutes where a
+            // dropped connection waits milliseconds.
+            let mut ladder = RetryLadder::STREAM;
             loop {
                 if attempt > 0 {
-                    let delay = retry_delay
-                        .take()
-                        .unwrap_or_else(|| crate::client::backoff(STREAM_RETRY_BASE, attempt as u64));
+                    let delay = retry_delay.take().unwrap_or_else(|| ladder.delay(attempt));
                     // Before the wait, not after. The backoff is the part anyone
                     // watching actually sits through, and a turn that says
                     // nothing for it is indistinguishable from one that has hung.
@@ -647,12 +648,19 @@ async fn run(
                     // goes to a window.
                     whisper_chat(ChatStreamEvent::Retry {
                         attempt,
-                        max_attempts: MAX_STREAM_RETRIES,
+                        max_attempts: ladder.max_retries,
                         delay_ms: delay.as_millis() as u64,
                         message_id: assistant_msg_id.clone(),
                         conversation_id: conversation_id.clone(),
                     });
-                    tokio::time::sleep(delay).await;
+                    // A wait can be a minute long, so Stop has to end it rather
+                    // than queue behind it. Nothing was read, so the round ends
+                    // with nothing — exactly as a stream cancelled before its
+                    // first event does.
+                    tokio::select! {
+                        _ = cancel.cancelled() => break StreamResult::abandoned(),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
                     // A retry replays the whole stream under the same message
                     // id; tell any window to drop what it already appended.
                     whisper_chat(ChatStreamEvent::Reset {
@@ -756,8 +764,11 @@ async fn run(
                         }
                         break recovered;
                     }
-                    Err(e) if is_retryable_stream_error(&e) && attempt < MAX_STREAM_RETRIES => {
-                        tracing::warn!(error = %e, attempt, "request failed, retrying");
+                    Err(e)
+                        if is_retryable_stream_error(&e) && attempt < RetryLadder::STREAM.for_error(&e).max_retries =>
+                    {
+                        ladder = RetryLadder::STREAM.for_error(&e);
+                        tracing::warn!(error = %e, attempt, max_retries = ladder.max_retries, "request failed, retrying");
                         retry_delay = crate::agent::parse_retry_after(&e);
                         attempt += 1;
                         continue;
@@ -1856,9 +1867,17 @@ mod tests {
         /// the turn's own provider, so a test about compaction has to answer for
         /// it too.
         summary: Option<String>,
+        /// How many requests are refused as overloaded before the script starts.
+        overloads: Mutex<u32>,
     }
 
     impl Scripted {
+        fn overloaded_for(self, requests: u32) -> Self {
+            Self {
+                overloads: Mutex::new(requests),
+                ..self
+            }
+        }
         fn of(rounds: Vec<Vec<StreamEvent>>) -> Self {
             Self {
                 script: Mutex::new(rounds.into()),
@@ -1908,6 +1927,16 @@ mod tests {
                 .unwrap()
                 .push((messages, tools.into_iter().map(|t| t.name).collect()));
             self.ceilings.lock().unwrap().push(params.max_tokens);
+            {
+                let mut overloads = self.overloads.lock().unwrap();
+                if *overloads > 0 {
+                    *overloads -= 1;
+                    return Err(ProviderError::Api {
+                        status: 503,
+                        body: "server_is_overloaded: Our servers are currently overloaded.".into(),
+                    });
+                }
+            }
             match self.script.lock().unwrap().pop_front() {
                 Some(events) => {
                     let said = futures::stream::iter(events.into_iter().map(Ok));
@@ -3711,6 +3740,60 @@ mod tests {
             tool_row.content
         );
         assert_eq!(tool_row.tool_outcome.as_deref(), Some("error"));
+    }
+
+    /// Six overloads is one more than the ordinary ladder allows, and was a
+    /// failed turn while every failure got that ladder's six seconds. (The
+    /// waits themselves are scaled down under test; their real lengths are
+    /// pinned in `agent::stream`.)
+    #[tokio::test]
+    async fn an_overloaded_upstream_is_waited_out_past_the_ordinary_ladder() {
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
+        let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
+        let provider = Scripted::of(vec![says("back again")]).overloaded_for(6);
+        let approvals = Answers::nobody();
+
+        let outcome = run_turn(
+            &services(&pool, &tools, &mcp),
+            setup(&provider, &pool, &cancel, &[]),
+            ports(&approvals, None),
+        )
+        .await;
+        assert_eq!(outcome.reply.as_deref(), Ok("back again"));
+        assert_eq!(provider.rounds(), 7);
+    }
+
+    /// Stops the turn the moment a retry wait is announced.
+    struct StopOnRetry(CancellationToken);
+
+    impl Emit for StopOnRetry {
+        fn emit(&self, _channel: &str, payload: serde_json::Value) -> Result<(), String> {
+            if payload["type"] == "retry" {
+                self.0.cancel();
+            }
+            Ok(())
+        }
+    }
+
+    /// A wait can be a minute long; Stop ends it rather than queueing behind it.
+    #[tokio::test]
+    async fn stop_ends_a_retry_wait() {
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
+        let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
+        let provider = Scripted::of(vec![says("too late")]).overloaded_for(8);
+        let approvals = Answers::nobody();
+        let stopper = StopOnRetry(cancel.clone());
+
+        let outcome = run_turn(
+            &services(&pool, &tools, &mcp),
+            setup(&provider, &pool, &cancel, &[]),
+            ports(&approvals, Some(&stopper)),
+        )
+        .await;
+        assert!(outcome.reply.is_ok(), "a stopped turn is not a failed one");
+        assert_eq!(provider.rounds(), 1, "nothing was sent after Stop");
     }
 
     /// Usage is accumulated across every round, not taken from the last one.

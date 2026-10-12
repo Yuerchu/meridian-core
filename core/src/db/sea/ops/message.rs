@@ -454,6 +454,79 @@ pub async fn delete_subtree(tx: &WriteTx, conversation_id: &str, message_id: &st
     Ok(new_head)
 }
 
+/// Take back the row a failed request left at the head, so the next turn does
+/// not replay it.
+///
+/// A round opens its assistant row before the request goes out, and a request
+/// that fails — an upstream overloaded past every retry — never fills it in.
+/// Left there, the next turn sends it as an empty assistant message, and a
+/// user who types "continue" after each failure grows the history by one empty
+/// answer and one "continue" each time. Only a row that was *never sent* may
+/// go: it is the head (nothing was built on it), its turn is recorded as
+/// failed, it carries no content, reasoning, calls or provider state, and
+/// nothing hangs off it or is anchored on it. A failed row that a later turn
+/// already replayed is no longer the head and stays as it is, because what was
+/// sent is never rewritten.
+///
+/// The head goes back to the row's parent exactly — not to the deepest branch
+/// under it as `delete_subtree` repairs it, which on a question with an older
+/// answer beside it would switch the user onto that answer.
+pub async fn retract_failed_head(tx: &WriteTx, conversation_id: &str) -> Result<Option<String>, DbErr> {
+    use crate::db::entity::turn::TurnStatus;
+
+    let Some(conv) = conversation::Entity::find_by_id(conversation_id)
+        .one(tx.conn()?)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(head_id) = conv.head_message_id else {
+        return Ok(None);
+    };
+    let Some(head) = get_message(tx, &head_id).await? else {
+        return Ok(None);
+    };
+    let blank = |s: &Option<String>| s.as_deref().is_none_or(str::is_empty);
+    if head.role != "assistant"
+        || !head.content.is_empty()
+        || !blank(&head.reasoning_content)
+        || !blank(&head.tool_calls)
+        || !blank(&head.provider_state)
+    {
+        return Ok(None);
+    }
+    let failed = match head.turn_id.as_deref() {
+        Some(turn_id) => crate::db::sea::ops::turn::get(tx, turn_id)
+            .await?
+            .is_some_and(|t| t.status == TurnStatus::Failed),
+        None => false,
+    };
+    if !failed {
+        return Ok(None);
+    }
+    let referenced = message::Entity::find()
+        .filter(message::Column::ConversationId.eq(conversation_id))
+        .filter(
+            sea_orm::Condition::any()
+                .add(message::Column::ParentId.eq(head.id.as_str()))
+                .add(message::Column::CompactAnchorId.eq(head.id.as_str())),
+        )
+        .one(tx.conn()?)
+        .await?
+        .is_some();
+    if referenced {
+        return Ok(None);
+    }
+
+    message::Entity::delete_by_id(head.id.as_str()).exec(tx.conn()?).await?;
+    conversation::Entity::update_many()
+        .col_expr(conversation::Column::HeadMessageId, Expr::value(head.parent_id.clone()))
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .exec(tx.conn()?)
+        .await?;
+    Ok(Some(head.id))
+}
+
 /// Move the head onto `message_id`'s branch, at the point that branch was
 /// last written. `RecordNotFound` for a message that is not on this
 /// conversation's tree.
@@ -765,6 +838,59 @@ mod tests {
             old_text: old_text.map(str::to_string),
             new_text: new_text.into(),
             line,
+        }
+    }
+
+    /// A question, an older answer beside it, and the empty row a request that
+    /// then failed opened under it — the head. `status` is how that turn ended.
+    async fn failed_round(status: crate::db::entity::turn::TurnStatus, content: &str) -> Db {
+        let db = with_conversations(&["c1"]).await;
+        append(&db, row("u1", "c1", "user"), None).await;
+        let older = message::Model {
+            content: "the older answer".into(),
+            ..row("a0", "c1", "assistant")
+        };
+        append(&db, older, Some("u1")).await;
+        db.write(async |tx| {
+            crate::db::sea::ops::turn::begin(tx, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1).await?;
+            crate::db::sea::ops::turn::finish(tx, "t1", status, Some("API error 503"), 2).await
+        })
+        .await
+        .unwrap();
+        let opened = message::Model {
+            content: content.into(),
+            turn_id: Some("t1".into()),
+            ..row("a1", "c1", "assistant")
+        };
+        append(&db, opened, Some("u1")).await;
+        db
+    }
+
+    async fn retract(db: &Db) -> Option<String> {
+        db.write(async |tx| retract_failed_head(tx, "c1").await).await.unwrap()
+    }
+
+    /// The head goes back to the question itself, not across to the older
+    /// answer that `delete_subtree`'s repair would have picked.
+    #[tokio::test]
+    async fn a_failed_requests_empty_row_is_taken_back_to_its_question() {
+        let db = failed_round(crate::db::entity::turn::TurnStatus::Failed, "").await;
+        assert_eq!(retract(&db).await.as_deref(), Some("a1"));
+        assert_eq!(head(&db, "c1").await.as_deref(), Some("u1"));
+        assert_eq!(ids(&db, "c1").await, ["u1", "a0"]);
+        assert_eq!(retract(&db).await, None, "a question is never retracted");
+    }
+
+    #[tokio::test]
+    async fn only_an_empty_row_of_a_failed_turn_is_retracted() {
+        for (status, content) in [
+            (crate::db::entity::turn::TurnStatus::Cancelled, ""),
+            (crate::db::entity::turn::TurnStatus::Done, ""),
+            (crate::db::entity::turn::TurnStatus::Failed, "half an answer"),
+        ] {
+            let db = failed_round(status, content).await;
+            assert_eq!(retract(&db).await, None, "{status:?} / {content:?}");
+            assert_eq!(head(&db, "c1").await.as_deref(), Some("a1"));
         }
     }
 

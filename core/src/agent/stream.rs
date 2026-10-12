@@ -28,8 +28,84 @@ pub(crate) struct StreamResult {
     pub(crate) ran_to_completion: bool,
 }
 
+impl StreamResult {
+    /// A round given up before anything was read: Stop pressed during a retry
+    /// wait.
+    pub(crate) fn abandoned() -> Self {
+        Self {
+            text: String::new(),
+            reasoning: String::new(),
+            provider_state: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: None,
+            response_model: None,
+            ran_to_completion: false,
+        }
+    }
+}
+
 pub(crate) const MAX_STREAM_RETRIES: u32 = 5;
 pub(crate) const STREAM_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How many times, and how far apart, a retryable failure is tried again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryLadder {
+    pub(crate) max_retries: u32,
+    base: std::time::Duration,
+}
+
+impl RetryLadder {
+    /// The turn loop's ladder for a dropped connection or a gateway's 502:
+    /// failures that clear in milliseconds.
+    pub(crate) const STREAM: Self = Self {
+        max_retries: MAX_STREAM_RETRIES,
+        base: STREAM_RETRY_BASE,
+    };
+
+    /// An upstream that says it is overloaded stays overloaded for tens of
+    /// seconds to minutes. The ordinary ladder spent its five retries in about
+    /// six seconds — measured against `server_is_overloaded`, every one of
+    /// them landed inside the same overload and the turn failed anyway. This
+    /// one waits 2, 4, 8, 16, 32, then 60 seconds three times: about four
+    /// minutes, each wait announced to the window and cut short by Stop.
+    pub(crate) const OVERLOAD: Self = Self {
+        max_retries: 8,
+        base: std::time::Duration::from_secs(2),
+    };
+
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub(crate) const fn new(max_retries: u32, base: std::time::Duration) -> Self {
+        Self { max_retries, base }
+    }
+
+    /// `self` unless the failure is an overload, which gets the long ladder.
+    pub(crate) fn for_error(self, err: &str) -> Self {
+        if is_overload_error(err) { Self::OVERLOAD } else { self }
+    }
+
+    /// The wait before retry number `attempt`, counted from 1.
+    pub(crate) fn delay(&self, attempt: u32) -> std::time::Duration {
+        let nominal = self.nominal_delay(attempt);
+        // A turn test that waits out an overload would otherwise take four
+        // real minutes, and tokio's paused clock is no way round it: it
+        // auto-advances while SQLite works on a blocking thread and fires the
+        // pool's acquire timeout instead. The schedule itself is pinned
+        // against `nominal_delay`.
+        if cfg!(test) { nominal / 1000 } else { nominal }
+    }
+
+    fn nominal_delay(&self, attempt: u32) -> std::time::Duration {
+        crate::client::backoff(self.base, attempt as u64).min(Self::MAX_WAIT)
+    }
+}
+
+/// The server blaming its own capacity: 503, Anthropic's 529, or the word
+/// itself from a relay that reports it some other way.
+pub(crate) fn is_overload_error(err: &str) -> bool {
+    matches!(status_in(err), Some(503 | 529)) || err.to_lowercase().contains("overloaded")
+}
 
 pub(crate) fn is_context_window_error(err: &str) -> bool {
     // 413 however it is worded, including `API error 413`, which the Responses
@@ -125,6 +201,34 @@ pub(crate) fn parse_retry_after(err: &str) -> Option<std::time::Duration> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn an_overload_gets_the_long_ladder_and_nothing_else_does() {
+        let overloaded = "API error 503: server_is_overloaded: Our servers are currently overloaded.";
+        assert_eq!(RetryLadder::STREAM.for_error(overloaded), RetryLadder::OVERLOAD);
+        assert_eq!(
+            RetryLadder::STREAM.for_error("transport: http 529: busy"),
+            RetryLadder::OVERLOAD
+        );
+        assert_eq!(
+            RetryLadder::STREAM.for_error("API error 502: bad gateway"),
+            RetryLadder::STREAM
+        );
+        assert_eq!(
+            RetryLadder::STREAM.for_error("network: connection reset"),
+            RetryLadder::STREAM
+        );
+    }
+
+    #[test]
+    fn the_overload_ladder_outlasts_minutes_and_no_wait_exceeds_one() {
+        let waits: Vec<_> = (1..=RetryLadder::OVERLOAD.max_retries)
+            .map(|a| RetryLadder::OVERLOAD.nominal_delay(a))
+            .collect();
+        let total: Duration = waits.iter().sum();
+        assert!(total >= Duration::from_secs(180), "{total:?}");
+        assert!(waits.iter().all(|w| *w <= Duration::from_secs(60)), "{waits:?}");
+    }
 
     #[test]
     fn parse_retry_after_seconds() {
