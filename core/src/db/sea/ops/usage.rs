@@ -146,10 +146,21 @@ pub struct UsageBucket {
     /// are optional — a NULL cache count means no cache activity — but a NULL
     /// input or output count leaves that side of the bill unknown.
     pub incomplete_token_usage_messages: i64,
+    /// The two sides of `incomplete_token_usage_messages`, which a reply can be
+    /// on both of. What says which side a listed gap is missing.
+    pub missing_input_messages: i64,
+    pub missing_output_messages: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    /// Prompt tokens and their cache hits, over the replies that reported a
+    /// prompt — the only replies a hit rate can be read off. `input_tokens`
+    /// falls back to the cache figures where the prompt is missing, so dividing
+    /// the totals would count those hits as a hundred percent of a prompt
+    /// nobody measured.
+    pub reported_input_tokens: i64,
+    pub reported_input_cache_read_tokens: i64,
     pub input_cost: Decimal,
     pub output_cost: Decimal,
     pub cache_cost: Decimal,
@@ -189,10 +200,14 @@ impl UsageBucket {
             external_messages: 0,
             missing_token_usage_messages: 0,
             incomplete_token_usage_messages: 0,
+            missing_input_messages: 0,
+            missing_output_messages: 0,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            reported_input_tokens: 0,
+            reported_input_cache_read_tokens: 0,
             input_cost: Decimal::zero(),
             output_cost: Decimal::zero(),
             cache_cost: Decimal::zero(),
@@ -236,6 +251,8 @@ pub(crate) struct GroupRow {
     pub(crate) output_tokens: i64,
     pub(crate) cache_read_tokens: i64,
     pub(crate) cache_write_tokens: i64,
+    pub(crate) reported_input_tokens: i64,
+    pub(crate) reported_input_cache_read_tokens: i64,
     /// Provider-side invocations, which bill per call rather than per token.
     pub(crate) server_tool_calls: i64,
     /// Replies in this group that actually made at least one billable provider
@@ -383,6 +400,10 @@ impl UsageAccumulator {
         self.bucket.output_tokens += group.output_tokens;
         self.bucket.cache_read_tokens += group.cache_read_tokens;
         self.bucket.cache_write_tokens += group.cache_write_tokens;
+        self.bucket.reported_input_tokens += group.reported_input_tokens;
+        self.bucket.reported_input_cache_read_tokens += group.reported_input_cache_read_tokens;
+        self.bucket.missing_input_messages += group.missing_input_messages;
+        self.bucket.missing_output_messages += group.missing_output_messages;
         self.server_tool_calls += group.server_tool_calls;
         self.bucket.missing_token_usage_messages += group.missing_token_usage_messages;
         self.bucket.incomplete_token_usage_messages += group.incomplete_token_usage_messages;
@@ -698,6 +719,113 @@ pub async fn report(
     Ok(out)
 }
 
+/// One reply whose usage or price is incomplete, and which part.
+///
+/// This is what the two warnings on the usage page count — "N replies did not
+/// report input or output tokens", "N replies are unpriced" — made findable. A
+/// count nobody can trace to a row is a count nobody can act on.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGap {
+    pub id: String,
+    pub created_at: i64,
+    pub conversation_id: String,
+    /// `None` when the conversation is gone; `Some("")` when it exists and has
+    /// never been titled — the same distinction `label` keeps.
+    pub conversation_title: Option<String>,
+    pub role: String,
+    pub provider_name: Option<String>,
+    pub model_id: Option<String>,
+    pub source_type: Option<String>,
+    pub billing_mode: BillingMode,
+    /// Characters of the stored reply. Not the reply: an empty one — a round
+    /// that failed before the provider reported anything — is most of what
+    /// these turn out to be, and the length is enough to say so.
+    pub content_chars: i64,
+    pub missing_input: bool,
+    pub missing_output: bool,
+    pub unpriced_tokens: bool,
+    pub unpriced_tools: bool,
+}
+
+/// The newest `limit` gaps, and how many there are in all.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGaps {
+    pub total: i64,
+    pub items: Vec<UsageGap>,
+}
+
+/// Every reply in `filter` with a usage or pricing gap, newest first.
+///
+/// Whether a reply has one is decided by the accumulator every report uses,
+/// over a group of one: deciding it again here would be a second reading of
+/// the same rules, and the list could then disagree with the counts it is
+/// meant to explain.
+pub async fn gaps(db: &impl Snapshot, filter: &UsageFilter, limit: usize) -> Result<UsageGaps, DbErr> {
+    let groups = grouped(db, sql::USAGE_GAPS, filter, false).await?;
+    let current = current_prices(db).await?;
+    let flagged: HashMap<String, UsageBucket> = accumulate(groups, &current)
+        .map_err(DbErr::Type)?
+        .into_iter()
+        .map(|(id, accumulator)| (id, accumulator.bucket))
+        .filter(|(_, bucket)| bucket.incomplete_token_usage_messages > 0 || bucket.unpriced_messages > 0)
+        .collect();
+
+    let rows = sql::query_all(db, sql::USAGE_GAP_DETAILS, filter_values(filter, false)).await?;
+    let mut total = 0;
+    let mut items = Vec::new();
+    for row in &rows {
+        let id: String = row.try_get("", "id")?;
+        let Some(bucket) = flagged.get(&id) else {
+            continue;
+        };
+        total += 1;
+        if items.len() >= limit {
+            continue;
+        }
+        let billing_mode = if bucket.metered_messages > 0 {
+            BillingMode::Metered
+        } else if bucket.subscription_messages > 0 {
+            BillingMode::Subscription
+        } else {
+            BillingMode::External
+        };
+        items.push(UsageGap {
+            id,
+            created_at: row.try_get("", "created_at")?,
+            conversation_id: row.try_get("", "conversation_id")?,
+            conversation_title: None,
+            role: row.try_get("", "role")?,
+            provider_name: row.try_get("", "provider_name")?,
+            model_id: row.try_get("", "model_id")?,
+            source_type: row.try_get("", "source_type")?,
+            billing_mode,
+            content_chars: row.try_get("", "content_chars")?,
+            missing_input: bucket.missing_input_messages > 0,
+            missing_output: bucket.missing_output_messages > 0,
+            unpriced_tokens: bucket.unpriced_token_messages > 0,
+            unpriced_tools: bucket.unpriced_tool_messages > 0,
+        });
+    }
+
+    let ids: Vec<&str> = items.iter().map(|gap| gap.conversation_id.as_str()).collect();
+    let titles: HashMap<String, Option<String>> = conversation::Entity::find()
+        .filter(conversation::Column::Id.is_in(ids))
+        .select_only()
+        .column(conversation::Column::Id)
+        .column(conversation::Column::Title)
+        .into_tuple::<(String, Option<String>)>()
+        .all(db.conn()?)
+        .await?
+        .into_iter()
+        .collect();
+    for gap in &mut items {
+        gap.conversation_title = titles
+            .get(&gap.conversation_id)
+            .map(|title| title.clone().unwrap_or_default());
+    }
+    Ok(UsageGaps { total, items })
+}
+
 /// One audit query for every turn in a conversation, then one current-price
 /// query for the legacy fallback. The cost work is the same accumulator used by
 /// [`report`], not a snapshot-specific formula and not one query per turn.
@@ -748,15 +876,9 @@ async fn current_prices(db: &impl Snapshot) -> Result<HashMap<(String, String), 
         .collect())
 }
 
-/// The registered grouping statement for one key, with the filter bound in
-/// placeholder order: each optional bound twice (`? IS NULL OR … = ?`), and the
-/// conversation once when the statement names it directly.
-async fn grouped(
-    db: &impl Read,
-    statement: sql::ReadOnly,
-    filter: &UsageFilter,
-    direct_conversation: bool,
-) -> Result<Vec<GroupRow>, DbErr> {
+/// The filter as bound values, in the placeholder order every usage statement
+/// shares.
+fn filter_values(filter: &UsageFilter, direct_conversation: bool) -> Vec<Value> {
     let origin = filter.origin.map(|value| value.as_str().to_string());
     let mut values: Vec<Value> = vec![
         filter.since_ms.into(),
@@ -776,7 +898,19 @@ async fn grouped(
         values.push(filter.conversation_id.clone().into());
         values.push(filter.conversation_id.clone().into());
     }
-    sql::query_all(db, statement, values)
+    values
+}
+
+/// The registered grouping statement for one key, with the filter bound in
+/// placeholder order: each optional bound twice (`? IS NULL OR … = ?`), and the
+/// conversation once when the statement names it directly.
+async fn grouped(
+    db: &impl Read,
+    statement: sql::ReadOnly,
+    filter: &UsageFilter,
+    direct_conversation: bool,
+) -> Result<Vec<GroupRow>, DbErr> {
+    sql::query_all(db, statement, filter_values(filter, direct_conversation))
         .await?
         .iter()
         .map(group_row)
@@ -805,6 +939,8 @@ fn group_row(row: &QueryResult) -> Result<GroupRow, DbErr> {
         output_tokens: int("output_tokens")?,
         cache_read_tokens: int("cache_read_tokens")?,
         cache_write_tokens: int("cache_write_tokens")?,
+        reported_input_tokens: int("reported_input_tokens")?,
+        reported_input_cache_read_tokens: int("reported_input_cache_read_tokens")?,
         server_tool_calls: int("server_tool_calls")?,
         server_tool_messages: int("server_tool_messages")?,
         missing_token_usage_messages: int("missing_token_usage_messages")?,
@@ -2003,6 +2139,87 @@ mod tests {
         assert_eq!(days.len(), 2);
         assert!(days[0].key < days[1].key, "oldest first");
         assert_eq!(days[0].input_tokens, 10);
+    }
+
+    /// A hit rate is read only off replies that reported a prompt. One that sent
+    /// its cache figures alone falls back to them as its prompt in
+    /// `input_tokens`, so dividing the totals counts it as a hundred percent hit.
+    #[tokio::test]
+    async fn a_hit_rate_counts_only_replies_that_reported_a_prompt() {
+        let db = sea_test_db().await;
+        reply(&db, "a1", "m1", 1, (1000, 10, 400, 0), Some(("1", "2")), "desktop").await;
+        insert(
+            &db,
+            audit_message::Model {
+                output_tokens: Some(5),
+                cache_read_tokens: Some(900),
+                ..audit_row("a2", 2)
+            },
+        )
+        .await;
+
+        let bucket = total(&db, &UsageFilter::default()).await;
+        assert_eq!(bucket.reported_input_tokens, 1000);
+        assert_eq!(bucket.reported_input_cache_read_tokens, 400);
+        assert_eq!(bucket.missing_input_messages, 1);
+        // What the totals alone would have said: 1300 of 1900.
+        assert_eq!(bucket.input_tokens, 1900);
+        assert_eq!(bucket.cache_read_tokens, 1300);
+    }
+
+    /// The list is the two counts beside it made findable, so it has to name
+    /// exactly the replies they count — no more (an estimate is not a gap, even
+    /// though its row has no rates on it) and no fewer.
+    #[tokio::test]
+    async fn the_gap_list_names_exactly_the_replies_the_counts_count() {
+        let db = sea_test_db().await;
+        seed_model(&db, "m1", "1", "2").await;
+        // No rates on the row, priced from today's configuration: an estimate.
+        reply_billed(&db, "estimated", "m1", "metered", (10, 10)).await;
+        insert(
+            &db,
+            audit_message::Model {
+                input_tokens: Some(10),
+                ..audit_row("no_output", 2)
+            },
+        )
+        .await;
+        reply_billed(&db, "unpriced", "nobody", "metered", (10, 10)).await;
+        insert(
+            &db,
+            audit_message::Model {
+                billing_mode: BillingMode::External,
+                content: "hi".into(),
+                ..audit_row("external", 3)
+            },
+        )
+        .await;
+
+        let filter = UsageFilter::default();
+        let bucket = total(&db, &filter).await;
+        assert_eq!(bucket.incomplete_token_usage_messages, 2, "no_output, external");
+        assert_eq!(bucket.unpriced_messages, 2, "no_output, unpriced");
+
+        let found = r!(db, gaps(&filter, 10)).unwrap();
+        assert_eq!(found.total, 3);
+        let ids: Vec<&str> = found.items.iter().map(|gap| gap.id.as_str()).collect();
+        assert_eq!(ids, ["external", "no_output", "unpriced"], "newest first");
+
+        let [external, no_output, unpriced] = &found.items[..] else {
+            unreachable!()
+        };
+        assert_eq!(external.billing_mode, BillingMode::External);
+        assert!(external.missing_input && external.missing_output);
+        assert!(!external.unpriced_tokens, "external traffic owes no local rate");
+        assert_eq!(external.content_chars, 2);
+        assert!(no_output.missing_output && !no_output.missing_input);
+        assert!(no_output.unpriced_tokens);
+        assert!(unpriced.unpriced_tokens && !unpriced.missing_input && !unpriced.missing_output);
+        assert_eq!(unpriced.conversation_title, None, "c1 has no conversation row");
+
+        let first = r!(db, gaps(&filter, 1)).unwrap();
+        assert_eq!(first.total, 3, "the limit cuts the list, not the count");
+        assert_eq!(first.items.len(), 1);
     }
 }
 
