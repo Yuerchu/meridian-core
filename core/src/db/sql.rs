@@ -92,6 +92,11 @@ macro_rules! usage_grouping {
                 COALESCE(SUM(output_tokens), 0) AS output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                 COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(input_tokens), 0) AS reported_input_tokens,
+                COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL
+                                  THEN COALESCE(cache_read_tokens, 0)
+                                  ELSE 0
+                             END), 0) AS reported_input_cache_read_tokens,
                 COALESCE(SUM(server_tool_calls), 0) AS server_tool_calls,
                 SUM(CASE WHEN COALESCE(server_tool_calls, 0) > 0 THEN 1 ELSE 0 END)
                     AS server_tool_messages,
@@ -197,6 +202,50 @@ const USAGE_BY_KIND: ReadOnly = usage_by!("role");
 /// with no turn id cannot be attached exactly and are left out.
 pub const USAGE_BY_TURN: ReadOnly = usage_grouping!("turn_id", "AND conversation_id = ?", "AND turn_id IS NOT NULL");
 
+/// The rows that can carry a usage or pricing gap: a side of the usage missing,
+/// or a rate not snapshotted. A superset on purpose — whether a row really has
+/// a gap is the accumulator's answer, through the same `add` every report goes
+/// through, so this only spares it the rows that cannot have one. A row with
+/// both sides reported and every rate stored is priced exactly.
+///
+/// Written once and handed to each statement as its last argument, so the two
+/// below cannot come to disagree about which rows they consider.
+macro_rules! with_gap_candidate {
+    ($statement:ident ! ( $($args:tt)* )) => {
+        $statement!($($args)* "AND (input_tokens IS NULL OR output_tokens IS NULL
+              OR input_price IS NULL OR output_price IS NULL
+              OR cache_read_price IS NULL OR cache_write_price IS NULL
+              OR server_tool_price IS NULL)")
+    };
+}
+
+/// One group per candidate reply, under the nullable conversation scope.
+pub const USAGE_GAPS: ReadOnly = with_gap_candidate!(usage_grouping!("id", "AND (? IS NULL OR conversation_id = ?)",));
+
+/// What a person needs to find each candidate again, newest first: never the
+/// content, only how long it was — an empty reply is most of the story. Same
+/// filter and values as [`USAGE_GAPS`].
+macro_rules! gap_details {
+    ($candidate:literal) => {
+        ReadOnly(concat!(
+            "SELECT id, created_at, conversation_id, role, provider_name, model_id, source_type,
+            LENGTH(content) AS content_chars
+       FROM audit_messages
+      WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction')
+        AND (? IS NULL OR created_at >= ?)
+        AND (? IS NULL OR created_at < ?)
+        AND (? IS NULL OR turn_origin = ?)
+        AND (? IS NULL OR conversation_id = ?)
+        ",
+            $candidate,
+            "
+   ORDER BY created_at DESC, id DESC"
+        ))
+    };
+}
+
+pub const USAGE_GAP_DETAILS: ReadOnly = with_gap_candidate!(gap_details!());
+
 /// The registered grouping for a report dimension. Its key is the
 /// dimension's `key_expr`, which the tests hold the two to.
 pub fn usage_grouping(dimension: crate::db::sea::ops::usage::UsageDimension) -> ReadOnly {
@@ -296,5 +345,7 @@ mod tests {
             assert!(usage_grouping(dimension).0.contains(&clause), "{dimension:?}");
         }
         assert!(USAGE_BY_TURN.0.contains(&clause));
+        assert!(USAGE_GAPS.0.contains(&clause));
+        assert!(USAGE_GAP_DETAILS.0.contains(&clause));
     }
 }
