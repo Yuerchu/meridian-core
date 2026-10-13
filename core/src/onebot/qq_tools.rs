@@ -142,14 +142,16 @@ impl QqTool {
                 needs_approval: true,
                 scope: Scope::Any,
             },
+            // 戳一戳和点赞是社交动作：不删东西、不改群设置、留不下需要收拾的后果。
+            // 每次都停下来等 Y，这两个工具就等于不存在。仍限管理员。
             Self::QqSendPoke => QqSpec {
                 admin_only: true,
-                needs_approval: true,
+                needs_approval: false,
                 scope: Scope::Any,
             },
             Self::QqSendLike => QqSpec {
                 admin_only: true,
-                needs_approval: true,
+                needs_approval: false,
                 scope: Scope::Any,
             },
             Self::QqSetEssenceMsg => QqSpec {
@@ -1079,8 +1081,13 @@ pub(super) fn exposes_full_toolset(kind: &SessionKind, is_admin: bool) -> bool {
 ///
 /// Narrowing only. An assistant that has `web_search` switched off still does
 /// not get it — `ToolExposure::Only` filters what `enabled_tools` already
-/// allowed — and its `Permission::Ask` is unchanged, so a search still asks
-/// before it runs.
+/// allowed.
+///
+/// And never asked about: the runner passes this list as
+/// `ApprovalRule::ByPermission::unasked`. A search reads nothing here and
+/// writes nothing anywhere, while its approval prompt is a message the whole
+/// group reads — one per search made the tool unusable. What it does cost is
+/// search-API quota, which any member who can @ the bot can now spend.
 pub(super) const OPEN_REGISTRY_TOOLS: &[&str] = &["web_search"];
 
 /// What an ordinary member may run: the session-locked QQ reads, plus any

@@ -15,7 +15,7 @@ use std::collections::HashSet;
 
 use crate::agent::modes::ModeSpec;
 use crate::provider::ToolCall;
-use crate::tools::{self, ToolContext, ToolRegistry};
+use crate::tools::{ToolContext, ToolRegistry};
 
 use super::ports::{SubAgents, SurfaceTools};
 use super::turn::ApprovalRule;
@@ -86,14 +86,7 @@ fn is_parallel_eligible(
         _ => return false,
     };
     let permission = tool.default_permission();
-    let must_ask = match approval_rule {
-        ApprovalRule::ByReach { accept_edits } => {
-            tools::reach::needs_approval(permission, tool.reach(&args, tool_context), *accept_edits)
-        }
-        ApprovalRule::ByPermission => permission == tools::Permission::Ask,
-    };
-
-    !must_ask
+    !approval_rule.must_ask(&tc.name, permission, || tool.reach(&args, tool_context))
 }
 
 /// Partition an ordered slice of tool calls into alternating parallel and

@@ -1255,16 +1255,16 @@
     },
     {
       "admin_only": true,
-      "effect": "messaging",
+      "effect": "read",
       "name": "qq_send_poke",
-      "needs_approval": true,
+      "needs_approval": false,
       "scope": "any"
     },
     {
       "admin_only": true,
-      "effect": "messaging",
+      "effect": "read",
       "name": "qq_send_like",
-      "needs_approval": true,
+      "needs_approval": false,
       "scope": "any"
     },
     {

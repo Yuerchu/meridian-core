@@ -98,10 +98,26 @@ async fn record_new(state: &SharedState, row: emoji::Model, hint: Option<&str>, 
                 return Ok(existing.id);
             }
             let mut row = row;
-            if let Some(hint) = hint
-                && emoji_ops::name_in_use(tx, &row.pack_id, hint).await?
-            {
-                row.name = format!("{hint}-{suffix}");
+            let base_name = hint
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| format!("pending-{suffix}"));
+            if emoji_ops::name_in_use(tx, &row.pack_id, &base_name).await? {
+                let candidate = format!("{base_name}-{suffix}");
+                if !emoji_ops::name_in_use(tx, &row.pack_id, &candidate).await? {
+                    row.name = candidate;
+                } else {
+                    let mut counter = 2;
+                    loop {
+                        let numbered = format!("{base_name}-{suffix}-{counter}");
+                        if !emoji_ops::name_in_use(tx, &row.pack_id, &numbered).await? {
+                            row.name = numbered;
+                            break;
+                        }
+                        counter += 1;
+                    }
+                }
+            } else {
+                row.name = base_name;
             }
             emoji_ops::create_emoji(tx, row).await.map(|created| created.id)
         })

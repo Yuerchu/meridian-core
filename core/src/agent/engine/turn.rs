@@ -241,9 +241,32 @@ pub struct TurnServices<'a> {
 /// edits. `ByPermission` does neither, so it asks more often and cannot be told
 /// to stop. Converging them is on the drift list; it is a change to when a
 /// person is interrupted, which is not something to do in passing.
+/// `ByPermission::unasked` names registry tools the runner has decided never to
+/// stop for, whatever they declare. QQ puts `web_search` there: a question in a
+/// group chat is a message everyone reads, and one per search made the tool
+/// unusable.
 pub enum ApprovalRule {
     ByReach { accept_edits: bool },
-    ByPermission,
+    ByPermission { unasked: &'static [&'static str] },
+}
+
+impl ApprovalRule {
+    /// Whether a registry tool call stops for a person. `reach` is only asked
+    /// under `ByReach`.
+    pub(crate) fn must_ask(
+        &self,
+        name: &str,
+        permission: tools::Permission,
+        reach: impl FnOnce() -> tools::reach::Reach,
+    ) -> bool {
+        match self {
+            // `reach` is advisory: it decides whether to prompt, not what the
+            // tool may touch. `tools::verified` enforces that against the
+            // handle when the I/O happens.
+            Self::ByReach { accept_edits } => tools::reach::needs_approval(permission, reach(), *accept_edits),
+            Self::ByPermission { unasked } => permission == tools::Permission::Ask && !unasked.contains(&name),
+        }
+    }
 }
 
 /// What the model is told when it names a tool this turn did not offer.
@@ -947,7 +970,7 @@ async fn run(
         let mut assistant_msg = ChatMessage::assistant_with_tools(
             &result.text,
             (!result.reasoning.is_empty()).then(|| result.reasoning.clone()),
-            result.tool_calls.clone(),
+            storable_calls.clone(),
         );
         assistant_msg.provider_state = result.provider_state.clone();
         chat_messages.push(assistant_msg);
@@ -1436,17 +1459,8 @@ async fn run(
                     Ok(mut args) => {
                         services.redaction_mappings.restore_in_json(&conversation_id, &mut args);
                         let permission = tool.default_permission();
-                        let must_ask = match &approval_rule {
-                            // `reach` is advisory: it decides whether to prompt, not
-                            // what the tool may touch. `tools::verified` enforces
-                            // that against the handle when the I/O happens.
-                            ApprovalRule::ByReach { accept_edits } => tools::reach::needs_approval(
-                                permission,
-                                tool.reach(&args, &tool_context),
-                                *accept_edits,
-                            ),
-                            ApprovalRule::ByPermission => permission == tools::Permission::Ask,
-                        };
+                        let must_ask =
+                            approval_rule.must_ask(&tc.name, permission, || tool.reach(&args, &tool_context));
                         // Three answers, not two. `None` is nobody answering — a card
                         // that expired, or a turn that outlived its question — and the
                         // `Approvals` contract says that is never a denial. Telling the
@@ -1748,6 +1762,22 @@ mod tests {
     use super::*;
     use crate::agent::turn_config::TurnConfig;
     use crate::db::sea::cap::Db;
+
+    /// `unasked` exempts exactly the names on it: every other `Ask` tool still
+    /// stops for a person.
+    #[test]
+    fn by_permission_skips_only_the_unasked() {
+        use tools::Permission::Ask;
+        let rule = ApprovalRule::ByPermission {
+            unasked: &["web_search"],
+        };
+        let reach = || tools::reach::Reach::Outside;
+        assert!(!rule.must_ask("web_search", Ask, reach));
+        assert!(rule.must_ask("run_command", Ask, reach));
+
+        let none = ApprovalRule::ByPermission { unasked: &[] };
+        assert!(none.must_ask("web_search", Ask, reach));
+    }
     use crate::provider::{ProviderError, SenderRef, StreamEvent, TokenUsage, ToolCall};
     use crate::turn::TurnOrigin;
     use std::collections::VecDeque;
