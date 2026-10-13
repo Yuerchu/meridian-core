@@ -1109,8 +1109,11 @@ async fn headless_chat_inner(
             context_limit,
             // The declared permission and nothing else: no reach check, and no
             // standing yes to project edits — there is no project. The desktop
-            // consults both. On the drift list.
-            approval_rule: engine::ApprovalRule::ByPermission,
+            // consults both. On the drift list. The open registry tools are the
+            // exception: see `OPEN_REGISTRY_TOOLS`.
+            approval_rule: engine::ApprovalRule::ByPermission {
+                unasked: super::qq_tools::OPEN_REGISTRY_TOOLS,
+            },
             // Was `Terse` — "Unknown tool" — which was true while a tool the
             // speaker could not run was also absent from the definitions. It is
             // no longer: the model can now see a tool it is refused, and being
