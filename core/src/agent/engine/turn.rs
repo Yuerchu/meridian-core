@@ -1459,8 +1459,13 @@ async fn run(
                     Ok(mut args) => {
                         services.redaction_mappings.restore_in_json(&conversation_id, &mut args);
                         let permission = tool.default_permission();
-                        let must_ask =
-                            approval_rule.must_ask(&tc.name, permission, || tool.reach(&args, &tool_context));
+                        // Reach is computed at most once: `must_ask` reads it under
+                        // `ByReach`, and an approved call below needs it again to
+                        // decide whether its grant covers an outside target.
+                        let mut tool_reach = None;
+                        let must_ask = approval_rule.must_ask(&tc.name, permission, || {
+                            *tool_reach.get_or_insert_with(|| tool.reach(&args, &tool_context))
+                        });
                         // Three answers, not two. `None` is nobody answering — a card
                         // that expired, or a turn that outlived its question — and the
                         // `Approvals` contract says that is never a denial. Telling the
@@ -1496,6 +1501,14 @@ async fn run(
                             Authorised::Refused(None) => ("Tool call denied by user.".to_string(), "denied"),
                             Authorised::Unanswered => (UNANSWERED_APPROVAL.to_string(), "denied"),
                             Authorised::Yes => {
+                                let execution_context = if must_ask
+                                    && tool_reach.get_or_insert_with(|| tool.reach(&args, &tool_context))
+                                        == &tools::reach::Reach::Outside
+                                {
+                                    tool_context.with_approved_external_access()
+                                } else {
+                                    tool_context.clone()
+                                };
                                 // The one phase that describes something outside the
                                 // database. A turn found dead here may already have
                                 // written the file or run the command.
@@ -1504,7 +1517,7 @@ async fn run(
                                     &turn_id,
                                     TurnPhase::RunningTool,
                                     Some(&tc.name),
-                                    tool.execute(args.clone(), &tool_context),
+                                    tool.execute(args.clone(), &execution_context),
                                 )
                                 .await;
                                 match executed {
