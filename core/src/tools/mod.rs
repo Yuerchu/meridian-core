@@ -139,6 +139,17 @@ impl ToolContext {
         ctx
     }
 
+    /// Clone this context for the one tool call whose external target the user
+    /// has approved. The grant is not persisted and cannot leak to a later
+    /// tool call because the owning turn keeps its original context.
+    pub fn with_approved_external_access(&self) -> Self {
+        let mut ctx = self.clone();
+        if matches!(ctx.file_access, FileAccess::Unrestricted) {
+            ctx.file_access = FileAccess::ApprovedExternal;
+        }
+        ctx
+    }
+
     /// This call's licence to journal, or `None` when the turn keeps none.
     pub fn journal_record<'a>(
         &'a self,
@@ -157,6 +168,9 @@ pub enum FileAccess {
     /// Desktop default: legacy behavior, paths validated against working_directory only.
     #[default]
     Unrestricted,
+    /// One-call desktop grant created after approval of an external target.
+    /// This is intentionally not a default or a persisted setting.
+    ApprovedExternal,
     /// Android: only paths under one of these roots are allowed.
     Roots(Vec<AccessRoot>),
 }
@@ -326,6 +340,11 @@ impl ToolContext {
                 let real = verified::verify_path(&resolved, root.as_deref()).map_err(|e| e.message())?;
                 Ok(ResolvedTarget::Real(real))
             }
+            FileAccess::ApprovedExternal => {
+                let resolved = self.resolve_path(path);
+                let real = verified::verify_path(&resolved, None).map_err(|e| e.message())?;
+                Ok(ResolvedTarget::Real(real))
+            }
             FileAccess::Roots(roots) => {
                 // An empty root set is the OneBot path and an Android install
                 // with nothing granted; worth telling apart from a path that
@@ -393,7 +412,11 @@ impl ToolContext {
     pub fn open_write(&self, path: &str) -> Result<OpenedTarget, String> {
         match self.resolve_and_validate(path)? {
             ResolvedTarget::Real(p) => {
-                let root = self.verified_root()?;
+                let root = if matches!(self.file_access, FileAccess::ApprovedExternal) {
+                    None
+                } else {
+                    self.verified_root()?
+                };
                 let vf = verified::open_write(&p, root.as_deref()).map_err(|e| e.message())?;
                 Ok(OpenedTarget::Real(vf))
             }
@@ -407,7 +430,11 @@ impl ToolContext {
     pub fn open_create_new(&self, path: &str) -> Result<OpenedTarget, String> {
         match self.resolve_and_validate(path)? {
             ResolvedTarget::Real(p) => {
-                let root = self.verified_root()?;
+                let root = if matches!(self.file_access, FileAccess::ApprovedExternal) {
+                    None
+                } else {
+                    self.verified_root()?
+                };
                 let vf = verified::open_create_new(&p, root.as_deref()).map_err(|e| e.message())?;
                 Ok(OpenedTarget::Real(vf))
             }
@@ -419,7 +446,11 @@ impl ToolContext {
     pub fn open_edit(&self, path: &str) -> Result<OpenedTarget, String> {
         match self.resolve_and_validate(path)? {
             ResolvedTarget::Real(p) => {
-                let root = self.verified_root()?;
+                let root = if matches!(self.file_access, FileAccess::ApprovedExternal) {
+                    None
+                } else {
+                    self.verified_root()?
+                };
                 let vf = verified::open_edit(&p, root.as_deref()).map_err(|e| e.message())?;
                 Ok(OpenedTarget::Real(vf))
             }
@@ -728,6 +759,26 @@ mod tests {
         }
     }
 
+    fn unrestricted_context(dir: &std::path::Path) -> ToolContext {
+        ToolContext {
+            working_directory: Some(dir.to_string_lossy().to_string()),
+            shell: ShellType::Bash,
+            file_access: FileAccess::Unrestricted,
+            project_id: None,
+            conversation_id: None,
+            turn_id: None,
+            assistant_id: None,
+            db: None,
+            #[cfg(not(target_os = "android"))]
+            sandbox_policy: crate::sandbox::CommandSandbox::UNCONFINED,
+            #[cfg(not(target_os = "android"))]
+            background: None,
+            tool_secrets: HashMap::new(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            journal: None,
+        }
+    }
+
     #[test]
     fn unrestricted_outside_working_dir_denied() {
         let dir = tempfile::tempdir().unwrap();
@@ -750,6 +801,18 @@ mod tests {
         };
         assert!(ctx.resolve_and_validate("inside.txt").is_ok());
         assert!(ctx.resolve_and_validate("../outside.txt").is_err());
+    }
+
+    #[test]
+    fn approved_external_access_is_scoped_to_a_derived_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = unrestricted_context(dir.path());
+        let approved = ctx.with_approved_external_access();
+
+        assert!(ctx.resolve_and_validate("../outside.txt").is_err());
+        assert!(approved.resolve_and_validate("../outside.txt").is_ok());
+        assert!(matches!(ctx.file_access, FileAccess::Unrestricted));
+        assert!(matches!(approved.file_access, FileAccess::ApprovedExternal));
     }
 
     #[test]

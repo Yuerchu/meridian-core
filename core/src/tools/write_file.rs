@@ -142,6 +142,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "must survive");
     }
 
+    #[tokio::test]
+    async fn approved_external_context_allows_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("important.txt");
+        std::fs::write(&victim, "before").unwrap();
+
+        WriteFileTool
+            .execute(
+                serde_json::json!({"path": victim.to_string_lossy(), "content": "after"}),
+                &ctx(dir.path()).with_approved_external_access(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "after");
+    }
+
     /// The escape a lexical check gets wrong: nothing exists to canonicalize,
     /// so the `..` survives into the comparison and the write lands outside.
     #[tokio::test]

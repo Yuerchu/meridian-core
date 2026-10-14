@@ -503,7 +503,7 @@ pub async fn suggest_references_from_context(
     limit: usize,
 ) -> Result<Vec<WorkspaceReferenceSuggestion>, String> {
     match &context.file_access {
-        tools::FileAccess::Unrestricted => {
+        tools::FileAccess::Unrestricted | tools::FileAccess::ApprovedExternal => {
             let root = context
                 .verified_root()?
                 .ok_or_else(|| "no workspace directory is configured".to_string())?;
@@ -699,7 +699,7 @@ fn lexical_reference_preflight(context: &ToolContext, requested: &str) -> Result
     let denied = || format!("workspace reference must stay inside the workspace: '{requested}'");
     let path = lexical_path(requested).map_err(|_| denied())?;
     match &context.file_access {
-        tools::FileAccess::Unrestricted => {
+        tools::FileAccess::Unrestricted | tools::FileAccess::ApprovedExternal => {
             let root = context
                 .working_directory
                 .as_deref()
@@ -749,7 +749,7 @@ fn reference_real_path_below_root(
     let denied = || format!("workspace reference must stay inside the workspace: '{requested}'");
     let requested_path = lexical_path(requested).map_err(|_| denied())?;
     match &context.file_access {
-        tools::FileAccess::Unrestricted => {
+        tools::FileAccess::Unrestricted | tools::FileAccess::ApprovedExternal => {
             let root_value = context
                 .working_directory
                 .as_deref()

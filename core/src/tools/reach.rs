@@ -88,6 +88,7 @@ pub fn locate(ctx: &ToolContext, path: &str, writing: bool) -> Reach {
             };
             classify(&real, &root, writing)
         }
+        FileAccess::ApprovedExternal => Reach::Outside,
         FileAccess::Roots(_) => {
             // The roots are exactly the directories the user granted, so landing
             // in one is the equivalent of landing in the project.
