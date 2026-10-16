@@ -9,6 +9,7 @@ pub mod deepseek;
 mod dto;
 pub mod gemma_tool;
 pub mod google_generate_content;
+pub mod google_interactions;
 pub mod models;
 pub mod openai_compat;
 pub mod openai_responses;
@@ -324,6 +325,10 @@ const UNTRUSTED_CLOSE: &str = "</untrusted_context>";
 pub enum Credential {
     /// A key the user pasted in, held in the secrets store.
     ApiKey(String),
+    /// A Google Cloud service-account JSON document, held in the same secret
+    /// store but exchanged for a short-lived Vertex OAuth token by the Google
+    /// Interactions adapter.
+    GoogleVertexServiceAccount(String),
     /// A ChatGPT session, refreshed on demand.
     ///
     /// The manager knows which store the session came from — the CLI's, or one
@@ -342,6 +347,7 @@ impl Credential {
     pub fn api_key(&self) -> &str {
         match self {
             Self::ApiKey(key) => key,
+            Self::GoogleVertexServiceAccount(_) => "",
             Self::ChatGpt(_) => "",
         }
     }
@@ -353,6 +359,7 @@ impl std::fmt::Debug for Credential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ApiKey(_) => f.write_str("Credential::ApiKey(<redacted>)"),
+            Self::GoogleVertexServiceAccount(_) => f.write_str("Credential::GoogleVertexServiceAccount(<redacted>)"),
             Self::ChatGpt(_) => f.write_str("Credential::ChatGpt"),
         }
     }
@@ -802,8 +809,8 @@ pub struct ServerToolCall {
     /// The provider's own item id, stable across the two announcements. What a
     /// card is revised by, rather than appended for a second time.
     pub id: String,
-    /// What the provider called it — `web_search`, `x_keyword_search`,
-    /// `code_execution`. Not always the name of the tool that was *requested*:
+    /// What the provider called it — `google_search`, `url_context`,
+    /// `web_search`, `x_keyword_search`, `code_execution`. Not always the name of the tool that was *requested*:
     /// asking xAI for `x_search` produces calls named `x_user_search` and
     /// `x_keyword_search`, which are the operations it decomposed into.
     pub name: String,
@@ -828,6 +835,11 @@ pub struct ServerToolCall {
 #[serde(rename_all = "snake_case")]
 pub enum ServerToolKind {
     WebSearch,
+    /// Google Interactions' provider-run web search. This is distinct from
+    /// `WebSearch`, which is the wire name used by the other adapters.
+    GoogleSearch,
+    /// Google Interactions' provider-run URL fetcher.
+    UrlContext,
     XSearch,
     CodeExecution,
 }
@@ -836,6 +848,8 @@ impl ServerToolKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WebSearch => "web_search",
+            Self::GoogleSearch => "google_search",
+            Self::UrlContext => "url_context",
             Self::XSearch => "x_search",
             Self::CodeExecution => "code_execution",
         }
@@ -855,7 +869,7 @@ impl std::fmt::Display for ServerToolKind {
 /// between them unpredictably. See `turn_config`, which drops the local one.
 pub fn superseded_local_tool(server_tool: ServerToolKind) -> Option<&'static str> {
     match server_tool {
-        ServerToolKind::WebSearch => Some("web_search"),
+        ServerToolKind::WebSearch | ServerToolKind::GoogleSearch => Some("web_search"),
         _ => None,
     }
 }

@@ -440,6 +440,10 @@ fn server_tools_for(provider_type: &str, api_format: Option<&str>) -> Vec<Server
         // Its compatibility table lists `function` and `web_search` as the
         // supported tool types and says everything else is ignored.
         ("deepseek", Some("responses")) => &[ServerToolKind::WebSearch],
+        // Vertex Gemini Interactions runs these on Google's side. They are
+        // separate from the other providers' `web_search` wire type: the
+        // Interactions schema calls them `google_search` and `url_context`.
+        ("google", Some("gemini_interactions")) => &[ServerToolKind::GoogleSearch, ServerToolKind::UrlContext],
         // Chat-completions has no such thing anywhere — measured: xAI answers
         // "expected `function` or `live_search`" — and nobody else is listed
         // without having been measured.
@@ -1049,6 +1053,19 @@ mod tests {
         assert_eq!(
             resolve("anthropic", None, "claude-sonnet-4-20250514").server_tools,
             vec![ServerToolKind::WebSearch]
+        );
+    }
+
+    #[test]
+    fn vertex_interactions_offers_google_search_and_url_context() {
+        assert_eq!(
+            resolve("google", Some("gemini_interactions"), "gemini-3.8-flash").server_tools,
+            vec![ServerToolKind::GoogleSearch, ServerToolKind::UrlContext]
+        );
+        assert!(
+            resolve("google", Some("gemini_generate_content"), "gemini-3.8-flash")
+                .server_tools
+                .is_empty()
         );
     }
 

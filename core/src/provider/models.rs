@@ -62,7 +62,13 @@ pub async fn fetch_models_on(
                 .collect())
         }
         super::registry::ProviderType::Google => {
-            let models = if api_format == Some(super::registry::ApiFormat::GeminiGenerateContent) {
+            let models = if api_format == Some(super::registry::ApiFormat::GeminiInteractions) {
+                // Agent Platform's Interactions API has no compatible
+                // `/models` endpoint. Keep the picker useful from the
+                // documented Gemini 3 model set instead of probing a URL that
+                // always returns 404.
+                vertex_interactions_models()
+            } else if api_format == Some(super::registry::ApiFormat::GeminiGenerateContent) {
                 fetch_google_models(base_url, api_key).await?
             } else {
                 fetch_openai_models(base_url, api_key).await?
@@ -76,6 +82,24 @@ pub async fn fetch_models_on(
             fetch_openai_models(base_url, api_key).await
         }
     }
+}
+
+fn vertex_interactions_models() -> Vec<ModelInfo> {
+    [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+    ]
+    .into_iter()
+    .map(|id| ModelInfo {
+        id: id.into(),
+        name: id.into(),
+    })
+    .collect()
 }
 
 /// What a ChatGPT subscription can reach, best-effort.

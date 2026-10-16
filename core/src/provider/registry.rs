@@ -4,6 +4,7 @@ use super::anthropic::AnthropicProvider;
 use super::deepseek::DeepSeekProvider;
 use super::gemma_tool::GemmaToolProvider;
 use super::google_generate_content::GoogleGenerateContentProvider;
+use super::google_interactions::GoogleInteractionsProvider;
 use super::openai_compat::OpenAICompatProvider;
 use super::openai_responses::OpenAIResponsesProvider;
 
@@ -25,6 +26,7 @@ pub enum ApiFormat {
     ChatCompletions,
     Responses,
     GeminiGenerateContent,
+    GeminiInteractions,
     GemmaTool,
 }
 
@@ -119,6 +121,7 @@ impl TransportProfile {
 #[strum(serialize_all = "snake_case")]
 pub enum CredentialKind {
     ApiKey,
+    GoogleVertexServiceAccount,
     CodexCli,
     ChatgptOauth,
 }
@@ -178,6 +181,7 @@ pub fn validate_stored_contract(
 
     match (transport_profile, credential_kind) {
         (TransportProfile::Standard, CredentialKind::ApiKey)
+        | (TransportProfile::Standard, CredentialKind::GoogleVertexServiceAccount)
         | (TransportProfile::ChatgptCodex, CredentialKind::CodexCli | CredentialKind::ChatgptOauth) => {}
         _ => {
             return Err(format!(
@@ -192,6 +196,15 @@ pub fn validate_stored_contract(
         return Err("the ChatGPT Codex transport requires provider type `openai`".into());
     }
 
+    if credential_kind == CredentialKind::GoogleVertexServiceAccount
+        && (provider_type != ProviderType::Google || api_format != ApiFormat::GeminiInteractions)
+    {
+        return Err(
+            "the Google Vertex Service Account credential requires provider type `google` and the `gemini_interactions` API format"
+                .into(),
+        );
+    }
+
     let supported = match provider_type {
         ProviderType::Anthropic => api_format == ApiFormat::ChatCompletions,
         ProviderType::Deepseek | ProviderType::Xai => {
@@ -200,7 +213,7 @@ pub fn validate_stored_contract(
         ProviderType::Google => {
             matches!(
                 api_format,
-                ApiFormat::ChatCompletions | ApiFormat::GeminiGenerateContent
+                ApiFormat::ChatCompletions | ApiFormat::GeminiGenerateContent | ApiFormat::GeminiInteractions
             )
         }
         ProviderType::Openai => {
@@ -221,11 +234,24 @@ pub fn validate_stored_contract(
     }
 }
 
-fn validate_runtime_credential(transport_profile: &str, credential: &super::Credential) -> Result<(), String> {
+fn validate_runtime_credential(
+    provider_type: ProviderType,
+    api_format: ApiFormat,
+    transport_profile: &str,
+    credential: &super::Credential,
+) -> Result<(), String> {
     match (transport_profile, credential) {
         ("standard", super::Credential::ApiKey(_)) | ("chatgpt_codex", super::Credential::ChatGpt(_)) => Ok(()),
+        ("standard", super::Credential::GoogleVertexServiceAccount(_))
+            if provider_type == ProviderType::Google && api_format == ApiFormat::GeminiInteractions =>
+        {
+            Ok(())
+        }
         ("standard", super::Credential::ChatGpt(_)) => {
             Err("the standard provider transport requires an API-key credential".into())
+        }
+        ("standard", super::Credential::GoogleVertexServiceAccount(_)) => {
+            Err("the Google Vertex Service Account credential requires the Google Interactions API".into())
         }
         ("chatgpt_codex", super::Credential::ApiKey(_)) => {
             Err("the ChatGPT Codex transport requires a ChatGPT login credential".into())
@@ -288,7 +314,7 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
     let api_format = ApiFormat::parse(api_format)?;
     validate_transport_profile(transport_profile)?;
     validate_wire_pair(api_format, transport_profile)?;
-    validate_runtime_credential(transport_profile, credential)?;
+    validate_runtime_credential(provider_type, api_format, transport_profile, credential)?;
     let api_key = credential.api_key();
 
     // Checked before `provider_type`, because it is the stronger statement: a
@@ -305,7 +331,7 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
                 return Ok(Box::new(super::codex::CodexProvider::new(base_url, auth.clone())));
             }
             // `validate_runtime_credential` already made this impossible.
-            super::Credential::ApiKey(_) => unreachable!(),
+            super::Credential::ApiKey(_) | super::Credential::GoogleVertexServiceAccount(_) => unreachable!(),
         }
     }
 
@@ -344,6 +370,13 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
         },
         ProviderType::Google => match api_format {
             ApiFormat::GeminiGenerateContent => Box::new(GoogleGenerateContentProvider::new(base_url, api_key)),
+            ApiFormat::GeminiInteractions => match credential {
+                super::Credential::ApiKey(api_key) => Box::new(GoogleInteractionsProvider::new(base_url, api_key)),
+                super::Credential::GoogleVertexServiceAccount(json) => {
+                    Box::new(GoogleInteractionsProvider::new_vertex(base_url, json)?)
+                }
+                super::Credential::ChatGpt(_) => unreachable!(),
+            },
             ApiFormat::ChatCompletions => Box::new(OpenAICompatProvider::new_google(base_url, api_key)),
             other => {
                 return Err(format!(
@@ -355,9 +388,10 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
             ApiFormat::ChatCompletions => Box::new(OpenAICompatProvider::new(base_url, api_key)),
             ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key, codex_shape.clone())),
             ApiFormat::GemmaTool => Box::new(GemmaToolProvider::new(base_url, api_key)),
-            ApiFormat::GeminiGenerateContent => {
+            ApiFormat::GeminiGenerateContent | ApiFormat::GeminiInteractions => {
                 return Err(format!(
-                    "API format `gemini_generate_content` is not supported by provider type `{}`",
+                    "API format `{}` is not supported by provider type `{}`",
+                    api_format.as_str(),
                     provider_type.as_str()
                 ));
             }
@@ -514,6 +548,7 @@ mod tests {
             ("xai", "responses", "OpenAIResponsesProvider"),
             ("xai", "chat_completions", "OpenAICompatProvider"),
             ("google", "gemini_generate_content", "GoogleGenerateContentProvider"),
+            ("google", "gemini_interactions", "GoogleInteractionsProvider"),
             ("openai", "responses", "OpenAIResponsesProvider"),
             ("openai", "chat_completions", "OpenAICompatProvider"),
             ("openai", "gemma_tool", "GemmaToolProvider"),
@@ -523,6 +558,28 @@ mod tests {
                 create_provider(wire(provider_type, "https://e.invalid", &key, api_format, "standard")).unwrap();
             assert_eq!(provider.adapter_name(), expected, "{provider_type}/{api_format}");
         }
+    }
+
+    #[test]
+    fn a_vertex_service_account_uses_the_interactions_adapter() {
+        let credentials = Credential::GoogleVertexServiceAccount(
+            r#"{
+                "type": "service_account",
+                "project_id": "billing-project",
+                "client_email": "vertex@example.iam.gserviceaccount.com",
+                "private_key": "not-a-key"
+            }"#
+            .into(),
+        );
+        let provider = create_provider(wire(
+            "google",
+            "https://aiplatform.googleapis.com/v1beta1/locations/global",
+            &credentials,
+            "gemini_interactions",
+            "standard",
+        ))
+        .unwrap();
+        assert_eq!(provider.adapter_name(), "GoogleInteractionsProvider");
     }
 
     /// **The Codex shape picks no adapter.** It changes what the Responses one
@@ -568,6 +625,12 @@ mod tests {
         for valid in [
             ("openai", "chat_completions", "standard", "api_key"),
             ("xai", "responses", "standard", "api_key"),
+            (
+                "google",
+                "gemini_interactions",
+                "standard",
+                "google_vertex_service_account",
+            ),
             ("openai", "responses", "chatgpt_codex", "codex_cli"),
             ("openai", "responses", "chatgpt_codex", "chatgpt_oauth"),
         ] {
@@ -582,6 +645,13 @@ mod tests {
             ("openai", "responses", "chatgpt_codex", "api_key"),
             ("openai", "responses", "standard", "codex_cli"),
             ("openai", "responses", "standard", "future_login"),
+            ("openai", "responses", "standard", "google_vertex_service_account"),
+            (
+                "google",
+                "gemini_generate_content",
+                "standard",
+                "google_vertex_service_account",
+            ),
             ("future", "responses", "standard", "api_key"),
             ("anthropic", "responses", "standard", "api_key"),
             ("xai", "responses", "chatgpt_codex", "codex_cli"),

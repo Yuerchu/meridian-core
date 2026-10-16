@@ -247,7 +247,10 @@ impl AnthropicProvider {
             })),
             // Not offered for this provider by the catalog; a name that
             // reached here anyway is a 400, so it is dropped with a note.
-            ServerToolKind::XSearch | ServerToolKind::CodeExecution => {
+            ServerToolKind::GoogleSearch
+            | ServerToolKind::UrlContext
+            | ServerToolKind::XSearch
+            | ServerToolKind::CodeExecution => {
                 tracing::debug!(tool = %kind, "not an Anthropic server tool; dropped");
                 None
             }

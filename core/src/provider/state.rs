@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 const STORAGE_VERSION: u32 = 1;
 pub const GOOGLE_OPENAI_CHAT_PROTOCOL: &str = "openai_chat_completions";
 pub const GOOGLE_GENERATE_CONTENT_PROTOCOL: &str = "google_generate_content";
+/// The stateless Google Interactions wire requires every model-generated step
+/// to be sent back verbatim on the next turn.
+pub const GOOGLE_INTERACTIONS_PROTOCOL: &str = "google_interactions";
 /// The Responses API as reached through ChatGPT's Codex backend.
 ///
 /// Its own protocol rather than plain `responses`, because what makes this state
@@ -40,6 +43,12 @@ pub struct ProviderStateProducer {
 pub enum ProviderStatePayload {
     GoogleThoughtSignatures {
         signatures: Vec<GoogleThoughtSignature>,
+    },
+    /// Raw model-generated Interactions steps, including thought summaries,
+    /// function calls and provider-tool calls/results. The API's stateless
+    /// replay contract requires these steps in their original order.
+    GoogleInteractionsSteps {
+        steps: Vec<GoogleInteractionStep>,
     },
     /// The signature alone, from before whole blocks were kept. Still read for
     /// rows written then; nothing writes it any more.
@@ -148,6 +157,12 @@ pub struct GoogleThoughtSignature {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleInteractionStep {
+    pub position: usize,
+    pub step_json: String,
+}
+
 /// One Anthropic content block, exactly as the upstream sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicContentBlock {
@@ -174,6 +189,11 @@ enum StoredProviderStateV1 {
         version: u32,
         producer: StoredProviderStateProducer,
         payload: StoredGoogleThoughtSignaturesPayload,
+    },
+    GoogleInteractionsSteps {
+        version: u32,
+        producer: StoredProviderStateProducer,
+        payload: StoredGoogleInteractionsStepsPayload,
     },
     AnthropicThinkingSignature {
         version: u32,
@@ -239,6 +259,19 @@ struct StoredProviderStateProducer {
 #[serde(deny_unknown_fields)]
 struct StoredGoogleThoughtSignaturesPayload {
     signatures: Vec<StoredGoogleThoughtSignature>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredGoogleInteractionsStepsPayload {
+    steps: Vec<StoredGoogleInteractionStep>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredGoogleInteractionStep {
+    position: usize,
+    step_json: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -351,6 +384,11 @@ pub enum ProviderStateUpdate {
         location: GoogleSignatureLocation,
         delta: String,
     },
+    GoogleInteractionsStep {
+        model: String,
+        position: usize,
+        step_json: String,
+    },
 }
 
 impl ProviderState {
@@ -397,6 +435,19 @@ impl ProviderState {
         }
         match &self.payload {
             ProviderStatePayload::GoogleThoughtSignatures { signatures } => Some(signatures),
+            _ => None,
+        }
+    }
+
+    pub fn google_interaction_steps_for(&self, model: &str) -> Option<&[GoogleInteractionStep]> {
+        if self.producer.vendor != "google"
+            || self.producer.protocol != GOOGLE_INTERACTIONS_PROTOCOL
+            || self.producer.model != model
+        {
+            return None;
+        }
+        match &self.payload {
+            ProviderStatePayload::GoogleInteractionsSteps { steps } => Some(steps),
             _ => None,
         }
     }
@@ -465,6 +516,14 @@ impl ProviderState {
                 }
                 if signatures.is_empty() || signatures.iter().any(|s| s.signature.is_empty()) {
                     return Err("Google thought signatures are empty".into());
+                }
+            }
+            ProviderStatePayload::GoogleInteractionsSteps { steps } => {
+                if self.producer.vendor != "google" || self.producer.protocol != GOOGLE_INTERACTIONS_PROTOCOL {
+                    return Err("Google Interactions steps have the wrong producer".into());
+                }
+                if steps.is_empty() || steps.iter().any(|step| step.step_json.is_empty()) {
+                    return Err("Google Interactions steps are empty".into());
                 }
             }
             ProviderStatePayload::AnthropicThinkingSignature { signature } => {
@@ -541,6 +600,19 @@ impl From<&ProviderState> for StoredProviderStateV1 {
                     },
                 }
             }
+            ProviderStatePayload::GoogleInteractionsSteps { steps } => StoredProviderStateV1::GoogleInteractionsSteps {
+                version: state.version,
+                producer: producer(),
+                payload: StoredGoogleInteractionsStepsPayload {
+                    steps: steps
+                        .iter()
+                        .map(|step| StoredGoogleInteractionStep {
+                            position: step.position,
+                            step_json: step.step_json.clone(),
+                        })
+                        .collect(),
+                },
+            },
             ProviderStatePayload::AnthropicThinkingSignature { signature } => {
                 StoredProviderStateV1::AnthropicThinkingSignature {
                     version: state.version,
@@ -629,6 +701,24 @@ impl From<StoredProviderStateV1> for ProviderState {
                         .map(|item| GoogleThoughtSignature {
                             location: GoogleSignatureLocation::from(item.location),
                             signature: item.signature,
+                        })
+                        .collect(),
+                },
+            ),
+            StoredProviderStateV1::GoogleInteractionsSteps {
+                version,
+                producer,
+                payload,
+            } => (
+                version,
+                producer,
+                ProviderStatePayload::GoogleInteractionsSteps {
+                    steps: payload
+                        .steps
+                        .into_iter()
+                        .map(|step| GoogleInteractionStep {
+                            position: step.position,
+                            step_json: step.step_json,
                         })
                         .collect(),
                 },
@@ -907,6 +997,41 @@ impl ProviderStateAccumulator {
                     Some(_) => return Err("a response mixed incompatible provider state".into()),
                 }
             }
+            ProviderStateUpdate::GoogleInteractionsStep {
+                model,
+                position,
+                step_json,
+            } => {
+                if step_json.is_empty() {
+                    return Ok(());
+                }
+                let arriving = GoogleInteractionStep { position, step_json };
+                match self.state.as_mut() {
+                    None => {
+                        self.state = Some(ProviderState {
+                            version: STORAGE_VERSION,
+                            producer: ProviderStateProducer {
+                                vendor: "google".into(),
+                                protocol: GOOGLE_INTERACTIONS_PROTOCOL.into(),
+                                model,
+                            },
+                            payload: ProviderStatePayload::GoogleInteractionsSteps { steps: vec![arriving] },
+                        });
+                    }
+                    Some(ProviderState {
+                        producer,
+                        payload: ProviderStatePayload::GoogleInteractionsSteps { steps },
+                        ..
+                    }) if producer.model == model && producer.protocol == GOOGLE_INTERACTIONS_PROTOCOL => {
+                        match steps.iter_mut().find(|step| step.position == arriving.position) {
+                            Some(existing) => *existing = arriving,
+                            None => steps.push(arriving),
+                        }
+                        steps.sort_by_key(|step| step.position);
+                    }
+                    Some(_) => return Err("a response mixed incompatible provider state".into()),
+                }
+            }
         }
         Ok(())
     }
@@ -961,6 +1086,28 @@ mod tests {
         let raw = state.to_storage_json().unwrap();
         assert_eq!(ProviderState::from_storage_json(&raw).unwrap(), state);
         assert!(raw.contains("google_thought_signatures"));
+    }
+
+    #[test]
+    fn google_interactions_steps_round_trip_for_stateless_replay() {
+        let mut acc = ProviderStateAccumulator::default();
+        acc.apply(ProviderStateUpdate::GoogleInteractionsStep {
+            model: "gemini-3.8-flash".into(),
+            position: 0,
+            step_json: r#"{"type":"thought","summary":[{"type":"text","text":"reason"}]}"#.into(),
+        })
+        .unwrap();
+        acc.apply(ProviderStateUpdate::GoogleInteractionsStep {
+            model: "gemini-3.8-flash".into(),
+            position: 1,
+            step_json: r#"{"type":"model_output","content":[{"type":"text","text":"answer"}]}"#.into(),
+        })
+        .unwrap();
+        let state = acc.finish().unwrap();
+        let raw = state.to_storage_json().unwrap();
+        assert!(raw.contains("google_interactions_steps"));
+        assert_eq!(ProviderState::from_storage_json(&raw).unwrap(), state);
+        assert_eq!(state.google_interaction_steps_for("gemini-3.8-flash").unwrap().len(), 2);
     }
 
     #[test]
