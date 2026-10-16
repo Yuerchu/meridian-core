@@ -10,6 +10,12 @@
   "models": [
     {
       "provider": "google",
+      "prefix": "gemini-3.8-flash",
+      "supported_efforts": ["low", "medium", "high"],
+      "default_effort": "medium"
+    },
+    {
+      "provider": "google",
       "prefix": "gemini-3.7-flash",
       "supported_efforts": ["low", "medium", "high"],
       "default_effort": "medium"

@@ -216,10 +216,20 @@
           "id": "api_key",
           "credential_kind": "api_key",
           "transport_profile": "standard",
-          "api_formats": ["gemini_generate_content", "chat_completions"],
+          "api_formats": ["gemini_generate_content", "gemini_interactions", "chat_completions"],
           "default_base_url": {
             "gemini_generate_content": "https://generativelanguage.googleapis.com",
+            "gemini_interactions": "https://aiplatform.googleapis.com/v1beta1/locations/global",
             "chat_completions": "https://generativelanguage.googleapis.com/v1beta/openai"
+          }
+        },
+        {
+          "id": "vertex_service_account",
+          "credential_kind": "google_vertex_service_account",
+          "transport_profile": "standard",
+          "api_formats": ["gemini_interactions"],
+          "default_base_url": {
+            "gemini_interactions": "https://aiplatform.googleapis.com/v1beta1/locations/global"
           }
         }
       ],

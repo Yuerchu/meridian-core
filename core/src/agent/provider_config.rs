@@ -218,6 +218,9 @@ fn resolve_credential(
         CredentialKind::ApiKey => get_provider_api_key(secrets, &provider.id)
             .map(provider::Credential::ApiKey)
             .ok_or_else(|| format!("API Key not set for provider '{}'", provider.name)),
+        CredentialKind::GoogleVertexServiceAccount => get_provider_api_key(secrets, &provider.id)
+            .map(provider::Credential::GoogleVertexServiceAccount)
+            .ok_or_else(|| format!("Vertex Service Account JSON not set for provider '{}'", provider.name)),
         CredentialKind::CodexCli => {
             let home = crate::codex_auth::storage::find_codex_home()
                 .ok_or("Could not work out where the Codex CLI keeps its login (no home directory).")?;
