@@ -1,4 +1,5 @@
 pub mod auto_review;
+pub mod auxiliary;
 mod base_prompt;
 pub mod call_identity;
 pub mod codex_install;

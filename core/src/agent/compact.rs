@@ -275,6 +275,19 @@ pub async fn do_compact(
     // The turn parameters use the same resolution as a normal turn: a
     // summarisation request that invents its own temperature or output ceiling
     // is rejected by models the chat path already knows how to talk to.
+    //
+    // The auxiliary model first (`agent::auxiliary`): when one is chosen the
+    // summary is written by it and sized against *its* window — the budget
+    // below is built from whichever model actually runs, and
+    // `compact_with_retry` drops the oldest sections when a smaller window
+    // cannot take them all. Configured but unusable is an error from here,
+    // not a quiet fall back to the conversation's model.
+    let auxiliary = crate::agent::auxiliary::configured(
+        secrets,
+        db,
+        crate::provider::codex_metadata::CodexRequestKind::Compaction,
+    )
+    .await?;
     let (
         provider_type,
         base_url,
@@ -287,7 +300,21 @@ pub async fn do_compact(
         turn,
         provider_id,
         provider_name,
-    ) = {
+    ) = if let Some(crate::agent::auxiliary::AuxiliaryModel { resolved, turn }) = auxiliary {
+        (
+            resolved.provider_type,
+            resolved.base_url,
+            resolved.credential,
+            resolved.model,
+            resolved.api_format,
+            resolved.transport_profile,
+            resolved.codex_request_shape,
+            resolved.codex_client_version,
+            turn,
+            resolved.provider_id,
+            resolved.provider_name,
+        )
+    } else {
         let crate::agent::ResolvedProvider {
             provider_type,
             base_url,
@@ -1463,5 +1490,42 @@ mod tests {
             }],
         )];
         assert!(extract_recent_files_from_chat(&msgs).contains("- src/lib.rs (edited)"));
+    }
+    /// `do_compact` asks for the auxiliary model before anything else, and a
+    /// chosen one that cannot be used stops it there. Falling back would have
+    /// gone on to the assistant path — which, with no assistant and no provider,
+    /// fails with a different error, so the message is what tells them apart.
+    #[tokio::test]
+    async fn an_unusable_auxiliary_model_stops_compaction_rather_than_falling_back() {
+        let db = crate::db::sea::sea_test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(SecretsManager::new_with_keyring_store(
+            dir.path().to_path_buf(),
+            Arc::new(crate::keyring::test_support::MockKeyringStore::new()),
+        ));
+        db.write(async |tx| {
+            sea_ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
+            let mut parent: Option<String> = None;
+            for index in 0..6 {
+                let role = if index % 2 == 0 { "user" } else { "assistant" };
+                let row = sea_ops::message::new_row(&format!("m{index}"), "c1", role, "words", 1);
+                let written = sea_ops::message::append_message(tx, row, parent.as_deref()).await?;
+                parent = Some(written.id);
+            }
+            sea_ops::preference::set_preference(
+                tx,
+                crate::agent::auxiliary::AUXILIARY_MODEL_PREFERENCE,
+                "gone:cheap",
+                1,
+            )
+            .await
+        })
+        .await
+        .unwrap();
+
+        let error = do_compact(&db, &secrets, "c1", None, 1, None)
+            .await
+            .expect_err("nothing here can be resolved");
+        assert!(error.contains("gone:cheap"), "{error}");
     }
 }

@@ -937,6 +937,97 @@ mod tests {
         assert!(!err.contains("No model configured"), "{err}");
     }
 
+    /// The auxiliary model (`agent::auxiliary`) resolves to the pair that was
+    /// chosen, with that model's own window and output ceiling — those are
+    /// what size the summariser.
+    #[tokio::test]
+    async fn the_auxiliary_model_resolves_to_the_chosen_pair() {
+        let db = sea_test_db().await;
+        seed(
+            &db,
+            provider_row(
+                ProviderType::Deepseek,
+                "Deepseek",
+                "https://api.deepseek.com/v1/",
+                ApiFormat::ChatCompletions,
+            ),
+            Some(FlatModelConfig {
+                model_id: "deepseek-v4-flash",
+                context_window: 64_000,
+                compact_threshold: 0,
+                max_output_tokens: Some(8_000),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = mock_secrets(dir.path());
+        secrets
+            .set(
+                &SecretScope::Global,
+                &SecretName::new("PROVIDER_P1_KEY").unwrap(),
+                "sk-test",
+            )
+            .unwrap();
+        let kind = provider::codex_metadata::CodexRequestKind::Compaction;
+
+        assert!(
+            crate::agent::auxiliary::configured(&secrets, &db, kind)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing chosen, nothing resolved"
+        );
+
+        db.write(async |tx| {
+            crate::db::sea::ops::preference::set_preference(
+                tx,
+                crate::agent::auxiliary::AUXILIARY_MODEL_PREFERENCE,
+                "p1:deepseek-v4-flash",
+                crate::db::types::EpochMs::from(1),
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        let auxiliary = crate::agent::auxiliary::configured(&secrets, &db, kind)
+            .await
+            .unwrap()
+            .expect("a chosen pair");
+        assert_eq!(auxiliary.resolved.provider_id, "p1");
+        assert_eq!(auxiliary.resolved.model, "deepseek-v4-flash");
+        assert_eq!(auxiliary.turn.context_limit, 64_000);
+        assert_eq!(auxiliary.turn.max_output, 8_000);
+    }
+
+    /// Chosen and unusable is an error naming the choice — never `None`, which
+    /// the callers would read as "use the conversation's model".
+    #[tokio::test]
+    async fn an_unusable_auxiliary_model_is_an_error_not_a_fallback() {
+        let db = sea_test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = mock_secrets(dir.path());
+        db.write(async |tx| {
+            crate::db::sea::ops::preference::set_preference(
+                tx,
+                crate::agent::auxiliary::AUXILIARY_MODEL_PREFERENCE,
+                "gone:some-model",
+                crate::db::types::EpochMs::from(1),
+            )
+            .await
+        })
+        .await
+        .unwrap();
+
+        let Err(error) =
+            crate::agent::auxiliary::configured(&secrets, &db, provider::codex_metadata::CodexRequestKind::Background)
+                .await
+        else {
+            panic!("a provider that does not exist cannot resolve");
+        };
+        assert!(error.contains("gone:some-model"), "{error}");
+    }
+
     fn configured_with(server_tools: Option<&str>) -> EffectiveModelConfig {
         EffectiveModelConfig {
             config_id: "mc".into(),
