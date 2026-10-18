@@ -242,6 +242,7 @@ fn resolve_credential(
                 slot: "default".into(),
             },
         ))),
+        CredentialKind::None => Ok(provider::Credential::None),
     }
 }
 
@@ -513,6 +514,7 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
             }
             false => None,
         },
+        context_limit: Some(context_limit as i32),
         // thinking_style and verbosity are derived from the catalog by
         // filter_params below, not supplied by the caller.
         ..Default::default()

@@ -1,0 +1,16 @@
+[package]
+name = "litert-lm"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Safe Rust wrapper around the LiteRT-LM C API for on-device LLM inference."
+repository = "https://github.com/Yuerchu/meridian-core"
+authors = ["于小丘 Yuerchu <admin@yuxiaoqiu.cn>"]
+
+[dependencies]
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
