@@ -246,7 +246,11 @@ impl ChatProvider for LiteRtLmProvider {
 
         tokio::task::spawn_blocking(move || {
             let result = (|| -> Result<(), ProviderError> {
-                let max_tokens = params.context_limit.unwrap_or(8192);
+                let max_tokens = params.context_limit.ok_or_else(|| {
+                    ProviderError::Upstream(
+                        "No context window known for this model. Set one in Settings → Provider → Model.".into(),
+                    )
+                })?;
                 let engine = {
                     let mut cache = ENGINE_CACHE.lock().unwrap();
                     let reuse = cache.as_ref().is_some_and(|c| {
