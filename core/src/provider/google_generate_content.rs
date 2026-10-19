@@ -11,7 +11,7 @@ use super::state::{
 };
 use super::{
     AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, MessageContentPart, ProviderError,
-    SenderRendering, StreamEvent, TokenUsage, ToolCall, ToolDefinition,
+    SenderRendering, StreamEvent, ThinkingStyle, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
 
@@ -53,9 +53,32 @@ impl GoogleGenerateContentProvider {
         }
         let mut thinking = serde_json::Map::new();
         thinking.insert("includeThoughts".into(), serde_json::Value::Bool(true));
-        if let Some(effort) = params.thinking_effort.as_deref() {
-            // Meridian keeps effort tiers in a vendor-neutral lowercase form;
-            // the native Gemini REST enum is uppercase.
+        if params.thinking_style == ThinkingStyle::Budget {
+            if params.thinking_effort.is_some() {
+                return Err(ProviderError::Parse(
+                    "Gemini thinkingBudget does not support thinking effort".into(),
+                ));
+            }
+            // 摘要会再次清除 enabled；不能把无法关闭思考的 Pro 编成预算 0。
+            let budget = if params.thinking_enabled {
+                params.thinking_budget
+            } else {
+                params.supports_thinking_off.then_some(0)
+            };
+            if let Some(budget) = budget {
+                if budget < -1 {
+                    return Err(ProviderError::Parse("Gemini thinkingBudget must be at least -1".into()));
+                }
+                if budget == 0 && !params.supports_thinking_off {
+                    return Err(ProviderError::Parse(format!(
+                        "thinking cannot be disabled for model '{}'",
+                        params.model
+                    )));
+                }
+                thinking.insert("thinkingBudget".into(), serde_json::json!(budget));
+            }
+        } else if let Some(effort) = params.thinking_effort.as_deref() {
+            // 原生 Gemini REST 的档位枚举使用大写。
             thinking.insert("thinkingLevel".into(), serde_json::json!(effort.to_ascii_uppercase()));
         }
         generation.insert("thinkingConfig".into(), serde_json::Value::Object(thinking));
@@ -657,7 +680,32 @@ impl ChatProvider for GoogleGenerateContentProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::capabilities;
     use crate::provider::state::{GoogleThoughtSignature, ProviderState, ProviderStatePayload, ProviderStateProducer};
+
+    fn resolved_params(model: &str, budget: Option<i32>, level: Option<&str>) -> ChatParams {
+        let caps = capabilities::resolve("google", Some("gemini_generate_content"), model);
+        let (thinking_enabled, thinking_budget, thinking_effort) =
+            capabilities::resolve_thinking(true, budget, level).unwrap();
+        let mut params = ChatParams {
+            model: model.into(),
+            thinking_enabled,
+            thinking_budget,
+            thinking_effort,
+            ..Default::default()
+        };
+        capabilities::filter_params(&mut params, &caps).unwrap();
+        params
+    }
+
+    fn thinking_config(params: &ChatParams, stream: bool) -> Result<serde_json::Value, ProviderError> {
+        let provider = GoogleGenerateContentProvider::new("https://relay.example", "secret");
+        let request = provider.build_request(&[ChatMessage::user("hi")], None, params, stream)?;
+        let Some(RequestBody::Json(body)) = request.body else {
+            panic!("expected JSON request body");
+        };
+        Ok(body["generationConfig"]["thinkingConfig"].clone())
+    }
 
     #[test]
     fn a_tool_picture_follows_the_function_responses_in_the_same_turn() {
@@ -729,12 +777,9 @@ mod tests {
     #[test]
     fn request_uses_native_thinking_level_and_tool_schema() {
         let provider = GoogleGenerateContentProvider::new("https://relay.example", "secret");
-        let params = ChatParams {
-            model: "gemini-3.7-flash".into(),
-            thinking_enabled: true,
-            thinking_effort: Some("high".into()),
-            ..Default::default()
-        };
+        let mut params = resolved_params("gemini-3.7-flash", Some(4097), Some("high"));
+        assert_eq!(params.thinking_budget, None);
+        params.thinking_budget = Some(4097);
         let tools = vec![ToolDefinition {
             name: "lookup".into(),
             description: "Look something up".into(),
@@ -744,21 +789,116 @@ mod tests {
                 "required": ["query"]
             }),
         }];
-        let request = provider
-            .build_request(&[ChatMessage::user("hi")], Some(&tools), &params, true)
-            .unwrap();
-        assert_eq!(
-            request.url,
-            "https://relay.example/v1beta/models/gemini-3.7-flash:streamGenerateContent?alt=sse"
-        );
-        let Some(RequestBody::Json(body)) = request.body else {
-            panic!("expected JSON request body");
-        };
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "HIGH");
-        assert_eq!(
-            body["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"]["required"][0],
-            "query"
-        );
+        for stream in [false, true] {
+            let request = provider
+                .build_request(&[ChatMessage::user("hi")], Some(&tools), &params, stream)
+                .unwrap();
+            let method = if stream {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
+            assert_eq!(
+                request.url,
+                format!("https://relay.example/v1beta/models/gemini-3.7-flash:{method}")
+            );
+            let Some(RequestBody::Json(body)) = request.body else {
+                panic!("expected JSON request body");
+            };
+            assert_eq!(
+                body["generationConfig"]["thinkingConfig"],
+                serde_json::json!({ "includeThoughts": true, "thinkingLevel": "HIGH" })
+            );
+            assert_eq!(
+                body["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"]["required"][0],
+                "query"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_25_requests_preserve_numeric_budgets() {
+        for model in ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"] {
+            for budget in [Some(4097), None, Some(-1)] {
+                let params = resolved_params(model, budget, None);
+                let mut expected = serde_json::json!({ "includeThoughts": true });
+                if let Some(budget) = budget {
+                    expected["thinkingBudget"] = serde_json::json!(budget);
+                }
+                for stream in [false, true] {
+                    assert_eq!(
+                        thinking_config(&params, stream).unwrap(),
+                        expected,
+                        "{model}: budget={budget:?}, stream={stream}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_25_flash_off_sends_zero() {
+        for model in ["gemini-2.5-flash", "gemini-2.5-flash-lite"] {
+            let off = resolved_params(model, Some(4097), Some("off"));
+            let zero = resolved_params(model, Some(0), None);
+            let summary = crate::agent::without_thinking(resolved_params(model, Some(4097), None));
+            assert!(!off.thinking_enabled);
+            assert!(!summary.thinking_enabled);
+            for params in [off, zero, summary] {
+                assert!(params.supports_thinking_off);
+                for stream in [false, true] {
+                    assert_eq!(
+                        thinking_config(&params, stream).unwrap(),
+                        serde_json::json!({ "includeThoughts": true, "thinkingBudget": 0 }),
+                        "{model}: stream={stream}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_25_pro_off_and_summary_leave_budget_unspecified() {
+        let off = resolved_params("gemini-2.5-pro", Some(4097), Some("off"));
+        let summary = crate::agent::without_thinking(resolved_params("gemini-2.5-pro", Some(4097), None));
+        assert!(off.thinking_enabled);
+        assert!(!summary.thinking_enabled);
+        for params in [off, summary] {
+            assert!(!params.supports_thinking_off);
+            for stream in [false, true] {
+                assert_eq!(
+                    thinking_config(&params, stream).unwrap(),
+                    serde_json::json!({ "includeThoughts": true })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_25_rejects_invalid_budget_and_effort() {
+        for (model, budget, expected) in [
+            ("gemini-2.5-flash", -2, "must be at least -1"),
+            ("gemini-2.5-pro", 0, "cannot be disabled"),
+        ] {
+            let mut params = resolved_params(model, None, None);
+            params.thinking_budget = Some(budget);
+            for stream in [false, true] {
+                let error = thinking_config(&params, stream).unwrap_err();
+                assert!(matches!(error, ProviderError::Parse(message) if message.contains(expected)));
+            }
+        }
+        for enabled in [false, true] {
+            let mut params = resolved_params("gemini-2.5-flash", Some(4097), None);
+            params.thinking_enabled = enabled;
+            params.thinking_effort = Some("high".into());
+            for stream in [false, true] {
+                let error = thinking_config(&params, stream).unwrap_err();
+                assert!(matches!(
+                    error,
+                    ProviderError::Parse(message) if message.contains("does not support thinking effort")
+                ));
+            }
+        }
     }
 
     #[test]

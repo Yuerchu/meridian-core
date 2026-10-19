@@ -801,6 +801,8 @@ pub struct ChatParams {
     pub top_p: Option<f64>,
     pub max_tokens: Option<i32>,
     pub thinking_enabled: bool,
+    /// 能力过滤后的关闭许可；摘要等调用清空思考参数时仍须保留，避免对不可关闭的模型发送零预算。
+    pub supports_thinking_off: bool,
     pub thinking_budget: Option<i32>,
     pub thinking_effort: Option<String>,
     /// Low-latency tier. Providers translate this to their own wire format:
@@ -1169,7 +1171,7 @@ pub enum ThinkingStyle {
     None,
     /// Effort is the only knob; there is no on/off switch (OpenAI o-series, gpt-5.x).
     EffortOnly,
-    /// `thinking: {type: "enabled", budget_tokens: N}` (Claude Sonnet 4.5 / Haiku 4.5 and earlier).
+    /// 数值 token 预算，如 Anthropic 的 `budget_tokens` 和 Gemini 2.5 原生接口的 `thinkingBudget`。
     Budget,
     /// `thinking: {type: "adaptive"}` plus `output_config.effort` (Claude Opus 4.6-4.8, Sonnet 4.6/5).
     /// `budget_tokens` is rejected with a 400 on Opus 4.7+ and Sonnet 5.

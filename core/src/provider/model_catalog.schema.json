@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ModelCapabilityCatalog",
+  "type": "object",
+  "required": ["version", "_comment", "models"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "_comment": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/modelEntry"
+      }
+    }
+  },
+  "$defs": {
+    "comment": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      ]
+    },
+    "effortLevel": {
+      "type": "string",
+      "enum": ["minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    "verbosityLevel": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "thinkingStyle": {
+      "type": "string",
+      "enum": [
+        "adaptive",
+        "always_on",
+        "budget",
+        "effort_only",
+        "none",
+        "toggle_off"
+      ]
+    },
+    "serverToolKind": {
+      "type": "string",
+      "enum": [
+        "web_search",
+        "google_search",
+        "url_context",
+        "x_search",
+        "code_execution"
+      ]
+    },
+    "modelEntry": {
+      "type": "object",
+      "required": ["provider", "prefix"],
+      "additionalProperties": false,
+      "properties": {
+        "_comment": {
+          "$ref": "#/$defs/comment"
+        },
+        "provider": {
+          "type": "string",
+          "enum": ["google", "anthropic", "openai", "deepseek", "xai"]
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "supports_tools": { "type": "boolean" },
+        "supports_streaming_tools": { "type": "boolean" },
+        "supports_thinking": { "type": "boolean" },
+        "supports_thinking_off": { "type": "boolean" },
+        "supports_images": { "type": "boolean" },
+        "supports_pdf": { "type": "boolean" },
+        "supports_temperature": { "type": "boolean" },
+        "supports_top_p": { "type": "boolean" },
+        "supports_fast": { "type": "boolean" },
+        "supports_verbosity": { "type": "boolean" },
+        "supports_remote_compaction": { "type": "boolean" },
+        "responses_lite": { "type": "boolean" },
+        "max_context_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "max_temperature": {
+          "type": "number",
+          "minimum": 0
+        },
+        "thinking_style": {
+          "$ref": "#/$defs/thinkingStyle"
+        },
+        "supported_efforts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/effortLevel"
+          }
+        },
+        "default_effort": {
+          "$ref": "#/$defs/effortLevel"
+        },
+        "default_verbosity": {
+          "$ref": "#/$defs/verbosityLevel"
+        },
+        "server_tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/serverToolKind"
+          }
+        }
+      }
+    }
+  }
+}

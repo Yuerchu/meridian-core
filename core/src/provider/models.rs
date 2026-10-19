@@ -146,7 +146,10 @@ fn configured_model(codex_home: &std::path::Path) -> Option<String> {
 fn is_google_agent_model(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
     let id = lower.strip_prefix("models/").unwrap_or(&lower);
-    if !id.starts_with("gemini-3") {
+    if !["gemini-2.5-", "gemini-3-", "gemini-3."]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+    {
         return false;
     }
     if ["image", "live", "tts", "audio", "embedding", "embed"]
@@ -239,19 +242,40 @@ mod tests {
     }
 
     #[test]
-    fn google_filter_keeps_general_gemini_3_models() {
-        assert!(is_google_agent_model("gemini-3.7-flash"));
-        assert!(is_google_agent_model("gemini-3.5-flash-lite"));
-        assert!(is_google_agent_model("gemini-3.1-pro-preview-customtools"));
-        assert!(is_google_agent_model("models/gemini-3-flash-preview"));
+    fn google_filter_keeps_gemini_2_5_and_3_models() {
+        for id in [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro",
+            "models/gemini-3-flash-preview",
+            "GEMINI-3.8-FLASH",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview-customtools",
+        ] {
+            assert!(is_google_agent_model(id), "{id}");
+        }
     }
 
     #[test]
-    fn google_filter_drops_other_families_and_modalities() {
-        assert!(!is_google_agent_model("gemini-2.5-flash"));
-        assert!(!is_google_agent_model("gemini-3-pro-image-preview"));
-        assert!(!is_google_agent_model("gemini-3-live-preview"));
-        assert!(!is_google_agent_model("gemini-embedding-001"));
+    fn google_filter_drops_old_families_and_modalities() {
+        for id in [
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-3-pro-image-preview",
+            "gemini-3-live-preview",
+            "gemini-2.5-flash-preview-tts",
+            "models/gemini-2.5-flash-native-audio-latest",
+            "gemini-embedding-001",
+            "gemini-3-embedding-001",
+            "gemini-3-embed",
+            "gemini-30-flash",
+            "gemini-2.50-pro",
+            "gemini-3-unknown",
+            "gemma-3-27b-it",
+        ] {
+            assert!(!is_google_agent_model(id), "{id}");
+        }
     }
 }
 

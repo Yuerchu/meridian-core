@@ -645,6 +645,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemini_25_turn_resolution_preserves_budget_and_the_off_capability() {
+        let db = sea_test_db().await;
+        for (model, supports_off) in [
+            ("gemini-2.5-pro", false),
+            ("gemini-2.5-flash", true),
+            ("gemini-2.5-flash-lite", true),
+        ] {
+            for budget in [None, Some(-1), Some(4097)] {
+                let mut assistant = assistant_with(None);
+                assistant.thinking_budget = budget;
+                let turn = resolve_turn_params(
+                    &db,
+                    TurnParamsResolveRequest {
+                        assistant: Some(&assistant),
+                        provider_id: None,
+                        provider_type: "google",
+                        api_format: "gemini_generate_content",
+                        transport_profile: "standard",
+                        codex_request_shape: false,
+                        codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                        codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
+                        model,
+                        thinking_level: None,
+                        fast: false,
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(turn.params.thinking_style, provider::ThinkingStyle::Budget);
+                assert!(turn.params.thinking_enabled);
+                assert_eq!(turn.params.thinking_budget, budget);
+                assert_eq!(turn.params.thinking_effort, None);
+                assert_eq!(turn.params.supports_thinking_off, supports_off);
+
+                let summarising = without_thinking(turn.params);
+                assert!(!summarising.thinking_enabled);
+                assert_eq!(summarising.thinking_budget, None);
+                assert_eq!(summarising.thinking_effort, None);
+                assert_eq!(summarising.thinking_style, provider::ThinkingStyle::Budget);
+                assert_eq!(summarising.supports_thinking_off, supports_off, "{model}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_model_that_rejects_temperature_never_sees_one() {
         let db = sea_test_db().await;
         let assistant = assistant_with(Some(0.7));
