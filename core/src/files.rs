@@ -31,17 +31,23 @@ fn is_extension(ext: &str) -> bool {
 }
 
 pub fn alloc_dest(app_data_dir: &Path, conversation_id: &str, ext: &str) -> Result<(PathBuf, String), String> {
+    alloc_in_files_root(&files_dir(app_data_dir), conversation_id, ext)
+}
+
+/// [`alloc_dest`] for a caller that holds the attachment root itself
+/// (`{app_data_dir}/files`) rather than the data directory above it — the turn
+/// loop, whose `files_root` is that root.
+pub fn alloc_in_files_root(root: &Path, conversation_id: &str, ext: &str) -> Result<(PathBuf, String), String> {
     if !is_conversation_id(conversation_id) {
         return Err("invalid conversation id".into());
     }
     if !is_extension(ext) {
         return Err("invalid file extension".into());
     }
-    let root = files_dir(app_data_dir);
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let dest_dir = root.join(conversation_id);
     std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-    let root_real = canonicalize(&root).map_err(|e| e.to_string())?;
+    let root_real = canonicalize(root).map_err(|e| e.to_string())?;
     let dest_real = canonicalize(&dest_dir).map_err(|e| e.to_string())?;
     if !dest_real.starts_with(&root_real) {
         return Err("invalid conversation id".into());
@@ -102,6 +108,61 @@ pub fn resolve_managed_file(uri: &str, files_root: &Path) -> Option<PathBuf> {
         return None;
     }
     std::fs::metadata(&canonical).ok()?.is_file().then_some(canonical)
+}
+
+/// Largest single non-image file a tool may hand back (a video, a recording,
+/// a document). Never inlined into a request — the cap only bounds what lands
+/// in the attachment directory.
+pub const MAX_TOOL_MEDIA_BYTES: u64 = 200 * 1024 * 1024;
+
+/// How many media items one tool result may carry.
+pub const MAX_TOOL_MEDIA_ITEMS: usize = 8;
+
+/// The one place a tool-supplied mime type becomes a file extension. A type
+/// outside the list is refused rather than stored as `.bin`: the extension is
+/// what every later reader guesses the type back from (`mime_guess`, the asset
+/// protocol, the preview), so an unknown one would come back as something
+/// nobody can show.
+pub fn media_extension(mime: &str) -> Option<&'static str> {
+    Some(
+        match mime
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "image/png" => "png",
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "video/mp4" => "mp4",
+            "video/webm" => "webm",
+            "audio/mpeg" | "audio/mp3" => "mp3",
+            "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+            "audio/ogg" => "ogg",
+            "application/pdf" => "pdf",
+            _ => return None,
+        },
+    )
+}
+
+/// [`resolve_managed_file`] narrowed to one conversation's directory. What a
+/// tool row may point at: a tool result is model- and server-influenced, so
+/// the root that admits every conversation's attachments is too wide for it.
+pub fn resolve_conversation_file(uri: &str, files_root: &Path, conversation_id: &str) -> Option<PathBuf> {
+    if !is_conversation_id(conversation_id) {
+        return None;
+    }
+    resolve_managed_file(uri, &files_root.join(conversation_id))
+}
+
+/// [`resolve_conversation_file`] with the inlining cap of
+/// [`resolve_attachment_uri`].
+pub fn resolve_conversation_attachment(uri: &str, files_root: &Path, conversation_id: &str) -> Option<PathBuf> {
+    let canonical = resolve_conversation_file(uri, files_root, conversation_id)?;
+    (std::fs::metadata(&canonical).ok()?.len() <= MAX_INLINE_ATTACHMENT_BYTES).then_some(canonical)
 }
 
 pub fn file_to_base64_data_uri(path: &Path, mime_type: &str) -> Result<String, String> {

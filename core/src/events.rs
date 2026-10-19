@@ -624,7 +624,9 @@ pub enum ChatStreamEvent {
     },
     ToolResult {
         call_id: String,
+        /// The text the model read. Media travels beside it, never inside.
         result: String,
+        media: Vec<crate::agent::tool_media::ToolMediaResponse>,
         outcome: ToolOutcome,
         message_id: String,
         conversation_id: String,

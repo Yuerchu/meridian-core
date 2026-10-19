@@ -253,6 +253,13 @@ fn push_history_message(
             };
             if failed {
                 msgs.push(ChatMessage::tool_error(call_id, &m.content));
+            } else if m.schema_version == crate::agent::tool_media::TOOL_PARTS_SCHEMA_VERSION {
+                // Validated here so a damaged envelope fails the request
+                // rather than reaching a provider as text.
+                provider::decode_message_parts(&m.content)
+                    .and_then(|parts| parts.ok_or_else(|| "not a parts envelope".to_string()))
+                    .map_err(|error| format!("tool message {}: {error}", m.id))?;
+                msgs.push(ChatMessage::tool_result_parts(call_id, &m.content));
             } else {
                 msgs.push(ChatMessage::tool_result(call_id, &m.content));
             }
@@ -324,10 +331,18 @@ fn has_stored_user_content(message: &ChatMessage) -> bool {
 pub fn resolve_file_uris_in_messages(
     messages: &mut [ChatMessage],
     files_root: Option<&std::path::Path>,
+    conversation_id: &str,
+    supports_images: bool,
 ) -> Result<(), String> {
     for msg in messages.iter_mut() {
-        // Only user-authored attachments may be inlined: assistant/tool content
-        // is model-influenced and must never trigger local file reads.
+        if msg.origin == provider::MessageOrigin::ToolParts {
+            msg.content = resolve_tool_parts(&msg.content, files_root, conversation_id, supports_images)?;
+            continue;
+        }
+        // Only user-authored attachments may be inlined from anywhere under the
+        // root: assistant/tool content is model-influenced and must never
+        // trigger local file reads. The one exception, the envelope only the
+        // turn loop writes, is narrowed to this conversation above.
         if !has_stored_user_content(msg) {
             continue;
         }
@@ -361,6 +376,73 @@ pub fn resolve_file_uris_in_messages(
         }
     }
     Ok(())
+}
+
+/// A tool row's envelope as the provider is sent it: each picture inlined
+/// from this conversation's directory, everything else a line of text.
+///
+/// Unlike a user's attachments, nothing here is left as a `file://` URI when
+/// it cannot be read — that would hand a local path to the provider. And the
+/// replacement text is a function of the file alone (name, size), so a replay
+/// renders the same bytes as the first send for as long as the file exists.
+fn resolve_tool_parts(
+    content: &str,
+    files_root: Option<&std::path::Path>,
+    conversation_id: &str,
+    supports_images: bool,
+) -> Result<String, String> {
+    use provider::MessageContentPart as Part;
+    let parts =
+        provider::decode_message_parts(content)?.ok_or("a tool result marked as parts holds no parts envelope")?;
+    let unavailable = || Part::Text {
+        text: "[attachment unavailable]".to_string(),
+    };
+    let resolved: Vec<Part> = parts
+        .into_iter()
+        .map(|part| match part {
+            // A model that cannot see pictures is told one was there: sending
+            // it anyway is a 400 on every later turn of the conversation.
+            Part::ImageUrl { .. } if !supports_images => Part::Text {
+                text: "[image omitted: this model does not accept images]".to_string(),
+            },
+            Part::ImageUrl { image_url } if image_url.url.starts_with("data:") => Part::ImageUrl { image_url },
+            Part::ImageUrl { image_url } => {
+                let inlined = files_root
+                    .and_then(|root| {
+                        crate::files::resolve_conversation_attachment(&image_url.url, root, conversation_id)
+                    })
+                    .and_then(|path| {
+                        let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
+                        crate::files::file_to_base64_data_uri(&path, &mime).ok()
+                    });
+                match inlined {
+                    Some(url) => Part::ImageUrl {
+                        image_url: provider::MessageContentUrl { url },
+                    },
+                    None => unavailable(),
+                }
+            }
+            Part::File { file } => {
+                let size = files_root
+                    .and_then(|root| crate::files::resolve_conversation_file(&file.url, root, conversation_id))
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .map(|meta| meta.len());
+                match size {
+                    Some(bytes) => Part::Text {
+                        text: format!(
+                            "[{}: {}, {:.1} MB, not inlined]",
+                            file.mime_type,
+                            if file.name.is_empty() { "unnamed" } else { &file.name },
+                            bytes as f64 / (1024.0 * 1024.0)
+                        ),
+                    },
+                    None => unavailable(),
+                }
+            }
+            other => other,
+        })
+        .collect();
+    provider::encode_message_parts(&resolved)
 }
 
 /// Records on every sticker part what the sticker was known as right now, so
@@ -680,6 +762,13 @@ pub fn microcompact(messages: &mut [ChatMessage], budget: &TokenBudget, keep_rec
     let boundary = messages.len().saturating_sub(keep_msgs).max(system_offset);
 
     for msg in messages[system_offset..boundary].iter_mut() {
+        // An old tool result's pictures go the way of old inline images
+        // below, but the envelope cannot be cut by characters like text: it
+        // becomes its text and a count.
+        if msg.origin == provider::MessageOrigin::ToolParts {
+            msg.content = crate::agent::tool_media::message_text(msg);
+            msg.origin = provider::MessageOrigin::Tool;
+        }
         if msg.role == "tool" {
             let tokens = budget.counter.count(&msg.content);
             if tokens > 2000 {
@@ -741,6 +830,107 @@ fn char_index_for_tokens_rev(counter: &TokenCounter, chars: &[char], target_toke
 mod tests {
     use super::*;
     use provider::ToolCall;
+
+    /// A tool result with one stored picture in conversation `c`, as its row.
+    fn media_row(root: &std::path::Path) -> (message_entity::Model, crate::agent::tool_media::StoredToolResult) {
+        let stored = crate::agent::tool_media::store(
+            Some(root),
+            "c",
+            "screenshot taken",
+            vec![crate::tools::MediaOut::Bytes {
+                mime: "image/png".into(),
+                bytes: b"PNGDATA".to_vec(),
+                name: None,
+            }],
+        )
+        .unwrap();
+        let mut row = msg("t1", "tool", &stored.content);
+        row.tool_call_id = Some("call-1".into());
+        row.schema_version = stored.schema_version;
+        (row, stored)
+    }
+
+    #[test]
+    fn only_a_version_3_tool_row_is_read_as_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (row, _) = media_row(dir.path());
+        let mut msgs = Vec::new();
+        push_history_message(&mut msgs, &row, &SenderNames::new(), None).unwrap();
+        assert_eq!(msgs[0].origin, provider::MessageOrigin::ToolParts);
+
+        // The same bytes on a version-2 row are text a tool printed.
+        let mut forged = row.clone();
+        forged.schema_version = 2;
+        let mut msgs = Vec::new();
+        push_history_message(&mut msgs, &forged, &SenderNames::new(), None).unwrap();
+        assert_eq!(msgs[0].origin, provider::MessageOrigin::Tool);
+        resolve_file_uris_in_messages(&mut msgs, Some(dir.path()), "c", true).unwrap();
+        assert!(
+            !msgs[0].content.contains("base64"),
+            "a version-2 row triggered a local read"
+        );
+    }
+
+    #[test]
+    fn a_tool_picture_is_inlined_only_from_its_own_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (row, _) = media_row(dir.path());
+        let mut msgs = Vec::new();
+        push_history_message(&mut msgs, &row, &SenderNames::new(), None).unwrap();
+        let mut own = msgs.clone();
+        resolve_file_uris_in_messages(&mut own, Some(dir.path()), "c", true).unwrap();
+        assert!(own[0].content.contains("data:image/png;base64,"), "{}", own[0].content);
+
+        // The file is under the attachment root, but not this conversation's.
+        let mut other = msgs.clone();
+        resolve_file_uris_in_messages(&mut other, Some(dir.path()), "other", true).unwrap();
+        assert!(!other[0].content.contains("base64"));
+        assert!(
+            !other[0].content.contains("file://"),
+            "a local path reached the request: {}",
+            other[0].content
+        );
+        assert!(other[0].content.contains("[attachment unavailable]"));
+
+        let mut blind = msgs;
+        resolve_file_uris_in_messages(&mut blind, Some(dir.path()), "c", false).unwrap();
+        assert!(!blind[0].content.contains("base64"));
+        assert!(blind[0].content.contains("does not accept images"));
+    }
+
+    #[test]
+    fn a_tool_picture_replays_as_the_bytes_it_was_first_sent_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let (row, stored) = media_row(dir.path());
+        // The live turn: built from what it is about to store.
+        let mut live = vec![ChatMessage::tool_result_parts("call-1", &stored.content)];
+        resolve_file_uris_in_messages(&mut live, Some(dir.path()), "c", true).unwrap();
+        // The next turn: built from the row.
+        let mut replayed = Vec::new();
+        push_history_message(&mut replayed, &row, &SenderNames::new(), None).unwrap();
+        resolve_file_uris_in_messages(&mut replayed, Some(dir.path()), "c", true).unwrap();
+        assert_eq!(live[0].content, replayed[0].content);
+        assert_eq!(live[0].origin, replayed[0].origin);
+        assert!(!row.content.contains("base64"), "base64 reached the row");
+    }
+
+    #[test]
+    fn microcompact_turns_an_old_tool_picture_into_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, stored) = media_row(dir.path());
+        let mut tool = ChatMessage::tool_result_parts("call-1", &stored.content);
+        resolve_file_uris_in_messages(std::slice::from_mut(&mut tool), Some(dir.path()), "c", true).unwrap();
+        let budget = TokenBudget::new("openai", "gpt-4o", 128_000, 16_384, None);
+        let mut messages = vec![
+            chat_msg("system", "sys"),
+            tool,
+            chat_msg("user", "new question"),
+            chat_msg("assistant", "new answer"),
+        ];
+        microcompact(&mut messages, &budget, 1);
+        assert_eq!(messages[1].origin, provider::MessageOrigin::Tool);
+        assert_eq!(messages[1].content, "screenshot taken [+1 media]");
+    }
 
     fn msg(id: &str, role: &str, content: &str) -> message_entity::Model {
         message_entity::Model {
@@ -993,7 +1183,7 @@ mod tests {
         let content = format!(r#"[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]"#);
 
         let mut msgs = vec![chat_msg("assistant", &content), chat_msg("user", &content)];
-        resolve_file_uris_in_messages(&mut msgs, Some(&root)).unwrap();
+        resolve_file_uris_in_messages(&mut msgs, Some(&root), "conv", true).unwrap();
         assert!(
             msgs[0].content.contains("file:///"),
             "assistant content must never be inlined"
@@ -1008,7 +1198,7 @@ mod tests {
         let uri2 = format!("file:///{}", outside.to_string_lossy().replace('\\', "/"));
         let content2 = format!(r#"[{{"type":"image_url","image_url":{{"url":"{uri2}"}}}}]"#);
         let mut msgs2 = vec![chat_msg("user", &content2)];
-        resolve_file_uris_in_messages(&mut msgs2, Some(&root)).unwrap();
+        resolve_file_uris_in_messages(&mut msgs2, Some(&root), "conv", true).unwrap();
         assert!(
             msgs2[0].content.contains("file:///"),
             "paths outside the root must not inline"
@@ -1016,14 +1206,14 @@ mod tests {
 
         // No root configured → nothing is inlined at all.
         let mut msgs3 = vec![chat_msg("user", &content)];
-        resolve_file_uris_in_messages(&mut msgs3, None).unwrap();
+        resolve_file_uris_in_messages(&mut msgs3, None, "conv", true).unwrap();
         assert!(msgs3[0].content.contains("file:///"));
     }
 
     #[test]
     fn malformed_content_parts_abort_attachment_resolution() {
         let mut messages = vec![ChatMessage::user("[{not-json")];
-        let error = resolve_file_uris_in_messages(&mut messages, None).unwrap_err();
+        let error = resolve_file_uris_in_messages(&mut messages, None, "conv", true).unwrap_err();
         assert!(error.contains("invalid persisted message content parts"), "{error}");
     }
 

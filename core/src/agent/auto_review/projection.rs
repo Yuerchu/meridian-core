@@ -157,7 +157,7 @@ fn line(msg: &message_entity::Model, party: Party<'_>) -> Result<Option<String>,
                 return Err(format!("tool message {} is missing tool_call_id", msg.id));
             }
             Ok(Some(
-                json!({ "untrusted_tool_output": cap(&msg.content, MAX_TOOL_OUTPUT_TOKENS) }).to_string(),
+                json!({ "untrusted_tool_output": cap(&crate::agent::tool_media::result_text(&msg.content, msg.schema_version), MAX_TOOL_OUTPUT_TOKENS) }).to_string(),
             ))
         }
         // Handled above before the compaction-summary branch.

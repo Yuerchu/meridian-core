@@ -144,9 +144,13 @@ fn serialize_gemma_messages(messages: &[ChatMessage]) -> Result<Vec<serde_json::
         }
     }
 
-    messages
-        .iter()
-        .map(|m| match m.role.as_str() {
+    let mut carry = super::ToolImageCarry::default();
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        if m.role != "tool" {
+            carry.flush(&mut out);
+        }
+        let message: Result<serde_json::Value, ProviderError> = match m.role.as_str() {
             "assistant" => {
                 let mut content = m.content.clone();
                 if let Some(ref tcs) = m.tool_calls {
@@ -167,9 +171,10 @@ fn serialize_gemma_messages(messages: &[ChatMessage]) -> Result<Vec<serde_json::
                     .and_then(|id| id_to_name.get(id))
                     .map(|n| n.as_str())
                     .unwrap_or("unknown");
+                let text = carry.take(m).map_err(ProviderError::Parse)?;
                 let content = format!(
                     "<|tool_response>response:{tool_name}{{result:{QUOTE}{}{QUOTE}}}<tool_response|>",
-                    m.content
+                    text.as_deref().unwrap_or(&m.content)
                 );
                 Ok(serde_json::json!({ "role": "tool", "content": content }))
             }
@@ -187,8 +192,11 @@ fn serialize_gemma_messages(messages: &[ChatMessage]) -> Result<Vec<serde_json::
                 }
                 Ok(msg)
             }
-        })
-        .collect()
+        };
+        out.push(message?);
+    }
+    carry.flush(&mut out);
+    Ok(out)
 }
 
 // --- Gemma format parsing ---

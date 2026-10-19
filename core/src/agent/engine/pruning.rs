@@ -84,6 +84,14 @@ pub(crate) fn prune_tool_results(messages: &mut [ChatMessage], config: &PruningC
             continue;
         }
 
+        // Pictures are the most expensive thing an old tool result carries,
+        // and an envelope cannot be cut by characters: it becomes its text and
+        // a count before either rule below sees it.
+        if msg.origin == crate::provider::MessageOrigin::ToolParts {
+            msg.content = crate::agent::tool_media::message_text(msg);
+            msg.origin = crate::provider::MessageOrigin::Tool;
+        }
+
         if age >= config.hard_age {
             msg.content = HARD_MARKER.to_string();
             continue;
@@ -104,6 +112,27 @@ pub(crate) fn prune_tool_results(messages: &mut [ChatMessage], config: &PruningC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An old picture is the most expensive thing to keep resending, and an
+    /// envelope cut by characters would be a request the provider refuses.
+    #[test]
+    fn an_old_tool_picture_becomes_its_text() {
+        let parts =
+            r#"[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#;
+        let mut msgs = vec![
+            user("hi"),
+            assistant("round 0"),
+            ChatMessage::tool_result_parts("c1", parts),
+            assistant("round 1"),
+        ];
+        let config = PruningConfig {
+            keep_last_n: 1,
+            ..Default::default()
+        };
+        prune_tool_results(&mut msgs, &config);
+        assert_eq!(msgs[2].origin, crate::provider::MessageOrigin::Tool);
+        assert_eq!(msgs[2].content, "shot [+1 media]");
+    }
 
     fn assistant(text: &str) -> ChatMessage {
         ChatMessage {

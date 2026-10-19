@@ -614,7 +614,19 @@ impl McpRegistry {
     /// request itself is awaited with nothing locked, which is the whole point
     /// of the rewrite: a server taking thirty seconds no longer stops every
     /// other conversation from assembling its tools.
+    /// [`Self::call_tool_rich`] for a caller that only wants the text: any
+    /// media the server returned is dropped.
     pub async fn call_tool(&self, qualified_name: &str, args: serde_json::Value) -> Result<String, String> {
+        self.call_tool_rich(qualified_name, args)
+            .await
+            .map(|output| output.text)
+    }
+
+    pub async fn call_tool_rich(
+        &self,
+        qualified_name: &str,
+        args: serde_json::Value,
+    ) -> Result<crate::tools::ToolOutput, String> {
         let (server_id, original_name) = {
             let tools = self.tools();
             let tool_def = tools
@@ -672,13 +684,7 @@ impl McpRegistry {
             format!("parse tools/call result: {e}")
         })?;
 
-        let text = call_result
-            .content
-            .iter()
-            .filter(|c| c.content_type == "text")
-            .filter_map(|c| c.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let output = fold_call_result(call_result.content);
 
         if call_result.is_error {
             // Length only: the text is tool output and goes to the model, not
@@ -686,16 +692,14 @@ impl McpRegistry {
             tracing::warn!(
                 server_id = %server_id,
                 tool = %original_name,
-                result_len = text.len(),
+                result_len = output.text.len(),
                 "MCP tool reported an error"
             );
-            Err(text)
+            Err(output.text)
+        } else if output.text.is_empty() && output.media.is_empty() {
+            Ok(crate::tools::ToolOutput::text("(no output)".to_string()))
         } else {
-            Ok(if text.is_empty() {
-                "(no output)".to_string()
-            } else {
-                text
-            })
+            Ok(output)
         }
     }
 
@@ -797,4 +801,105 @@ fn string_map(column: Option<&Json<BTreeMap<String, String>>>) -> HashMap<String
     column
         .map(|map| map.0.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default()
+}
+
+/// A `tools/call` result as one tool answer: text blocks joined by newlines,
+/// pictures and other binary blocks decoded into media for the turn loop to
+/// store, and anything that cannot be used described in the text instead of
+/// vanishing. Dropping non-text blocks silently was the old behaviour; a
+/// screenshot tool then answered with nothing and the model had no way to tell.
+pub(crate) fn fold_call_result(content: Vec<protocol::McpContent>) -> crate::tools::ToolOutput {
+    use base64::Engine;
+    let mut lines: Vec<String> = Vec::new();
+    let mut media = Vec::new();
+    let mut binary = |kind: &str, data: Option<String>, mime: Option<String>, lines: &mut Vec<String>| {
+        let mime = mime.unwrap_or_default();
+        let Some(data) = data else {
+            lines.push(format!("[{kind} without data]"));
+            return;
+        };
+        if crate::files::media_extension(&mime).is_none() {
+            lines.push(format!("[{kind} omitted: unsupported type {mime:?}]"));
+            return;
+        }
+        if media.len() >= crate::files::MAX_TOOL_MEDIA_ITEMS {
+            lines.push(format!(
+                "[{kind} omitted: more than {} media items]",
+                crate::files::MAX_TOOL_MEDIA_ITEMS
+            ));
+            return;
+        }
+        match base64::engine::general_purpose::STANDARD.decode(data.trim()) {
+            Ok(bytes) => media.push(crate::tools::MediaOut::Bytes {
+                mime,
+                bytes,
+                name: None,
+            }),
+            Err(_) => lines.push(format!("[{kind} omitted: invalid base64]")),
+        }
+    };
+    for block in content {
+        match block.content_type.as_str() {
+            "text" => lines.extend(block.text),
+            "image" | "audio" => binary(&block.content_type, block.data, block.mime_type, &mut lines),
+            "resource" => match block.resource {
+                Some(protocol::McpEmbeddedResource { text: Some(text), .. }) => lines.push(text),
+                Some(protocol::McpEmbeddedResource { blob, mime_type, .. }) => {
+                    binary("resource", blob, mime_type, &mut lines)
+                }
+                None => lines.push("[resource without contents]".to_string()),
+            },
+            "resource_link" => lines.push(format!("[resource link: {}]", block.uri.unwrap_or_default())),
+            other => lines.push(format!("[unsupported content type {other:?}]")),
+        }
+    }
+    crate::tools::ToolOutput {
+        text: lines.join("\n"),
+        media,
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    fn block(json: serde_json::Value) -> protocol::McpContent {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn an_image_block_becomes_media_and_text_stays_text() {
+        let output = fold_call_result(vec![
+            block(serde_json::json!({"type": "text", "text": "captured"})),
+            block(serde_json::json!({"type": "image", "data": "UE5HREFUQQ==", "mimeType": "image/png"})),
+        ]);
+        assert_eq!(output.text, "captured");
+        assert_eq!(
+            output.media,
+            vec![crate::tools::MediaOut::Bytes {
+                mime: "image/png".into(),
+                bytes: b"PNGDATA".to_vec(),
+                name: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_used_is_described_rather_than_dropped() {
+        let output = fold_call_result(vec![
+            block(serde_json::json!({"type": "image", "data": "AAAA", "mimeType": "image/tiff"})),
+            block(serde_json::json!({"type": "image", "data": "not base64!", "mimeType": "image/png"})),
+            block(serde_json::json!({"type": "resource", "resource": {"uri": "file:///a", "text": "inline"}})),
+            block(serde_json::json!({"type": "resource_link", "uri": "https://example.test/x"})),
+        ]);
+        assert!(output.media.is_empty());
+        assert!(
+            output.text.contains("unsupported type \"image/tiff\""),
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("invalid base64"));
+        assert!(output.text.contains("inline"));
+        assert!(output.text.contains("https://example.test/x"));
+    }
 }

@@ -588,6 +588,7 @@ async fn run_turn(
         approval_rule: engine::ApprovalRule::ByReach { accept_edits: false },
         withheld: engine::WithheldWording::Explained,
         files_root: None,
+        supports_images: params.caps.supports_images,
         stickers: None,
         interrupted: None,
         compaction: engine::CompactionPolicy::Desktop {

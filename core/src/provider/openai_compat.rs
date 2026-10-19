@@ -162,43 +162,63 @@ impl OpenAICompatProvider {
     }
 }
 
-fn content_value(content: &str) -> Result<serde_json::Value, ProviderError> {
-    if let Some(parts) = super::decode_message_parts(content).map_err(ProviderError::Parse)? {
+/// Only a user message can be the attachment envelope. Everything else is text
+/// whatever it starts with: a tool printing a JSON array, or a model answering
+/// with one, is not a list of parts.
+fn content_value(role: &str, content: &str) -> Result<serde_json::Value, ProviderError> {
+    if role == "user"
+        && let Some(parts) = super::decode_message_parts(content).map_err(ProviderError::Parse)?
+    {
         return serde_json::to_value(parts).map_err(|error| ProviderError::Parse(error.to_string()));
     }
     Ok(serde_json::Value::String(content.to_string()))
 }
 
 pub fn serialize_openai_messages(messages: &[ChatMessage]) -> Result<Vec<serde_json::Value>, ProviderError> {
-    messages
-        .iter()
-        .map(|m| {
-            // chat-completions has a native `name`, so identity never touches the body.
-            let rendered = super::render_message(m, super::SenderRendering::NameField).map_err(ProviderError::Parse)?;
-            let mut msg = serde_json::json!({ "role": m.role, "content": content_value(&rendered.content)? });
-            if let Some(ref name) = rendered.name {
-                msg["name"] = serde_json::json!(name);
-            }
-            if let Some(ref tool_calls) = m.tool_calls {
-                msg["tool_calls"] = serde_json::json!(
-                    tool_calls
-                        .iter()
-                        .map(|tc| {
-                            serde_json::json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": { "name": tc.name, "arguments": tc.arguments }
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                );
-            }
-            if let Some(ref tool_call_id) = m.tool_call_id {
-                msg["tool_call_id"] = serde_json::json!(tool_call_id);
-            }
-            Ok(msg)
-        })
-        .collect()
+    let mut carry = super::ToolImageCarry::default();
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        if m.role != "tool" {
+            carry.flush(&mut out);
+        }
+        out.push(serialize_openai_message(m, &mut carry)?);
+    }
+    carry.flush(&mut out);
+    Ok(out)
+}
+
+fn serialize_openai_message(
+    m: &ChatMessage,
+    carry: &mut super::ToolImageCarry,
+) -> Result<serde_json::Value, ProviderError> {
+    // chat-completions has a native `name`, so identity never touches the body.
+    let rendered = super::render_message(m, super::SenderRendering::NameField).map_err(ProviderError::Parse)?;
+    let content = match carry.take(m).map_err(ProviderError::Parse)? {
+        Some(text) => serde_json::Value::String(text),
+        None => content_value(&m.role, &rendered.content)?,
+    };
+    let mut msg = serde_json::json!({ "role": m.role, "content": content });
+    if let Some(ref name) = rendered.name {
+        msg["name"] = serde_json::json!(name);
+    }
+    if let Some(ref tool_calls) = m.tool_calls {
+        msg["tool_calls"] = serde_json::json!(
+            tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": { "name": tc.name, "arguments": tc.arguments }
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(ref tool_call_id) = m.tool_call_id {
+        msg["tool_call_id"] = serde_json::json!(tool_call_id);
+    }
+    Ok(msg)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,11 +275,13 @@ fn serialize_google_messages(messages: &[ChatMessage], model: &str) -> Result<Ve
     let mut flattened_calls = HashSet::<String>::new();
     let mut signed_tool_names = HashMap::<String, String>::new();
     let mut interrupted_results = Vec::<(String, String)>::new();
+    let mut carry = super::ToolImageCarry::default();
     let mut out = Vec::new();
 
     for (message_index, m) in messages.iter().enumerate() {
         if m.role != "tool" {
             append_interrupted_results(&mut out, std::mem::take(&mut interrupted_results));
+            carry.flush(&mut out);
             flattened_calls.clear();
             signed_tool_names.clear();
         }
@@ -297,19 +319,24 @@ fn serialize_google_messages(messages: &[ChatMessage], model: &str) -> Result<Ve
         }
 
         if m.role == "tool" && m.tool_call_id.as_ref().is_some_and(|id| flattened_calls.contains(id)) {
+            let text = carry.take(m).map_err(ProviderError::Parse)?;
             out.push(serde_json::json!({
                 "role": "user",
                 "content": format!(
                     "[Historical tool result for {}]\n{}",
                     m.tool_call_id.as_deref().unwrap_or("unknown"),
-                    m.content
+                    text.as_deref().unwrap_or(&m.content)
                 )
             }));
             continue;
         }
 
         let rendered = super::render_message(m, super::SenderRendering::NameField).map_err(ProviderError::Parse)?;
-        let mut msg = serde_json::json!({ "role": m.role, "content": content_value(&rendered.content)? });
+        let content = match carry.take(m).map_err(ProviderError::Parse)? {
+            Some(text) => serde_json::Value::String(text),
+            None => content_value(&m.role, &rendered.content)?,
+        };
+        let mut msg = serde_json::json!({ "role": m.role, "content": content });
         if let Some(name) = rendered.name {
             msg["name"] = serde_json::json!(name);
         }
@@ -368,6 +395,7 @@ fn serialize_google_messages(messages: &[ChatMessage], model: &str) -> Result<Ve
         out.push(msg);
     }
     append_interrupted_results(&mut out, interrupted_results);
+    carry.flush(&mut out);
     Ok(out)
 }
 
@@ -1739,5 +1767,62 @@ mod openai_tests {
             panic!("JSON body")
         };
         assert!(body.get("verbosity").is_none());
+    }
+
+    /// A tool or assistant row is text whatever it starts with. JSON output
+    /// beginning `[{` — a listing, an API response, a JSON file — used to be
+    /// read as the user-attachment envelope, fail its strict decode, and take
+    /// the whole request down with it on every later turn.
+    #[test]
+    fn tool_and_assistant_text_that_looks_like_parts_is_sent_as_text() {
+        let wire = serialize_openai_messages(&[
+            ChatMessage::assistant_with_tools(
+                "",
+                None,
+                vec![crate::provider::ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("c1", r#"[{"a":1}]"#),
+            ChatMessage::assistant(r#"[{"b":2}]"#),
+        ])
+        .unwrap();
+        assert_eq!(wire[1]["content"], r#"[{"a":1}]"#);
+        assert_eq!(wire[2]["content"], r#"[{"b":2}]"#);
+    }
+
+    /// Pictures wait for the end of the run of results: a user message
+    /// between two results of one batch breaks chat-completions' ordering.
+    #[test]
+    fn tool_pictures_follow_the_last_result_of_the_batch() {
+        let wire = serialize_openai_messages(&[
+            ChatMessage::assistant_with_tools(
+                "",
+                None,
+                vec![
+                    crate::provider::ToolCall { id: "c1".into(), name: "shot".into(), arguments: "{}".into() },
+                    crate::provider::ToolCall { id: "c2".into(), name: "read".into(), arguments: "{}".into() },
+                ],
+            ),
+            ChatMessage::tool_result_parts("c1", r#"[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#),
+            ChatMessage::tool_result("c2", "plain"),
+            ChatMessage::assistant("seen"),
+        ])
+        .unwrap();
+        assert_eq!(wire.len(), 5);
+        assert_eq!(wire[1]["role"], "tool");
+        assert_eq!(wire[1]["content"], "shot\n[1 image(s) follow the tool results]");
+        assert_eq!(wire[2]["role"], "tool");
+        assert_eq!(wire[3]["role"], "user");
+        assert_eq!(
+            wire[3]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "[Images returned by tool call c1]"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+            ])
+        );
+        assert_eq!(wire[4]["role"], "assistant");
     }
 }

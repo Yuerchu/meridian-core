@@ -99,7 +99,7 @@ impl LiteRtLmProvider {
     }
 }
 
-fn messages_to_litert_json(messages: &[ChatMessage]) -> serde_json::Value {
+fn messages_to_litert_json(messages: &[ChatMessage]) -> Result<serde_json::Value, ProviderError> {
     let mut arr = Vec::new();
     for m in messages {
         let mut msg = serde_json::Map::new();
@@ -125,7 +125,7 @@ fn messages_to_litert_json(messages: &[ChatMessage]) -> serde_json::Value {
             let content = serde_json::json!([{
                 "type": "tool_response",
                 "name": m.tool_call_id.as_deref().unwrap_or(""),
-                "response": m.content
+                "response": litert_tool_text(m)?
             }]);
             msg.insert("content".into(), content);
         } else {
@@ -138,7 +138,24 @@ fn messages_to_litert_json(messages: &[ChatMessage]) -> serde_json::Value {
 
         arr.push(serde_json::Value::Object(msg));
     }
-    serde_json::Value::Array(arr)
+    Ok(serde_json::Value::Array(arr))
+}
+
+/// A tool result as this runtime takes it: text only. A picture a tool
+/// returned is a line saying so — the stored envelope, base64 and all, is not
+/// something to hand a local model as its tool response.
+fn litert_tool_text(m: &ChatMessage) -> Result<String, ProviderError> {
+    let Some(parts) = super::tool_result_parts(m).map_err(ProviderError::Parse)? else {
+        return Ok(m.content.clone());
+    };
+    Ok(parts
+        .into_iter()
+        .map(|part| match part {
+            super::ToolWirePart::Text(text) => text,
+            super::ToolWirePart::Image(_) => "[image omitted: this model does not accept images]".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn tools_to_litert_json(tools: &[ToolDefinition]) -> String {
@@ -282,8 +299,8 @@ impl ChatProvider for LiteRtLmProvider {
                     return Err(ProviderError::Upstream("no messages".into()));
                 };
 
-                let history_json = messages_to_litert_json(history);
-                let last_msg_json = messages_to_litert_json(std::slice::from_ref(last_msg));
+                let history_json = messages_to_litert_json(history)?;
+                let last_msg_json = messages_to_litert_json(std::slice::from_ref(last_msg))?;
                 let last_msg_str = last_msg_json[0].to_string();
 
                 let tools_json = if tools.is_empty() {
@@ -417,5 +434,19 @@ impl ChatProvider for LiteRtLmProvider {
             usage,
             provider_state: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tool_picture_reaches_the_runtime_as_text() {
+        let parts =
+            r#"[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#;
+        let wire = messages_to_litert_json(&[ChatMessage::tool_result_parts("c1", parts)]).unwrap();
+        let response = wire[0]["content"][0]["response"].as_str().unwrap();
+        assert_eq!(response, "shot\n[image omitted: this model does not accept images]");
     }
 }

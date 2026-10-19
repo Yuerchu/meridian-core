@@ -591,6 +591,47 @@ pub trait Tool: Send + Sync {
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<String, String>;
+
+    /// [`Self::execute`] for a tool that can hand back pictures or other media
+    /// beside its text. What the turn loop calls; everything else keeps calling
+    /// `execute`, and a tool with only text never overrides this.
+    async fn execute_rich(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput, String> {
+        self.execute(args, context).await.map(ToolOutput::text)
+    }
+}
+
+/// A tool's successful answer: the text the model reads, and media the turn
+/// loop stores in the conversation's attachment directory and sends with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolOutput {
+    pub text: String,
+    pub media: Vec<MediaOut>,
+}
+
+impl ToolOutput {
+    pub fn text(text: String) -> Self {
+        Self {
+            text,
+            media: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaOut {
+    /// Bytes the loop writes to a new file under the conversation's directory.
+    Bytes {
+        mime: String,
+        bytes: Vec<u8>,
+        name: Option<String>,
+    },
+    /// A file the tool already wrote there. Anything outside that directory
+    /// fails the whole result rather than being sent.
+    ManagedFile {
+        uri: String,
+        mime: String,
+        name: Option<String>,
+    },
 }
 
 pub struct ToolRegistry {

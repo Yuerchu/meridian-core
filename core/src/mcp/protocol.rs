@@ -69,12 +69,41 @@ pub struct McpCallToolResult {
     pub is_error: bool,
 }
 
+/// One block of a `tools/call` result. Loose on purpose, like the rest of the
+/// client half: a server is somebody else's code, and a block this app cannot
+/// use is described to the model rather than failing the call.
 #[derive(Debug, Deserialize)]
 pub struct McpContent {
     #[serde(rename = "type")]
     pub content_type: String,
     #[serde(default)]
     pub text: Option<String>,
+    /// Base64, on `image` and `audio`.
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+    /// On `resource` (embedded).
+    #[serde(default)]
+    pub resource: Option<McpEmbeddedResource>,
+    /// On `resource_link`.
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpEmbeddedResource {
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Base64.
+    #[serde(default)]
+    pub blob: Option<String>,
 }
 
 // ------------------------------------------------------------ the server half

@@ -168,7 +168,10 @@ fn prepare_compact_input(
         let Some(role_label) = role_label(&m.role) else {
             continue;
         };
-        let mut content = compact_content(&m.role, &m.content);
+        let mut content = compact_content(
+            &m.role,
+            &crate::agent::tool_media::result_text(&m.content, m.schema_version),
+        );
         if m.role == "user" {
             let sender = m.sender_id.map(|uid| crate::agent::sender_ref(uid, sender_names));
             content.insert_str(0, &user_section_prefix(m.created_at, sender.as_ref())?);
@@ -204,7 +207,7 @@ fn prepare_chat_compact_input(messages: &[ChatMessage]) -> Result<Vec<CompactSec
         let Some(role_label) = role_label(&message.role) else {
             continue;
         };
-        let mut content = compact_content(&message.role, &message.content);
+        let mut content = compact_content(&message.role, &crate::agent::tool_media::message_text(message));
         // A user message that is a row has a send time; a summary standing in
         // for earlier history does not, and gets no prefix.
         if message.role == "user"

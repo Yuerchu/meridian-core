@@ -31,6 +31,7 @@ pub(crate) mod tokenizer;
 // mean a transcript that renders differently depending on who wrote it.
 pub(crate) mod tool_calls;
 pub(crate) mod tool_defs;
+pub mod tool_media;
 mod truncate;
 pub mod turn_config;
 pub mod turn_record;
