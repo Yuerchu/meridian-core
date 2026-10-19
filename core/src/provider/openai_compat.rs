@@ -162,8 +162,13 @@ impl OpenAICompatProvider {
     }
 }
 
-fn content_value(content: &str) -> Result<serde_json::Value, ProviderError> {
-    if let Some(parts) = super::decode_message_parts(content).map_err(ProviderError::Parse)? {
+/// Only a user message can be the attachment envelope. Everything else is text
+/// whatever it starts with: a tool printing a JSON array, or a model answering
+/// with one, is not a list of parts.
+fn content_value(role: &str, content: &str) -> Result<serde_json::Value, ProviderError> {
+    if role == "user"
+        && let Some(parts) = super::decode_message_parts(content).map_err(ProviderError::Parse)?
+    {
         return serde_json::to_value(parts).map_err(|error| ProviderError::Parse(error.to_string()));
     }
     Ok(serde_json::Value::String(content.to_string()))
@@ -175,7 +180,7 @@ pub fn serialize_openai_messages(messages: &[ChatMessage]) -> Result<Vec<serde_j
         .map(|m| {
             // chat-completions has a native `name`, so identity never touches the body.
             let rendered = super::render_message(m, super::SenderRendering::NameField).map_err(ProviderError::Parse)?;
-            let mut msg = serde_json::json!({ "role": m.role, "content": content_value(&rendered.content)? });
+            let mut msg = serde_json::json!({ "role": m.role, "content": content_value(&m.role, &rendered.content)? });
             if let Some(ref name) = rendered.name {
                 msg["name"] = serde_json::json!(name);
             }
@@ -309,7 +314,7 @@ fn serialize_google_messages(messages: &[ChatMessage], model: &str) -> Result<Ve
         }
 
         let rendered = super::render_message(m, super::SenderRendering::NameField).map_err(ProviderError::Parse)?;
-        let mut msg = serde_json::json!({ "role": m.role, "content": content_value(&rendered.content)? });
+        let mut msg = serde_json::json!({ "role": m.role, "content": content_value(&m.role, &rendered.content)? });
         if let Some(name) = rendered.name {
             msg["name"] = serde_json::json!(name);
         }
@@ -1739,5 +1744,29 @@ mod openai_tests {
             panic!("JSON body")
         };
         assert!(body.get("verbosity").is_none());
+    }
+
+    /// A tool or assistant row is text whatever it starts with. JSON output
+    /// beginning `[{` — a listing, an API response, a JSON file — used to be
+    /// read as the user-attachment envelope, fail its strict decode, and take
+    /// the whole request down with it on every later turn.
+    #[test]
+    fn tool_and_assistant_text_that_looks_like_parts_is_sent_as_text() {
+        let wire = serialize_openai_messages(&[
+            ChatMessage::assistant_with_tools(
+                "",
+                None,
+                vec![crate::provider::ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("c1", r#"[{"a":1}]"#),
+            ChatMessage::assistant(r#"[{"b":2}]"#),
+        ])
+        .unwrap();
+        assert_eq!(wire[1]["content"], r#"[{"a":1}]"#);
+        assert_eq!(wire[2]["content"], r#"[{"b":2}]"#);
     }
 }

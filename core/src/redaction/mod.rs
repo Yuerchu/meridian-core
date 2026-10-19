@@ -540,7 +540,10 @@ impl RedactionEngine {
                 continue;
             }
 
-            if msg.content.starts_with("[{") {
+            // Only a user message can be the attachment envelope. Read as one,
+            // a tool printing a JSON array had only its `"type":"text"`
+            // members scanned, which for ordinary JSON is none of it.
+            if msg.role == "user" && msg.content.starts_with("[{") {
                 if let Some(redacted) =
                     self.redact_multimodal_mapped(&msg.content, project_id, &set, &mut conv_map, &mut report)
                 {
@@ -728,6 +731,19 @@ impl Clone for RuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_output_that_is_a_json_array_is_scanned_as_text() {
+        let engine = RedactionEngine::new();
+        let mappings = RedactionMappings::new();
+        let mut messages = vec![ChatMessage::tool_result("c1", r#"[{"email":"user@example.com"}]"#)];
+        engine.scrub_for_conversation(&mut messages, None, "conv", &mappings);
+        assert!(
+            !messages[0].content.contains("user@example.com"),
+            "{}",
+            messages[0].content
+        );
+    }
 
     #[test]
     fn disabled_engine_does_nothing() {

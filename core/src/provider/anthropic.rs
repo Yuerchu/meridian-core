@@ -142,7 +142,11 @@ impl AnthropicProvider {
             if m.role == "assistant" && rendered.content.trim().is_empty() {
                 continue;
             }
-            if let Some(parts) = super::decode_message_parts(&rendered.content).map_err(ProviderError::Parse)? {
+            // Only a user message can be the attachment envelope; an assistant
+            // answering with a JSON array is still text.
+            if m.role == "user"
+                && let Some(parts) = super::decode_message_parts(&rendered.content).map_err(ProviderError::Parse)?
+            {
                 let anthropic_parts = parts
                     .into_iter()
                     .map(|part| match part {
@@ -1148,6 +1152,19 @@ impl ChatProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The other half of the chat-completions case: an assistant answering
+    /// with a JSON array went through the user-attachment decoder and failed
+    /// the request.
+    #[test]
+    fn assistant_text_that_looks_like_parts_is_sent_as_text() {
+        let wire = AnthropicProvider::serialize_messages(
+            &[ChatMessage::user("hi"), ChatMessage::assistant(r#"[{"b":2}]"#)],
+            "claude-test",
+        )
+        .unwrap();
+        assert_eq!(wire[1]["content"], r#"[{"b":2}]"#);
+    }
 
     fn usage_from(json: &str) -> AnthropicUsage {
         serde_json::from_str(json).expect("a usage body from the wire")
