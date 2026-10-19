@@ -101,6 +101,13 @@ fn escalation_not_approved(escalation: super::Escalation<'_>) -> String {
     }
 }
 
+fn tool_denial_message(reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("Tool call denied. Reason: {reason}"),
+        None => "Tool call denied.".to_string(),
+    }
+}
+
 fn no_room(budget: &TokenBudget) -> String {
     format!(
         "the conversation fills the context window ({used} of {limit} tokens) and compacting it \
@@ -1301,10 +1308,7 @@ async fn run(
                             Err(e) => (format!("Error: {e}"), "error"),
                         }
                     }
-                    Some(ApprovalDecision::Denied(Some(reason))) => {
-                        (format!("Tool call denied by user. Reason: {reason}"), "denied")
-                    }
-                    Some(ApprovalDecision::Denied(None)) => ("Tool call denied by user.".to_string(), "denied"),
+                    Some(ApprovalDecision::Denied(reason)) => (tool_denial_message(reason.as_deref()), "denied"),
                     // Nobody answered — not a denial. See `UNANSWERED_APPROVAL`.
                     _ => (UNANSWERED_APPROVAL.to_string(), "denied"),
                 }
@@ -1473,10 +1477,9 @@ async fn run(
                                     Err(e) => (format!("MCP error: {e}"), "error"),
                                 }
                             }
-                            Some(ApprovalDecision::Denied(Some(reason))) => {
-                                (format!("Tool call denied by user. Reason: {reason}"), "denied")
+                            Some(ApprovalDecision::Denied(reason)) => {
+                                (tool_denial_message(reason.as_deref()), "denied")
                             }
-                            Some(ApprovalDecision::Denied(None)) => ("Tool call denied by user.".to_string(), "denied"),
                             // Nobody answered, which the port's contract says is not a
                             // denial — see `UNANSWERED_APPROVAL`.
                             _ => (UNANSWERED_APPROVAL.to_string(), "denied"),
@@ -1525,10 +1528,7 @@ async fn run(
                             }
                         };
                         match authorised {
-                            Authorised::Refused(Some(reason)) => {
-                                (format!("Tool call denied by user. Reason: {reason}"), "denied")
-                            }
-                            Authorised::Refused(None) => ("Tool call denied by user.".to_string(), "denied"),
+                            Authorised::Refused(reason) => (tool_denial_message(reason.as_deref()), "denied"),
                             Authorised::Unanswered => (UNANSWERED_APPROVAL.to_string(), "denied"),
                             Authorised::Yes => {
                                 let execution_context = if must_ask
@@ -4264,6 +4264,50 @@ mod tests {
         // an "unknown MCP server" from further down.
         assert_eq!(said(2), UNANSWERED_APPROVAL, "an MCP tool is not authorised either");
         assert_eq!(said(3), "go on then", "but the question that was asked gets its answer");
+    }
+
+    #[tokio::test]
+    async fn tool_refusals_preserve_the_reason_without_inventing_who_decided() {
+        for reason in [None, Some("outside the approved scope")] {
+            let pool = crate::db::sea::sea_test_db().await;
+            conversation(&pool).await;
+            let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
+            let provider = Scripted::of(vec![
+                calls("call-1", "fixture", "{}"),
+                calls("call-2", "mcp__server__do", "{}"),
+                calls("call-3", "run_command", r#"{"command":"echo should-not-run"}"#),
+                says("fine"),
+            ]);
+            let approvals = Answers::saying(Some(ApprovalDecision::Denied(reason.map(str::to_owned))));
+            let fixture = Fixture::returning("ran anyway").asking_first();
+
+            let outcome = run_turn(
+                &services(&pool, &tools, &mcp),
+                setup(
+                    &provider,
+                    &pool,
+                    &cancel,
+                    &["fixture", "mcp__server__do", "run_command"],
+                ),
+                TurnPorts {
+                    surface_tools: Some(&fixture),
+                    ..ports(&approvals, None)
+                },
+            )
+            .await;
+
+            assert!(outcome.reply.is_ok());
+            assert!(fixture.ran.lock().unwrap().is_empty());
+            assert_eq!(approvals.asked.lock().unwrap().len(), 3);
+            let expected = match reason {
+                Some(reason) => format!("Tool call denied. Reason: {reason}"),
+                None => "Tool call denied.".to_string(),
+            };
+            let requests = provider.requests();
+            for request in &requests[1..] {
+                assert_eq!(request.0.last().unwrap().content, expected);
+            }
+        }
     }
 
     /// An unanswered card is not a yes. The distinction matters most on the
