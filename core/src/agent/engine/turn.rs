@@ -334,8 +334,12 @@ pub struct TurnSetup<'a> {
     pub context_limit: usize,
     pub approval_rule: ApprovalRule,
     pub withheld: WithheldWording,
-    /// Where a steered message's `file://` parts resolve against.
+    /// Where a steered message's `file://` parts resolve against, and where a
+    /// tool's media is stored.
     pub files_root: Option<std::path::PathBuf>,
+    /// Whether the model is sent the pictures a tool returns, or a line of
+    /// text in their place. Fixed for a model, so a replay agrees with the turn.
+    pub supports_images: bool,
     /// What a steered message's sticker parts render against. `None` for a
     /// runner whose messages never carry one.
     pub stickers: Option<StickerRendering>,
@@ -526,6 +530,7 @@ async fn run(
         approval_rule,
         withheld,
         files_root,
+        supports_images,
         stickers,
         mut interrupted,
         compaction,
@@ -1043,22 +1048,23 @@ async fn run(
                             let call_id = tc.id.clone();
                             match parse_sub_agent(&tc.arguments, &msg_id, &call_id) {
                                 Err(e) => {
-                                    in_flight
-                                        .push_back(futures::future::ready((format!("Error: {e}"), "error")).boxed());
+                                    in_flight.push_back(
+                                        futures::future::ready((format!("Error: {e}"), "error", Vec::new())).boxed(),
+                                    );
                                 }
                                 Ok(spec) => {
                                     let sub = ports.sub_agents.expect("partition guarantees sub_agents port");
                                     in_flight.push_back(
                                         async move {
                                             if cancel_inner.is_cancelled() {
-                                                return ("Cancelled".to_string(), "error");
+                                                return ("Cancelled".to_string(), "error", Vec::new());
                                             }
                                             match sub.run(spec).await {
                                                 Ok(report) => {
                                                     let outcome = report.status.outcome();
-                                                    (sub_agent_result(&report), outcome)
+                                                    (sub_agent_result(&report), outcome, Vec::new())
                                                 }
-                                                Err(e) => (format!("Error: {e}"), "error"),
+                                                Err(e) => (format!("Error: {e}"), "error", Vec::new()),
                                             }
                                         }
                                         .boxed(),
@@ -1074,8 +1080,9 @@ async fn run(
                             let mut args = match parse_tool_arguments(&tc.arguments) {
                                 Ok(a) => a,
                                 Err(e) => {
-                                    in_flight
-                                        .push_back(futures::future::ready((format!("Error: {e}"), "error")).boxed());
+                                    in_flight.push_back(
+                                        futures::future::ready((format!("Error: {e}"), "error", Vec::new())).boxed(),
+                                    );
                                     continue;
                                 }
                             };
@@ -1084,11 +1091,11 @@ async fn run(
                             in_flight.push_back(
                                 async move {
                                     if cancel_inner.is_cancelled() {
-                                        return ("Cancelled".to_string(), "error");
+                                        return ("Cancelled".to_string(), "error", Vec::new());
                                     }
-                                    match tool.execute(args, &ctx).await {
-                                        Ok(o) => (o, "success"),
-                                        Err(e) => (format!("Error: {e}"), "error"),
+                                    match tool.execute_rich(args, &ctx).await {
+                                        Ok(o) => (o.text, "success", o.media),
+                                        Err(e) => (format!("Error: {e}"), "error", Vec::new()),
                                     }
                                 }
                                 .boxed(),
@@ -1098,7 +1105,8 @@ async fn run(
 
                     // Collect results in wire order.
                     use futures::StreamExt;
-                    let mut results: Vec<(String, &str)> = Vec::with_capacity(parallel_ok.len());
+                    let mut results: Vec<(String, &'static str, Vec<tools::MediaOut>)> =
+                        Vec::with_capacity(parallel_ok.len());
                     while let Some(res) = in_flight.next().await {
                         results.push(res);
                     }
@@ -1107,9 +1115,10 @@ async fn run(
                     crate::agent::turn_record::note_phase(pool, &turn_id, TurnPhase::Streaming, None).await;
 
                     // Post-process each result sequentially in wire order.
-                    for (tc, (output, outcome)) in parallel_ok.iter().zip(results) {
-                        let output =
-                            crate::agent::formatted_truncate_text(&output, crate::agent::TOOL_OUTPUT_TRUNCATION);
+                    for (tc, (output, outcome, media)) in parallel_ok.iter().zip(results) {
+                        let settled =
+                            settle_tool_result(files_root.as_deref(), &conversation_id, &output, outcome, media);
+                        let (output, outcome) = (settled.text, settled.outcome);
 
                         let event_outcome = match outcome {
                             "success" => ToolOutcome::Success,
@@ -1118,6 +1127,7 @@ async fn run(
                         announce(ChatStreamEvent::ToolResult {
                             call_id: tc.id.clone(),
                             result: output.clone(),
+                            media: settled.stored.media.clone(),
                             outcome: event_outcome,
                             message_id: assistant_msg_id.clone(),
                             conversation_id: conversation_id.clone(),
@@ -1128,7 +1138,8 @@ async fn run(
                             &conversation_id,
                             &turn_id,
                             &tc.id,
-                            &output,
+                            &settled.stored.content,
+                            settled.stored.schema_version,
                             outcome,
                             parent_cursor.as_deref(),
                         )
@@ -1137,10 +1148,15 @@ async fn run(
                             parent_cursor = Some(id);
                         }
 
-                        chat_messages.push(match event_outcome {
-                            ToolOutcome::Success => ChatMessage::tool_result(&tc.id, &output),
-                            ToolOutcome::Denied | ToolOutcome::Error => ChatMessage::tool_error(&tc.id, &output),
-                        });
+                        chat_messages.push(tool_message(
+                            &tc.id,
+                            event_outcome,
+                            &output,
+                            &settled.stored,
+                            files_root.as_deref(),
+                            &conversation_id,
+                            supports_images,
+                        )?);
                     }
                 }
 
@@ -1175,7 +1191,9 @@ async fn run(
                         unreachable!("fallback_serial only contains guard-hit calls");
                     };
 
-                    let output = crate::agent::formatted_truncate_text(&output, crate::agent::TOOL_OUTPUT_TRUNCATION);
+                    let settled =
+                        settle_tool_result(files_root.as_deref(), &conversation_id, &output, outcome, Vec::new());
+                    let (output, outcome) = (settled.text, settled.outcome);
 
                     let event_outcome = match outcome {
                         "success" => ToolOutcome::Success,
@@ -1186,6 +1204,7 @@ async fn run(
                     announce(ChatStreamEvent::ToolResult {
                         call_id: tc.id.clone(),
                         result: output.clone(),
+                        media: settled.stored.media.clone(),
                         outcome: event_outcome,
                         message_id: assistant_msg_id.clone(),
                         conversation_id: conversation_id.clone(),
@@ -1196,7 +1215,8 @@ async fn run(
                         &conversation_id,
                         &turn_id,
                         &tc.id,
-                        &output,
+                        &settled.stored.content,
+                        settled.stored.schema_version,
                         outcome,
                         parent_cursor.as_deref(),
                     )
@@ -1205,10 +1225,15 @@ async fn run(
                         parent_cursor = Some(id);
                     }
 
-                    chat_messages.push(match event_outcome {
-                        ToolOutcome::Success => ChatMessage::tool_result(&tc.id, &output),
-                        ToolOutcome::Denied | ToolOutcome::Error => ChatMessage::tool_error(&tc.id, &output),
-                    });
+                    chat_messages.push(tool_message(
+                        &tc.id,
+                        event_outcome,
+                        &output,
+                        &settled.stored,
+                        files_root.as_deref(),
+                        &conversation_id,
+                        supports_images,
+                    )?);
 
                     if turn_aborted {
                         break;
@@ -1244,6 +1269,8 @@ async fn run(
             // attention on the same dialog forty times.
             let verdict = loop_guard.observe(&tc.name, &tc.arguments);
 
+            // Filled only by the two branches whose tools can return media.
+            let mut media: Vec<tools::MediaOut> = Vec::new();
             let (output, outcome): (String, &'static str) = if let crate::agent::LoopVerdict::Warn(n) = verdict {
                 (crate::agent::loop_warning_message(&tc.name, n), "error")
             } else if let crate::agent::LoopVerdict::Abort(n) = verdict {
@@ -1435,11 +1462,14 @@ async fn run(
                                     &turn_id,
                                     TurnPhase::RunningTool,
                                     Some(&tc.name),
-                                    services.mcp.call_tool(&tc.name, args),
+                                    services.mcp.call_tool_rich(&tc.name, args),
                                 )
                                 .await;
                                 match called {
-                                    Ok(o) => (o, "success"),
+                                    Ok(o) => {
+                                        media = o.media;
+                                        (o.text, "success")
+                                    }
                                     Err(e) => (format!("MCP error: {e}"), "error"),
                                 }
                             }
@@ -1517,11 +1547,14 @@ async fn run(
                                     &turn_id,
                                     TurnPhase::RunningTool,
                                     Some(&tc.name),
-                                    tool.execute(args.clone(), &execution_context),
+                                    tool.execute_rich(args.clone(), &execution_context),
                                 )
                                 .await;
                                 match executed {
-                                    Ok(o) => (o, "success"),
+                                    Ok(o) => {
+                                        media = o.media;
+                                        (o.text, "success")
+                                    }
                                     Err(e) => match tools::decode_escalation(&e) {
                                         None => (format!("Error: {e}"), "error"),
                                         Some(escalation) => {
@@ -1537,11 +1570,14 @@ async fn run(
                                                     &turn_id,
                                                     TurnPhase::RunningTool,
                                                     Some(&tc.name),
-                                                    tool.execute(args, &escalated),
+                                                    tool.execute_rich(args, &escalated),
                                                 )
                                                 .await;
                                                 match retried {
-                                                    Ok(o) => (o, "success"),
+                                                    Ok(o) => {
+                                                        media = o.media;
+                                                        (o.text, "success")
+                                                    }
                                                     Err(e2) => (format!("Error: {e2}"), "error"),
                                                 }
                                             } else {
@@ -1562,7 +1598,8 @@ async fn run(
                 plan_update_failed = true;
             }
 
-            let output = crate::agent::formatted_truncate_text(&output, crate::agent::TOOL_OUTPUT_TRUNCATION);
+            let settled = settle_tool_result(files_root.as_deref(), &conversation_id, &output, outcome, media);
+            let (output, outcome) = (settled.text, settled.outcome);
 
             let event_outcome = match outcome {
                 "success" => ToolOutcome::Success,
@@ -1573,6 +1610,7 @@ async fn run(
             announce(ChatStreamEvent::ToolResult {
                 call_id: tc.id.clone(),
                 result: output.clone(),
+                media: settled.stored.media.clone(),
                 outcome: event_outcome,
                 message_id: assistant_msg_id.clone(),
                 conversation_id: conversation_id.clone(),
@@ -1586,7 +1624,8 @@ async fn run(
                 &conversation_id,
                 &turn_id,
                 &tc.id,
-                &output,
+                &settled.stored.content,
+                settled.stored.schema_version,
                 outcome,
                 parent_cursor.as_deref(),
             )
@@ -1595,10 +1634,15 @@ async fn run(
                 parent_cursor = Some(id);
             }
 
-            chat_messages.push(match event_outcome {
-                ToolOutcome::Success => ChatMessage::tool_result(&tc.id, &output),
-                ToolOutcome::Denied | ToolOutcome::Error => ChatMessage::tool_error(&tc.id, &output),
-            });
+            chat_messages.push(tool_message(
+                &tc.id,
+                event_outcome,
+                &output,
+                &settled.stored,
+                files_root.as_deref(),
+                &conversation_id,
+                supports_images,
+            )?);
 
             if turn_aborted {
                 break;
@@ -1700,6 +1744,68 @@ fn narrow_offered(offered: &mut HashSet<String>, steering: Option<&dyn Steering>
     }
 }
 
+/// A tool result after truncation and after its media has been stored.
+struct SettledToolResult {
+    /// What the model reads and the event carries as `result`.
+    text: String,
+    outcome: &'static str,
+    /// The row. Its content equals `text` unless media was stored.
+    stored: crate::agent::tool_media::StoredToolResult,
+}
+
+/// Truncate the text — media never takes part — and store any media under
+/// the conversation's directory. Media that cannot be stored turns the whole
+/// result into an error: see `tool_media::store`. Only a success carries it.
+fn settle_tool_result(
+    files_root: Option<&std::path::Path>,
+    conversation_id: &str,
+    output: &str,
+    outcome: &'static str,
+    media: Vec<tools::MediaOut>,
+) -> SettledToolResult {
+    let text = crate::agent::formatted_truncate_text(output, crate::agent::TOOL_OUTPUT_TRUNCATION);
+    let media = if outcome == "success" { media } else { Vec::new() };
+    match crate::agent::tool_media::store(files_root, conversation_id, &text, media) {
+        Ok(stored) => SettledToolResult { text, outcome, stored },
+        Err(error) => {
+            tracing::warn!(%error, "a tool result's media could not be stored");
+            let text = format!("Error: {error}");
+            SettledToolResult {
+                stored: crate::agent::tool_media::StoredToolResult {
+                    content: text.clone(),
+                    schema_version: 2,
+                    media: Vec::new(),
+                },
+                text,
+                outcome: "error",
+            }
+        }
+    }
+}
+
+/// The request message for a tool result: the same bytes the next turn will
+/// rebuild from its row, with pictures inlined the same way.
+fn tool_message(
+    call_id: &str,
+    outcome: ToolOutcome,
+    text: &str,
+    stored: &crate::agent::tool_media::StoredToolResult,
+    files_root: Option<&std::path::Path>,
+    conversation_id: &str,
+    supports_images: bool,
+) -> Result<ChatMessage, String> {
+    Ok(match outcome {
+        ToolOutcome::Success if stored.schema_version == crate::agent::tool_media::TOOL_PARTS_SCHEMA_VERSION => {
+            let mut message = [ChatMessage::tool_result_parts(call_id, &stored.content)];
+            crate::agent::resolve_file_uris_in_messages(&mut message, files_root, conversation_id, supports_images)?;
+            let [message] = message;
+            message
+        }
+        ToolOutcome::Success => ChatMessage::tool_result(call_id, text),
+        ToolOutcome::Denied | ToolOutcome::Error => ChatMessage::tool_error(call_id, text),
+    })
+}
+
 async fn inject_steering(
     pool: &crate::db::sea::cap::Db,
     conversation_id: &str,
@@ -1762,7 +1868,8 @@ async fn inject_steering(
             )
             .await?;
         }
-        crate::agent::resolve_file_uris_in_messages(&mut injected, files_root)?;
+        // Steered messages are a person's, and the flag only governs tool rows.
+        crate::agent::resolve_file_uris_in_messages(&mut injected, files_root, conversation_id, true)?;
         chat_messages.extend(injected);
     }
     Ok(())
@@ -2295,6 +2402,7 @@ mod tests {
             approval_rule: ApprovalRule::ByReach { accept_edits: false },
             withheld: WithheldWording::Explained,
             files_root: None,
+            supports_images: true,
             stickers: None,
             interrupted: None,
             compaction: CompactionPolicy::OneBot,
@@ -4348,5 +4456,112 @@ mod tests {
 
         assert_eq!(approvals.asked.lock().unwrap().len(), 2);
         assert!(marker.exists(), "confirmed, and it did not run");
+    }
+
+    /// A registry tool that answers with a long text and one picture.
+    struct Camera {
+        parallel: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl tools::Tool for Camera {
+        fn name(&self) -> &str {
+            "camera"
+        }
+        fn description(&self) -> &str {
+            "takes a picture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn default_permission(&self) -> tools::Permission {
+            tools::Permission::Always
+        }
+        fn spec(&self) -> tools::spec::ToolSpec {
+            tools::spec::ToolSpec {
+                effect: tools::spec::Effect::Read,
+                loop_handled: false,
+                plan_mode: true,
+                explore: true,
+                reviewer: true,
+                parallel: self.parallel,
+            }
+        }
+        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String, String> {
+            unreachable!("the loop calls execute_rich")
+        }
+        async fn execute_rich(&self, _: serde_json::Value, _: &ToolContext) -> Result<tools::ToolOutput, String> {
+            Ok(tools::ToolOutput {
+                text: "x".repeat(100_000),
+                media: vec![tools::MediaOut::Bytes {
+                    mime: "image/png".into(),
+                    bytes: b"PNGDATA".to_vec(),
+                    name: None,
+                }],
+            })
+        }
+    }
+
+    async fn a_tool_picture_is_stored_and_sent(parallel: bool) {
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
+        let dir = tempfile::tempdir().unwrap();
+        let tools = registry();
+        tools.set_custom_tools(vec![std::sync::Arc::new(Camera { parallel })]);
+        let (mcp, cancel) = (McpRegistry::new(), CancellationToken::new());
+        let provider = Scripted::of(vec![calls("c1", "camera", "{}"), says("a cat")]);
+        let approvals = Answers::nobody();
+        let mut turn = setup(&provider, &pool, &cancel, &["camera"]);
+        turn.files_root = Some(dir.path().to_path_buf());
+
+        let outcome = run_turn(&services(&pool, &tools, &mcp), turn, ports(&approvals, None)).await;
+        assert_eq!(outcome.reply.as_deref(), Ok("a cat"));
+
+        let row = rows(&pool).await.into_iter().find(|r| r.role == "tool").unwrap();
+        assert_eq!(row.schema_version, crate::agent::tool_media::TOOL_PARTS_SCHEMA_VERSION);
+        assert!(row.content.contains("file://") && !row.content.contains("base64"));
+        let view = crate::agent::tool_media::view(&row.content, row.schema_version).unwrap();
+        assert_eq!(view.media.len(), 1);
+        // The text was truncated; the picture took no part in it.
+        assert!(view.text.len() < 100_000, "{}", view.text.len());
+        assert!(crate::files::resolve_conversation_file(&view.media[0].url, dir.path(), "c1").is_some());
+
+        let second = &provider.requests()[1].0;
+        let sent = second.iter().find(|m| m.role == "tool").unwrap();
+        assert_eq!(sent.origin, crate::provider::MessageOrigin::ToolParts);
+        assert!(sent.content.contains("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn a_tool_picture_is_stored_and_sent_on_the_serial_path() {
+        a_tool_picture_is_stored_and_sent(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_tool_picture_is_stored_and_sent_on_the_parallel_path() {
+        a_tool_picture_is_stored_and_sent(true).await;
+    }
+
+    /// Without somewhere to store it, a picture is an error, not silently lost.
+    #[tokio::test]
+    async fn a_tool_picture_with_no_attachment_directory_fails_the_call() {
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
+        let tools = registry();
+        tools.set_custom_tools(vec![std::sync::Arc::new(Camera { parallel: false })]);
+        let (mcp, cancel) = (McpRegistry::new(), CancellationToken::new());
+        let provider = Scripted::of(vec![calls("c1", "camera", "{}"), says("sorry")]);
+        let approvals = Answers::nobody();
+        let outcome = run_turn(
+            &services(&pool, &tools, &mcp),
+            setup(&provider, &pool, &cancel, &["camera"]),
+            ports(&approvals, None),
+        )
+        .await;
+        assert_eq!(outcome.reply.as_deref(), Ok("sorry"));
+        let row = rows(&pool).await.into_iter().find(|r| r.role == "tool").unwrap();
+        assert_eq!(row.schema_version, 2);
+        assert_eq!(row.tool_outcome.as_deref(), Some("error"));
+        assert!(row.content.contains("no attachment directory"), "{}", row.content);
     }
 }

@@ -23,43 +23,54 @@ impl DeepSeekProvider {
     }
 
     fn serialize_messages(messages: &[ChatMessage]) -> Result<Vec<serde_json::Value>, ProviderError> {
-        messages
-            .iter()
-            .map(|m| {
-                let rendered =
-                    super::render_message(m, super::SenderRendering::NameField).map_err(ProviderError::Parse)?;
-                let mut msg = serde_json::json!({ "role": m.role, "content": rendered.content });
-                if let Some(ref name) = rendered.name {
-                    msg["name"] = serde_json::json!(name);
-                }
-                // DeepSeek requires reasoning_content only for assistant messages with
-                // tool_calls; for plain assistant replies it is ignored by the API and
-                // stripping it keeps the prefix shorter → better cache hit rate.
-                if let Some(ref rc) = m.reasoning_content
-                    && m.tool_calls.is_some()
-                {
-                    msg["reasoning_content"] = serde_json::json!(rc);
-                }
-                if let Some(ref tool_calls) = m.tool_calls {
-                    msg["tool_calls"] = serde_json::json!(
-                        tool_calls
-                            .iter()
-                            .map(|tc| {
-                                serde_json::json!({
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": { "name": tc.name, "arguments": tc.arguments }
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    );
-                }
-                if let Some(ref tool_call_id) = m.tool_call_id {
-                    msg["tool_call_id"] = serde_json::json!(tool_call_id);
-                }
-                Ok(msg)
-            })
-            .collect()
+        let mut carry = super::ToolImageCarry::default();
+        let mut out = Vec::with_capacity(messages.len());
+        for m in messages {
+            if m.role != "tool" {
+                carry.flush(&mut out);
+            }
+            out.push(Self::serialize_message(m, &mut carry)?);
+        }
+        carry.flush(&mut out);
+        Ok(out)
+    }
+
+    fn serialize_message(
+        m: &ChatMessage,
+        carry: &mut super::ToolImageCarry,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let rendered = super::render_message(m, super::SenderRendering::NameField).map_err(ProviderError::Parse)?;
+        let content = carry.take(m).map_err(ProviderError::Parse)?.unwrap_or(rendered.content);
+        let mut msg = serde_json::json!({ "role": m.role, "content": content });
+        if let Some(ref name) = rendered.name {
+            msg["name"] = serde_json::json!(name);
+        }
+        // DeepSeek requires reasoning_content only for assistant messages with
+        // tool_calls; for plain assistant replies it is ignored by the API and
+        // stripping it keeps the prefix shorter → better cache hit rate.
+        if let Some(ref rc) = m.reasoning_content
+            && m.tool_calls.is_some()
+        {
+            msg["reasoning_content"] = serde_json::json!(rc);
+        }
+        if let Some(ref tool_calls) = m.tool_calls {
+            msg["tool_calls"] = serde_json::json!(
+                tool_calls
+                    .iter()
+                    .map(|tc| {
+                        serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": { "name": tc.name, "arguments": tc.arguments }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        if let Some(ref tool_call_id) = m.tool_call_id {
+            msg["tool_call_id"] = serde_json::json!(tool_call_id);
+        }
+        Ok(msg)
     }
 
     fn build_request(

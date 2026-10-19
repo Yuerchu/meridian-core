@@ -454,6 +454,24 @@ fn responses_user_content(content: &str) -> Result<Vec<serde_json::Value>, Provi
         .collect()
 }
 
+/// A `function_call_output.output`: the text, or — for a result with pictures —
+/// the content list the field also accepts, in the same part shapes a user
+/// message uses.
+pub(super) fn responses_tool_output(m: &ChatMessage) -> Result<serde_json::Value, ProviderError> {
+    Ok(match super::tool_result_parts(m).map_err(ProviderError::Parse)? {
+        None => serde_json::json!(m.content),
+        Some(parts) => serde_json::Value::Array(
+            parts
+                .into_iter()
+                .map(|part| match part {
+                    super::ToolWirePart::Text(text) => serde_json::json!({ "type": "input_text", "text": text }),
+                    super::ToolWirePart::Image(url) => serde_json::json!({ "type": "input_image", "image_url": url }),
+                })
+                .collect(),
+        ),
+    })
+}
+
 /// `reasoning_replay` names the model whose stored reasoning items go back into
 /// the input, or `None` to leave them out — see
 /// [`OpenAIResponsesProvider::reasoning_replay`].
@@ -514,7 +532,7 @@ fn serialize_responses_input(
                     input.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": m.content,
+                        "output": responses_tool_output(m)?,
                     }));
                 }
             }
@@ -1639,6 +1657,31 @@ impl ChatProvider for OpenAIResponsesProvider {
 mod tests {
     use super::*;
     use crate::provider::ServerToolKind;
+
+    #[test]
+    fn a_tool_picture_goes_back_as_an_output_list() {
+        let (_, input) = serialize_responses_input(
+            &[
+                ChatMessage::assistant_with_tools(
+                    "",
+                    None,
+                    vec![crate::provider::ToolCall { id: "c1".into(), name: "shot".into(), arguments: "{}".into() }],
+                ),
+                ChatMessage::tool_result_parts("c1", r#"[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#),
+                ChatMessage::tool_result("c2", "plain"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            input[1]["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "shot"},
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+            ])
+        );
+        assert_eq!(input[2]["output"], "plain");
+    }
 
     fn body_for(model: &str, mutate: impl FnOnce(&mut ChatParams)) -> serde_json::Value {
         let caps = crate::provider::capabilities::resolve("openai", Some("responses"), model);

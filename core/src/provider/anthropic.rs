@@ -70,10 +70,27 @@ impl AnthropicProvider {
             // requires every tool_result for a turn to share the user message that
             // immediately follows the tool_use.
             if m.role == "tool" {
+                // A result with pictures is a block list; `tool_result` takes
+                // text and image blocks natively.
+                let content = match super::tool_result_parts(m).map_err(ProviderError::Parse)? {
+                    None => serde_json::json!(m.content),
+                    Some(parts) => serde_json::Value::Array(
+                        parts
+                            .into_iter()
+                            .filter(|part| !matches!(part, super::ToolWirePart::Text(text) if text.is_empty()))
+                            .map(|part| match part {
+                                super::ToolWirePart::Text(text) => serde_json::json!({"type": "text", "text": text}),
+                                super::ToolWirePart::Image(url) => {
+                                    serde_json::json!({"type": "image", "source": Self::source_for(&url)})
+                                }
+                            })
+                            .collect(),
+                    ),
+                };
                 let mut block = serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": m.tool_call_id.as_deref().unwrap_or(""),
-                    "content": m.content,
+                    "content": content,
                 });
                 if m.tool_error {
                     block["is_error"] = serde_json::Value::Bool(true);
@@ -1152,6 +1169,30 @@ impl ChatProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_picture_goes_back_inside_its_tool_result() {
+        let wire = AnthropicProvider::serialize_messages(
+            &[
+                ChatMessage::user("look"),
+                ChatMessage::assistant_with_tools(
+                    "",
+                    None,
+                    vec![crate::provider::ToolCall { id: "c1".into(), name: "shot".into(), arguments: "{}".into() }],
+                ),
+                ChatMessage::tool_result_parts("c1", r#"[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#),
+            ],
+            "claude-test",
+        )
+        .unwrap();
+        assert_eq!(
+            wire[2]["content"][0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "shot"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+            ])
+        );
+    }
 
     /// The other half of the chat-completions case: an assistant answering
     /// with a JSON array went through the user-attachment decoder and failed

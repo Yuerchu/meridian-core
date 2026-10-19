@@ -411,7 +411,7 @@ fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec
             input.push(json!({
                 "type": "function_result",
                 "call_id": call_id,
-                "result": [{ "type": "text", "text": message.content }],
+                "result": function_result_content(message)?,
             }));
             continue;
         }
@@ -442,7 +442,7 @@ fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec
                 let recorded_results = messages[message_index + 1..]
                     .iter()
                     .take_while(|next| next.role == "tool")
-                    .filter_map(|next| Some((next.tool_call_id.as_deref()?, next.content.as_str())))
+                    .filter_map(|next| Some((next.tool_call_id.as_deref()?, next)))
                     .collect::<HashMap<_, _>>();
                 for call in tool_calls {
                     let arguments =
@@ -455,15 +455,18 @@ fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec
                             "arguments": arguments,
                         }));
                     }
-                    let result = recorded_results
-                        .get(call.id.as_str())
-                        .copied()
-                        .unwrap_or("Tool execution was interrupted before a result was recorded. It was not retried.");
+                    let result = match recorded_results.get(call.id.as_str()) {
+                        Some(message) => function_result_content(message)?,
+                        None => vec![json!({
+                            "type": "text",
+                            "text": "Tool execution was interrupted before a result was recorded. It was not retried.",
+                        })],
+                    };
                     input.push(json!({
                         "type": "function_result",
                         "call_id": call.id,
                         "name": call.name,
-                        "result": [{ "type": "text", "text": result }],
+                        "result": result,
                     }));
                     consumed_results.insert(call.id.clone());
                 }
@@ -495,6 +498,21 @@ fn rendered_parts(content: &str) -> Result<Vec<Value>, ProviderError> {
             )),
         })
         .collect()
+}
+
+/// A `function_result.result`: the same content list a user input takes, so
+/// pictures a tool returned go back inside the result they belong to.
+fn function_result_content(message: &ChatMessage) -> Result<Vec<Value>, ProviderError> {
+    Ok(match super::tool_result_parts(message).map_err(ProviderError::Parse)? {
+        None => vec![json!({ "type": "text", "text": message.content })],
+        Some(parts) => parts
+            .into_iter()
+            .map(|part| match part {
+                super::ToolWirePart::Text(text) => json!({ "type": "text", "text": text }),
+                super::ToolWirePart::Image(url) => interaction_media("image", &url),
+            })
+            .collect(),
+    })
 }
 
 fn interaction_media(kind: &str, url: &str) -> Value {
@@ -1282,6 +1300,29 @@ impl ChatProvider for GoogleInteractionsProvider {
 mod tests {
     use super::*;
     use crate::provider::state::ProviderStateAccumulator;
+
+    #[test]
+    fn a_tool_picture_goes_back_inside_its_function_result() {
+        let assistant = ChatMessage::assistant_with_tools(
+            "",
+            None,
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "shot".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        let (_, input) =
+            serialize_input(&[assistant, ChatMessage::tool_result_parts("c1", r#"[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#)], "gemini-test").unwrap();
+        let result = input.iter().find(|step| step["type"] == "function_result").unwrap();
+        assert_eq!(
+            result["result"],
+            json!([
+                {"type": "text", "text": "shot"},
+                {"type": "image", "data": "QUJD", "mime_type": "image/png"},
+            ])
+        );
+    }
 
     #[test]
     fn endpoint_defaults_to_vertex_global_interactions() {

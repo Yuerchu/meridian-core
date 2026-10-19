@@ -93,7 +93,7 @@ fn line(msg: &message_entity::Model) -> Result<Option<String>, String> {
             Ok(Some(serde_json::Value::Object(entry).to_string()))
         }
         MessageRole::Tool => Ok(Some(
-            json!({ "tool_output": cap(&msg.content, MAX_TOOL_OUTPUT_TOKENS) }).to_string(),
+            json!({ "tool_output": cap(&crate::agent::tool_media::result_text(&msg.content, msg.schema_version), MAX_TOOL_OUTPUT_TOKENS) }).to_string(),
         )),
         // Handled above.
         MessageRole::Context => unreachable!(),
@@ -238,6 +238,18 @@ async fn freeze_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a tool returned beside its text is counted, never quoted: the
+    /// envelope holds a path into this machine's attachment directory.
+    #[test]
+    fn a_tool_picture_is_a_count_not_a_path() {
+        let content = r#"[{"type":"text","text":"captured"},{"type":"image_url","image_url":{"url":"file:///C:/x/files/c/a.png"}}]"#;
+        let mut tool = row("m1", "tool", content);
+        tool.schema_version = crate::agent::tool_media::TOOL_PARTS_SCHEMA_VERSION;
+        let (out, _) = render_excerpt(&[tool], 1_000).unwrap();
+        assert!(out.contains("captured [+1 media]"), "{out}");
+        assert!(!out.contains("file://"), "{out}");
+    }
 
     fn row(id: &str, role: &str, content: &str) -> message_entity::Model {
         message_entity::Model {

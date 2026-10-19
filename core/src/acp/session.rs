@@ -704,6 +704,7 @@ impl Shared {
                 self.emit(ChatStreamEvent::ToolResult {
                     call_id,
                     result,
+                    media: Vec::new(),
                     outcome,
                     message_id,
                     conversation_id: self.conversation_id.clone(),
@@ -978,6 +979,7 @@ impl Shared {
                 turn_id,
                 call_id,
                 output,
+                2,
                 outcome.as_str(),
                 Some(&last),
             )

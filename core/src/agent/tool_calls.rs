@@ -113,7 +113,9 @@ pub fn parse_stored_tool_calls(schema_version: i32, json: Option<&str>) -> Resul
             .map(extract_tool_calls_from_blocks)
             .transpose()
             .map(Option::unwrap_or_default),
-        2 => parse_openai_tool_calls(json),
+        // 3 differs from 2 only in what a *tool* row's content holds
+        // (`agent::tool_media`); an assistant row's calls are the same.
+        2 | 3 => parse_openai_tool_calls(json),
         version => Err(format!("unsupported persisted message schema_version {version}")),
     }
 }
@@ -218,6 +220,6 @@ mod tests {
     #[test]
     fn future_message_schema_versions_are_rejected() {
         assert!(parse_stored_tool_calls(0, None).is_err());
-        assert!(parse_stored_tool_calls(3, Some("[]")).is_err());
+        assert!(parse_stored_tool_calls(4, Some("[]")).is_err());
     }
 }

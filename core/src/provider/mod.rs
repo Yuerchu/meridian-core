@@ -67,6 +67,11 @@ pub enum MessageOrigin {
     LegacyUser,
     Assistant,
     Tool,
+    /// A tool row whose `content` is the parts envelope (text plus pictures),
+    /// which only the turn loop writes — see `agent::tool_media`. Its own
+    /// origin rather than a check on the text: a tool returning something that
+    /// merely looks like the envelope is still text.
+    ToolParts,
     /// Background injected by us — memories, group facts. Not something anyone
     /// said, and never to be replied to directly.
     SystemContext,
@@ -233,6 +238,13 @@ impl ChatMessage {
             provider_state: None,
             origin: MessageOrigin::Tool,
             sent_at: None,
+        }
+    }
+    /// A tool result carrying media: `content` is an encoded parts envelope.
+    pub fn tool_result_parts(tool_call_id: &str, content: &str) -> Self {
+        Self {
+            origin: MessageOrigin::ToolParts,
+            ..Self::tool_result(tool_call_id, content)
         }
     }
     /// Same row as `tool_result`, flagged as a failure or a refusal.
@@ -541,6 +553,112 @@ pub(crate) fn encode_message_parts(parts: &[MessageContentPart]) -> Result<Strin
         return Err("invalid persisted message content parts: the array must not be empty".into());
     }
     serde_json::to_string(parts).map_err(|error| format!("could not encode persisted message content parts: {error}"))
+}
+
+/// A tool result carrying media, as the parts an adapter puts on the wire:
+/// `None` for an ordinary text result. By the time a request is built
+/// `agent::resolve_file_uris_in_messages` has reduced the envelope to text
+/// and inlined pictures, so a part of any other kind here is a bug upstream
+/// of the adapter and fails the request.
+pub(crate) fn tool_result_parts(m: &ChatMessage) -> Result<Option<Vec<ToolWirePart>>, String> {
+    if m.origin != MessageOrigin::ToolParts {
+        return Ok(None);
+    }
+    let parts = decode_message_parts(&m.content)?.ok_or("a tool result marked as parts holds no parts envelope")?;
+    parts
+        .into_iter()
+        .map(|part| match part {
+            MessageContentPart::Text { text } => Ok(ToolWirePart::Text(text)),
+            MessageContentPart::ImageUrl { image_url } if image_url.url.starts_with("data:") => {
+                Ok(ToolWirePart::Image(image_url.url))
+            }
+            _ => Err("a tool result reached the adapter with an unresolved attachment".to_string()),
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(Some)
+}
+
+/// One part of a tool result on its way to the wire. See [`tool_result_parts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolWirePart {
+    Text(String),
+    /// A `data:` URI.
+    Image(String),
+}
+
+/// The text of a tool result for a wire format that cannot put pictures in
+/// one: its text, and how many pictures follow after the results. Never
+/// results. Never empty, which some chat-completions servers refuse.
+pub(crate) fn tool_result_wire_text(parts: &[ToolWirePart]) -> String {
+    let text = parts
+        .iter()
+        .filter_map(|part| match part {
+            ToolWirePart::Text(text) => Some(text.as_str()),
+            ToolWirePart::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let images = parts
+        .iter()
+        .filter(|part| matches!(part, ToolWirePart::Image(_)))
+        .count();
+    match (text.is_empty(), images) {
+        (_, 0) => text,
+        (true, n) => format!("[{n} image(s) follow the tool results]"),
+        (false, n) => format!("{text}\n[{n} image(s) follow the tool results]"),
+    }
+}
+
+/// The caption in front of pictures a tool returned, when they have to travel
+/// in a user message of their own.
+pub(crate) fn tool_media_caption(call_id: &str) -> String {
+    format!("[Images returned by tool call {call_id}]")
+}
+
+/// Pictures from tool results, for the chat-completions dialects, where a
+/// `role: "tool"` message is text only. Each result's text goes into its tool
+/// message; its pictures wait here and go out as one user message after the
+/// last tool message of the run — a user message between two results of the
+/// same batch would break the rule that results follow their calls.
+#[derive(Default)]
+pub(crate) struct ToolImageCarry {
+    pending: Vec<serde_json::Value>,
+}
+
+impl ToolImageCarry {
+    /// The text for `m`'s tool message, or `None` for a result without media
+    /// (whose content goes out as it is).
+    pub(crate) fn take(&mut self, m: &ChatMessage) -> Result<Option<String>, String> {
+        let Some(parts) = tool_result_parts(m)? else {
+            return Ok(None);
+        };
+        let images: Vec<&str> = parts
+            .iter()
+            .filter_map(|part| match part {
+                ToolWirePart::Image(url) => Some(url.as_str()),
+                ToolWirePart::Text(_) => None,
+            })
+            .collect();
+        if !images.is_empty() {
+            let caption = tool_media_caption(m.tool_call_id.as_deref().unwrap_or(""));
+            self.pending
+                .push(serde_json::json!({ "type": "text", "text": caption }));
+            self.pending.extend(
+                images
+                    .into_iter()
+                    .map(|url| serde_json::json!({ "type": "image_url", "image_url": { "url": url } })),
+            );
+        }
+        Ok(Some(tool_result_wire_text(&parts)))
+    }
+
+    /// Emit what is waiting. Called before every message that is not a tool
+    /// result, and once at the end.
+    pub(crate) fn flush(&mut self, out: &mut Vec<serde_json::Value>) {
+        if !self.pending.is_empty() {
+            out.push(serde_json::json!({ "role": "user", "content": std::mem::take(&mut self.pending) }));
+        }
+    }
 }
 
 pub(crate) fn decode_tool_arguments(arguments: &str, call_id: &str) -> Result<serde_json::Value, String> {

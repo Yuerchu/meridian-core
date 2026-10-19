@@ -243,7 +243,7 @@ fn serialize_codex_input(
                     input.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": m.content,
+                        "output": super::openai_responses::responses_tool_output(m)?,
                     }));
                 }
             }

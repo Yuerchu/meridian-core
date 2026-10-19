@@ -543,7 +543,11 @@ impl RedactionEngine {
             // Only a user message can be the attachment envelope. Read as one,
             // a tool printing a JSON array had only its `"type":"text"`
             // members scanned, which for ordinary JSON is none of it.
-            if msg.role == "user" && msg.content.starts_with("[{") {
+            // The same envelope on a tool row is marked by its origin, never
+            // guessed from the text; scanned as text, its base64 would be.
+            if (msg.role == "user" || msg.origin == crate::provider::MessageOrigin::ToolParts)
+                && msg.content.starts_with("[{")
+            {
                 if let Some(redacted) =
                     self.redact_multimodal_mapped(&msg.content, project_id, &set, &mut conv_map, &mut report)
                 {
@@ -731,6 +735,28 @@ impl Clone for RuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool result with a picture is scanned part by part like a user's
+    /// attachments: its text is redacted and its base64 is left whole.
+    #[test]
+    fn tool_parts_redaction_scans_the_text_and_spares_the_picture() {
+        let engine = RedactionEngine::new();
+        let mappings = RedactionMappings::new();
+        // Digits are base64 too; scanned as text, this payload reads as a phone number.
+        let content = r#"[{"type":"text","text":"mail user@example.com"},{"type":"image_url","image_url":{"url":"data:image/png;base64,13800138000+AAA"}}]"#;
+        let mut messages = vec![ChatMessage::tool_result_parts("c1", content)];
+        engine.scrub_for_conversation(&mut messages, None, "conv", &mappings);
+        assert!(
+            !messages[0].content.contains("user@example.com"),
+            "{}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("base64,13800138000+AAA"),
+            "{}",
+            messages[0].content
+        );
+    }
 
     #[test]
     fn tool_output_that_is_a_json_array_is_scanned_as_text() {

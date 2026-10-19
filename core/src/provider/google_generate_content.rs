@@ -119,21 +119,24 @@ fn serialize_contents(
             let id = message.tool_call_id.as_deref().unwrap_or("");
             if consumed_results.contains(id) {
                 continue;
-            } else if flattened_calls.contains(id) {
+            }
+            let (text, media) = tool_result_wire(message)?;
+            if flattened_calls.contains(id) {
                 push_content(
                     &mut out,
                     "user",
                     vec![serde_json::json!({
-                        "text": format!("[Historical tool result for {id}]\n{}", message.content)
+                        "text": format!("[Historical tool result for {id}]\n{text}")
                     })],
                 );
             } else {
                 push_content(
                     &mut out,
                     "user",
-                    vec![function_response_part(id, "unknown_tool", &message.content)],
+                    vec![function_response_part(id, "unknown_tool", &text)],
                 );
             }
+            push_content(&mut out, "user", media);
             continue;
         }
         flattened_calls.clear();
@@ -193,17 +196,26 @@ fn serialize_contents(
             let recorded_results = messages[message_index + 1..]
                 .iter()
                 .take_while(|next| next.role == "tool")
-                .filter_map(|next| Some((next.tool_call_id.as_deref()?, next.content.as_str())))
+                .filter_map(|next| Some((next.tool_call_id.as_deref()?, next)))
                 .collect::<HashMap<_, _>>();
             let mut result_parts = Vec::with_capacity(tool_calls.len());
+            let mut media_parts = Vec::new();
             for call in tool_calls {
-                let result = recorded_results
-                    .get(call.id.as_str())
-                    .copied()
-                    .unwrap_or("Tool execution was interrupted before a result was recorded. It was not retried.");
-                result_parts.push(function_response_part(&call.id, &call.name, result));
+                let result = match recorded_results.get(call.id.as_str()) {
+                    Some(message) => {
+                        let (text, media) = tool_result_wire(message)?;
+                        media_parts.extend(media);
+                        text
+                    }
+                    None => "Tool execution was interrupted before a result was recorded. It was not retried.".into(),
+                };
+                result_parts.push(function_response_part(&call.id, &call.name, &result));
                 consumed_results.insert(call.id.clone());
             }
+            // Pictures a tool returned follow every response of the batch, in
+            // the same user turn: `functionResponse.response` is a JSON object
+            // and has no place for bytes on the models this adapter serves.
+            result_parts.extend(media_parts);
             push_content(&mut out, "user", result_parts);
             continue;
         }
@@ -281,6 +293,25 @@ fn media_part(url: Option<&str>) -> serde_json::Value {
         return serde_json::json!({ "inlineData": { "mimeType": mime_type, "data": payload } });
     }
     serde_json::json!({ "fileData": { "fileUri": url } })
+}
+
+/// A tool result as the text of its `functionResponse`, and the parts that
+/// carry its pictures: a caption naming the call, then each image inline.
+fn tool_result_wire(message: &ChatMessage) -> Result<(String, Vec<serde_json::Value>), ProviderError> {
+    let Some(parts) = super::tool_result_parts(message).map_err(ProviderError::Parse)? else {
+        return Ok((message.content.clone(), Vec::new()));
+    };
+    let mut media = Vec::new();
+    for part in &parts {
+        if let super::ToolWirePart::Image(url) = part {
+            if media.is_empty() {
+                let id = message.tool_call_id.as_deref().unwrap_or("");
+                media.push(serde_json::json!({ "text": super::tool_media_caption(id) }));
+            }
+            media.push(media_part(Some(url)));
+        }
+    }
+    Ok((super::tool_result_wire_text(&parts), media))
 }
 
 fn function_response_part(id: &str, name: &str, output: &str) -> serde_json::Value {
@@ -627,6 +658,63 @@ impl ChatProvider for GoogleGenerateContentProvider {
 mod tests {
     use super::*;
     use crate::provider::state::{GoogleThoughtSignature, ProviderState, ProviderStatePayload, ProviderStateProducer};
+
+    #[test]
+    fn a_tool_picture_follows_the_function_responses_in_the_same_turn() {
+        let mut assistant = ChatMessage::assistant_with_tools(
+            "",
+            None,
+            vec![
+                ToolCall {
+                    id: "call-a".into(),
+                    name: "shot".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "call-b".into(),
+                    name: "other".into(),
+                    arguments: "{}".into(),
+                },
+            ],
+        );
+        assistant.provider_state = Some(ProviderState {
+            version: 1,
+            producer: ProviderStateProducer {
+                vendor: "google".into(),
+                protocol: GOOGLE_GENERATE_CONTENT_PROTOCOL.into(),
+                model: "gemini-3.7-flash".into(),
+            },
+            payload: ProviderStatePayload::GoogleThoughtSignatures {
+                signatures: vec![GoogleThoughtSignature {
+                    location: GoogleSignatureLocation::ToolCall {
+                        index: 0,
+                        call_id: Some("call-a".into()),
+                    },
+                    signature: "signed-call".into(),
+                }],
+            },
+        });
+        let (_, contents) = serialize_contents(
+            &[
+                assistant,
+                ChatMessage::tool_result_parts("call-a", r#"[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]"#),
+                ChatMessage::tool_result("call-b", "plain"),
+            ],
+            "gemini-3.7-flash",
+        )
+        .unwrap();
+        let parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(
+            parts[0]["functionResponse"]["response"]["output"],
+            "shot\n[1 image(s) follow the tool results]"
+        );
+        assert_eq!(parts[1]["functionResponse"]["response"]["output"], "plain");
+        assert_eq!(parts[2]["text"], "[Images returned by tool call call-a]");
+        assert_eq!(
+            parts[3]["inlineData"],
+            serde_json::json!({"mimeType": "image/png", "data": "QUJD"})
+        );
+    }
 
     #[test]
     fn root_accepts_official_openai_compat_urls() {

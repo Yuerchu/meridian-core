@@ -162,12 +162,15 @@ pub(crate) async fn append_tool_result(
     turn_id: &str,
     call_id: &str,
     content: &str,
+    schema_version: i32,
     outcome: &'static str,
     parent: Option<&str>,
 ) -> Option<String> {
     let message_id = uuid::Uuid::new_v4().to_string();
     let row = message::Model {
         tool_call_id: Some(call_id.to_owned()),
+        // 3 when `content` is the parts envelope; see `agent::tool_media`.
+        schema_version,
         // The same word the event carries, so a reload does not turn a refusal
         // into a green tick with the refusal text sitting in it as the result.
         tool_outcome: Some(outcome.to_owned()),
@@ -478,11 +481,11 @@ mod tests {
     async fn a_tool_result_that_cannot_be_written_does_not_stop_the_turn() {
         let db = conversation().await;
         let assistant = begin_assistant(&db, "c1", "t1", (None, None), "m", None).await.unwrap();
-        let landed = append_tool_result(&db, "c1", "t1", "call-1", "done", "success", Some(&assistant)).await;
+        let landed = append_tool_result(&db, "c1", "t1", "call-1", "done", 2, "success", Some(&assistant)).await;
         assert!(landed.is_some());
         assert_eq!(head(&db).await, landed, "the cursor moves onto it");
 
-        let lost = append_tool_result(&db, "nope", "t1", "call-2", "done", "success", Some(&assistant)).await;
+        let lost = append_tool_result(&db, "nope", "t1", "call-2", "done", 2, "success", Some(&assistant)).await;
         assert_eq!(lost, None, "None is how the caller knows to leave the cursor alone");
     }
 
@@ -492,7 +495,7 @@ mod tests {
     async fn a_tool_row_records_how_the_call_went() {
         let db = conversation().await;
         for (call, outcome) in [("a", "success"), ("b", "denied"), ("c", "error")] {
-            append_tool_result(&db, "c1", "t1", call, "x", outcome, None)
+            append_tool_result(&db, "c1", "t1", call, "x", 2, outcome, None)
                 .await
                 .unwrap();
         }

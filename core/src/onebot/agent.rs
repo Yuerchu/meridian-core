@@ -906,7 +906,12 @@ async fn headless_chat_inner(
     )
     .await?;
     let files_root = data_dir.map(crate::files::files_dir);
-    crate::agent::resolve_file_uris_in_messages(&mut chat_messages, files_root.as_deref())?;
+    crate::agent::resolve_file_uris_in_messages(
+        &mut chat_messages,
+        files_root.as_deref(),
+        conversation_id,
+        supports_images,
+    )?;
     microcompact(&mut chat_messages, &budget, keep_recent);
     trim_to_context_limit(&mut chat_messages, context_limit, keep_recent);
 
@@ -1123,6 +1128,7 @@ async fn headless_chat_inner(
             // Steering resolves image URIs against this, which is why it is here
             // rather than only in the setup above.
             files_root,
+            supports_images,
             stickers: services.map(|s| engine::StickerRendering {
                 db: s.db.clone(),
                 data_dir: s.paths.data_dir.clone(),
