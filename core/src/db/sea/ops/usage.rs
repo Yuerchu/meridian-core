@@ -143,8 +143,9 @@ pub struct UsageBucket {
     /// unknown usage without representing a missing price.
     pub missing_token_usage_messages: i64,
     /// Replies missing either required side of the usage report. Cache fields
-    /// are optional — a NULL cache count means no cache activity — but a NULL
-    /// input or output count leaves that side of the bill unknown.
+    /// are optional — a NULL cache count means the provider did not report that
+    /// cache component — but a NULL input or output count leaves that side of
+    /// the bill unknown.
     pub incomplete_token_usage_messages: i64,
     /// The two sides of `incomplete_token_usage_messages`, which a reply can be
     /// on both of. What says which side a listed gap is missing.
@@ -161,6 +162,11 @@ pub struct UsageBucket {
     /// nobody measured.
     pub reported_input_tokens: i64,
     pub reported_input_cache_read_tokens: i64,
+    /// Prompt tokens over replies that explicitly reported cache reads. A
+    /// missing cache-read field is not a zero hit and is excluded here.
+    pub cache_reported_input_tokens: i64,
+    pub cache_reported_input_cache_read_tokens: i64,
+    pub cache_reported_input_messages: i64,
     pub input_cost: Decimal,
     pub output_cost: Decimal,
     pub cache_cost: Decimal,
@@ -208,6 +214,9 @@ impl UsageBucket {
             cache_write_tokens: 0,
             reported_input_tokens: 0,
             reported_input_cache_read_tokens: 0,
+            cache_reported_input_tokens: 0,
+            cache_reported_input_cache_read_tokens: 0,
+            cache_reported_input_messages: 0,
             input_cost: Decimal::zero(),
             output_cost: Decimal::zero(),
             cache_cost: Decimal::zero(),
@@ -253,6 +262,9 @@ pub(crate) struct GroupRow {
     pub(crate) cache_write_tokens: i64,
     pub(crate) reported_input_tokens: i64,
     pub(crate) reported_input_cache_read_tokens: i64,
+    pub(crate) cache_reported_input_tokens: i64,
+    pub(crate) cache_reported_input_cache_read_tokens: i64,
+    pub(crate) cache_reported_input_messages: i64,
     /// Provider-side invocations, which bill per call rather than per token.
     pub(crate) server_tool_calls: i64,
     /// Replies in this group that actually made at least one billable provider
@@ -402,6 +414,9 @@ impl UsageAccumulator {
         self.bucket.cache_write_tokens += group.cache_write_tokens;
         self.bucket.reported_input_tokens += group.reported_input_tokens;
         self.bucket.reported_input_cache_read_tokens += group.reported_input_cache_read_tokens;
+        self.bucket.cache_reported_input_tokens += group.cache_reported_input_tokens;
+        self.bucket.cache_reported_input_cache_read_tokens += group.cache_reported_input_cache_read_tokens;
+        self.bucket.cache_reported_input_messages += group.cache_reported_input_messages;
         self.bucket.missing_input_messages += group.missing_input_messages;
         self.bucket.missing_output_messages += group.missing_output_messages;
         self.server_tool_calls += group.server_tool_calls;
@@ -941,6 +956,9 @@ fn group_row(row: &QueryResult) -> Result<GroupRow, DbErr> {
         cache_write_tokens: int("cache_write_tokens")?,
         reported_input_tokens: int("reported_input_tokens")?,
         reported_input_cache_read_tokens: int("reported_input_cache_read_tokens")?,
+        cache_reported_input_tokens: int("cache_reported_input_tokens")?,
+        cache_reported_input_cache_read_tokens: int("cache_reported_input_cache_read_tokens")?,
+        cache_reported_input_messages: int("cache_reported_input_messages")?,
         server_tool_calls: int("server_tool_calls")?,
         server_tool_messages: int("server_tool_messages")?,
         missing_token_usage_messages: int("missing_token_usage_messages")?,
@@ -2141,29 +2159,56 @@ mod tests {
         assert_eq!(days[0].input_tokens, 10);
     }
 
-    /// A hit rate is read only off replies that reported a prompt. One that sent
-    /// its cache figures alone falls back to them as its prompt in
-    /// `input_tokens`, so dividing the totals counts it as a hundred percent hit.
+    /// A hit rate is read only off replies that reported both a prompt and its
+    /// cache-read field. Missing cache-read usage is unknown rather than a zero
+    /// hit; a cache-write-only report must not be inferred as a cache miss.
     #[tokio::test]
-    async fn a_hit_rate_counts_only_replies_that_reported_a_prompt() {
+    async fn a_hit_rate_counts_only_replies_that_reported_cache_reads() {
         let db = sea_test_db().await;
         reply(&db, "a1", "m1", 1, (1000, 10, 400, 0), Some(("1", "2")), "desktop").await;
         insert(
             &db,
             audit_message::Model {
+                input_tokens: Some(1000),
+                output_tokens: Some(10),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                ..audit_row("a2", 2)
+            },
+        )
+        .await;
+        insert(
+            &db,
+            audit_message::Model {
+                input_tokens: Some(1000),
+                output_tokens: Some(10),
+                cache_read_tokens: None,
+                cache_write_tokens: Some(100),
+                ..audit_row("a3", 3)
+            },
+        )
+        .await;
+        reply(&db, "a4", "m1", 4, (1000, 10, 0, 0), Some(("1", "2")), "desktop").await;
+        insert(
+            &db,
+            audit_message::Model {
                 output_tokens: Some(5),
                 cache_read_tokens: Some(900),
-                ..audit_row("a2", 2)
+                ..audit_row("a5", 5)
             },
         )
         .await;
 
         let bucket = total(&db, &UsageFilter::default()).await;
-        assert_eq!(bucket.reported_input_tokens, 1000);
+        assert_eq!(bucket.reported_input_tokens, 4000);
         assert_eq!(bucket.reported_input_cache_read_tokens, 400);
+        assert_eq!(bucket.cache_reported_input_tokens, 2000);
+        assert_eq!(bucket.cache_reported_input_cache_read_tokens, 400);
+        assert_eq!(bucket.cache_reported_input_messages, 2);
         assert_eq!(bucket.missing_input_messages, 1);
-        // What the totals alone would have said: 1300 of 1900.
-        assert_eq!(bucket.input_tokens, 1900);
+        // The billing totals still include all reported cache figures, including
+        // a cache-read-only row whose input count is unavailable.
+        assert_eq!(bucket.input_tokens, 4900);
         assert_eq!(bucket.cache_read_tokens, 1300);
     }
 
