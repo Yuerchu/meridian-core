@@ -16,6 +16,7 @@ opaque! {
     LiteRtLmConversation,
     LiteRtLmConversationOptionalArgs,
     LiteRtLmStreamChunk,
+    LiteRtLmLoadedFile,
 }
 
 pub type StreamCallback = unsafe extern "C" fn(user_data: *mut c_void, chunk: *const LiteRtLmStreamChunk);
@@ -48,15 +49,31 @@ type ConversationSendMessageStream = unsafe extern "C" fn(
     *mut c_void, // callback_data
 ) -> c_int;
 type ConversationCancel = unsafe extern "C" fn(*mut LiteRtLmConversation);
+type OptionalArgsCreate = unsafe extern "C" fn() -> *mut LiteRtLmConversationOptionalArgs;
+type OptionalArgsDelete = unsafe extern "C" fn(*mut LiteRtLmConversationOptionalArgs);
+type OptionalArgsMaxOutput = unsafe extern "C" fn(*mut LiteRtLmConversationOptionalArgs, c_int);
 type ConversationTokenCount = unsafe extern "C" fn(*mut LiteRtLmConversation) -> c_int;
 type ChunkGetStr = unsafe extern "C" fn(*const LiteRtLmStreamChunk) -> *const c_char;
 type ChunkIsFinal = unsafe extern "C" fn(*const LiteRtLmStreamChunk) -> bool;
 type SetMinLogLevel = unsafe extern "C" fn(c_int);
+type LoadedFileCreate = unsafe extern "C" fn(*const c_char) -> *mut LiteRtLmLoadedFile;
+type LoadedFileDelete = unsafe extern "C" fn(*mut LiteRtLmLoadedFile);
+type FileGetBool = unsafe extern "C" fn(*mut LiteRtLmLoadedFile) -> bool;
+type FileGetInt = unsafe extern "C" fn(*mut LiteRtLmLoadedFile) -> c_int;
+type FileGetUint = unsafe extern "C" fn(*mut LiteRtLmLoadedFile) -> u32;
+type FileGetFloat = unsafe extern "C" fn(*mut LiteRtLmLoadedFile) -> f32;
+type FileGetString = unsafe extern "C" fn(*mut LiteRtLmLoadedFile) -> *const c_char;
+type FileGetVector = unsafe extern "C" fn(*mut LiteRtLmLoadedFile, *mut c_int, c_int) -> c_int;
+type FileModalityBool = unsafe extern "C" fn(*mut LiteRtLmLoadedFile, c_int) -> bool;
+type FileModalityInt = unsafe extern "C" fn(*mut LiteRtLmLoadedFile, c_int) -> c_int;
+type FileModalityString = unsafe extern "C" fn(*mut LiteRtLmLoadedFile, c_int) -> *const c_char;
+type FileModalityVector = unsafe extern "C" fn(*mut LiteRtLmLoadedFile, c_int, *mut c_int, c_int) -> c_int;
+type LastErrorMessage = unsafe extern "C" fn() -> *const c_char;
+type LastErrorCode = unsafe extern "C" fn() -> c_int;
+type ClearLastError = unsafe extern "C" fn();
 
-/// All C API function pointers loaded at runtime via `libloading`.
-///
-/// Signatures are taken from `python/litert_lm/_ffi.py` (ctypes declarations)
-/// and verified against the v0.17.0 DLL export table (390 symbols).
+/// 动态加载的签名只对应 v0.18.0 / C ABI 0.2.0，不接受 main 的新 ABI。
+#[derive(Clone)]
 pub(crate) struct Symbols {
     // ── Engine settings ──
     pub engine_settings_create: EngineSettingsCreate,
@@ -83,6 +100,9 @@ pub(crate) struct Symbols {
     pub conversation_clone: ConversationClone,
     pub conversation_send_message_stream: ConversationSendMessageStream,
     pub conversation_cancel_process: ConversationCancel,
+    pub conversation_optional_args_create: OptionalArgsCreate,
+    pub conversation_optional_args_delete: OptionalArgsDelete,
+    pub conversation_optional_args_set_max_output_tokens: OptionalArgsMaxOutput,
     pub conversation_get_token_count: ConversationTokenCount,
 
     // ── Stream chunk ──
@@ -92,6 +112,30 @@ pub(crate) struct Symbols {
 
     // ── Log ──
     pub set_min_log_level: SetMinLogLevel,
+    pub loaded_file_create: LoadedFileCreate,
+    pub loaded_file_delete: LoadedFileDelete,
+    pub loaded_file_model_type: FileGetInt,
+    pub loaded_file_has_speculative_decoding_support: FileGetBool,
+    pub loaded_file_supports_thinking: FileGetBool,
+    pub loaded_file_supports_function_calling: FileGetBool,
+    pub loaded_file_sampler_type: FileGetInt,
+    pub loaded_file_sampler_temperature: FileGetFloat,
+    pub loaded_file_sampler_top_k: FileGetInt,
+    pub loaded_file_sampler_top_p: FileGetFloat,
+    pub loaded_file_supports_input_modality: FileModalityBool,
+    pub loaded_file_max_vision_token_budget: FileGetInt,
+    pub loaded_file_max_context_tokens: FileGetUint,
+    pub loaded_file_is_dynamic_context: FileGetBool,
+    pub loaded_file_vision_signature_selection: FileGetVector,
+    pub loaded_file_embedding_signature_selection: FileGetVector,
+    pub loaded_file_embedding_dimension: FileGetInt,
+    pub loaded_file_modality_supported_backends: FileModalityVector,
+    pub loaded_file_modality_npu_brand: FileModalityInt,
+    pub loaded_file_modality_soc_name: FileModalityString,
+    pub loaded_file_min_runtime_version: FileGetString,
+    pub get_last_error_message: LastErrorMessage,
+    pub get_last_error_code: LastErrorCode,
+    pub clear_last_error: ClearLastError,
 }
 
 macro_rules! load_sym {
@@ -141,11 +185,62 @@ impl Symbols {
                 ConversationSendMessageStream
             ),
             conversation_cancel_process: load_sym!(lib, "conversation_cancel_process", ConversationCancel),
+            conversation_optional_args_create: load_sym!(lib, "conversation_optional_args_create", OptionalArgsCreate),
+            conversation_optional_args_delete: load_sym!(lib, "conversation_optional_args_delete", OptionalArgsDelete),
+            conversation_optional_args_set_max_output_tokens: load_sym!(
+                lib,
+                "conversation_optional_args_set_max_output_tokens",
+                OptionalArgsMaxOutput
+            ),
             conversation_get_token_count: load_sym!(lib, "conversation_get_token_count", ConversationTokenCount),
             stream_chunk_get_text: load_sym!(lib, "stream_chunk_get_text", ChunkGetStr),
             stream_chunk_is_final: load_sym!(lib, "stream_chunk_is_final", ChunkIsFinal),
             stream_chunk_get_error: load_sym!(lib, "stream_chunk_get_error", ChunkGetStr),
             set_min_log_level: load_sym!(lib, "set_min_log_level", SetMinLogLevel),
+            loaded_file_create: load_sym!(lib, "loaded_file_create", LoadedFileCreate),
+            loaded_file_delete: load_sym!(lib, "loaded_file_delete", LoadedFileDelete),
+            loaded_file_model_type: load_sym!(lib, "loaded_file_model_type", FileGetInt),
+            loaded_file_has_speculative_decoding_support: load_sym!(
+                lib,
+                "loaded_file_has_speculative_decoding_support",
+                FileGetBool
+            ),
+            loaded_file_supports_thinking: load_sym!(lib, "loaded_file_supports_thinking", FileGetBool),
+            loaded_file_supports_function_calling: load_sym!(lib, "loaded_file_supports_function_calling", FileGetBool),
+            loaded_file_sampler_type: load_sym!(lib, "loaded_file_sampler_type", FileGetInt),
+            loaded_file_sampler_temperature: load_sym!(lib, "loaded_file_sampler_temperature", FileGetFloat),
+            loaded_file_sampler_top_k: load_sym!(lib, "loaded_file_sampler_top_k", FileGetInt),
+            loaded_file_sampler_top_p: load_sym!(lib, "loaded_file_sampler_top_p", FileGetFloat),
+            loaded_file_supports_input_modality: load_sym!(
+                lib,
+                "loaded_file_supports_input_modality",
+                FileModalityBool
+            ),
+            loaded_file_max_vision_token_budget: load_sym!(lib, "loaded_file_max_vision_token_budget", FileGetInt),
+            loaded_file_max_context_tokens: load_sym!(lib, "loaded_file_max_context_tokens", FileGetUint),
+            loaded_file_is_dynamic_context: load_sym!(lib, "loaded_file_is_dynamic_context", FileGetBool),
+            loaded_file_vision_signature_selection: load_sym!(
+                lib,
+                "loaded_file_vision_signature_selection",
+                FileGetVector
+            ),
+            loaded_file_embedding_signature_selection: load_sym!(
+                lib,
+                "loaded_file_embedding_signature_selection",
+                FileGetVector
+            ),
+            loaded_file_embedding_dimension: load_sym!(lib, "loaded_file_embedding_dimension", FileGetInt),
+            loaded_file_modality_supported_backends: load_sym!(
+                lib,
+                "loaded_file_modality_supported_backends",
+                FileModalityVector
+            ),
+            loaded_file_modality_npu_brand: load_sym!(lib, "loaded_file_modality_npu_brand", FileModalityInt),
+            loaded_file_modality_soc_name: load_sym!(lib, "loaded_file_modality_soc_name", FileModalityString),
+            loaded_file_min_runtime_version: load_sym!(lib, "loaded_file_min_runtime_version", FileGetString),
+            get_last_error_message: load_sym!(lib, "get_last_error_message", LastErrorMessage),
+            get_last_error_code: load_sym!(lib, "get_last_error_code", LastErrorCode),
+            clear_last_error: load_sym!(lib, "clear_last_error", ClearLastError),
         })
     }
 }
@@ -162,6 +257,16 @@ pub(crate) fn read_cstr(p: *const c_char) -> String {
 
 /// Create a `CString`, panicking on embedded NUL (which the C API cannot
 /// handle anyway).
-pub(crate) fn cstr(s: &str) -> std::ffi::CString {
-    std::ffi::CString::new(s).expect("string passed to C API contains NUL")
+pub(crate) fn cstr(s: &str) -> Result<std::ffi::CString, crate::LiteRtError> {
+    Ok(std::ffi::CString::new(s)?)
+}
+
+pub(crate) fn read_optional_cstr(p: *const c_char) -> Result<Option<String>, crate::LiteRtError> {
+    if p.is_null() {
+        return Ok(None);
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_str()
+        .map_err(|error| crate::LiteRtError::InvalidMetadata(format!("invalid UTF-8 from runtime: {error}")))?;
+    Ok(if text.is_empty() { None } else { Some(text.to_string()) })
 }

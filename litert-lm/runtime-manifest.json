@@ -1,0 +1,106 @@
+{
+  "version": "0.18.0",
+  "c_api_version": "0.2.0",
+  "license": {
+    "url": "https://raw.githubusercontent.com/google-ai-edge/LiteRT-LM/v0.18.0/LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "platforms": {
+    "windows-x86_64": {
+      "library": "litert-lm.dll",
+      "file": "litert_lm_api-0.18.0-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/2e/a4/842c858a90aac25a2ae6e4744197b22764a38fb35e45b15cf9c3b7570656/litert_lm_api-0.18.0-py3-none-win_amd64.whl",
+      "sha256": "eb02dc5d0fc6a894a664cfcc63e3aaf3100973ba2c9a6a7eebf4df8749a01038",
+      "files": [
+        {
+          "entry": "litert_lm/litert-lm.dll",
+          "to": "litert-lm.dll",
+          "size": 50051584,
+          "sha256": "c6421334f409a5b4b50b32e7925d6eb9d7e62245d00a6b01a7541596c8a1a1e3"
+        },
+        {
+          "entry": "litert_lm/dxcompiler.dll",
+          "to": "dxcompiler.dll",
+          "size": 17951808,
+          "sha256": "b86a738ece4c05dbe2d9bbb29668a2ccb28a0740773c9b027cdc61e8d07b4d75"
+        },
+        {
+          "entry": "litert_lm/dxil.dll",
+          "to": "dxil.dll",
+          "size": 1503304,
+          "sha256": "058f2f52a680c38b223a5615b7df969def21f77e577562e5099d971dede992de"
+        }
+      ]
+    },
+    "linux-x86_64": {
+      "library": "liblitert-lm.so",
+      "file": "litert_lm_api-0.18.0-py3-none-manylinux_2_27_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/c9/8f/eb7a5203be1d48440c6b8d6e6382c3f744dd6d338fe400555718b4d695a1/litert_lm_api-0.18.0-py3-none-manylinux_2_27_x86_64.whl",
+      "sha256": "b64e2cf6d7dcb90ff094b74af595cc5d53faa07e0889f967d15df8d3e696b53c",
+      "files": [
+        {
+          "entry": "litert_lm/liblitert-lm.so",
+          "to": "liblitert-lm.so",
+          "size": 131785976,
+          "sha256": "193a2d8581ff525a242334863f36b439e4ba8bd08f31a33d87c503be4fb61cff"
+        }
+      ]
+    },
+    "linux-aarch64": {
+      "library": "liblitert-lm.so",
+      "file": "litert_lm_api-0.18.0-py3-none-manylinux_2_27_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/cf/f2/60707ac6860248e5f3601926c7cfe44794db350b60c1f14cb6e7e8874ae4/litert_lm_api-0.18.0-py3-none-manylinux_2_27_aarch64.whl",
+      "sha256": "d066db0c2bcd832b2b9cf8532b5fff385f7cff8562a1b482f8da0b51f810c47c",
+      "files": [
+        {
+          "entry": "litert_lm/liblitert-lm.so",
+          "to": "liblitert-lm.so",
+          "size": 133496240,
+          "sha256": "b0c0258edc9e4868bd62f18526bb32791739a1d1b93df9360c8fa726814571ff"
+        }
+      ]
+    },
+    "macos-aarch64": {
+      "library": "liblitert-lm.dylib",
+      "file": "litert_lm_api-0.18.0-py3-none-macosx_12_0_arm64.whl",
+      "url": "https://files.pythonhosted.org/packages/cc/df/147e5fa60cf8964bdcbc022cbd38502f91ea415bf82bed2c9335fcf9be9d/litert_lm_api-0.18.0-py3-none-macosx_12_0_arm64.whl",
+      "sha256": "9fd0c55835e469a035c1b75cde4797b26292963c2c36d9fcdfceb965ffa08a37",
+      "files": [
+        {
+          "entry": "litert_lm/liblitert-lm.dylib",
+          "to": "liblitert-lm.dylib",
+          "size": 65705728,
+          "sha256": "cbec999a8156f10d277484ad3c6b6d9ac012375c4a03019aa1b0eab68ccaa4e9"
+        }
+      ]
+    },
+    "android-aarch64": {
+      "library": "liblitert-lm.so",
+      "file": "litert_lm_api-0.18.0-py3-none-android_23_arm64_v8a.whl",
+      "url": "https://files.pythonhosted.org/packages/e2/2c/487f022101b4079b8b229e820483dd5a657d3efe8e3568dcde2ef935418b/litert_lm_api-0.18.0-py3-none-android_23_arm64_v8a.whl",
+      "sha256": "a045af401dc199c35b1f44c29e8899cecbf2712a8194c9e35489ab5e2a95d47d",
+      "files": [
+        {
+          "entry": "litert_lm/liblitert-lm.so",
+          "to": "liblitert-lm.so",
+          "size": 39860448,
+          "sha256": "3d591b09116e7be3ab6b2b5b1a27bb3079dda0eb66550271533e6aee19e2dfd9"
+        }
+      ]
+    },
+    "android-x86_64": {
+      "library": "liblitert-lm.so",
+      "file": "litert_lm_api-0.18.0-py3-none-android_23_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/4a/9c/7c4bc445dfe07eff06f16ca870a062fb66c123d89b5742ef8561b2701888/litert_lm_api-0.18.0-py3-none-android_23_x86_64.whl",
+      "sha256": "db5268c5eb8e60f5a7cdecea310f8084426ae174fdbe8efe2991c47f54d74889",
+      "files": [
+        {
+          "entry": "litert_lm/liblitert-lm.so",
+          "to": "liblitert-lm.so",
+          "size": 44419920,
+          "sha256": "cc8fdef43d1900234d3bebecd29b3610a7b09c62e0a3b3cdb08499e4b8e8e4c7"
+        }
+      ]
+    }
+  }
+}

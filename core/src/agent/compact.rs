@@ -291,87 +291,37 @@ pub async fn do_compact(
         crate::provider::codex_metadata::CodexRequestKind::Compaction,
     )
     .await?;
-    let (
-        provider_type,
-        base_url,
-        credential,
-        model,
-        api_format,
-        transport_profile,
-        codex_request_shape,
-        codex_client_version,
-        turn,
-        provider_id,
-        provider_name,
-    ) = if let Some(crate::agent::auxiliary::AuxiliaryModel { resolved, turn }) = auxiliary {
-        (
-            resolved.provider_type,
-            resolved.base_url,
-            resolved.credential,
-            resolved.model,
-            resolved.api_format,
-            resolved.transport_profile,
-            resolved.codex_request_shape,
-            resolved.codex_client_version,
-            turn,
-            resolved.provider_id,
-            resolved.provider_name,
-        )
+    let (resolved, turn) = if let Some(crate::agent::auxiliary::AuxiliaryModel { resolved, turn }) = auxiliary {
+        (resolved, turn)
     } else {
-        let crate::agent::ResolvedProvider {
-            provider_type,
-            base_url,
-            credential,
-            model,
-            api_format,
-            transport_profile,
-            codex_request_shape,
-            codex_client_version,
-            provider_id,
-            provider_name,
-        } = resolve_provider_config(secrets, db, assistant).await?;
+        let resolved = resolve_provider_config(secrets, db, assistant).await?;
         let turn = resolve_turn_params(
             db,
             TurnParamsResolveRequest {
                 assistant,
-                provider_id: assistant.and_then(|a| a.provider_id.as_deref()),
-                provider_type: &provider_type,
-                api_format: &api_format,
-
-                transport_profile: &transport_profile,
-                codex_request_shape,
+                provider_id: Some(&resolved.provider_id),
+                provider_type: &resolved.provider_type,
+                api_format: &resolved.api_format,
+                transport_profile: &resolved.transport_profile,
+                codex_request_shape: resolved.codex_request_shape,
                 codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Compaction,
                 codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::User,
-                model: &model,
+                model: &resolved.model,
                 thinking_level: None,
-                // Summarising is background work; it does not take the priority tier.
                 fast: false,
             },
         )
         .await?;
-        (
-            provider_type,
-            base_url,
-            credential,
-            model,
-            api_format,
-            transport_profile,
-            codex_request_shape,
-            codex_client_version,
-            turn,
-            provider_id,
-            provider_name,
-        )
+        (resolved, turn)
     };
-    let prov = provider::registry::create_provider(provider::registry::ProviderWire {
-        provider_type: &provider_type,
-        base_url: &base_url,
-        credential: &credential,
-        api_format: &api_format,
-        transport_profile: &transport_profile,
-        codex_request_shape,
-        codex_client_version: codex_client_version.as_deref(),
-    })?;
+    let prov = provider::registry::create_provider(resolved.wire())?;
+    let crate::agent::ResolvedProvider {
+        provider_type,
+        model,
+        provider_id,
+        provider_name,
+        ..
+    } = resolved;
     let params = without_thinking(turn.params);
     // The same window and the same tokenizer the turn would use. A summariser
     // sized against a different one is sized against nothing.

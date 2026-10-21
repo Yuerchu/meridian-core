@@ -202,6 +202,7 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
                     // Nor a request shape: `chat_completions` above has none
                     // to follow.
                     codex_request_shape: SqlBool::FALSE,
+                    local_backend: None,
                 },
             )
             .await
@@ -556,6 +557,7 @@ mod tests {
                     transport_profile: TransportProfile::Standard,
                     icon: None,
                     codex_request_shape: SqlBool::FALSE,
+                    local_backend: None,
                 },
             )
             .await

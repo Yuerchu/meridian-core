@@ -18,6 +18,7 @@ pub mod m0002_skill_keys;
 pub mod m0003_background_tasks;
 pub mod m0004_frozen_stickers;
 pub mod m0005_board_tasks;
+pub mod m0006_local_inference_backend;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -37,6 +38,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0003BackgroundTasks),
             Box::new(M0004FrozenStickers),
             Box::new(M0005BoardTasks),
+            Box::new(M0006LocalInferenceBackend),
         ]
     }
 }
@@ -88,6 +90,7 @@ pub fn sqlite_statements() -> Vec<String> {
     all.extend(m0003_background_tasks::sqlite_statements());
     all.extend(m0004_frozen_stickers::sqlite_statements());
     all.extend(m0005_board_tasks::sqlite_statements());
+    all.extend(m0006_local_inference_backend::sqlite_statements());
     all
 }
 
@@ -186,6 +189,34 @@ impl MigrationTrait for M0003BackgroundTasks {
             ));
         }
         for statement in m0003_background_tasks::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0006LocalInferenceBackend;
+
+impl MigrationName for M0006LocalInferenceBackend {
+    fn name(&self) -> &str {
+        "m0006_local_inference_backend"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0006LocalInferenceBackend {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "local inference backend migration requires SQLite".into(),
+            ));
+        }
+        for statement in m0006_local_inference_backend::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;
         }
         Ok(())

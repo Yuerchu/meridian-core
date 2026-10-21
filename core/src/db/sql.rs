@@ -97,6 +97,21 @@ macro_rules! usage_grouping {
                                   THEN COALESCE(cache_read_tokens, 0)
                                   ELSE 0
                              END), 0) AS reported_input_cache_read_tokens,
+                COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL
+                                       AND cache_read_tokens IS NOT NULL
+                                  THEN input_tokens
+                                  ELSE 0
+                             END), 0) AS cache_reported_input_tokens,
+                COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL
+                                       AND cache_read_tokens IS NOT NULL
+                                  THEN cache_read_tokens
+                                  ELSE 0
+                             END), 0) AS cache_reported_input_cache_read_tokens,
+                COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL
+                                       AND cache_read_tokens IS NOT NULL
+                                  THEN 1
+                                  ELSE 0
+                             END), 0) AS cache_reported_input_messages,
                 COALESCE(SUM(server_tool_calls), 0) AS server_tool_calls,
                 SUM(CASE WHEN COALESCE(server_tool_calls, 0) > 0 THEN 1 ELSE 0 END)
                     AS server_tool_messages,

@@ -1,4 +1,5 @@
 {
+  "$schema": "./model_catalog.schema.json",
   "version": 1,
   "_comment": [
     "Model capability catalog. Entries are matched by longest `prefix` wins, scoped to `provider`.",
@@ -8,6 +9,18 @@
     "`supported_efforts` must stay in ascending order; unsupported explicit tiers are rejected."
   ],
   "models": [
+    {
+      "provider": "google",
+      "prefix": "gemini-2.5-pro",
+      "thinking_style": "budget",
+      "supports_thinking_off": false
+    },
+    {
+      "provider": "google",
+      "prefix": "gemini-2.5-flash",
+      "thinking_style": "budget",
+      "supports_thinking_off": true
+    },
     {
       "provider": "google",
       "prefix": "gemini-3.8-flash",
@@ -63,6 +76,35 @@
       "default_effort": "high"
     },
 
+    {
+      "provider": "anthropic",
+      "prefix": "claude-opus-5-5",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "medium",
+      "supports_fast": true
+    },
+    {
+      "provider": "anthropic",
+      "prefix": "claude-fable-5-1",
+      "supports_thinking": true,
+      "supports_images": true,
+      "supports_pdf": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "always_on",
+      "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "default_effort": "high"
+    },
     {
       "provider": "anthropic",
       "prefix": "claude-fable-5",

@@ -54,6 +54,8 @@ impl StoredThinkingLevel {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Catalog {
+    #[serde(rename = "$schema")]
+    _schema: Option<String>,
     #[serde(rename = "version")]
     _version: u32,
     #[serde(rename = "_comment")]
@@ -303,11 +305,6 @@ fn litert_lm_default() -> ProviderCapabilities {
         supports_streaming_tools: true,
         supports_thinking: true,
         supports_thinking_off: true,
-        supports_temperature: true,
-        supports_top_p: true,
-        max_temperature: Some(2.0),
-        max_context_tokens: Some(8192),
-        max_output_tokens: Some(4096),
         ..Default::default()
     }
 }
@@ -427,6 +424,16 @@ fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> 
     caps.supports_remote_compaction = remote_compaction_for(provider_type, api_format);
     if let Some(entry) = find_longest_prefix_match(catalog_provider, model) {
         apply(&mut caps, entry);
+    }
+    if catalog_provider == "google" && caps.thinking_style == ThinkingStyle::Budget {
+        if api_format == Some("gemini_generate_content") {
+            caps.supported_efforts.clear();
+            caps.default_effort = None;
+        } else {
+            // 这两条适配器仍使用档位协议，不能宣称会发送原生预算或关闭值。
+            caps.thinking_style = ThinkingStyle::EffortOnly;
+            caps.supports_thinking_off = false;
+        }
     }
     caps
 }
@@ -693,6 +700,7 @@ pub fn filter_params(params: &mut ChatParams, caps: &ProviderCapabilities) -> Re
         }
     }
     params.thinking_style = caps.thinking_style;
+    params.supports_thinking_off = caps.supports_thinking && caps.supports_thinking_off;
     if !caps.supports_temperature {
         params.temperature = None;
     }
@@ -760,6 +768,120 @@ mod tests {
     #[test]
     fn catalog_parses() {
         assert!(!CATALOG.models.is_empty());
+    }
+
+    #[test]
+    fn catalog_schema_metadata_is_part_of_the_strict_contract() {
+        let catalog: Catalog = serde_json::from_str(include_str!("model_catalog.json")).unwrap();
+        assert_eq!(catalog._schema.as_deref(), Some("./model_catalog.schema.json"));
+        let schema: serde_json::Value = serde_json::from_str(include_str!("model_catalog.schema.json")).unwrap();
+        assert_eq!(schema["properties"]["version"]["const"], catalog._version);
+        assert_eq!(schema["required"], serde_json::json!(["version", "_comment", "models"]));
+        assert_eq!(
+            schema["properties"]["_comment"],
+            serde_json::json!({"type": "array", "items": {"type": "string"}})
+        );
+    }
+
+    #[test]
+    fn catalog_schema_covers_authored_and_optional_fields() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!("model_catalog.schema.json")).unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(include_str!("model_catalog.json")).unwrap();
+        assert_eq!(schema["additionalProperties"], false);
+        for key in catalog.as_object().unwrap().keys() {
+            assert!(schema["properties"].get(key).is_some(), "schema missing Catalog.{key}");
+        }
+
+        // 补齐内置目录尚未覆盖的合法补丁字段。
+        let optional = serde_json::json!({
+            "provider": "openai",
+            "prefix": "schema-test",
+            "supports_tools": false,
+            "supports_streaming_tools": false,
+            "supports_thinking_off": false,
+            "max_temperature": 1.0,
+            "server_tools": ["web_search"],
+            "supports_remote_compaction": true
+        });
+        serde_json::from_value::<CatalogEntry>(optional.clone()).unwrap();
+        let entry_schema = &schema["$defs"]["modelEntry"];
+        assert_eq!(schema["properties"]["models"]["items"]["$ref"], "#/$defs/modelEntry");
+        assert_eq!(entry_schema["additionalProperties"], false);
+        assert_eq!(entry_schema["required"], serde_json::json!(["provider", "prefix"]));
+        for entry in catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(std::iter::once(&optional))
+        {
+            for key in entry.as_object().unwrap().keys() {
+                assert!(
+                    entry_schema["properties"].get(key).is_some(),
+                    "schema missing CatalogEntry.{key} for {}",
+                    entry["prefix"]
+                );
+            }
+            assert!(
+                entry_schema["properties"]["provider"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&entry["provider"])
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_schema_enums_match_the_serde_contract() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!("model_catalog.schema.json")).unwrap();
+        for (name, expected) in [
+            ("effortLevel", serde_json::json!(&EFFORT_LADDER[1..])),
+            (
+                "verbosityLevel",
+                serde_json::json!([
+                    CapabilityVerbosity::Low.as_str(),
+                    CapabilityVerbosity::Medium.as_str(),
+                    CapabilityVerbosity::High.as_str()
+                ]),
+            ),
+            (
+                "thinkingStyle",
+                serde_json::json!([
+                    ThinkingStyle::Adaptive,
+                    ThinkingStyle::AlwaysOn,
+                    ThinkingStyle::Budget,
+                    ThinkingStyle::EffortOnly,
+                    ThinkingStyle::None,
+                    ThinkingStyle::ToggleOff
+                ]),
+            ),
+            (
+                "serverToolKind",
+                serde_json::json!([
+                    ServerToolKind::WebSearch,
+                    ServerToolKind::GoogleSearch,
+                    ServerToolKind::UrlContext,
+                    ServerToolKind::XSearch,
+                    ServerToolKind::CodeExecution
+                ]),
+            ),
+        ] {
+            assert_eq!(schema["$defs"][name]["enum"], expected, "schema enum {name} drifted");
+        }
+        serde_json::from_value::<Vec<CapabilityEffort>>(schema["$defs"]["effortLevel"]["enum"].clone()).unwrap();
+        serde_json::from_value::<Vec<CapabilityVerbosity>>(schema["$defs"]["verbosityLevel"]["enum"].clone()).unwrap();
+        for (path, name) in [
+            ("/thinking_style", "thinkingStyle"),
+            ("/supported_efforts/items", "effortLevel"),
+            ("/default_effort", "effortLevel"),
+            ("/default_verbosity", "verbosityLevel"),
+            ("/server_tools/items", "serverToolKind"),
+        ] {
+            assert_eq!(
+                schema["$defs"]["modelEntry"]["properties"].pointer(path).unwrap()["$ref"],
+                format!("#/$defs/{name}"),
+                "schema enum is not applied at {path}"
+            );
+        }
     }
 
     #[test]
@@ -894,6 +1016,90 @@ mod tests {
         let original_pro = resolve("google", None, "gemini-3-pro-preview");
         assert_eq!(original_pro.supported_efforts, vec!["low", "high"]);
         assert_eq!(original_pro.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn gemini_25_thinking_controls_follow_the_wire() {
+        for (model, supports_off) in [
+            ("gemini-2.5-pro", false),
+            ("gemini-2.5-flash", true),
+            ("gemini-2.5-flash-lite", true),
+            ("models/GEMINI-2.5-FLASH-preview", true),
+        ] {
+            let native = resolve("google", Some("gemini_generate_content"), model);
+            assert_eq!(native.thinking_style, ThinkingStyle::Budget, "{model}");
+            assert_eq!(native.supports_thinking_off, supports_off, "{model}");
+            assert!(native.supported_efforts.is_empty(), "{model}");
+            assert_eq!(native.default_effort, None, "{model}");
+            for format in [None, Some("chat_completions"), Some("gemini_interactions")] {
+                let caps = resolve("google", format, model);
+                assert_eq!(caps.thinking_style, ThinkingStyle::EffortOnly, "{model} {format:?}");
+                assert_eq!(caps.supported_efforts, ["low", "medium", "high"]);
+                assert!(!caps.supports_thinking_off, "{model} {format:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_25_native_preserves_the_configured_budget_without_a_default() {
+        for model in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"] {
+            let caps = resolve("google", Some("gemini_generate_content"), model);
+            for budget in [None, Some(-1), Some(4097)] {
+                let (enabled, budget, effort) = resolve_thinking(true, budget, None).unwrap();
+                let mut params = ChatParams {
+                    model: model.into(),
+                    thinking_enabled: enabled,
+                    thinking_budget: budget,
+                    thinking_effort: effort,
+                    ..Default::default()
+                };
+                filter_params(&mut params, &caps).unwrap();
+                assert_eq!(params.thinking_style, ThinkingStyle::Budget);
+                assert_eq!(params.thinking_budget, budget, "{model}");
+                assert_eq!(params.thinking_effort, None);
+                assert_eq!(params.supports_thinking_off, caps.supports_thinking_off);
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_25_native_off_respects_the_model_capability() {
+        for (model, supports_off) in [
+            ("gemini-2.5-pro", false),
+            ("gemini-2.5-flash", true),
+            ("gemini-2.5-flash-lite", true),
+        ] {
+            let caps = resolve("google", Some("gemini_generate_content"), model);
+            let (enabled, budget, effort) = resolve_thinking(true, Some(4097), Some("off")).unwrap();
+            let mut params = ChatParams {
+                model: model.into(),
+                thinking_enabled: enabled,
+                thinking_budget: budget,
+                thinking_effort: effort,
+                supports_thinking_off: !supports_off,
+                ..Default::default()
+            };
+            filter_params(&mut params, &caps).unwrap();
+            assert_eq!(params.thinking_enabled, !supports_off, "{model}");
+            assert_eq!(params.supports_thinking_off, supports_off, "{model}");
+            assert_eq!(params.thinking_budget, None);
+            assert_eq!(params.thinking_effort, None);
+        }
+    }
+
+    #[test]
+    fn gemini_25_native_rejects_effort_instead_of_inventing_a_budget() {
+        for model in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"] {
+            let caps = resolve("google", Some("gemini_generate_content"), model);
+            let mut params = ChatParams {
+                model: model.into(),
+                thinking_enabled: true,
+                thinking_budget: Some(4097),
+                thinking_effort: Some("high".into()),
+                ..Default::default()
+            };
+            assert!(filter_params(&mut params, &caps).unwrap_err().contains("not supported"));
+        }
     }
 
     #[test]

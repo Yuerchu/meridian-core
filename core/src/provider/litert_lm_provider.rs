@@ -1,10 +1,11 @@
+use super::registry::LocalInferenceBackend;
 use super::{
     AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, TokenUsage, ToolCall,
     ToolDefinition,
 };
 use async_trait::async_trait;
 use litert_lm::conversation::ConversationConfig;
-use litert_lm::engine::{Backend, Engine, EngineConfig};
+use litert_lm::engine::{Engine, EngineConfig};
 use litert_lm::runtime::{LogSeverity, Runtime};
 use litert_lm::stream::StreamChunk;
 use std::path::{Path, PathBuf};
@@ -13,10 +14,33 @@ use std::sync::{Arc, Mutex, OnceLock};
 static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 static ENGINE_CACHE: Mutex<Option<CachedEngine>> = Mutex::new(None);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineCacheKey {
+    revision: u64,
+    config: EngineConfig,
+    runtime_version: &'static str,
+}
+
+fn local_budgets(params: &ChatParams) -> Result<(i32, i32), ProviderError> {
+    let context = params.context_limit.filter(|value| *value > 0).ok_or_else(|| {
+        ProviderError::Upstream("Set a positive runtime context budget in Settings → Provider → Model".into())
+    })?;
+    let output = params
+        .max_tokens
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ProviderError::Upstream("Set a positive output budget in Settings → Provider → Model".into()))?;
+    if output > context {
+        return Err(ProviderError::Upstream("output budget exceeds runtime context".into()));
+    }
+    Ok((context, output))
+}
+
+fn same_engine(existing: &EngineCacheKey, requested: &EngineCacheKey) -> bool {
+    existing == requested
+}
+
 struct CachedEngine {
-    model_path: String,
-    backend: Backend,
-    max_tokens: i32,
+    key: EngineCacheKey,
     engine: Arc<Engine>,
 }
 
@@ -47,6 +71,15 @@ fn discover_dll() -> Result<PathBuf, String> {
             return Ok(candidate);
         }
     }
+    #[cfg(test)]
+    {
+        let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../resources")
+            .join(DLL_NAME);
+        if is_real_dll(&candidate) {
+            return Ok(candidate);
+        }
+    }
     Err(format!(
         "LiteRT-LM runtime not found: place `{DLL_NAME}` next to the executable or set LITERT_LM_LIB_PATH"
     ))
@@ -56,7 +89,7 @@ fn is_real_dll(path: &Path) -> bool {
     path.metadata().map(|m| m.len() > 1024).unwrap_or(false)
 }
 
-fn get_or_init_runtime() -> Result<&'static Runtime, String> {
+pub(super) fn get_or_init_runtime() -> Result<&'static Runtime, String> {
     RUNTIME
         .get_or_init(|| {
             let path = discover_dll()?;
@@ -68,7 +101,7 @@ fn get_or_init_runtime() -> Result<&'static Runtime, String> {
 }
 
 pub fn is_available() -> bool {
-    discover_dll().is_ok()
+    get_or_init_runtime().is_ok()
 }
 
 pub struct LiteRtLmProvider {
@@ -78,24 +111,24 @@ pub struct LiteRtLmProvider {
 struct Shared {
     runtime: Runtime,
     model_path: String,
-    backend: Backend,
+    preference: LocalInferenceBackend,
 }
 
 impl LiteRtLmProvider {
-    pub fn new(runtime: Runtime, model_path: &str, backend: Backend) -> Self {
+    pub fn new(runtime: Runtime, model_path: &str, preference: LocalInferenceBackend) -> Self {
         runtime.set_log_level(LogSeverity::Error);
         Self {
             shared: Arc::new(Shared {
                 runtime,
                 model_path: model_path.to_string(),
-                backend,
+                preference,
             }),
         }
     }
 
-    pub fn from_model_path(model_path: &str) -> Result<Self, String> {
+    pub fn from_model_path(model_path: &str, preference: LocalInferenceBackend) -> Result<Self, String> {
         let rt = get_or_init_runtime()?.clone();
-        Ok(Self::new(rt, model_path, Backend::Cpu))
+        Ok(Self::new(rt, model_path, preference))
     }
 }
 
@@ -251,6 +284,11 @@ impl ChatProvider for LiteRtLmProvider {
         "litert_lm"
     }
 
+    #[cfg(test)]
+    fn local_backend_for_test(&self) -> Option<LocalInferenceBackend> {
+        Some(self.shared.preference)
+    }
+
     async fn stream_chat_with_tools(
         &self,
         messages: Vec<ChatMessage>,
@@ -263,29 +301,34 @@ impl ChatProvider for LiteRtLmProvider {
 
         tokio::task::spawn_blocking(move || {
             let result = (|| -> Result<(), ProviderError> {
-                let max_tokens = params.context_limit.ok_or_else(|| {
-                    ProviderError::Upstream(
-                        "No context window known for this model. Set one in Settings → Provider → Model.".into(),
-                    )
-                })?;
+                let (max_tokens, max_output) = local_budgets(&params)?;
+                let snapshot = super::local_model::inspect(&shared.model_path, shared.preference, false)
+                    .map_err(ProviderError::Upstream)?;
+                let config = super::local_model::engine_config(&snapshot, shared.preference, max_tokens)
+                    .map_err(ProviderError::Upstream)?;
+                let key = EngineCacheKey {
+                    revision: snapshot.revision,
+                    config,
+                    runtime_version: litert_lm::runtime::runtime_version(),
+                };
                 let engine = {
-                    let mut cache = ENGINE_CACHE.lock().unwrap();
-                    let reuse = cache.as_ref().is_some_and(|c| {
-                        c.model_path == shared.model_path && c.backend == shared.backend && c.max_tokens == max_tokens
-                    });
-                    if reuse {
-                        cache.as_ref().unwrap().engine.clone()
+                    let mut cache = ENGINE_CACHE
+                        .lock()
+                        .map_err(|_| ProviderError::Upstream("engine cache lock was poisoned".into()))?;
+                    if let Some(cached) = cache.as_ref().filter(|cached| same_engine(&cached.key, &key)) {
+                        cached.engine.clone()
                     } else {
-                        let mut config = EngineConfig::new(&shared.model_path, shared.backend);
-                        config.max_tokens = max_tokens;
-                        let engine = Arc::new(
-                            Engine::new(&shared.runtime, &config)
-                                .map_err(|e| ProviderError::Upstream(e.to_string()))?,
-                        );
+                        // 先释放缓存自己的旧引用；活跃会话仍保有自己的 Arc。
+                        *cache = None;
+                        let engine = Arc::new(Engine::new(&shared.runtime, &key.config).map_err(|error| {
+                            ProviderError::Upstream(format!(
+                                "requested={}, resolved={}, context={max_tokens}: {error}",
+                                shared.preference.as_str(),
+                                key.config.backend.as_str()
+                            ))
+                        })?);
                         *cache = Some(CachedEngine {
-                            model_path: shared.model_path.clone(),
-                            backend: shared.backend,
-                            max_tokens,
+                            key,
                             engine: engine.clone(),
                         });
                         engine
@@ -332,7 +375,7 @@ impl ChatProvider for LiteRtLmProvider {
 
                 let tokens_before = conv.token_count();
 
-                conv.send_message_stream(&last_msg_str, extra_context, |chunk| {
+                conv.send_message_stream(&last_msg_str, extra_context, max_output, |chunk| {
                     let events = parse_chunk_to_events(&chunk);
                     for event in events {
                         if tx.blocking_send(Ok(event)).is_err() {
@@ -376,16 +419,7 @@ impl ChatProvider for LiteRtLmProvider {
     }
 
     async fn chat(&self, messages: Vec<ChatMessage>, params: ChatParams) -> Result<String, ProviderError> {
-        let rx = self.stream_chat_with_tools(messages, vec![], params).await?;
-        use futures::StreamExt;
-        let mut rx = rx;
-        let mut text = String::new();
-        while let Some(event) = rx.next().await {
-            if let Ok(StreamEvent::Text { content }) = event {
-                text.push_str(&content);
-            }
-        }
-        Ok(text)
+        Ok(self.chat_with_tools(messages, vec![], params).await?.text)
     }
 
     async fn chat_with_tools(
@@ -394,52 +428,160 @@ impl ChatProvider for LiteRtLmProvider {
         tools: Vec<ToolDefinition>,
         params: ChatParams,
     ) -> Result<AgentResponse, ProviderError> {
-        let rx = self.stream_chat_with_tools(messages, tools, params).await?;
-        use futures::StreamExt;
-        let mut rx = rx;
-        let mut text = String::new();
-        let mut reasoning = None;
-        let mut tool_calls = Vec::new();
-        let mut usage = None;
-
-        while let Some(event) = rx.next().await {
-            match event {
-                Ok(StreamEvent::Text { content }) => text.push_str(&content),
-                Ok(StreamEvent::Reasoning { content }) => {
-                    reasoning.get_or_insert_with(String::new).push_str(&content);
-                }
-                Ok(StreamEvent::ToolCallStart { id, name, .. }) => {
-                    tool_calls.push(ToolCall {
-                        id,
-                        name,
-                        arguments: String::new(),
-                    });
-                }
-                Ok(StreamEvent::ToolCallDone { arguments, .. }) => {
-                    if let Some(last) = tool_calls.last_mut() {
-                        last.arguments = arguments;
-                    }
-                }
-                Ok(StreamEvent::Stop { usage: u, .. }) => {
-                    usage = u;
-                }
-                _ => {}
-            }
-        }
-
-        Ok(AgentResponse {
-            text,
-            reasoning_content: reasoning,
-            tool_calls,
-            usage,
-            provider_state: None,
-        })
+        collect_response(self.stream_chat_with_tools(messages, tools, params).await?).await
     }
+}
+
+async fn collect_response(mut rx: ChatStream) -> Result<AgentResponse, ProviderError> {
+    use futures::StreamExt;
+    let mut text = String::new();
+    let mut reasoning = None;
+    let mut tool_calls = Vec::new();
+    let mut usage = None;
+    while let Some(event) = rx.next().await {
+        match event? {
+            StreamEvent::Text { content } => text.push_str(&content),
+            StreamEvent::Reasoning { content } => {
+                reasoning.get_or_insert_with(String::new).push_str(&content);
+            }
+            StreamEvent::ToolCallStart { id, name, .. } => {
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments: String::new(),
+                });
+            }
+            StreamEvent::ToolCallDone { arguments, .. } => {
+                if let Some(last) = tool_calls.last_mut() {
+                    last.arguments = arguments;
+                }
+            }
+            StreamEvent::Stop { usage: value, .. } => {
+                usage = value;
+            }
+            StreamEvent::Error { message } => return Err(ProviderError::Upstream(message)),
+            _ => {}
+        }
+    }
+    Ok(AgentResponse {
+        text,
+        reasoning_content: reasoning,
+        tool_calls,
+        usage,
+        provider_state: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_requests_require_explicit_valid_budgets_before_loading_a_model() {
+        let valid = ChatParams {
+            context_limit: Some(1024),
+            max_tokens: Some(32),
+            ..Default::default()
+        };
+        assert_eq!(local_budgets(&valid).unwrap(), (1024, 32));
+        for params in [
+            ChatParams {
+                context_limit: None,
+                ..valid.clone()
+            },
+            ChatParams {
+                max_tokens: None,
+                ..valid.clone()
+            },
+            ChatParams {
+                context_limit: Some(0),
+                ..valid.clone()
+            },
+            ChatParams {
+                max_tokens: Some(-1),
+                ..valid.clone()
+            },
+            ChatParams {
+                max_tokens: Some(1025),
+                ..valid.clone()
+            },
+        ] {
+            assert!(local_budgets(&params).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn error_events_and_error_items_cannot_become_partial_success() {
+        let failures = [
+            Ok(StreamEvent::Error {
+                message: "injected failure".into(),
+            }),
+            Err(ProviderError::Upstream("injected failure".into())),
+        ];
+        for failure in failures {
+            let events = vec![
+                Ok(StreamEvent::Text {
+                    content: "partial".into(),
+                }),
+                failure,
+            ];
+            let stream: ChatStream = Box::pin(futures::stream::iter(events));
+            let error = collect_response(stream)
+                .await
+                .err()
+                .expect("failure must be propagated");
+            assert!(error.to_string().contains("injected failure"));
+        }
+    }
+
+    #[test]
+    fn cache_key_includes_backend_file_context_and_runtime() {
+        use litert_lm::engine::Backend;
+        let original = EngineCacheKey {
+            revision: 1,
+            config: EngineConfig::new("a.litertlm", Backend::Cpu, 1024),
+            runtime_version: "0.18.0",
+        };
+        assert!(same_engine(&original, &original.clone()));
+        let mut changed = original.clone();
+        changed.config.backend = Backend::Gpu;
+        assert!(!same_engine(&original, &changed));
+        let mut changed = original.clone();
+        changed.config.max_tokens = 2048;
+        assert!(!same_engine(&original, &changed));
+        let mut changed = original.clone();
+        changed.revision += 1;
+        assert!(!same_engine(&original, &changed));
+        let mut changed = original.clone();
+        changed.config.model_path = "b.litertlm".into();
+        assert!(!same_engine(&original, &changed));
+        let mut changed = original.clone();
+        changed.runtime_version = "future";
+        assert!(!same_engine(&original, &changed));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn non_streaming_paths_propagate_model_errors_instead_of_empty_success() {
+        let provider = LiteRtLmProvider::from_model_path("definitely-not-a-model", LocalInferenceBackend::Gpu).unwrap();
+        let params = ChatParams {
+            context_limit: Some(1024),
+            max_tokens: Some(32),
+            ..Default::default()
+        };
+        assert!(
+            provider
+                .chat(vec![ChatMessage::user("test")], params.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            provider
+                .chat_with_tools(vec![ChatMessage::user("test")], vec![], params)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn a_tool_picture_reaches_the_runtime_as_text() {

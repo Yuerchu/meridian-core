@@ -142,6 +142,61 @@ impl CredentialKind {
     }
 }
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum LocalInferenceBackend {
+    Auto,
+    Cpu,
+    Gpu,
+    Npu,
+}
+
+impl LocalInferenceBackend {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        value
+            .parse()
+            .map_err(|_| format!("unknown local inference backend `{value}`"))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+
+    pub fn native(self) -> Option<litert_lm::engine::Backend> {
+        use litert_lm::engine::Backend;
+        match self {
+            Self::Auto => None,
+            Self::Cpu => Some(Backend::Cpu),
+            Self::Gpu => Some(Backend::Gpu),
+            Self::Npu => Some(Backend::Npu),
+        }
+    }
+}
+
+pub fn validate_local_backend(
+    provider_type: ProviderType,
+    backend: Option<LocalInferenceBackend>,
+) -> Result<(), String> {
+    match (provider_type, backend) {
+        (ProviderType::LitertLm, Some(_)) => Ok(()),
+        (ProviderType::LitertLm, None) => Err("LiteRT-LM requires an explicit local_backend setting".into()),
+        (_, None) => Ok(()),
+        (_, Some(_)) => Err("local_backend must be null for a non-LiteRT provider".into()),
+    }
+}
+
 fn validate_transport_profile(value: &str) -> Result<(), String> {
     TransportProfile::parse(value).map(|_| ())
 }
@@ -291,6 +346,7 @@ pub struct ProviderWire<'a> {
     /// app claim to be", and a second answer per provider would be two
     /// identities for one install. Meaningless unless the shape is on.
     pub codex_client_version: Option<&'a str>,
+    pub local_backend: Option<LocalInferenceBackend>,
 }
 
 /// Pick the adapter for a provider row.
@@ -313,12 +369,14 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
         transport_profile,
         codex_request_shape,
         codex_client_version,
+        local_backend,
     } = wire;
     let codex_shape = super::openai_responses::CodexShape {
         enabled: codex_request_shape,
         client_version: codex_client_version.map(str::to_string),
     };
     let provider_type = ProviderType::parse(provider_type)?;
+    validate_local_backend(provider_type, local_backend)?;
     let api_format = ApiFormat::parse(api_format)?;
     validate_transport_profile(transport_profile)?;
     validate_wire_pair(api_format, transport_profile)?;
@@ -410,7 +468,8 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
             }
         },
         ProviderType::LitertLm => {
-            let provider = super::litert_lm_provider::LiteRtLmProvider::from_model_path(base_url)?;
+            let backend = local_backend.ok_or("LiteRT-LM requires local_backend")?;
+            let provider = super::litert_lm_provider::LiteRtLmProvider::from_model_path(base_url, backend)?;
             return Ok(Box::new(provider));
         }
     };
@@ -467,6 +526,7 @@ mod tests {
             transport_profile,
             codex_request_shape: false,
             codex_client_version: None,
+            local_backend: None,
         }
     }
 
