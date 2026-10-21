@@ -11,6 +11,7 @@ pub mod gemma_tool;
 pub mod google_generate_content;
 pub mod google_interactions;
 pub mod litert_lm_provider;
+pub mod local_model;
 pub mod models;
 pub mod openai_compat;
 pub mod openai_responses;
@@ -1275,6 +1276,11 @@ pub trait ChatProvider: Send + Sync {
     /// then builds.
     #[cfg(test)]
     fn adapter_name(&self) -> &'static str;
+
+    #[cfg(test)]
+    fn local_backend_for_test(&self) -> Option<registry::LocalInferenceBackend> {
+        None
+    }
 
     /// Unqueried today: turn parameters come from `resolve_turn_params`, not
     /// from asking the provider. Part of the multi-provider surface.

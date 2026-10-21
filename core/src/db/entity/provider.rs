@@ -14,7 +14,7 @@
 use sea_orm::entity::prelude::*;
 
 use crate::db::types::{EpochMs, SqlBool, text_enum_column};
-use crate::provider::registry::{ApiFormat, CredentialKind, ProviderType, TransportProfile};
+use crate::provider::registry::{ApiFormat, CredentialKind, LocalInferenceBackend, ProviderType, TransportProfile};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "providers")]
@@ -40,6 +40,7 @@ pub struct Model {
     /// Whether requests to this row are shaped exactly the way Codex shapes its
     /// own — see migration 63.
     pub codex_request_shape: SqlBool,
+    pub local_backend: Option<LocalInferenceBackend>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -72,6 +73,7 @@ pub struct ProviderChangeset {
     pub catalog_id: Option<Option<String>>,
     pub icon: Option<Option<String>>,
     pub codex_request_shape: Option<SqlBool>,
+    pub local_backend: Option<Option<LocalInferenceBackend>>,
 }
 
 // The registry's enums are used far beyond this table; none of the four
@@ -80,6 +82,7 @@ text_enum_column!(ProviderType);
 text_enum_column!(ApiFormat);
 text_enum_column!(CredentialKind);
 text_enum_column!(TransportProfile);
+text_enum_column!(LocalInferenceBackend);
 
 #[cfg(test)]
 mod tests {
@@ -118,5 +121,6 @@ mod tests {
         round_trips::<ApiFormat>();
         round_trips::<CredentialKind>();
         round_trips::<TransportProfile>();
+        round_trips::<LocalInferenceBackend>();
     }
 }

@@ -359,73 +359,35 @@ pub(super) async fn oneshot_completion(
     // The turn parameters are resolved like any other turn: an extraction
     // request that invents its own temperature is rejected by models the chat
     // path already talks to.
-    let (
-        provider_type,
-        base_url,
-        credential,
-        api_format,
-        transport_profile,
-        codex_request_shape,
-        codex_client_version,
-        turn,
+    let mut resolved = resolve_provider_config(&state.services.secrets, sea, assistant.as_ref()).await?;
+    resolved.model = assistant
+        .as_ref()
+        .and_then(|a| a.model_id.clone())
+        .unwrap_or_else(|| resolved.model.clone());
+    let turn = crate::agent::resolve_turn_params(
+        sea,
+        crate::agent::TurnParamsResolveRequest {
+            assistant: assistant.as_ref(),
+            provider_id: Some(&resolved.provider_id),
+            provider_type: &resolved.provider_type,
+            api_format: &resolved.api_format,
+            transport_profile: &resolved.transport_profile,
+            codex_request_shape: resolved.codex_request_shape,
+            codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
+            codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
+            model: &resolved.model,
+            thinking_level: None,
+            fast: false,
+        },
+    )
+    .await?;
+    let provider = provider::registry::create_provider(resolved.wire())?;
+    let crate::agent::ResolvedProvider {
         provider_id,
         provider_name,
         model,
-    ) = {
-        let crate::agent::ResolvedProvider {
-            provider_id,
-            provider_name,
-            provider_type,
-            base_url,
-            credential,
-            model,
-            api_format,
-            transport_profile,
-            codex_request_shape,
-            codex_client_version,
-        } = resolve_provider_config(&state.services.secrets, sea, assistant.as_ref()).await?;
-        let effective_model = assistant.as_ref().and_then(|a| a.model_id.clone()).unwrap_or(model);
-        let turn = crate::agent::resolve_turn_params(
-            sea,
-            crate::agent::TurnParamsResolveRequest {
-                assistant: assistant.as_ref(),
-                provider_id: assistant.as_ref().and_then(|a| a.provider_id.as_deref()),
-                provider_type: &provider_type,
-                api_format: &api_format,
-
-                transport_profile: &transport_profile,
-                codex_request_shape,
-                codex_request_kind: crate::provider::codex_metadata::CodexRequestKind::Turn,
-                codex_thread_source: crate::provider::codex_metadata::CodexThreadSource::Onebot,
-                model: &effective_model,
-                thinking_level: None,
-                fast: false,
-            },
-        )
-        .await?;
-        (
-            provider_type,
-            base_url,
-            credential,
-            api_format,
-            transport_profile,
-            codex_request_shape,
-            codex_client_version,
-            turn,
-            provider_id,
-            provider_name,
-            effective_model,
-        )
-    };
-    let provider = provider::registry::create_provider(provider::registry::ProviderWire {
-        provider_type: &provider_type,
-        base_url: &base_url,
-        credential: &credential,
-        api_format: &api_format,
-        transport_profile: &transport_profile,
-        codex_request_shape,
-        codex_client_version: codex_client_version.as_deref(),
-    })?;
+        ..
+    } = resolved;
 
     let messages = vec![
         ChatMessage {
@@ -634,15 +596,13 @@ async fn headless_chat_inner(
     let provider = provider::registry::create_provider(resolved.wire())?;
     let crate::agent::ResolvedProvider {
         provider_type,
-        base_url: _,
-        credential: _,
         model,
         api_format,
         transport_profile,
         provider_id,
         provider_name,
         codex_request_shape,
-        codex_client_version: _,
+        ..
     } = resolved;
 
     // The same resolver the desktop loop uses. Sharing it is what keeps a QQ

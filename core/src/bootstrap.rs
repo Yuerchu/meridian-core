@@ -190,6 +190,7 @@ pub async fn bootstrap_with_secrets(
                         // `chat_completions` above has no Codex shape to follow,
                         // and nothing here has said the address is a relay for one.
                         codex_request_shape: SqlBool::FALSE,
+                        local_backend: None,
                     };
                     // The row and the default assistant pointed at it, together.
                     let written = sea

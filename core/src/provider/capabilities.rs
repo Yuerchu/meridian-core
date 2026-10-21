@@ -305,11 +305,6 @@ fn litert_lm_default() -> ProviderCapabilities {
         supports_streaming_tools: true,
         supports_thinking: true,
         supports_thinking_off: true,
-        supports_temperature: true,
-        supports_top_p: true,
-        max_temperature: Some(2.0),
-        max_context_tokens: Some(8192),
-        max_output_tokens: Some(4096),
         ..Default::default()
     }
 }

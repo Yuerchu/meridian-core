@@ -81,7 +81,16 @@ pub async fn fetch_models_on(
         super::registry::ProviderType::Openai | super::registry::ProviderType::Deepseek => {
             fetch_openai_models(base_url, api_key).await
         }
-        super::registry::ProviderType::LitertLm => Ok(litert_lm_models()),
+        super::registry::ProviderType::LitertLm => {
+            let snapshot = super::local_model::inspect_async(
+                base_url.to_string(),
+                super::registry::LocalInferenceBackend::Auto,
+                false,
+            )
+            .await
+            .map_err(ProviderError::Upstream)?;
+            local_file_models(&snapshot.file_name)
+        }
     }
 }
 
@@ -473,15 +482,26 @@ async fn fetch_anthropic_models(base_url: &str, api_key: &str) -> Result<Vec<Mod
     Ok(models)
 }
 
-fn litert_lm_models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "gemma-4-E4B-it".into(),
-            name: "Gemma 4 E4B".into(),
-        },
-        ModelInfo {
-            id: "gemma-4-E2B-it".into(),
-            name: "Gemma 4 E2B".into(),
-        },
-    ]
+fn local_file_models(file_name: &str) -> Result<Vec<ModelInfo>, ProviderError> {
+    if file_name.is_empty() {
+        return Err(ProviderError::Parse("local model file has no name".into()));
+    }
+    Ok(vec![ModelInfo {
+        id: file_name.to_string(),
+        name: file_name.to_string(),
+    }])
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+
+    #[test]
+    fn local_models_are_file_aliases_not_a_hardcoded_catalog() {
+        let models = local_file_models("my-custom-12b-gpu.litertlm").unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "my-custom-12b-gpu.litertlm");
+        assert_eq!(models[0].name, "my-custom-12b-gpu.litertlm");
+        assert!(local_file_models("").is_err());
+    }
 }

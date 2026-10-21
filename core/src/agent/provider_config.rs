@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::db::entity::{assistant, provider as provider_entity};
 use crate::db::sea::cap::Db;
 use crate::db::sea::ops::{preference, provider as provider_ops};
-use crate::provider::registry::CredentialKind;
+use crate::provider::registry::{CredentialKind, LocalInferenceBackend};
 use crate::provider::{self, ChatParams, ProviderCapabilities, ServerToolKind};
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
 
@@ -85,6 +85,7 @@ async fn destination(
         api_format: provider.api_format.as_str().to_string(),
         transport_profile: provider.transport_profile.as_str().to_string(),
         codex_request_shape: provider.codex_request_shape.get(),
+        local_backend: provider.local_backend,
         codex_client_version,
     })
 }
@@ -157,6 +158,7 @@ pub struct ResolvedProvider {
     /// that already holds a connection when a provider is resolved. `None` is
     /// the ordinary case and takes `codex_identity::DEFAULT_CODEX_CLIENT_VERSION`.
     pub codex_client_version: Option<String>,
+    pub local_backend: Option<LocalInferenceBackend>,
 }
 
 impl ResolvedProvider {
@@ -174,6 +176,7 @@ impl ResolvedProvider {
             transport_profile: &self.transport_profile,
             codex_request_shape: self.codex_request_shape,
             codex_client_version: self.codex_client_version.as_deref(),
+            local_backend: self.local_backend,
         }
     }
 }
@@ -458,12 +461,16 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
     };
 
     let mut caps = provider::registry::get_capabilities(provider_type, api_format, transport_profile, model)?;
+    let local_info = provider::local_model::apply_capabilities(db, provider_id, provider_type, &mut caps).await?;
     provider::capabilities::apply_overrides(
         &mut caps,
         model_config.as_ref().and_then(|mc| mc.capability_overrides.as_deref()),
     )?;
     // After the patch: no per-model correction can hand back a field the
     // adapter will not put on the wire.
+    if local_info.is_some() {
+        provider::local_model::narrow_to_adapter(&mut caps);
+    }
     if codex_request_shape {
         provider::capabilities::narrow_to_codex_shape(&mut caps);
     }
@@ -484,6 +491,13 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
             format!("No max output tokens known for '{model}'. Go to Settings → Provider → Model to set one.")
         })?;
 
+    if let Some(ref info) = local_info {
+        let context = i32::try_from(context_limit).map_err(|_| "runtime context exceeds the native API range")?;
+        info.validate_context(context).map_err(|error| error.to_string())?;
+        if max_output > context_limit {
+            return Err("output budget exceeds the configured local context budget".into());
+        }
+    }
     let server_tools = enabled_server_tools(model_config.as_ref(), &caps)?;
 
     let (thinking_enabled, thinking_budget, thinking_effort) = provider::capabilities::resolve_thinking(
@@ -560,6 +574,7 @@ mod tests {
             transport_profile: TransportProfile::Standard,
             icon: None,
             codex_request_shape: SqlBool::FALSE,
+            local_backend: None,
         }
     }
 
@@ -1094,6 +1109,35 @@ mod tests {
             server_tools: server_tools.map(str::to_string),
             server_tool_price: None,
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_saved_gpu_selection_reaches_the_actual_provider_factory() {
+        let db = sea_test_db().await;
+        let mut row = provider_row(
+            ProviderType::LitertLm,
+            "Local",
+            "C:/Models/custom.litertlm",
+            ApiFormat::LitertLm,
+        );
+        row.credential_kind = CredentialKind::None;
+        row.transport_profile = TransportProfile::LocalNative;
+        row.local_backend = Some(LocalInferenceBackend::Gpu);
+        seed(&db, row, None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_with_overrides(
+            &mock_secrets(dir.path()),
+            &db,
+            None,
+            Some("file-alias".into()),
+            Some("p1"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.wire().local_backend, Some(LocalInferenceBackend::Gpu));
+        let adapter = provider::registry::create_provider(resolved.wire()).unwrap();
+        assert_eq!(adapter.local_backend_for_test(), Some(LocalInferenceBackend::Gpu));
     }
 
     #[tokio::test]
