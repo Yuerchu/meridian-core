@@ -313,8 +313,11 @@ fn native_diagnostics_are_thread_local() {
 #[cfg(windows)]
 #[test]
 fn pinned_windows_runtime_really_exports_the_018_api_and_reports_errors() {
-    let library = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/litert-lm.dll");
-    let rt = Runtime::load(&library).expect("run pnpm litert:fetch before Windows tests");
+    let library = std::env::var_os("LITERT_LM_LIB_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/litert-lm.dll"));
+    let rt =
+        Runtime::load(&library).expect("prepare the pinned runtime and set LITERT_LM_LIB_PATH before Windows tests");
     let error = rt.inspect_model("definitely-not-a-model.litertlm").unwrap_err();
     assert!(
         matches!(error, crate::LiteRtError::Native { code, .. } if code != 0),

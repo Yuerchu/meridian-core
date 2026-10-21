@@ -33,6 +33,30 @@ Requirements:
   first build, Android included (from 1.13.8). `SHERPA_ONNX_LIB_DIR` still
   overrides that for every target, so leave it unset unless you mean it.
 
+Windows tests also load the real LiteRT-LM runtime to verify its C ABI.
+In a standalone checkout, prepare it in PowerShell 7 before running the tests:
+
+```powershell
+$env:LITERT_LM_LIB_PATH = & ./.github/scripts/prepare-litert-runtime.ps1 -OutputDir target/litert-runtime
+```
+
+The script reads `litert-lm/runtime-manifest.json`, checks the archive and each
+DLL's SHA-256, and extracts only the listed DLLs into a new directory. A valid
+existing output is reusable offline; unknown or changed output is refused, not
+overwritten. The wheel is only an archive: no Python code is installed or run,
+and this preparation does not need the desktop repository or pnpm. The offline
+fixture checks are `./.github/scripts/test-prepare-litert-runtime.ps1`.
+When built inside Meridian, the existing prepared `src-tauri/resources/` path
+remains usable if no explicit `LITERT_LM_LIB_PATH` is set.
+
+The standalone Windows CI runs nine offline preparation checks before the real
+ABI test. Previously the ABI test assumed the desktop's sibling `resources/`
+directory existed: Linux compiled that test out, and testing inside the app
+hid the missing fixture. A standalone source snapshot with no such directory
+reproduced the failure; using the prepared runtime passed, reverting the path
+selection failed again, and restoring it passed all 18 wrapper tests. Removing
+either the archive or DLL hash check also makes the offline checks fail.
+
 Style gates are `cargo fmt --all --check` and
 `cargo clippy --workspace --all-targets -- -D warnings`. A pre-commit hook that
 runs both is in `.githooks/`; enable it with

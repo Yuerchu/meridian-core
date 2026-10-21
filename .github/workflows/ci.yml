@@ -64,5 +64,18 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Test LiteRT runtime preparation
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./.github/scripts/test-prepare-litert-runtime.ps1
+
+      - name: Prepare pinned LiteRT runtime
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP "meridian-litert-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $library = & ./.github/scripts/prepare-litert-runtime.ps1 -OutputDir $output
+          "LITERT_LM_LIB_PATH=$library" >> $env:GITHUB_ENV
+
       - name: Tests
         run: cargo test --workspace
