@@ -23,6 +23,7 @@ pub mod memory;
 pub mod message;
 pub mod message_context_item;
 pub mod model_config;
+pub mod model_price;
 pub mod model_profile;
 pub mod notification;
 pub mod plan;

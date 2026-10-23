@@ -273,7 +273,7 @@ pub async fn bootstrap_with_secrets(
         agent::skills::seed_builtin_bindings(&sea).await;
     }
 
-    Ok(Services::new(ServicesInner {
+    let services = Services::new(ServicesInner {
         db: sea,
         secrets: mgr,
         tools: Arc::new(registry),
@@ -290,6 +290,7 @@ pub async fn bootstrap_with_secrets(
         sleep: AppSleepInhibitor::new(),
         events,
         alert_sinks: crate::notify::AlertSinks::new(),
+        models_dev: Arc::new(crate::provider::models_dev::ModelsDevCatalog::new()),
         paths: Paths { data_dir, skills_root },
         plan_files,
         #[cfg(not(target_os = "android"))]
@@ -305,7 +306,11 @@ pub async fn bootstrap_with_secrets(
         journal_shared: crate::journal::capture::JournalShared::new(),
         redaction,
         redaction_mappings: crate::redaction::RedactionMappings::new(),
-    }))
+    });
+    // Prices arrive from models.dev in the background; nothing above waits for
+    // it and a failed fetch leaves every stored price alone.
+    crate::provider::models_dev::spawn_sync_loop(services.db.clone(), services.models_dev.clone());
+    Ok(services)
 }
 
 /// The built-in tool categories and presets, and the repairs earlier seeds
