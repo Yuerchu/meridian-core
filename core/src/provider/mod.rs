@@ -13,6 +13,7 @@ pub mod google_interactions;
 pub mod litert_lm_provider;
 pub mod local_model;
 pub mod models;
+pub mod models_dev;
 pub mod openai_compat;
 pub mod openai_responses;
 pub mod registry;

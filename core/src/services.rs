@@ -84,6 +84,12 @@ pub struct ServicesInner {
     /// registered by anything else. What registers is an outlet that only
     /// exists while something is running, so it unregisters too.
     pub alert_sinks: crate::notify::AlertSinks,
+    /// The last models.dev document, and where the price timer keeps it. See
+    /// [`crate::provider::models_dev`].
+    ///
+    /// Held here rather than on the timer so a save can fill one model's
+    /// prices straight away instead of waiting up to a day for the next pass.
+    pub models_dev: Arc<crate::provider::models_dev::ModelsDevCatalog>,
     pub paths: Paths,
     /// Crash-safe app-private `plan.md` materialisation shared by every runner.
     /// The shared value owns the per-document locks; constructing one per turn
@@ -207,6 +213,7 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         sleep: AppSleepInhibitor::new(),
         events: EventBus::new(),
         alert_sinks: crate::notify::AlertSinks::new(),
+        models_dev: Arc::new(crate::provider::models_dev::ModelsDevCatalog::new()),
         paths: Paths {
             data_dir: dir.to_path_buf(),
             skills_root: dir.join("skills"),
