@@ -72,13 +72,13 @@ impl ModelFacts {
 
 /// models.dev as of one fetch, indexed by the id we normalise to.
 #[derive(Debug)]
-pub struct Snapshot {
+pub struct ModelsDevSnapshot {
     fetched_at: EpochMs,
     /// provider id → normalised model id → rates.
     providers: HashMap<String, HashMap<String, ModelFacts>>,
 }
 
-impl Snapshot {
+impl ModelsDevSnapshot {
     /// Answers for a model reached through one provider.
     ///
     /// The provider is looked up by the catalog id the row carries, falling
@@ -103,7 +103,7 @@ impl Snapshot {
 /// it is kept behind an `Arc` rather than cloned per lookup.
 #[derive(Default)]
 pub struct ModelsDevCatalog {
-    snapshot: RwLock<Option<Arc<Snapshot>>>,
+    snapshot: RwLock<Option<Arc<ModelsDevSnapshot>>>,
 }
 
 impl ModelsDevCatalog {
@@ -111,14 +111,14 @@ impl ModelsDevCatalog {
         Self::default()
     }
 
-    fn current(&self) -> Option<Arc<Snapshot>> {
+    fn current(&self) -> Option<Arc<ModelsDevSnapshot>> {
         self.snapshot
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    fn store(&self, snapshot: Snapshot) {
+    fn store(&self, snapshot: ModelsDevSnapshot) {
         *self.snapshot.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(snapshot));
     }
 }
@@ -141,7 +141,7 @@ pub struct SyncReport {
 /// `async fn fetch` on the trait rather than a body-first helper: this is the
 /// one request in the app with no credential, no dialect and no retry of its
 /// own, so it uses the transport directly.
-pub async fn fetch(transport: &impl HttpTransport) -> Result<Snapshot, String> {
+pub async fn fetch(transport: &impl HttpTransport) -> Result<ModelsDevSnapshot, String> {
     let mut request = Request::new(http::Method::GET, API_URL.to_owned());
     request.timeout = Some(FETCH_TIMEOUT);
     let response = transport
@@ -150,10 +150,10 @@ pub async fn fetch(transport: &impl HttpTransport) -> Result<Snapshot, String> {
         .map_err(|error| format!("models.dev: {error}"))?;
     let raw: HashMap<String, ApiProvider> = serde_json::from_slice(&response.body)
         .map_err(|error| format!("models.dev returned an unexpected document: {error}"))?;
-    Ok(Snapshot::from_api(raw, now_ms()))
+    Ok(ModelsDevSnapshot::from_api(raw, now_ms()))
 }
 
-impl Snapshot {
+impl ModelsDevSnapshot {
     /// A snapshot built without going through the document's spelling rules,
     /// for tests that are about what happens to a row rather than what the
     /// document says.
@@ -428,7 +428,7 @@ pub async fn sync_once(db: &Db, catalog: &ModelsDevCatalog, force: bool) -> Resu
 /// row being written, and a save landing between them would otherwise be
 /// overwritten. The document is fetched outside it — a network wait inside
 /// `BEGIN IMMEDIATE` would hold the database for as long as models.dev took.
-async fn apply(db: &Db, snapshot: &Snapshot) -> Result<SyncReport, String> {
+async fn apply(db: &Db, snapshot: &ModelsDevSnapshot) -> Result<SyncReport, String> {
     db.write(async |tx| ops::model_price::apply(tx, snapshot).await)
         .await
         .map_err(|error| error.to_string())
@@ -449,7 +449,7 @@ pub async fn fill_for_config(db: &Db, catalog: &ModelsDevCatalog, provider_id: &
     }
 }
 
-async fn fill_one(db: &Db, snapshot: &Snapshot, provider_id: &str, model_id: &str) -> Result<(), String> {
+async fn fill_one(db: &Db, snapshot: &ModelsDevSnapshot, provider_id: &str, model_id: &str) -> Result<(), String> {
     db.write(async |tx| ops::model_price::fill_one(tx, snapshot, provider_id, model_id).await)
         .await
         .map(|_| ())
@@ -485,9 +485,9 @@ mod tests {
     use super::*;
     use crate::db::types::SqlBool;
 
-    fn snapshot(json: &str) -> Snapshot {
+    fn snapshot(json: &str) -> ModelsDevSnapshot {
         let raw: HashMap<String, ApiProvider> = serde_json::from_str(json).expect("the fixture must parse");
-        Snapshot::from_api(raw, 0)
+        ModelsDevSnapshot::from_api(raw, 0)
     }
 
     fn price_of(raw: &str) -> Option<Decimal> {

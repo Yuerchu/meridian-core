@@ -15,7 +15,7 @@ use crate::db::entity::{model_config, model_profile, provider};
 use crate::db::sea::cap::WriteTx;
 use crate::db::sea::cap::sealed::Access;
 use crate::db::sea::ops;
-use crate::provider::models_dev::{ModelFacts, Snapshot, SyncReport, catalog_of, may_write};
+use crate::provider::models_dev::{ModelFacts, ModelsDevSnapshot, SyncReport, catalog_of, may_write};
 use crate::util::now_ms;
 
 /// Every profile the snapshot can price.
@@ -23,7 +23,7 @@ use crate::util::now_ms;
 /// A profile reached through two providers that disagree is skipped rather
 /// than resolved: the same model on a vendor's API and on a reseller can carry
 /// different rates, and choosing one would bill against a number nobody set.
-pub async fn apply(tx: &WriteTx, snapshot: &Snapshot) -> Result<SyncReport, sea_orm::DbErr> {
+pub async fn apply(tx: &WriteTx, snapshot: &ModelsDevSnapshot) -> Result<SyncReport, sea_orm::DbErr> {
     let providers = provider::Entity::find().all(tx.conn()?).await?;
     let by_id: HashMap<&str, &provider::Model> = providers.iter().map(|row| (row.id.as_str(), row)).collect();
     let configs = model_config::Entity::find().all(tx.conn()?).await?;
@@ -90,7 +90,7 @@ pub async fn apply(tx: &WriteTx, snapshot: &Snapshot) -> Result<SyncReport, sea_
 /// prices. That is the ordinary outcome, not a failure.
 pub async fn fill_one(
     tx: &WriteTx,
-    snapshot: &Snapshot,
+    snapshot: &ModelsDevSnapshot,
     provider_id: &str,
     model_id: &str,
 ) -> Result<bool, sea_orm::DbErr> {
@@ -155,7 +155,7 @@ mod tests {
     use crate::db::sea::cap::Db;
     use crate::db::sea::sea_test_db;
     use crate::db::types::SqlBool;
-    use crate::provider::models_dev::{ModelFacts, Snapshot};
+    use crate::provider::models_dev::{ModelFacts, ModelsDevSnapshot};
     use crate::provider::registry::{ApiFormat, CredentialKind, ProviderType, TransportProfile};
 
     use super::*;
@@ -169,12 +169,12 @@ mod tests {
         }
     }
 
-    fn snapshot(input: &str, output: &str) -> Snapshot {
+    fn snapshot(input: &str, output: &str) -> ModelsDevSnapshot {
         let mut models = HashMap::new();
         models.insert("claude-sonnet-4".to_owned(), facts(input, output));
         let mut providers = HashMap::new();
         providers.insert("anthropic".to_owned(), models);
-        Snapshot::from_facts(providers)
+        ModelsDevSnapshot::from_facts(providers)
     }
 
     fn provider_row(id: &str) -> provider::Model {
@@ -344,7 +344,7 @@ mod tests {
         let mut google = HashMap::new();
         google.insert("claude-sonnet-4".to_owned(), facts("4", "20"));
         providers.insert("google".to_owned(), google);
-        let snapshot = Snapshot::from_facts(providers);
+        let snapshot = ModelsDevSnapshot::from_facts(providers);
 
         let report = db.write(async |tx| apply(tx, &snapshot).await).await.unwrap();
         assert_eq!(
