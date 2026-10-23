@@ -387,6 +387,9 @@ pub(crate) fn may_write(profile: &model_profile::Model, facts: &ModelFacts) -> b
 /// The document itself is fetched outside it — a network wait inside
 /// `BEGIN IMMEDIATE` would hold the database for as long as models.dev took.
 pub async fn sync_once(db: &Db, catalog: &ModelsDevCatalog, force: bool) -> Result<SyncReport, String> {
+    // pool-read-before-write: the switch is read before a network fetch, and
+    // the fetch must not run inside `BEGIN IMMEDIATE`. A switch flipped while
+    // the document is in flight is picked up by the next pass, not this one.
     let enabled = ops::preference::parse_bool_preference(
         SYNC_ENABLED_KEY,
         ops::preference::get_preference(db, SYNC_ENABLED_KEY)
