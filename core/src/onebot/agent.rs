@@ -793,6 +793,7 @@ async fn headless_chat_inner(
     let keep_recent = assistant
         .as_ref()
         .map(|a| a.compact_keep_recent_tokens.max(0) as usize)
+        // domain-default: migration m0007 gives the column this default; a row without one is absent configuration, not an unknown limit.
         .unwrap_or(20_000);
 
     let budget = TokenBudget::new(

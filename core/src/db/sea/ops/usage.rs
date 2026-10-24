@@ -782,7 +782,9 @@ pub async fn cache_misses(db: &impl Read, filter: &UsageFilter) -> Result<CacheM
         let Some(input) = row.try_get::<Option<i64>>("", "input_tokens")? else {
             continue;
         };
+        // domain-default: a missing cache leg itemises nothing, and the billing contract reads that as zero.
         let cache_read = row.try_get::<Option<i64>>("", "cache_read_tokens")?.unwrap_or(0);
+        // domain-default: a missing cache leg itemises nothing, and the billing contract reads that as zero.
         let cache_write = row.try_get::<Option<i64>>("", "cache_write_tokens")?.unwrap_or(0);
         let prompt = input + cache_read + cache_write;
         if let Some(previous) = previous_prompt {
