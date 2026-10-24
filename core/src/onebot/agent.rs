@@ -5,9 +5,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::engine::{self};
-use crate::agent::{
-    TokenBudget, build_messages_with_senders, microcompact, resolve_provider_config, trim_to_context_limit,
-};
+use crate::agent::{TokenBudget, build_messages_with_senders, resolve_provider_config, trim_to_context_limit};
 use crate::db::models::turn::TurnPhase;
 use crate::mcp::McpRegistry;
 use crate::provider::{self, ChatMessage, ToolCall};
@@ -792,7 +790,11 @@ async fn headless_chat_inner(
     // The checklist, frozen the same way and placed right after memory. A QQ
     // group never has one and this is a no-op there; a private admin chat can.
     let todo = crate::agent::plan_todo_injection(sea, conversation_id, ctx.live()).await?;
-    let keep_recent = assistant.as_ref().map(|a| a.compact_keep_recent as usize).unwrap_or(10);
+    let keep_recent = assistant
+        .as_ref()
+        .map(|a| a.compact_keep_recent_tokens.max(0) as usize)
+        // domain-default: migration m0007 gives the column this default; a row without one is absent configuration, not an unknown limit.
+        .unwrap_or(20_000);
 
     let budget = TokenBudget::new(
         &provider_type,
@@ -872,8 +874,8 @@ async fn headless_chat_inner(
         conversation_id,
         supports_images,
     )?;
-    microcompact(&mut chat_messages, &budget, keep_recent);
-    trim_to_context_limit(&mut chat_messages, context_limit, keep_recent);
+    // Compaction replaces the history; this is only the floor beneath it.
+    trim_to_context_limit(&mut chat_messages, context_limit, keep_recent, &budget.counter);
 
     let params = turn_params.params;
 
@@ -1072,6 +1074,7 @@ async fn headless_chat_inner(
             cancel: cancel.clone(),
             keep_recent,
             context_limit,
+            warm: None,
             // The declared permission and nothing else: no reach check, and no
             // standing yes to project edits — there is no project. The desktop
             // consults both. On the drift list. The open registry tools are the

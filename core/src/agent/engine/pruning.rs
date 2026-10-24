@@ -17,6 +17,25 @@
 
 use crate::provider::ChatMessage;
 
+use super::super::tokenizer::TokenBudget;
+
+/// Prune only when the history is more than half the window.
+///
+/// grok-build's `should_prune` gates its pruning the same way, and the gate is
+/// what makes this a pressure response rather than a per-round ritual: below
+/// half the window the history is cheap to send whole, and rewriting it would
+/// change the cached prefix for nothing. Returns the tokens it freed.
+pub(crate) fn maybe_prune(messages: &mut [ChatMessage], budget: &mut TokenBudget) -> usize {
+    budget.update_estimate(messages);
+    if !budget.needs_prune() {
+        return 0;
+    }
+    let before = budget.current_estimate;
+    prune_tool_results(messages, &PruningConfig::default());
+    budget.update_estimate(messages);
+    before.saturating_sub(budget.current_estimate)
+}
+
 pub(crate) struct PruningConfig {
     pub keep_last_n: usize,
     pub soft_threshold: usize,
@@ -132,6 +151,42 @@ mod tests {
         prune_tool_results(&mut msgs, &config);
         assert_eq!(msgs[2].origin, crate::provider::MessageOrigin::Tool);
         assert_eq!(msgs[2].content, "shot [+1 media]");
+    }
+
+    /// Five rounds, so the first tool result is old enough for the soft trim
+    /// and young enough that only the window gate can keep it intact.
+    fn history_with_an_old_big_result() -> Vec<ChatMessage> {
+        let big = big_content(5_000);
+        let mut msgs = vec![user("hi")];
+        for i in 0..5 {
+            msgs.push(assistant(&format!("round {i}")));
+            msgs.push(tool(&format!("c{i}"), if i == 0 { &big } else { "small" }));
+            msgs.push(user("ok"));
+        }
+        msgs
+    }
+
+    /// A history below half the window is sent as it was stored. Rewriting it
+    /// here is what used to break the cached prefix on every round.
+    #[test]
+    fn below_half_the_window_rewrites_nothing() {
+        let mut msgs = history_with_an_old_big_result();
+        let before = msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>();
+        let mut budget = TokenBudget::new("openai", "gpt-4o", 128_000, 16_384, None);
+        let freed = maybe_prune(&mut msgs, &mut budget);
+        assert_eq!(freed, 0);
+        assert_eq!(before, msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>());
+    }
+
+    /// Above half the window the same history is trimmed, which is the whole
+    /// reason the gate exists.
+    #[test]
+    fn above_half_the_window_trims_old_output() {
+        let mut msgs = history_with_an_old_big_result();
+        let mut budget = TokenBudget::new("openai", "gpt-4o", 1_000, 100, None);
+        let freed = maybe_prune(&mut msgs, &mut budget);
+        assert!(freed > 0);
+        assert!(msgs[2].content.contains("trimmed"));
     }
 
     fn assistant(text: &str) -> ChatMessage {

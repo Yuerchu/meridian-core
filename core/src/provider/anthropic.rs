@@ -410,6 +410,13 @@ impl AnthropicProvider {
             }));
         }
         if !wire_tools.is_empty() {
+            // The tool block is the front of the cached prefix. A marker here
+            // keeps every definition cached when a later turn edits the system
+            // prompt; without it the system breakpoint is the first one, and a
+            // change there invalidates the tools with it.
+            if let Some(last) = wire_tools.last_mut() {
+                last["cache_control"] = ephemeral();
+            }
             body["tools"] = serde_json::json!(wire_tools);
         }
 
@@ -1688,6 +1695,10 @@ mod tests {
 
     /// `body_for` with a conversation of one's own behind the system prompt.
     fn body_with(messages: Vec<ChatMessage>) -> serde_json::Value {
+        body_with_tools(messages, None)
+    }
+
+    fn body_with_tools(messages: Vec<ChatMessage>, tools: Option<&[ToolDefinition]>) -> serde_json::Value {
         let model = "claude-opus-4-8";
         let caps = crate::provider::capabilities::resolve("anthropic", None, model);
         let mut params = ChatParams {
@@ -1709,15 +1720,15 @@ mod tests {
             sent_at: None,
         }];
         all.extend(messages);
-        let req = provider.build_request(&all, None, &params, false).unwrap();
+        let req = provider.build_request(&all, tools, &params, false).unwrap();
         match req.body {
             Some(RequestBody::Json(v)) => v,
             _ => panic!("expected a JSON body"),
         }
     }
 
-    /// Every `cache_control` in the request: on system blocks and on message
-    /// blocks. Anthropic allows four.
+    /// Every `cache_control` in the request: on tools, system blocks and
+    /// message blocks. Anthropic allows four.
     fn cache_markers(body: &serde_json::Value) -> usize {
         let in_blocks = |blocks: &serde_json::Value| {
             blocks
@@ -1725,7 +1736,12 @@ mod tests {
                 .map(|b| b.iter().filter(|block| block.get("cache_control").is_some()).count())
                 .unwrap_or(0)
         };
-        in_blocks(&body["system"])
+        let in_tools = body["tools"]
+            .as_array()
+            .map(|tools| tools.iter().filter(|tool| tool.get("cache_control").is_some()).count())
+            .unwrap_or(0);
+        in_tools
+            + in_blocks(&body["system"])
             + body["messages"]
                 .as_array()
                 .unwrap()
@@ -1756,6 +1772,32 @@ mod tests {
         assert!(marked(&messages[0]), "the user message: {}", messages[0]);
         assert!(marked(&messages[1]), "the roster, as the last block: {}", messages[1]);
         assert_eq!(cache_markers(&body), 3, "system, user, last");
+    }
+
+    /// The tool array is the first part of the prefix a later turn repeats. A
+    /// marker on its last definition keeps every tool cached when the system
+    /// prompt changes, which a system-only breakpoint cannot do.
+    #[test]
+    fn the_last_tool_carries_a_cache_marker() {
+        let tools = [crate::provider::ToolDefinition {
+            name: "read_file".into(),
+            description: "read a file".into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        }];
+        let body = body_with_tools(
+            vec![ChatMessage::persisted_user("hi", 1_600_000_000_000, None)],
+            Some(&tools),
+        );
+        let wire_tools = body["tools"].as_array().unwrap();
+        assert_eq!(wire_tools.len(), 1);
+        assert!(
+            wire_tools[0].get("cache_control").is_some(),
+            "the last tool: {}",
+            wire_tools[0]
+        );
+        // system + the user message + the last tool; the user message is also
+        // the last message, so its two markers coincide.
+        assert_eq!(cache_markers(&body), 3);
     }
 
     /// With no roster the two breakpoints name the same block, and the block

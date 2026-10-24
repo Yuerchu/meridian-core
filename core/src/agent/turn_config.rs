@@ -370,7 +370,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             context_limit: 128000,
-            compact_keep_recent: 10,
+            compact_keep_recent_tokens: 20_000,
             enabled_tools: enabled.map(|json| crate::db::types::Json::decode(json).unwrap()),
             thinking_enabled: crate::db::types::SqlBool::FALSE,
             thinking_budget: None,

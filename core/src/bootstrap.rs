@@ -123,7 +123,7 @@ pub async fn bootstrap_with_secrets(
                     // outranked the window of every model the default
                     // assistant was pointed at, and nobody chose it.
                     context_limit: 0,
-                    compact_keep_recent: 10,
+                    compact_keep_recent_tokens: 20_000,
                     enabled_tools: None,
                     thinking_enabled: SqlBool::FALSE,
                     thinking_budget: None,

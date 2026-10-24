@@ -82,6 +82,14 @@ pub enum MessageOrigin {
     /// so adapters can keep its trust boundary intact. Unlike SystemContext it
     /// is ordinary branch history: compaction and trimming may remove it.
     UserProvidedContext,
+    /// A summary written by compaction, standing in for every turn before the
+    /// anchor that follows it.
+    ///
+    /// Its own origin rather than a plain user message: trimming keeps it even
+    /// when it falls outside the kept tail, because dropping it would silently
+    /// remove the only record of the history it replaced. It carries no send
+    /// time, and adapters do not treat it as something a person said.
+    CompactSummary,
 }
 
 impl MessageOrigin {
@@ -174,6 +182,20 @@ impl ChatMessage {
             tool_error: false,
             provider_state: None,
             origin: MessageOrigin::SystemContext,
+            sent_at: None,
+        }
+    }
+    /// A compaction summary standing in for the history before its anchor.
+    pub fn compact_summary(content: &str) -> Self {
+        Self {
+            role: "user".into(),
+            content: content.into(),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_error: false,
+            provider_state: None,
+            origin: MessageOrigin::CompactSummary,
             sent_at: None,
         }
     }

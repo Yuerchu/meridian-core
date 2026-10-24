@@ -131,6 +131,18 @@ impl OpenAICompatProvider {
             );
         }
 
+        // OpenAI's own API accepts `prompt_cache_key` on chat-completions and
+        // routes a conversation back to the machine already holding its prefix.
+        // Its own host only: a relay that predates the field may reject an
+        // unknown body member, which is the same reason the vendor header
+        // stays gated on the xAI flavor.
+        if self.flavor == OpenAICompatFlavor::Generic
+            && let Some(key) = params.cache_key.as_deref()
+            && is_openai_host(&self.base_url)
+        {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+
         let mut req = Request::new(http::Method::POST, format!("{}/chat/completions", self.base_url));
         req.headers.insert(
             http::header::AUTHORIZATION,
@@ -160,6 +172,18 @@ impl OpenAICompatProvider {
         req.body = Some(RequestBody::Json(body));
         Ok(req)
     }
+}
+
+/// Whether this base URL is OpenAI's own API rather than a relay.
+///
+/// Exact host match: `contains` would also accept `api.openai.com.evil.test`,
+/// and a match here sends a body member some relays have never heard of.
+fn is_openai_host(base_url: &str) -> bool {
+    base_url
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(|host| host.eq_ignore_ascii_case("api.openai.com")))
+        .unwrap_or(false)
 }
 
 /// Only a user message can be the attachment envelope. Everything else is text
@@ -1222,6 +1246,51 @@ mod xai_tests {
             .build_request(&[ChatMessage::user("hello")], None, &params(), true)
             .unwrap();
         assert!(req.headers.get("x-grok-conv-id").is_none());
+    }
+
+    fn openai_body(base_url: &str, cache_key: Option<&str>) -> serde_json::Value {
+        let provider = OpenAICompatProvider::new(base_url, "key");
+        let p = ChatParams {
+            model: "gpt-5.5".into(),
+            cache_key: cache_key.map(str::to_string),
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(&[ChatMessage::user("hello")], None, &p, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        body
+    }
+
+    /// OpenAI's own API defines the field and uses it to route a conversation
+    /// to the machine already holding its prefix.
+    #[test]
+    fn the_official_openai_host_gets_a_prompt_cache_key() {
+        let body = openai_body("https://api.openai.com/v1", Some("conv-42"));
+        assert_eq!(body["prompt_cache_key"], "conv-42");
+    }
+
+    /// A relay that predates the field may reject an unknown body member.
+    #[test]
+    fn a_relay_is_not_sent_an_unknown_body_field() {
+        let body = openai_body("https://relay.example.test/v1", Some("conv-42"));
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    /// A `contains` check would accept this host, and the field would reach a
+    /// server that is not OpenAI's.
+    #[test]
+    fn a_lookalike_host_is_not_the_official_api() {
+        let body = openai_body("https://api.openai.com.evil.test/v1", Some("conv-42"));
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn without_a_cache_key_no_field_is_sent() {
+        let body = openai_body("https://api.openai.com/v1", None);
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     fn usage(json: &str) -> ChunkUsage {

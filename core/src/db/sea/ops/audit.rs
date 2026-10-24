@@ -236,6 +236,14 @@ pub const TITLE_ROLE: &str = "title";
 /// usage away at the adapter boundary.
 pub const EXTRACTION_ROLE: &str = "extraction";
 
+/// Re-sending a conversation's prefix with a one-token output cap so the
+/// upstream keeps it cached while the turn is still running.
+///
+/// A request nobody typed, made on purpose and billed like any other. Its own
+/// role because otherwise the protection it buys reads as unexplained spend on
+/// a conversation the user never asked anything extra of.
+pub const CACHE_WARM_ROLE: &str = "cache_warm";
+
 /// Every role that carries spend.
 ///
 /// The list `db::sea::ops::usage` filters on. A role missing from here is traffic
@@ -248,6 +256,7 @@ pub const BILLED_ROLES: &[&str] = &[
     COMPACTION_ROLE,
     TITLE_ROLE,
     EXTRACTION_ROLE,
+    CACHE_WARM_ROLE,
 ];
 
 /// What one request the app made on its own behalf cost.

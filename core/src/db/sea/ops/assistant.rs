@@ -89,7 +89,7 @@ pub(crate) mod tests {
             created_at: 1,
             updated_at: 1,
             context_limit: 0,
-            compact_keep_recent: 10,
+            compact_keep_recent_tokens: 20_000,
             enabled_tools: Some(Json(vec!["read_file".into()])),
             thinking_enabled: SqlBool::FALSE,
             thinking_budget: None,

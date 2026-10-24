@@ -177,7 +177,7 @@ macro_rules! usage_grouping {
                                AND COALESCE(server_tool_calls, 0) = 0
                          THEN 1 ELSE 0 END) AS explicit_zero_messages
            FROM audit_messages
-          WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction')
+          WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction', 'cache_warm')
             AND (? IS NULL OR created_at >= ?)
             AND (? IS NULL OR created_at < ?)
             AND (? IS NULL OR turn_origin = ?)
@@ -217,6 +217,25 @@ const USAGE_BY_KIND: ReadOnly = usage_by!("role");
 /// with no turn id cannot be attached exactly and are left out.
 pub const USAGE_BY_TURN: ReadOnly = usage_grouping!("turn_id", "AND conversation_id = ?", "AND turn_id IS NOT NULL");
 
+/// Every reply and every compaction in the window, per conversation, in order.
+///
+/// Values match [`filter_values`]: since, since, until, until, origin, origin,
+/// then the nullable conversation twice. A compaction row is included only as
+/// a reset marker: the summary it writes replaces the prefix, so the next
+/// request is new content rather than missed cache.
+pub const USAGE_CACHE_MISS_ROWS: ReadOnly = ReadOnly(
+    "SELECT conversation_id, role, created_at,
+            input_tokens, cache_read_tokens, cache_write_tokens,
+            input_price, cache_write_price, cache_read_price
+       FROM audit_messages
+      WHERE role IN ('assistant', 'compaction')
+        AND (? IS NULL OR created_at >= ?)
+        AND (? IS NULL OR created_at < ?)
+        AND (? IS NULL OR turn_origin = ?)
+        AND (? IS NULL OR conversation_id = ?)
+      ORDER BY conversation_id, created_at, id",
+);
+
 /// The rows that can carry a usage or pricing gap: a side of the usage missing,
 /// or a rate not snapshotted. A superset on purpose — whether a row really has
 /// a gap is the accumulator's answer, through the same `add` every report goes
@@ -246,7 +265,7 @@ macro_rules! gap_details {
             "SELECT id, created_at, conversation_id, role, provider_name, model_id, source_type,
             LENGTH(content) AS content_chars
        FROM audit_messages
-      WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction')
+      WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction', 'cache_warm')
         AND (? IS NULL OR created_at >= ?)
         AND (? IS NULL OR created_at < ?)
         AND (? IS NULL OR turn_origin = ?)

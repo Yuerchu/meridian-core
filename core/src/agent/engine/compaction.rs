@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use crate::agent::{
-    CompactCircuitBreaker, TokenBudget, microcompact, mid_turn_compact, mid_turn_compact_remote, trim_to_context_limit,
+    CompactCircuitBreaker, TokenBudget, mid_turn_compact, mid_turn_compact_remote, trim_to_context_limit,
 };
 use crate::events::{CompactDoneEvent, CompactOutcome, CompactStartEvent, CompactTrigger};
 use crate::provider::{ChatMessage, ChatParams, ChatProvider};
@@ -36,6 +36,7 @@ pub(crate) struct Compacting<'a> {
     /// one being summarised for would be counted against the wrong tokenizer.
     pub provider: &'a dyn ChatProvider,
     pub params: &'a ChatParams,
+    /// The tail compaction keeps, in tokens. See `TurnSetup::keep_recent`.
     pub keep_recent: usize,
     pub context_limit: usize,
     pub emit: Option<&'a dyn Emit>,
@@ -43,24 +44,17 @@ pub(crate) struct Compacting<'a> {
 }
 
 impl Compacting<'_> {
-    /// The cheap rung: truncate the old tool output and drop the inlined
-    /// images, keeping every message. Costs no model call, which is why both
-    /// moments reach for it before anything that does.
-    ///
-    /// Hands back what it freed, because the threshold path puts that number in
-    /// front of a person.
-    fn cheap_pass(&mut self) -> usize {
-        let reclaimed = microcompact(self.messages, self.budget, self.keep_recent);
-        self.budget.update_estimate(self.messages);
-        reclaimed
-    }
-
     /// The last resort, and the only step that cannot fail. Half the window and
     /// half the tail: deliberately harsher than the threshold path, because by
     /// the time anything calls this the alternative is a request that will be
     /// refused again.
     fn trim(&mut self) {
-        trim_to_context_limit(self.messages, self.context_limit / 2, (self.keep_recent / 2).max(2));
+        trim_to_context_limit(
+            self.messages,
+            self.context_limit / 2,
+            (self.keep_recent / 2).max(2_000),
+            &self.budget.counter,
+        );
         // Re-measured here rather than at each of the four call sites. Trimming
         // is the one step that always changes what the estimate describes, and
         // the caller sizes the retry's output allowance from it — a stale one
@@ -143,20 +137,12 @@ impl CompactionPolicy {
         let before = c.budget.current_estimate;
         match self {
             CompactionPolicy::OneBot => {
-                // Ahead of the trim rather than instead of it. Truncating the
-                // old tool output can put the history back under the limit on
-                // its own, and then the trim discards nothing — which is the
-                // whole of what this rung buys here: the same recovery, minus
-                // the turns it used to throw away to get there.
-                c.cheap_pass();
+                // The trim is the only recovery here: a summary would go to the
+                // same provider that just refused this request.
                 c.trim();
-                // Still "trim": the rung names the deepest one reached, which is
-                // how the other policy reads, and `before`/`after` in the same
-                // record already show what the cheap pass achieved.
                 c.report("api_error", before, "trim");
             }
             CompactionPolicy::Desktop { breaker, .. } => {
-                c.cheap_pass();
                 if !(c.budget.needs_compact() && breaker.can_compact()) {
                     c.trim();
                     c.report("api_error", before, "trim");
@@ -198,23 +184,16 @@ impl CompactionPolicy {
         let before = c.budget.current_estimate;
         match self {
             CompactionPolicy::OneBot => {
-                c.cheap_pass();
-                let mut rung = "microcompact";
-                if c.budget.needs_compact() {
-                    if c.try_remote_compact().await.is_ok() {
-                        rung = "remote";
-                        c.budget.update_estimate(c.messages);
-                    } else if let Err(e) =
-                        mid_turn_compact(c.messages, c.budget, c.provider, c.params, c.keep_recent).await
-                    {
-                        tracing::warn!("OneBot mid-turn compact failed: {e}");
-                        rung = "trim";
-                        c.trim();
-                    } else {
-                        rung = "summary";
-                    }
-                    c.budget.update_estimate(c.messages);
+                let mut rung = "summary";
+                if c.try_remote_compact().await.is_ok() {
+                    rung = "remote";
+                } else if let Err(e) = mid_turn_compact(c.messages, c.budget, c.provider, c.params, c.keep_recent).await
+                {
+                    tracing::warn!("OneBot mid-turn compact failed: {e}");
+                    rung = "trim";
+                    c.trim();
                 }
+                c.budget.update_estimate(c.messages);
                 c.report("threshold", before, rung);
             }
             CompactionPolicy::Desktop { enabled, breaker } => {
@@ -222,24 +201,13 @@ impl CompactionPolicy {
                     return;
                 }
                 c.announce_start(CompactTrigger::Threshold);
-                let reclaimed = c.cheap_pass();
-                if !c.budget.needs_compact() {
-                    c.announce_done(
-                        CompactTrigger::Threshold,
-                        CompactOutcome::Completed,
-                        Some(reclaimed),
-                        None,
-                    );
-                    c.report("threshold", before, "microcompact");
-                    return;
-                }
                 if let Ok(more) = c.try_remote_compact().await {
                     breaker.record_success();
                     c.budget.update_estimate(c.messages);
                     c.announce_done(
                         CompactTrigger::Threshold,
                         CompactOutcome::RemoteCompacted,
-                        Some(reclaimed + more),
+                        Some(more),
                         None,
                     );
                     c.report("threshold", before, "remote");
@@ -249,12 +217,7 @@ impl CompactionPolicy {
                     Ok(more) => {
                         breaker.record_success();
                         c.budget.update_estimate(c.messages);
-                        c.announce_done(
-                            CompactTrigger::Threshold,
-                            CompactOutcome::Completed,
-                            Some(reclaimed + more),
-                            None,
-                        );
+                        c.announce_done(CompactTrigger::Threshold, CompactOutcome::Completed, Some(more), None);
                         c.report("threshold", before, "summary");
                     }
                     Err(e) => {
@@ -265,7 +228,7 @@ impl CompactionPolicy {
                         c.announce_done(
                             CompactTrigger::Threshold,
                             CompactOutcome::Fallback,
-                            Some(reclaimed),
+                            None,
                             Some(e.to_string()),
                         );
                         c.report("threshold", before, "trim");
@@ -361,11 +324,12 @@ mod tests {
         ]
     }
 
-    /// The thing this policy could not do before: truncating the old output can
-    /// put the history back under the limit on its own, and then nothing has to
-    /// be thrown away at all.
+    /// OneBot has no summariser on the recovery path: an overflow is answered
+    /// by keeping the tail. The old cheap pass used to truncate the tool result
+    /// and keep every message, but that rewrite is what broke the cached
+    /// prefix, so the recovery now pays for it by dropping turns instead.
     #[tokio::test]
-    async fn overflow_recovery_truncates_before_it_discards() {
+    async fn overflow_recovery_discards_instead_of_rewriting() {
         let (mut messages, mut budget) = (one_heavy_tool_result(), budget());
         let before = messages.len();
         budget.update_estimate(&messages);
@@ -380,7 +344,7 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(messages.len(), before, "discarded turns it did not have to");
+        assert!(messages.len() < before, "the trim must have dropped a turn");
         assert!(
             budget.current_estimate < was,
             "freed nothing: {was} -> {}",

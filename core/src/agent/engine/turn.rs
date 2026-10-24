@@ -337,8 +337,15 @@ pub struct TurnSetup<'a> {
     /// the turn writes as it goes, and steering can add rows mid-flight.
     pub parent_cursor: Option<String>,
     pub cancel: CancellationToken,
+    /// The tail compaction keeps, in **tokens** rather than message pairs.
+    /// Two tool results can outweigh forty short exchanges, so a message count
+    /// says nothing about how much context survives.
     pub keep_recent: usize,
     pub context_limit: usize,
+    /// When set, keeps this turn's prompt cache warm while it is still running.
+    /// `None` is every runner that has no provider it can replay through, and
+    /// every test.
+    pub warm: Option<crate::agent::cache_warmer::WarmSeed>,
     pub approval_rule: ApprovalRule,
     pub withheld: WithheldWording,
     /// Where a steered message's `file://` parts resolve against, and where a
@@ -534,6 +541,7 @@ async fn run(
         cancel,
         keep_recent,
         context_limit,
+        warm,
         approval_rule,
         withheld,
         files_root,
@@ -546,6 +554,15 @@ async fn run(
     } = setup;
     let pool = services.db;
     let emit = ports.emit;
+    // The rates the warmer's arithmetic needs are the same ones this turn
+    // prices its rounds with; taking them from here keeps one answer. A caller
+    // that already set them keeps its own.
+    let warm = warm.map(|mut seed| {
+        if seed.prices.is_none() {
+            seed.prices = pricing.as_ref().map(|p| p.base().clone());
+        }
+        crate::agent::cache_warmer::WarmGuard::start(seed)
+    });
 
     // Two ways to send, and the difference is the whole reason `Emit` returns a
     // `Result`. A window that missed a chunk is showing a transcript that never
@@ -589,10 +606,12 @@ async fn run(
             break;
         }
 
-        // Trim old, large tool results before estimating tokens. Cheaper than
-        // compaction and runs every round, so the budget sees a tighter history
-        // and compaction fires less often.
-        super::pruning::prune_tool_results(&mut chat_messages, &super::pruning::PruningConfig::default());
+        // Trim old, large tool results only once the history is more than half
+        // the window. grok-build gates its pruning the same way, and the gate
+        // is what keeps an ordinary turn's cached prefix untouched: without it
+        // every round rewrote old tool output at a moving boundary, and no
+        // later request could read the cache back.
+        super::pruning::maybe_prune(&mut chat_messages, &mut budget);
 
         // A caller may already have trimmed the initial history, but request
         // safety cannot depend on that. Re-apply the user-context aggregate cap
@@ -703,6 +722,20 @@ async fn run(
                         conversation_id: conversation_id.clone(),
                     });
                 }
+                // The request about to be made is the prefix worth keeping.
+                // Recorded before it goes out, so a timer armed by an earlier
+                // round is replaced rather than left pointing at a stale one.
+                if let Some(warm) = warm.as_ref()
+                    && warm.should_touch(&params, budget.current_estimate)
+                {
+                    warm.touch(crate::agent::cache_warmer::WarmSnapshot {
+                        params: params.clone(),
+                        messages: chat_messages.clone(),
+                        tools: tool_defs.clone(),
+                        prompt_tokens: budget.current_estimate,
+                        message_id: assistant_msg_id.clone(),
+                    });
+                }
                 // Asked for against what this prompt has left rather than
                 // against the model's advertised maximum. Most providers count
                 // the prompt and `max_tokens` against one window, so a long
@@ -774,6 +807,17 @@ async fn run(
                         // Recomputed, not reused: the recovery above is what just
                         // made room, and asking with the pre-compaction ceiling
                         // would waste it.
+                        if let Some(warm) = warm.as_ref()
+                            && warm.should_touch(&params, budget.current_estimate)
+                        {
+                            warm.touch(crate::agent::cache_warmer::WarmSnapshot {
+                                params: params.clone(),
+                                messages: chat_messages.clone(),
+                                tools: tool_defs.clone(),
+                                prompt_tokens: budget.current_estimate,
+                                message_id: assistant_msg_id.clone(),
+                            });
+                        }
                         let stream = provider
                             .stream_chat_with_tools(
                                 chat_messages.clone(),
@@ -2399,6 +2443,7 @@ mod tests {
             cancel: cancel.clone(),
             keep_recent: 10,
             context_limit: 128_000,
+            warm: None,
             approval_rule: ApprovalRule::ByReach { accept_edits: false },
             withheld: WithheldWording::Explained,
             files_root: None,
