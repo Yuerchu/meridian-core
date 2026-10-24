@@ -266,6 +266,16 @@ impl TokenBudget {
     pub fn needs_compact(&self) -> bool {
         self.current_estimate > self.compact_threshold
     }
+
+    /// Whether old tool output is worth trimming yet.
+    ///
+    /// Half the window, matching grok-build's `should_prune`. Below that the
+    /// history is cheap to send whole, and trimming it would change the cached
+    /// prefix for nothing. Strictly greater, so a prompt that exactly fills
+    /// half the window is still left alone.
+    pub fn needs_prune(&self) -> bool {
+        self.current_estimate > self.context_limit / 2
+    }
 }
 
 #[cfg(test)]

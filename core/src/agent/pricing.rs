@@ -208,6 +208,13 @@ pub struct TurnPricing {
 }
 
 impl TurnPricing {
+    /// The rates a prompt of any size starts at, for callers that only need to
+    /// decide whether something is worth doing — the cache warmer's arithmetic
+    /// is one. Pricing a request still goes through `for_prompt`.
+    pub fn base(&self) -> &Prices {
+        &self.base
+    }
+
     /// `None` when no part of a model's cost is known. A provider-tool rate is
     /// useful on its own: live progress can still show that known lower bound
     /// while the usage report flags the missing token rates.

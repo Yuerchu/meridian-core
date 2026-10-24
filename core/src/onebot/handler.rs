@@ -1864,7 +1864,10 @@ async fn dispatch_compact(
     }
     let (assistant, keep_recent) = match conversation_and_assistant(state, &conversation_id, None).await {
         Ok((_, assistant)) => {
-            let keep_recent = assistant.as_ref().map(|a| a.compact_keep_recent as usize).unwrap_or(10);
+            let keep_recent = assistant
+                .as_ref()
+                .map(|a| a.compact_keep_recent_tokens.max(0) as usize)
+                .unwrap_or(20_000);
             (assistant, keep_recent)
         }
         Err(e) => return build_reply(event, &format!("Compact 失败: {e}"), reply_to),

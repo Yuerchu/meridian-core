@@ -5,7 +5,7 @@ use crate::db::entity::message_context_item;
 use crate::db::sea::ops::message::ActiveContext;
 use crate::provider::{self, ChatMessage, SenderRef};
 
-use super::tokenizer::{TokenBudget, TokenCounter, TokenizerKind};
+use super::tokenizer::{TokenCounter, TokenizerKind};
 use super::tool_calls::parse_stored_tool_calls;
 
 /// Last known nickname per platform user id. Nicknames are not stored on the
@@ -76,7 +76,7 @@ pub fn build_messages_with_context_items(
         // history it replaced and must stay compactable and stay put.
         // SystemContext is reserved for background we regenerate each turn,
         // which `take_injected_context` lifts out and re-appends at the tail.
-        msgs.push(ChatMessage::user(&summary.content));
+        msgs.push(ChatMessage::compact_summary(&summary.content));
     }
     for m in context.live() {
         push_history_message(&mut msgs, m, sender_names, context_items.get(&m.id).map(Vec::as_slice))?;
@@ -685,10 +685,52 @@ pub(crate) fn cap_user_provided_context(messages: &mut Vec<ChatMessage>, context
     });
 }
 
-pub fn trim_to_context_limit(messages: &mut Vec<ChatMessage>, context_limit: usize, keep_recent: usize) {
+/// The index the kept tail starts at, measured in tokens rather than messages.
+///
+/// Mechanism from Pi (`keepRecentTokens`, MIT, Copyright (c) 2025 Mario
+/// Zechner); see NOTICE. Rewritten against Meridian's `ChatMessage`.
+///
+/// Walks back from the newest message accumulating counted tokens until the
+/// budget is reached. The turn granularity that matters is the tool pair, not
+/// the message: a kept tail may not start on a `tool` row, because that row
+/// answers a call the tail would have dropped. `floor` is the index nothing is
+/// ever cut below — the system message when there is one.
+///
+/// Returns `messages.len()` when even the newest message exceeds the budget,
+/// which callers read as "nothing to keep, and nothing to compact".
+pub(crate) fn keep_tail_boundary(
+    messages: &[ChatMessage],
+    counter: &TokenCounter,
+    keep_tokens: usize,
+    floor: usize,
+) -> usize {
+    let mut total = 0usize;
+    let mut boundary = messages.len();
+    while boundary > floor {
+        let cost = counter.count(&messages[boundary - 1].content);
+        // The newest message is always kept, whatever it costs: a tail of
+        // nothing is not a smaller prompt, it is a turn with no question in it.
+        if total + cost > keep_tokens && boundary < messages.len() {
+            break;
+        }
+        total += cost;
+        boundary -= 1;
+    }
+    while boundary > floor && messages.get(boundary).is_some_and(|m| m.role == "tool") {
+        boundary -= 1;
+    }
+    boundary
+}
+
+pub fn trim_to_context_limit(
+    messages: &mut Vec<ChatMessage>,
+    context_limit: usize,
+    keep_tokens: usize,
+    counter: &TokenCounter,
+) {
     let safe_limit = context_limit * 4 / 5;
     cap_user_provided_context(messages, context_limit);
-    let total_tokens: usize = messages.iter().map(|m| estimate_tokens(&m.content)).sum();
+    let total_tokens: usize = messages.iter().map(|m| counter.count(&m.content)).sum();
     if total_tokens <= safe_limit {
         return;
     }
@@ -697,14 +739,21 @@ pub fn trim_to_context_limit(messages: &mut Vec<ChatMessage>, context_limit: usi
     let injected = take_injected_context(messages);
     let has_system = messages.first().is_some_and(|m| m.role == "system");
     let system_offset = if has_system { 1 } else { 0 };
-    let keep = (keep_recent * 2).min(messages.len().saturating_sub(system_offset));
-    let start = messages.len() - keep;
+    let boundary = keep_tail_boundary(messages, counter, keep_tokens, system_offset);
     let mut trimmed = Vec::new();
     if has_system {
         trimmed.push(messages[0].clone());
     }
+    // A summary stands in for the history before the kept tail. Dropping it
+    // here would silently remove the only record of what was compacted away,
+    // leaving the model with a tail whose beginning has no cause.
+    for message in &messages[system_offset..boundary] {
+        if message.origin == provider::MessageOrigin::CompactSummary {
+            trimmed.push(message.clone());
+        }
+    }
     trimmed.extend(injected);
-    trimmed.extend_from_slice(&messages[start..]);
+    trimmed.extend_from_slice(&messages[boundary..]);
     remove_orphan_tool_messages(&mut trimmed);
     *messages = trimmed;
 }
@@ -751,85 +800,14 @@ pub(crate) fn data_uri_re() -> &'static regex::Regex {
     DATA_URI_RE.get_or_init(|| regex::Regex::new(r"data:(image/[^;]+);base64,[A-Za-z0-9+/=]+").unwrap())
 }
 
-pub fn microcompact(messages: &mut [ChatMessage], budget: &TokenBudget, keep_recent_turns: usize) -> usize {
-    let before = budget.counter.count_messages(messages);
-
-    let has_system = messages.first().is_some_and(|m| m.role == "system");
-    let system_offset = if has_system { 1 } else { 0 };
-    let keep_msgs = keep_recent_turns * 2;
-    // Clamp to system_offset: for short histories boundary can fall below it,
-    // which would invert the slice below and panic.
-    let boundary = messages.len().saturating_sub(keep_msgs).max(system_offset);
-
-    for msg in messages[system_offset..boundary].iter_mut() {
-        // An old tool result's pictures go the way of old inline images
-        // below, but the envelope cannot be cut by characters like text: it
-        // becomes its text and a count.
-        if msg.origin == provider::MessageOrigin::ToolParts {
-            msg.content = crate::agent::tool_media::message_text(msg);
-            msg.origin = provider::MessageOrigin::Tool;
-        }
-        if msg.role == "tool" {
-            let tokens = budget.counter.count(&msg.content);
-            if tokens > 2000 {
-                let chars: Vec<char> = msg.content.chars().collect();
-                let head_end = char_index_for_tokens(&budget.counter, &chars, 200);
-                let tail_start = chars
-                    .len()
-                    .saturating_sub(char_index_for_tokens_rev(&budget.counter, &chars, 100));
-                if head_end < tail_start {
-                    let head: String = chars[..head_end].iter().collect();
-                    let tail: String = chars[tail_start..].iter().collect();
-                    msg.content = format!("{head}\n[... truncated, was {tokens} tokens ...]\n{tail}");
-                }
-            }
-        }
-
-        msg.content = data_uri_re()
-            .replace_all(&msg.content, |caps: &regex::Captures| {
-                let mime = caps.get(1).map(|m| m.as_str()).unwrap_or("image/unknown");
-                format!("[image: {mime}]")
-            })
-            .into_owned();
-
-        if msg.role == "assistant" {
-            msg.reasoning_content = None;
-        }
-    }
-
-    let after = budget.counter.count_messages(messages);
-    before.saturating_sub(after)
-}
-
-fn char_index_for_tokens(counter: &TokenCounter, chars: &[char], target_tokens: usize) -> usize {
-    let mut idx = (target_tokens * 4).min(chars.len());
-    loop {
-        let s: String = chars[..idx].iter().collect();
-        if counter.count(&s) >= target_tokens || idx >= chars.len() {
-            break idx;
-        }
-        idx = (idx + 50).min(chars.len());
-    }
-}
-
-fn char_index_for_tokens_rev(counter: &TokenCounter, chars: &[char], target_tokens: usize) -> usize {
-    let mut count = (target_tokens * 4).min(chars.len());
-    loop {
-        // Recompute start each round: the counted suffix must grow with count,
-        // otherwise a low-token-density tail loops forever.
-        let start = chars.len().saturating_sub(count);
-        let s: String = chars[start..].iter().collect();
-        if counter.count(&s) >= target_tokens || start == 0 {
-            break count;
-        }
-        count = (count + 50).min(chars.len());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use provider::ToolCall;
+
+    fn test_counter() -> TokenCounter {
+        TokenCounter::new(TokenizerKind::Cl100kBase)
+    }
 
     /// A tool result with one stored picture in conversation `c`, as its row.
     fn media_row(root: &std::path::Path) -> (message_entity::Model, crate::agent::tool_media::StoredToolResult) {
@@ -912,24 +890,6 @@ mod tests {
         assert_eq!(live[0].content, replayed[0].content);
         assert_eq!(live[0].origin, replayed[0].origin);
         assert!(!row.content.contains("base64"), "base64 reached the row");
-    }
-
-    #[test]
-    fn microcompact_turns_an_old_tool_picture_into_its_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_, stored) = media_row(dir.path());
-        let mut tool = ChatMessage::tool_result_parts("call-1", &stored.content);
-        resolve_file_uris_in_messages(std::slice::from_mut(&mut tool), Some(dir.path()), "c", true).unwrap();
-        let budget = TokenBudget::new("openai", "gpt-4o", 128_000, 16_384, None);
-        let mut messages = vec![
-            chat_msg("system", "sys"),
-            tool,
-            chat_msg("user", "new question"),
-            chat_msg("assistant", "new answer"),
-        ];
-        microcompact(&mut messages, &budget, 1);
-        assert_eq!(messages[1].origin, provider::MessageOrigin::Tool);
-        assert_eq!(messages[1].content, "screenshot taken [+1 media]");
     }
 
     fn msg(id: &str, role: &str, content: &str) -> message_entity::Model {
@@ -1339,7 +1299,7 @@ mod tests {
     #[test]
     fn test_trim_no_trim_needed() {
         let mut msgs = vec![chat_msg("system", "sys"), chat_msg("user", "hi")];
-        trim_to_context_limit(&mut msgs, 100_000, 5);
+        trim_to_context_limit(&mut msgs, 100_000, 5, &test_counter());
         assert_eq!(msgs.len(), 2);
     }
 
@@ -1355,7 +1315,7 @@ mod tests {
         .to_string();
         let mut messages = vec![chat_msg("system", "sys"), chat_msg("user", &image)];
 
-        trim_to_context_limit(&mut messages, 20_000, 20);
+        trim_to_context_limit(&mut messages, 20_000, 20, &test_counter());
 
         assert_eq!(
             messages.len(),
@@ -1373,25 +1333,24 @@ mod tests {
         );
     }
 
+    /// A summary stands in for the history before the kept tail. If the tail
+    /// is chosen past it, the summary must survive anyway: dropping it leaves
+    /// the model with a tail whose beginning has no cause.
     #[test]
-    fn microcompact_still_replaces_old_inline_images() {
-        let image = serde_json::json!([
-            { "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } }
-        ])
-        .to_string();
-        let budget = TokenBudget::new("openai", "gpt-4o", 128_000, 16_384, None);
-        let mut messages = vec![
-            chat_msg("system", "sys"),
-            chat_msg("user", &image),
-            chat_msg("assistant", "old answer"),
-            chat_msg("user", "new question"),
-            chat_msg("assistant", "new answer"),
-        ];
+    fn trimming_keeps_a_compaction_summary() {
+        let mut msgs = vec![chat_msg("system", "sys"), ChatMessage::compact_summary("SUMMARY")];
+        for i in 0..20 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            msgs.push(chat_msg(role, &"word ".repeat(100)));
+        }
 
-        microcompact(&mut messages, &budget, 1);
+        trim_to_context_limit(&mut msgs, 1_000, 10, &test_counter());
 
-        assert!(!messages[1].content.contains("base64"));
-        assert!(messages[1].content.contains("[image: image/png]"));
+        assert!(
+            msgs.iter().any(|m| m.origin == provider::MessageOrigin::CompactSummary),
+            "the summary was trimmed away with the history it replaces"
+        );
+        assert!(msgs.iter().any(|m| m.content == "SUMMARY"));
     }
 
     #[test]
@@ -1401,7 +1360,7 @@ mod tests {
             let role = if i % 2 == 0 { "user" } else { "assistant" };
             msgs.push(chat_msg(role, &"x".repeat(200)));
         }
-        trim_to_context_limit(&mut msgs, 500, 2);
+        trim_to_context_limit(&mut msgs, 500, 2, &test_counter());
         assert_eq!(msgs[0].role, "system");
         assert!(msgs.len() < 21);
     }
@@ -1413,7 +1372,7 @@ mod tests {
             let role = if i % 2 == 0 { "user" } else { "assistant" };
             msgs.push(chat_msg(role, &format!("msg-{i}")));
         }
-        trim_to_context_limit(&mut msgs, 10, 2);
+        trim_to_context_limit(&mut msgs, 10, 2, &test_counter());
         let last = msgs.last().unwrap();
         assert_eq!(last.content, "msg-9");
     }
@@ -1435,7 +1394,7 @@ mod tests {
             chat_msg("user", &"x".repeat(500)),
             chat_msg("assistant", &"y".repeat(500)),
         ];
-        trim_to_context_limit(&mut msgs, 100, 2);
+        trim_to_context_limit(&mut msgs, 100, 2, &test_counter());
         for m in &msgs {
             if m.role == "tool" {
                 let id = m.tool_call_id.as_deref().unwrap();
@@ -1452,27 +1411,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_microcompact_short_history_with_system_no_panic() {
-        let budget = TokenBudget::new("openai", "gpt-4o", 128_000, 16_384, None);
-        let mut msgs = vec![
-            chat_msg("system", "You are a helpful assistant."),
-            chat_msg("user", "hello"),
-            chat_msg("assistant", "hi there"),
-        ];
-        // boundary < system_offset here; must not panic.
-        let _ = microcompact(&mut msgs, &budget, 10);
-        assert_eq!(msgs.len(), 3);
-    }
-
-    #[test]
-    fn test_char_index_for_tokens_rev_terminates_on_low_density() {
-        let counter = TokenCounter::new(TokenizerKind::Cl100kBase);
-        // Low token-density tail: a fixed-start loop would spin forever.
-        let chars: Vec<char> = "=".repeat(4000).chars().collect();
-        let idx = char_index_for_tokens_rev(&counter, &chars, 100);
-        assert!(idx <= chars.len());
-    }
     /// The wire flag comes off the row's `tool_outcome`, so an error the
     /// model was told about in one turn is still marked one when the history
     /// is replayed. A row from before the column, and a success, stay plain.
@@ -1500,6 +1438,10 @@ mod tests {
 mod injected_context_tests {
     use super::*;
     use crate::provider::MessageOrigin;
+
+    fn test_counter() -> TokenCounter {
+        TokenCounter::new(TokenizerKind::Cl100kBase)
+    }
 
     fn long_history(n: usize) -> Vec<ChatMessage> {
         (0..n)
@@ -1562,7 +1504,7 @@ mod injected_context_tests {
         msgs.push(ChatMessage::system_context("<bot_memories>\n- x\n</bot_memories>"));
         msgs.extend(long_history(40));
 
-        trim_to_context_limit(&mut msgs, 1_000, 2);
+        trim_to_context_limit(&mut msgs, 1_000, 2, &test_counter());
 
         assert!(
             msgs.iter().any(|m| m.origin.is_system_context()),
@@ -1713,7 +1655,7 @@ mod injected_context_tests {
             ChatMessage::assistant("previous answer"),
         ];
 
-        trim_to_context_limit(&mut messages, 1_000, 20);
+        trim_to_context_limit(&mut messages, 1_000, 20, &test_counter());
 
         let contexts = messages
             .iter()
@@ -1743,7 +1685,7 @@ mod injected_context_tests {
             ChatMessage::user_provided_context(&"new ".repeat(4_000)),
         ];
 
-        trim_to_context_limit(&mut messages, 2_000, 20);
+        trim_to_context_limit(&mut messages, 2_000, 20, &test_counter());
 
         let context_tokens = messages
             .iter()
@@ -1775,7 +1717,7 @@ mod injected_context_tests {
             msgs.push(ChatMessage::assistant(&format!("answer {i} {}", "y".repeat(400))));
         }
 
-        trim_to_context_limit(&mut msgs, 2_000, 4);
+        trim_to_context_limit(&mut msgs, 2_000, 4, &test_counter());
 
         let block = msgs.iter().find(|m| m.origin.is_system_context());
         assert!(

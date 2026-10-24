@@ -1,3 +1,10 @@
+// The token-budget boundary below is ported from Pi
+// (https://github.com/earendil-works/pi, commit ede2c9b),
+// packages/coding-agent/src/core/compaction/compaction.ts.
+// Copyright (c) 2025 Mario Zechner. Licensed under the MIT License; see NOTICE.
+// Changes: rewritten in Rust; the anchor is a database row id and the budget
+// is measured in tokens rather than a message count.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -220,6 +227,33 @@ fn prepare_chat_compact_input(messages: &[ChatMessage]) -> Result<Vec<CompactSec
     Ok(sections)
 }
 
+/// The first message the compacted tail keeps, measured in tokens.
+///
+/// The old boundary counted message pairs, which says nothing about how much
+/// context survives: two tool results can outweigh forty short exchanges. The
+/// walk never starts the tail on a `tool` row, so a call and its result stay on
+/// the same side of the anchor.
+///
+/// `estimate_tokens` is the character heuristic rather than the model's
+/// tokenizer: this runs before the summariser's model is resolved, and Pi's
+/// `estimateTokens` makes the same trade.
+fn compact_boundary(messages: &[&db::entity::message::Model], keep_tokens: usize) -> usize {
+    let mut total = 0usize;
+    let mut boundary = messages.len();
+    while boundary > 1 {
+        let cost = super::context::estimate_tokens(&messages[boundary - 1].content);
+        if total + cost > keep_tokens && boundary < messages.len() {
+            break;
+        }
+        total += cost;
+        boundary -= 1;
+    }
+    while boundary > 0 && boundary < messages.len() && messages[boundary].role == "tool" {
+        boundary -= 1;
+    }
+    boundary
+}
+
 pub async fn do_compact(
     db: &Db,
     secrets: &Arc<SecretsManager>,
@@ -259,12 +293,12 @@ pub async fn do_compact(
     // through a summariser is not something to leave resting on one.
     let active_messages: Vec<&db::entity::message::Model> = ctx.path.iter().filter(|m| m.role != "context").collect();
 
-    let min_messages = keep_recent * 2 + 2;
-    if active_messages.len() < min_messages {
+    let boundary_idx = compact_boundary(&active_messages, keep_recent);
+    // An anchor at either end means there is nothing on both sides of it: no
+    // history to summarise, or no tail worth keeping.
+    if boundary_idx == 0 || boundary_idx >= active_messages.len() {
         return Err("Not enough messages to compact".into());
     }
-
-    let boundary_idx = active_messages.len() - keep_recent * 2;
     let anchor_id = active_messages[boundary_idx].id.clone();
 
     let to_compact = &active_messages[..boundary_idx];
@@ -566,8 +600,7 @@ pub(crate) async fn mid_turn_compact(
 
     let has_system = messages.first().is_some_and(|m| m.role == "system");
     let system_offset = if has_system { 1 } else { 0 };
-    let keep_msgs = (keep_recent * 2).min(messages.len().saturating_sub(system_offset));
-    let mut boundary = messages.len() - keep_msgs;
+    let mut boundary = super::context::keep_tail_boundary(messages, &budget.counter, keep_recent, system_offset);
 
     // A frozen item belongs to the user message immediately before it. If the
     // keep boundary lands between them, move it back so the retry section below
@@ -616,7 +649,7 @@ pub(crate) async fn mid_turn_compact(
     if has_system {
         new_messages.push(messages[0].clone());
     }
-    new_messages.push(ChatMessage::user(&summary_with_context));
+    new_messages.push(ChatMessage::compact_summary(&summary_with_context));
     // Back in verbatim, ahead of the kept tail so later trims keep it too.
     new_messages.extend(injected);
     new_messages.extend_from_slice(&messages[boundary..]);

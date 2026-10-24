@@ -1,6 +1,7 @@
 pub mod auto_review;
 pub mod auxiliary;
 mod base_prompt;
+pub mod cache_warmer;
 pub mod call_identity;
 pub mod codex_install;
 mod compact;
@@ -54,8 +55,7 @@ pub use context::build_messages;
 pub(crate) use context::sender_ref;
 pub use context::{
     build_messages_with_context_items, build_messages_with_senders, freeze_sticker_parts, load_sender_names,
-    microcompact, persisted_user_message, resolve_file_uris_in_messages, resolve_sticker_parts_in_messages,
-    trim_to_context_limit,
+    persisted_user_message, resolve_file_uris_in_messages, resolve_sticker_parts_in_messages, trim_to_context_limit,
 };
 pub use file_access::{build_file_access, file_access_prompt};
 pub(crate) use inline_tag::{InlineHiddenTagParser, InlineTagSpec};
@@ -67,8 +67,9 @@ pub(crate) use memory_context::{MemorySubjectRef, roster_block};
 pub use project_instructions::{instruction_budget, load_project_instructions};
 pub(crate) use provider_config::without_thinking;
 pub use provider_config::{
-    ResolvedProvider, TurnParams, TurnParamsResolveRequest, build_tool_secrets, get_provider_api_key,
-    provider_secret_name, resolve_max_tokens, resolve_provider_config, resolve_turn_params, resolve_with_overrides,
+    ResolvedProvider, TurnParams, TurnParamsResolveRequest, build_tool_secrets, context_limit_for_turn,
+    get_provider_api_key, provider_secret_name, resolve_max_tokens, resolve_provider_config, resolve_turn_params,
+    resolve_with_overrides,
 };
 pub(crate) use stream::{
     RetryLadder, StreamResult, is_context_window_error, is_retryable_stream_error, parse_retry_after,

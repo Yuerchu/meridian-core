@@ -12,6 +12,21 @@ pub fn provider_secret_name(provider_id: &str) -> String {
     format!("PROVIDER_{}_KEY", provider_id.replace('-', "_").to_uppercase())
 }
 
+/// An assistant override may only narrow the answering model's window.
+///
+/// A number on the assistant used to replace the model's window outright, so a
+/// 1M Gemini default carried into a 128k on-device file and the GPU runtime
+/// allocated past WebGPU's 2 GiB buffer limit. `None` means nobody configured
+/// a window at all — the caller turns that into the existing settings error.
+pub fn context_limit_for_turn(asked: Option<usize>, model_window: Option<usize>) -> Option<usize> {
+    match (asked, model_window) {
+        (Some(asked), Some(window)) => Some(asked.min(window)),
+        (Some(asked), None) => Some(asked),
+        (None, Some(window)) => Some(window),
+        (None, None) => None,
+    }
+}
+
 pub fn get_provider_api_key(secrets: &SecretsManager, provider_id: &str) -> Option<String> {
     let key = provider_secret_name(provider_id);
     match secrets.get(&SecretScope::Global, &SecretName::new(&key).unwrap()) {
@@ -475,14 +490,25 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
         provider::capabilities::narrow_to_codex_shape(&mut caps);
     }
 
-    let context_limit = assistant
+    let model_window = model_config
+        .as_ref()
+        .map(|mc| mc.context_window as usize)
+        .or_else(|| caps.max_context_tokens.map(|t| t as usize));
+    let asked = assistant
         .filter(|a| a.context_limit > 0)
-        .map(|a| a.context_limit as usize)
-        .or_else(|| model_config.as_ref().map(|mc| mc.context_window as usize))
-        .or_else(|| caps.max_context_tokens.map(|t| t as usize))
-        .ok_or_else(|| {
-            format!("No context window known for '{model}'. Go to Settings → Provider → Model to set one.")
-        })?;
+        .map(|a| a.context_limit as usize);
+    if let (Some(asked), Some(window)) = (asked, model_window)
+        && asked > window
+    {
+        tracing::debug!(
+            asked,
+            window,
+            "assistant context override exceeds the answering model's window; using the model's"
+        );
+    }
+    let context_limit = context_limit_for_turn(asked, model_window).ok_or_else(|| {
+        format!("No context window known for '{model}'. Go to Settings → Provider → Model to set one.")
+    })?;
     let max_output = model_config
         .as_ref()
         .and_then(|mc| mc.max_output_tokens.map(|t| t as usize))
@@ -607,6 +633,18 @@ mod tests {
         );
     }
 
+    /// An assistant override may only narrow the answering model. A larger
+    /// number used to replace the window outright, which is how a 1M Gemini
+    /// default reached a 128k on-device file.
+    #[test]
+    fn an_assistant_context_override_cannot_exceed_the_model_window() {
+        assert_eq!(context_limit_for_turn(Some(1_000_000), Some(128_000)), Some(128_000));
+        assert_eq!(context_limit_for_turn(Some(64_000), Some(128_000)), Some(64_000));
+        assert_eq!(context_limit_for_turn(None, Some(128_000)), Some(128_000));
+        assert_eq!(context_limit_for_turn(Some(1_000_000), None), Some(1_000_000));
+        assert_eq!(context_limit_for_turn(None, None), None);
+    }
+
     #[test]
     fn test_provider_secret_name() {
         assert_eq!(provider_secret_name("my-provider-1"), "PROVIDER_MY_PROVIDER_1_KEY");
@@ -629,7 +667,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             context_limit: 0,
-            compact_keep_recent: 10,
+            compact_keep_recent_tokens: 20_000,
             enabled_tools: None,
             thinking_enabled: crate::db::types::SqlBool::TRUE,
             thinking_budget: Some(4096),
@@ -875,6 +913,54 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("web_search"), "{error}");
+    }
+
+    /// A Gemini-sized assistant override must not outrank the answering
+    /// model's stored window. That is the LiteRT-LM garbled-output path:
+    /// `engine_settings_set_max_num_tokens(1_000_000)` on a 128k GPU file.
+    #[tokio::test]
+    async fn a_turn_caps_the_assistant_window_to_the_model() {
+        let db = sea_test_db().await;
+        seed(
+            &db,
+            provider_row(
+                ProviderType::Openai,
+                "P",
+                "https://example.invalid",
+                ApiFormat::ChatCompletions,
+            ),
+            Some(FlatModelConfig {
+                model_id: "gemma-4-E2B-it-gpu.litertlm",
+                context_window: 128_000,
+                compact_threshold: 90_000,
+                max_output_tokens: Some(32_768),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let mut assistant = assistant_with(None);
+        assistant.context_limit = 1_000_000;
+
+        let turn = resolve_turn_params(
+            &db,
+            TurnParamsResolveRequest {
+                assistant: Some(&assistant),
+                provider_id: Some("p1"),
+                provider_type: "openai",
+                api_format: "chat_completions",
+                transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
+                model: "gemma-4-E2B-it-gpu.litertlm",
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.context_limit, 128_000);
+        assert_eq!(turn.params.context_limit, Some(128_000));
     }
 
     /// Only absence and an explicit empty array mean "ask for none". Broken
