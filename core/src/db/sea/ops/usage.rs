@@ -734,6 +734,82 @@ pub async fn report(
     Ok(out)
 }
 
+/// A miss below this many tokens is breakpoint granularity, not a lost
+/// prefix. Pi's `cache-stats.ts` uses the same floor; without it every
+/// conversation reads as slightly broken.
+const CACHE_MISS_NOISE_FLOOR: i64 = 1_024;
+
+/// Tokens that were in the previous request's prompt and were billed again
+/// instead of read from cache, with the cost they added.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CacheMissTotals {
+    pub missed_tokens: i64,
+    /// A lower bound when `has_unpriced_misses` is set: a counted miss without
+    /// a snapshotted input or cache-read rate contributes tokens but no money.
+    pub missed_cost: Decimal,
+    pub miss_count: i64,
+    /// Replies a comparison was possible for, so a zero miss count can be
+    /// told apart from a window with nothing to compare.
+    pub measured_messages: i64,
+    pub has_unpriced_misses: bool,
+}
+
+/// Walk the window per conversation, comparing each reply's prompt with the
+/// one before it.
+///
+/// `prompt = input + cache_read + cache_write`: providers report the uncached
+/// remainder as `input`, so adding both cache legs reconstructs the size of
+/// what was sent. A compaction row resets the comparison — the summary
+/// replaces the prefix, and the request after it is new content rather than a
+/// miss.
+pub async fn cache_misses(db: &impl Read, filter: &UsageFilter) -> Result<CacheMissTotals, DbErr> {
+    let rows = sql::query_all(db, sql::USAGE_CACHE_MISS_ROWS, filter_values(filter, false)).await?;
+    let per_million: Decimal = "0.000001".parse().expect("constant decimal");
+    let mut totals = CacheMissTotals::default();
+    let mut conversation: Option<String> = None;
+    let mut previous_prompt: Option<i64> = None;
+    for row in &rows {
+        let current: String = row.try_get("", "conversation_id")?;
+        if conversation.as_deref() != Some(current.as_str()) {
+            conversation = Some(current);
+            previous_prompt = None;
+        }
+        let role: String = row.try_get("", "role")?;
+        if role == "compaction" {
+            previous_prompt = None;
+            continue;
+        }
+        let Some(input) = row.try_get::<Option<i64>>("", "input_tokens")? else {
+            continue;
+        };
+        let cache_read = row.try_get::<Option<i64>>("", "cache_read_tokens")?.unwrap_or(0);
+        let cache_write = row.try_get::<Option<i64>>("", "cache_write_tokens")?.unwrap_or(0);
+        let prompt = input + cache_read + cache_write;
+        if let Some(previous) = previous_prompt {
+            totals.measured_messages += 1;
+            let missed = previous.min(prompt).saturating_sub(cache_read);
+            if missed > CACHE_MISS_NOISE_FLOOR {
+                totals.missed_tokens += missed;
+                totals.miss_count += 1;
+                let input_price = row.try_get::<Option<Decimal>>("", "input_price")?;
+                let cache_read_price = row.try_get::<Option<Decimal>>("", "cache_read_price")?;
+                match (input_price, cache_read_price) {
+                    (Some(input_price), Some(cache_read_price)) => {
+                        let mut extra = input_price - cache_read_price;
+                        if extra.is_negative() {
+                            extra = Decimal::zero();
+                        }
+                        totals.missed_cost += Decimal::from(missed) * extra * per_million.clone();
+                    }
+                    _ => totals.has_unpriced_misses = true,
+                }
+            }
+        }
+        previous_prompt = Some(prompt);
+    }
+    Ok(totals)
+}
+
 /// One reply whose usage or price is incomplete, and which part.
 ///
 /// This is what the two warnings on the usage page count — "N replies did not
@@ -2157,6 +2233,60 @@ mod tests {
         assert_eq!(days.len(), 2);
         assert!(days[0].key < days[1].key, "oldest first");
         assert_eq!(days[0].input_tokens, 10);
+    }
+
+    async fn miss_row(db: &Db, id: &str, created_at: i64, role: &str, input: i32, cache_read: i32) {
+        insert(
+            db,
+            audit_message::Model {
+                role: role.into(),
+                input_tokens: Some(input),
+                output_tokens: Some(1),
+                cache_read_tokens: Some(cache_read),
+                cache_write_tokens: Some(0),
+                input_price: Some(decimal("2")),
+                output_price: Some(decimal("4")),
+                cache_read_price: Some(decimal("0.5")),
+                cache_write_price: Some(decimal("2.5")),
+                ..audit_row(id, created_at)
+            },
+        )
+        .await;
+    }
+
+    /// A miss is the previous request's prompt, billed again instead of read
+    /// from cache. A compaction resets the comparison: the summary replaces the
+    /// prefix, so the request after it is new content rather than a miss.
+    #[tokio::test]
+    async fn a_miss_is_the_previous_prompt_and_a_summary_resets_it() {
+        let db = sea_test_db().await;
+        miss_row(&db, "a1", 1, "assistant", 10_000, 0).await;
+        miss_row(&db, "a2", 2, "assistant", 8_000, 2_000).await;
+        miss_row(&db, "s1", 3, "compaction", 1_000, 0).await;
+        miss_row(&db, "a3", 4, "assistant", 50_000, 0).await;
+
+        let totals = r!(db, cache_misses(&UsageFilter::default())).unwrap();
+
+        assert_eq!(totals.missed_tokens, 8_000);
+        assert_eq!(totals.miss_count, 1);
+        assert_eq!(totals.measured_messages, 1, "a3 has nothing before it to compare with");
+        // 8,000 × (2 − 0.5) per million.
+        assert_eq!(totals.missed_cost, decimal("0.012"));
+        assert!(!totals.has_unpriced_misses);
+    }
+
+    /// Below the floor this is breakpoint granularity, not a lost prefix.
+    #[tokio::test]
+    async fn a_small_difference_is_breakpoint_noise() {
+        let db = sea_test_db().await;
+        miss_row(&db, "a1", 1, "assistant", 10_000, 0).await;
+        miss_row(&db, "a2", 2, "assistant", 500, 9_500).await;
+
+        let totals = r!(db, cache_misses(&UsageFilter::default())).unwrap();
+
+        assert_eq!(totals.miss_count, 0);
+        assert_eq!(totals.missed_tokens, 0);
+        assert_eq!(totals.measured_messages, 1);
     }
 
     /// A hit rate is read only off replies that reported both a prompt and its
