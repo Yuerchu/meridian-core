@@ -7,12 +7,13 @@ pub mod streamable_http;
 mod tests;
 
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::tokenizer::{TokenCounter, TokenizerKind};
 use crate::db::entity::mcp_server;
 use crate::db::entity::mcp_server::McpTransport as McpTransportKind;
 use crate::db::types::Json;
@@ -126,6 +127,39 @@ fn build_qualified_name(server_name: &str, tool_name: &str) -> String {
     format!("mcp__{}__{}", sanitize_name(server_name), sanitize_name(tool_name))
 }
 
+/// How many tokens the model is billed for this tool's definition, as cl100k
+/// counts the JSON object that goes on the wire. An estimate: the live turn
+/// may use another encoding, and providers add their own framing.
+pub fn definition_tokens(name: &str, description: &str, parameters: &serde_json::Value) -> usize {
+    let def = ToolDefinition {
+        name: name.to_string(),
+        description: description.to_string(),
+        parameters: parameters.clone(),
+    };
+    let json = serde_json::to_string(&def).expect("a tool definition serializes");
+    TokenCounter::new(TokenizerKind::Cl100kBase).count(&json)
+}
+
+fn disabled_names(tools: &Json<Vec<String>>) -> HashSet<String> {
+    tools.0.iter().cloned().collect()
+}
+
+fn tool_is_disabled(disabled: &HashMap<String, HashSet<String>>, server_id: &str, name: &str) -> bool {
+    disabled.get(server_id).is_some_and(|set| set.contains(name))
+}
+
+fn definitions_from(tools: &[McpToolDef], disabled: &HashMap<String, HashSet<String>>) -> Vec<ToolDefinition> {
+    tools
+        .iter()
+        .filter(|tool| !tool_is_disabled(disabled, &tool.server_id, &tool.name))
+        .map(|tool| ToolDefinition {
+            name: tool.qualified_name.clone(),
+            description: tool.description.clone(),
+            parameters: tool.input_schema.clone(),
+        })
+        .collect()
+}
+
 /// Owns every MCP connection and the tool list derived from them.
 ///
 /// Interior mutability rather than an outer mutex, because the outer mutex was
@@ -153,11 +187,14 @@ pub struct McpRegistry {
 }
 
 /// Published together so a reader can never see tools from one moment and
-/// definitions from another.
+/// definitions from another. `disabled` is the same snapshot: a toggle and a
+/// `tools/list` that land in either order still agree on what the model sees.
 #[derive(Default)]
 struct Snapshot {
     tools: Arc<Vec<McpToolDef>>,
     definitions: Arc<Vec<ToolDefinition>>,
+    /// Per server id, the tool names (the server's own) that are not offered.
+    disabled: HashMap<String, HashSet<String>>,
 }
 
 impl McpRegistry {
@@ -202,6 +239,37 @@ impl McpRegistry {
             .filter(|t| t.server_id == server_id)
             .cloned()
             .collect()
+    }
+
+    /// Whether this server's tool is currently withheld from the model.
+    ///
+    /// Unknown servers and unknown names are enabled: a name that is not in
+    /// the disabled set is on, including one that has not been listed yet.
+    pub fn is_tool_enabled(&self, server_id: &str, name: &str) -> bool {
+        let snapshot = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
+        !tool_is_disabled(&snapshot.disabled, server_id, name)
+    }
+
+    /// Withhold or restore a tool without reconnecting. The caller has already
+    /// written the row; this only refreshes what `tool_definitions` returns.
+    pub fn set_tool_enabled(&self, server_id: &str, name: &str, enabled: bool) {
+        let mut snapshot = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+        if enabled {
+            if let Some(set) = snapshot.disabled.get_mut(server_id) {
+                set.remove(name);
+                if set.is_empty() {
+                    snapshot.disabled.remove(server_id);
+                }
+            }
+        } else {
+            snapshot
+                .disabled
+                .entry(server_id.to_string())
+                .or_default()
+                .insert(name.to_string());
+        }
+        let definitions = definitions_from(&snapshot.tools, &snapshot.disabled);
+        snapshot.definitions = Arc::new(definitions);
     }
 
     /// Only servers with an entry appear. Anything absent is disconnected, and
@@ -256,15 +324,8 @@ impl McpRegistry {
     }
 
     fn publish(&self, tools: Vec<McpToolDef>) {
-        let definitions = tools
-            .iter()
-            .map(|t| ToolDefinition {
-                name: t.qualified_name.clone(),
-                description: t.description.clone(),
-                parameters: t.input_schema.clone(),
-            })
-            .collect();
         let mut snapshot = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+        let definitions = definitions_from(&tools, &snapshot.disabled);
         snapshot.tools = Arc::new(tools);
         snapshot.definitions = Arc::new(definitions);
     }
@@ -544,7 +605,17 @@ impl McpRegistry {
             });
         }
         let tool_count = all.iter().filter(|t| t.server_id == server.id).count();
-        self.publish(all);
+        {
+            // The row's disabled set and the new catalogue land in one write, so
+            // a reconnect cannot offer a tool the user already turned off.
+            let mut snapshot = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+            snapshot
+                .disabled
+                .insert(server.id.clone(), disabled_names(&server.disabled_tools));
+            let definitions = definitions_from(&all, &snapshot.disabled);
+            snapshot.tools = Arc::new(all);
+            snapshot.definitions = Arc::new(definitions);
+        }
         drop(servers);
 
         // Connecting is a user-initiated, low-frequency state change, and the
@@ -628,11 +699,15 @@ impl McpRegistry {
         args: serde_json::Value,
     ) -> Result<crate::tools::ToolOutput, String> {
         let (server_id, original_name) = {
-            let tools = self.tools();
-            let tool_def = tools
+            let snapshot = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
+            let tool_def = snapshot
+                .tools
                 .iter()
                 .find(|t| t.qualified_name == qualified_name)
                 .ok_or_else(|| format!("MCP tool not found: {qualified_name}"))?;
+            if tool_is_disabled(&snapshot.disabled, &tool_def.server_id, &tool_def.name) {
+                return Err(format!("MCP tool `{qualified_name}` is disabled"));
+            }
             (tool_def.server_id.clone(), tool_def.name.clone())
         };
 

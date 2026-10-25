@@ -20,6 +20,7 @@ pub mod m0004_frozen_stickers;
 pub mod m0005_board_tasks;
 pub mod m0006_local_inference_backend;
 pub mod m0007_compact_keep_recent_tokens;
+pub mod m0008_mcp_disabled_tools;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -41,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0005BoardTasks),
             Box::new(M0006LocalInferenceBackend),
             Box::new(M0007CompactKeepRecentTokens),
+            Box::new(M0008McpDisabledTools),
         ]
     }
 }
@@ -94,6 +96,7 @@ pub fn sqlite_statements() -> Vec<String> {
     all.extend(m0005_board_tasks::sqlite_statements());
     all.extend(m0006_local_inference_backend::sqlite_statements());
     all.extend(m0007_compact_keep_recent_tokens::sqlite_statements());
+    all.extend(m0008_mcp_disabled_tools::sqlite_statements());
     all
 }
 
@@ -248,6 +251,34 @@ impl MigrationTrait for M0007CompactKeepRecentTokens {
             ));
         }
         for statement in m0007_compact_keep_recent_tokens::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0008McpDisabledTools;
+
+impl MigrationName for M0008McpDisabledTools {
+    fn name(&self) -> &str {
+        "m0008_mcp_disabled_tools"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0008McpDisabledTools {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "m0008_mcp_disabled_tools adds a SQLite TEXT column; other backends are not shipped yet".into(),
+            ));
+        }
+        for statement in m0008_mcp_disabled_tools::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;
         }
         Ok(())
