@@ -27,6 +27,10 @@ pub struct Model {
     /// Connect at startup. Not "usable": a disabled server can still be
     /// connected by hand from the settings page.
     pub is_enabled: SqlBool,
+    /// Tool names the model is not offered, as the server reports them.
+    /// Empty means every discovered tool is on. A name that is not in the
+    /// current `tools/list` is kept so a reconnect still honours it.
+    pub disabled_tools: Json<Vec<String>>,
     pub sort_order: i32,
     pub created_at: EpochMs,
     pub updated_at: EpochMs,
@@ -91,6 +95,7 @@ pub struct McpServerChangeset {
     pub url: Option<Option<String>>,
     pub headers: Option<Option<Json<BTreeMap<String, String>>>>,
     pub is_enabled: Option<SqlBool>,
+    pub disabled_tools: Option<Json<Vec<String>>>,
     pub updated_at: Option<EpochMs>,
 }
 

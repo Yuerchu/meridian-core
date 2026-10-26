@@ -88,6 +88,7 @@ mod tests {
             url: None,
             headers: None,
             is_enabled: enabled.into(),
+            disabled_tools: Json(Vec::new()),
             sort_order,
             created_at: 1,
             updated_at: 1,
@@ -173,6 +174,8 @@ mod tests {
             ("env", "'{\"TOKEN\": 1}'"),
             ("args", "'not json'"),
             ("transport_type", "'sse'"),
+            ("disabled_tools", "'{}'"),
+            ("disabled_tools", "'[1]'"),
         ] {
             let db = sea_test_db().await;
             insert(&db, server("s1", 0, true)).await;

@@ -4,7 +4,8 @@
 //! there being a single global lock.
 
 use super::*;
-use std::sync::atomic::AtomicUsize;
+use crate::db::types::Json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// How a mock server behaves when a tool call arrives.
@@ -163,6 +164,7 @@ fn server(id: &str) -> mcp_server::Model {
         env: None,
         url: None,
         is_enabled: crate::db::types::SqlBool::FALSE,
+        disabled_tools: Json(Vec::new()),
         sort_order: 0,
         created_at: 0,
         updated_at: 0,
@@ -590,4 +592,64 @@ async fn shutting_everything_down_closes_each_server() {
     assert!(registry.tool_definitions().is_empty());
     assert_eq!(a.shutdowns.load(Ordering::SeqCst), 1);
     assert_eq!(b.shutdowns.load(Ordering::SeqCst), 1);
+}
+
+/// The catalogue stays whole so the settings page can draw a switch that is
+/// off; only `tool_definitions` (what the model is sent) drops the name.
+#[tokio::test]
+async fn disabled_tools_are_listed_but_not_offered() {
+    let spec = MockSpec::new(vec!["keep", "drop"]);
+    let registry = McpRegistry::new();
+    stage(&registry, spec.build());
+    let mut row = server("a");
+    row.disabled_tools = Json(vec!["drop".into()]);
+    registry.connect(&row).await.unwrap();
+
+    assert_eq!(registry.tools().len(), 2, "the catalogue still has both tools");
+    let names: Vec<String> = registry.tool_definitions().iter().map(|d| d.name.clone()).collect();
+    assert_eq!(names, vec!["mcp__a__keep".to_string()]);
+    assert!(!registry.is_tool_enabled("a", "drop"));
+    assert!(registry.is_tool_enabled("a", "keep"));
+}
+
+#[tokio::test]
+async fn disabling_a_live_tool_drops_it_from_definitions_without_reconnect() {
+    let spec = MockSpec::new(vec!["keep", "drop"]);
+    let registry = connected("a", &spec).await;
+    assert_eq!(registry.tool_definitions().len(), 2);
+
+    registry.set_tool_enabled("a", "drop", false);
+    let names: Vec<String> = registry.tool_definitions().iter().map(|d| d.name.clone()).collect();
+    assert_eq!(names, vec!["mcp__a__keep".to_string()]);
+    assert_eq!(registry.tools().len(), 2);
+
+    registry.set_tool_enabled("a", "drop", true);
+    assert_eq!(registry.tool_definitions().len(), 2);
+}
+
+#[tokio::test]
+async fn calling_a_disabled_tool_is_refused() {
+    let spec = MockSpec::new(vec!["drop"]);
+    let registry = connected("a", &spec).await;
+    registry.set_tool_enabled("a", "drop", false);
+    let err = registry
+        .call_tool("mcp__a__drop", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("disabled"), "{err}");
+    assert_eq!(spec.calls.load(Ordering::SeqCst), 0, "the server was not asked");
+}
+
+#[test]
+fn a_wider_schema_costs_more_definition_tokens() {
+    let small = definition_tokens("t", "d", &serde_json::json!({ "type": "object" }));
+    let large = definition_tokens(
+        "t",
+        "d",
+        &serde_json::json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" }, "b": { "type": "number" } }
+        }),
+    );
+    assert!(large > small, "small={small} large={large}");
 }

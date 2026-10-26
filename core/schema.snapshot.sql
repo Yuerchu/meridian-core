@@ -44,7 +44,7 @@ CREATE TABLE "memory_proposals" ( "id" integer PRIMARY KEY AUTOINCREMENT, "key" 
 
 CREATE TABLE "mode_artifacts" ( "id" text NOT NULL PRIMARY KEY, "conversation_id" text NOT NULL, "kind" text NOT NULL DEFAULT 'plan', "content" text NOT NULL, "status" text NOT NULL, "created_at" integer NOT NULL, "updated_at" integer NOT NULL, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE CASCADE );
 
-CREATE TABLE "mcp_servers" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, "transport_type" text NOT NULL DEFAULT 'stdio', "command" text, "args" text, "env" text, "url" text, "headers" text, "is_enabled" integer NOT NULL DEFAULT 0, "sort_order" integer NOT NULL DEFAULT 0, "created_at" integer NOT NULL, "updated_at" integer NOT NULL );
+CREATE TABLE "mcp_servers" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, "transport_type" text NOT NULL DEFAULT 'stdio', "command" text, "args" text, "env" text, "url" text, "headers" text, "is_enabled" integer NOT NULL DEFAULT 0, "sort_order" integer NOT NULL DEFAULT 0, "created_at" integer NOT NULL, "updated_at" integer NOT NULL , disabled_tools TEXT NOT NULL DEFAULT '[]');
 
 CREATE TABLE "turns" ( "id" text NOT NULL PRIMARY KEY, "conversation_id" text NOT NULL, "origin" text NOT NULL, "status" text NOT NULL, "phase" text, "phase_tool" text, "error" text, "started_at" integer NOT NULL, "updated_at" integer NOT NULL, "ended_at" integer, "reported_at" integer, "parent_reported_at" integer, "self_id" integer, "trigger" text NOT NULL DEFAULT 'user', "trigger_ref" text, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE CASCADE, CHECK (trigger IN ('user', 'plan_continuation', 'task_completion', 'agent_autonomous')) );
 
