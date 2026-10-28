@@ -6,6 +6,7 @@ use super::agent::{self, ApprovalFn, TextNotifyFn};
 use super::command::{self, SlashCommand};
 use super::format;
 use super::protocol::{MessageSegment, OneBotAction, OneBotEvent};
+use super::replies::ReplySlot;
 use super::session::{SessionKey, SessionKind};
 use super::{SharedState, call_api};
 use crate::db::models::turn::{ERROR_LOOP_DETECTED, TurnStatus};
@@ -173,17 +174,20 @@ async fn handle_text_message(
             let said = parsed.typed.as_str();
             let _ = pending.responder.send(said.to_string());
             let trimmed = said.trim();
+            if trimmed.is_empty() {
+                let text = pick_slot(state, ReplySlot::EmptyReply).await;
+                return client_reply(event, &session_key, &text, None);
+            }
             let reply = match kind {
-                _ if trimmed.is_empty() => "没看到文字，当作未回答。",
-                super::agent::AskKind::Question => "已转达。",
+                super::agent::AskKind::Question => "已转达。".to_string(),
                 super::agent::AskKind::Permission
                     if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") =>
                 {
-                    "已批准执行。"
+                    pick_slot(state, ReplySlot::AckApproved).await
                 }
-                super::agent::AskKind::Permission => "已拒绝，你写的理由会一并转达。",
+                super::agent::AskKind::Permission => pick_slot(state, ReplySlot::AckDenied).await,
             };
-            return build_reply(event, reply, None);
+            return build_reply(event, &reply, None);
         }
     }
 
@@ -230,7 +234,7 @@ async fn handle_text_message(
 
     // Media processing needs the conversation; get_or_create is idempotent and
     // run_agent_turn will hit the cache for the same key.
-    let (_, conversation_id, model_override) = {
+    let session_lookup = {
         let mut sessions = state.sessions.lock().await;
         match sessions
             .get_or_create(&session_key, &title, state.config.assistant_id.as_deref())
@@ -238,12 +242,16 @@ async fn handle_text_message(
         {
             Ok((pid, cid)) => {
                 let ovr = sessions.get_model_override(&session_key);
-                (pid, cid, ovr)
+                Ok((pid, cid, ovr))
             }
-            Err(e) => {
-                tracing::error!("Session error: {e}");
-                return build_reply(event, &format!("内部错误: {e}"), event_message_id);
-            }
+            Err(e) => Err(e),
+        }
+    };
+    let (_, conversation_id, model_override) = match session_lookup {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("Session error: {e}");
+            return server_error_for_event(event, state, &session_key, event_message_id, &e).await;
         }
     };
 
@@ -442,18 +450,11 @@ fn make_approval_fn(
                 // call (escalation to run without sandbox); say so, or it reads
                 // as a duplicate of the prompt just answered. It is a permission
                 // by construction — `ask_user` never runs a command.
-                (Some(reason), _) => format!(
-                    "⚠️ 命令被沙箱拦截:\n工具: {}\n参数: {}\n拦截输出: {}\n\n引用本条消息回复 Y 在沙箱外重试，其他内容拒绝并作为理由转达（60秒超时）",
-                    tc.name,
-                    truncate_args(&tc.arguments, 500),
-                    truncate_args(&reason, 300),
-                ),
+                (Some(reason), _) => super::labels::approval_prompt(&tc.name, &tc.arguments, Some(&reason)),
                 (None, super::agent::AskKind::Question) => super::format::ask_user_prompt(&tc.arguments)?,
-                (None, super::agent::AskKind::Permission) => format!(
-                    "🔧 工具调用请求:\n工具: {}\n参数: {}\n\n引用本条消息回复 Y 批准，其他内容拒绝并作为理由转达（60秒超时）",
-                    tc.name,
-                    truncate_args(&tc.arguments, 500),
-                ),
+                (None, super::agent::AskKind::Permission) => {
+                    super::labels::approval_prompt(&tc.name, &tc.arguments, None)
+                }
             };
 
             let approval_msg = if is_group {
@@ -563,7 +564,7 @@ pub(super) async fn run_agent_turn(
     // conversation, not the session key. The message path already did this a
     // moment ago (media processing needs it) and the manager caches, so for an
     // ordinary message this costs nothing; the poke path pays one lookup.
-    let (project_id, conversation_id, model_override) = {
+    let session_lookup = {
         let mut sessions = state.sessions.lock().await;
         match sessions
             .get_or_create(session_key, title, state.config.assistant_id.as_deref())
@@ -571,12 +572,16 @@ pub(super) async fn run_agent_turn(
         {
             Ok((pid, cid)) => {
                 let ovr = sessions.get_model_override(session_key);
-                (pid, cid, ovr)
+                Ok((pid, cid, ovr))
             }
-            Err(e) => {
-                tracing::error!("Session error: {e}");
-                return build_session_reply(session_key, &format!("内部错误: {e}"), reply_to);
-            }
+            Err(e) => Err(e),
+        }
+    };
+    let (project_id, conversation_id, model_override) = match session_lookup {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("Session error: {e}");
+            return server_error_actions(state, session_key, initiator_user_id, reply_to, &e).await;
         }
     };
 
@@ -638,7 +643,8 @@ pub(super) async fn run_agent_turn(
                 reason = %busy,
                 "OneBot turn refused: the conversation is held elsewhere"
             );
-            return build_session_reply(session_key, "这个对话正在电脑端处理,请等它结束后再发。", reply_to);
+            let text = pick_slot(state, ReplySlot::Busy).await;
+            return client_reply_to(session_key, initiator_user_id, &text, reply_to);
         }
     };
 
@@ -680,7 +686,7 @@ pub(super) async fn run_agent_turn(
     // announces the end and hands both claims back.
     if let Err(e) = running.open_record(&state.services.db, self_id).await {
         tracing::error!(turn_id = %turn_id, error = %e, "OneBot turn id collided");
-        return build_session_reply(session_key, "内部错误,请重试。", reply_to);
+        return server_error_actions(state, session_key, initiator_user_id, reply_to, &e).await;
     }
 
     let approval_fn = make_approval_fn(state, session_key, initiator_user_id, &turn_id);
@@ -757,7 +763,7 @@ pub(super) async fn run_agent_turn(
             }
             Err(e) => {
                 tracing::error!("Chat error for {}: {e}", session_key);
-                build_session_reply(session_key, &format!("处理消息时出错: {e}"), reply_anchor)
+                server_error_actions(state, session_key, initiator_user_id, reply_anchor, &e).await
             }
         };
 
@@ -1735,7 +1741,7 @@ async fn dispatch_command(
             command::CommandScope::GroupOnly if !is_group => "该指令仅限群聊使用。",
             _ => "该指令仅管理员可用。",
         };
-        return build_reply(event, why, reply_to);
+        return client_reply(event, session_key, why, reply_to);
     }
 
     // Resetting or compacting the conversation while a turn is writing to it
@@ -1747,7 +1753,8 @@ async fn dispatch_command(
             .get(&session_key.to_string())
             .is_some_and(|s| s.turn_active);
         if busy {
-            return build_reply(event, "当前有任务正在处理,请稍后再试。", reply_to);
+            let text = pick_slot(state, ReplySlot::Busy).await;
+            return client_reply(event, session_key, &text, reply_to);
         }
     }
 
@@ -1782,9 +1789,13 @@ async fn dispatch_new(
             .get_or_create(session_key, title, state.config.assistant_id.as_deref())
             .await
         {
-            Ok((_, cid)) => cid,
-            Err(e) => return build_reply(event, &format!("内部错误: {e}"), reply_to),
+            Ok((_, cid)) => Ok(cid),
+            Err(e) => Err(e),
         }
+    };
+    let conversation_id = match conversation_id {
+        Ok(cid) => cid,
+        Err(e) => return server_error_for_event(event, state, session_key, reply_to, &e).await,
     };
 
     let _lease = match state.services.turns.try_acquire_mutation(&conversation_id, "a reset") {
@@ -1795,22 +1806,25 @@ async fn dispatch_new(
                 reason = %busy,
                 "OneBot /new refused: the conversation is held elsewhere"
             );
-            return build_reply(event, "这个对话正在电脑端处理,请稍后再试。", reply_to);
+            let text = pick_slot(state, ReplySlot::Busy).await;
+            return client_reply(event, session_key, &text, reply_to);
         }
     };
 
-    let mut sessions = state.sessions.lock().await;
-    let reset = sessions
-        .reset_conversation(
-            session_key,
-            title,
-            state.config.assistant_id.as_deref(),
-            &conversation_id,
-        )
-        .await;
+    let reset = {
+        let mut sessions = state.sessions.lock().await;
+        sessions
+            .reset_conversation(
+                session_key,
+                title,
+                state.config.assistant_id.as_deref(),
+                &conversation_id,
+            )
+            .await
+    };
     match reset {
         Ok(_) => build_reply(event, "已重置对话。新的对话已创建。", reply_to),
-        Err(e) => build_reply(event, &format!("重置失败: {e}"), reply_to),
+        Err(e) => server_error_for_event(event, state, session_key, reply_to, &e).await,
     }
 }
 
@@ -1824,15 +1838,15 @@ async fn dispatch_compact(
 ) -> Vec<OneBotAction> {
     let custom_instructions = if args.is_empty() { None } else { Some(args.to_string()) };
 
-    let (_, conversation_id) = {
+    let conversation_lookup = {
         let mut sessions = state.sessions.lock().await;
-        match sessions
+        sessions
             .get_or_create(session_key, title, state.config.assistant_id.as_deref())
             .await
-        {
-            Ok(ids) => ids,
-            Err(e) => return build_reply(event, &format!("内部错误: {e}"), reply_to),
-        }
+    };
+    let (_, conversation_id) = match conversation_lookup {
+        Ok(ids) => ids,
+        Err(e) => return server_error_for_event(event, state, session_key, reply_to, &e).await,
     };
 
     // The check above only knows about this session's own turns. The desktop
@@ -1849,7 +1863,8 @@ async fn dispatch_compact(
                 reason = %busy,
                 "OneBot /compact refused: the conversation is held elsewhere"
             );
-            return build_reply(event, "这个对话正在电脑端处理,请稍后再试。", reply_to);
+            let text = pick_slot(state, ReplySlot::Busy).await;
+            return client_reply(event, session_key, &text, reply_to);
         }
     };
 
@@ -1871,7 +1886,7 @@ async fn dispatch_compact(
                 .unwrap_or(20_000);
             (assistant, keep_recent)
         }
-        Err(e) => return build_reply(event, &format!("Compact 失败: {e}"), reply_to),
+        Err(e) => return server_error_for_event(event, state, session_key, reply_to, &e).await,
     };
 
     match crate::agent::do_compact(
@@ -1885,7 +1900,7 @@ async fn dispatch_compact(
     .await
     {
         Ok(_) => build_reply(event, "对话上下文已压缩。", reply_to),
-        Err(e) => build_reply(event, &format!("Compact 失败: {e}"), reply_to),
+        Err(e) => server_error_for_event(event, state, session_key, reply_to, &e).await,
     }
 }
 
@@ -1897,36 +1912,55 @@ async fn dispatch_model(
     args: &str,
     reply_to: Option<i64>,
 ) -> Vec<OneBotAction> {
-    // Ensure session exists, get conversation_id and current override
-    let (conversation_id, model_override) = {
+    enum ModelLookup {
+        Show {
+            conversation_id: String,
+            model_override: Option<String>,
+        },
+        Reset,
+        Switch,
+    }
+
+    let session_lookup = {
         let mut sessions = state.sessions.lock().await;
-        let (_, cid) = match sessions
+        match sessions
             .get_or_create(session_key, title, state.config.assistant_id.as_deref())
             .await
         {
-            Ok(ids) => ids,
-            Err(e) => return build_reply(event, &format!("内部错误: {e}"), reply_to),
-        };
-
-        if args.eq_ignore_ascii_case("reset") || args.eq_ignore_ascii_case("default") {
-            sessions.set_model_override(session_key, None);
-            return build_reply(event, "已恢复默认模型。", reply_to);
+            Ok(ids) => {
+                if args.eq_ignore_ascii_case("reset") || args.eq_ignore_ascii_case("default") {
+                    sessions.set_model_override(session_key, None);
+                    Ok(ModelLookup::Reset)
+                } else if !args.is_empty() {
+                    sessions.set_model_override(session_key, Some(args.to_string()));
+                    Ok(ModelLookup::Switch)
+                } else {
+                    let ovr = sessions.get_model_override(session_key);
+                    Ok(ModelLookup::Show {
+                        conversation_id: ids.1,
+                        model_override: ovr,
+                    })
+                }
+            }
+            Err(e) => Err(e),
         }
-
-        if !args.is_empty() {
-            sessions.set_model_override(session_key, Some(args.to_string()));
+    };
+    let (conversation_id, model_override) = match session_lookup {
+        Ok(ModelLookup::Reset) => return build_reply(event, "已恢复默认模型。", reply_to),
+        Ok(ModelLookup::Switch) => {
             return build_reply(
                 event,
                 &format!("已切换模型: {}\n发送 /model reset 恢复默认", args),
                 reply_to,
             );
         }
-
-        let ovr = sessions.get_model_override(session_key);
-        (cid, ovr)
+        Ok(ModelLookup::Show {
+            conversation_id,
+            model_override,
+        }) => (conversation_id, model_override),
+        Err(e) => return server_error_for_event(event, state, session_key, reply_to, &e).await,
     };
 
-    // Show current model info
     let info = conversation_and_assistant(state, &conversation_id, state.config.assistant_id.as_deref())
         .await
         .map(|(_, assistant)| {
@@ -1952,7 +1986,7 @@ async fn dispatch_model(
             };
             build_reply(event, &reply, reply_to)
         }
-        Err(e) => build_reply(event, &format!("获取模型信息失败: {e}"), reply_to),
+        Err(e) => server_error_for_event(event, state, session_key, reply_to, &e).await,
     }
 }
 
@@ -1964,17 +1998,22 @@ async fn dispatch_status(
     is_admin: bool,
     reply_to: Option<i64>,
 ) -> Vec<OneBotAction> {
-    let (conversation_id, model_override) = {
+    let session_lookup = {
         let mut sessions = state.sessions.lock().await;
-        let (_, cid) = match sessions
+        match sessions
             .get_or_create(session_key, title, state.config.assistant_id.as_deref())
             .await
         {
-            Ok(ids) => ids,
-            Err(e) => return build_reply(event, &format!("内部错误: {e}"), reply_to),
-        };
-        let ovr = sessions.get_model_override(session_key);
-        (cid, ovr)
+            Ok((_, cid)) => {
+                let ovr = sessions.get_model_override(session_key);
+                Ok((cid, ovr))
+            }
+            Err(e) => Err(e),
+        }
+    };
+    let (conversation_id, model_override) = match session_lookup {
+        Ok(ids) => ids,
+        Err(e) => return server_error_for_event(event, state, session_key, reply_to, &e).await,
     };
 
     let info = status_of(state, &conversation_id).await;
@@ -1995,7 +2034,7 @@ async fn dispatch_status(
             );
             build_reply(event, &reply, reply_to)
         }
-        Err(e) => build_reply(event, &format!("获取状态失败: {e}"), reply_to),
+        Err(e) => server_error_for_event(event, state, session_key, reply_to, &e).await,
     }
 }
 
@@ -2161,6 +2200,135 @@ fn align_sticker_ids(parsed: &format::ParsedMessage) -> Vec<Option<String>> {
     ids
 }
 
+async fn pick_slot(state: &SharedState, slot: ReplySlot) -> String {
+    super::replies::load_for_send(&state.services.db).await.pick(slot)
+}
+
+fn session_text_action(
+    session_key: &SessionKey,
+    text: &str,
+    reply_to: Option<i64>,
+    at_user_ids: &[i64],
+) -> OneBotAction {
+    let mut segments = Vec::new();
+    if let Some(id) = reply_to {
+        segments.push(MessageSegment::reply(id));
+    }
+    for (i, uid) in at_user_ids.iter().enumerate() {
+        segments.push(MessageSegment::at(*uid));
+        if i + 1 < at_user_ids.len() {
+            segments.push(MessageSegment::text(" "));
+        }
+    }
+    if !at_user_ids.is_empty() {
+        segments.push(MessageSegment::text(" "));
+    }
+    segments.extend(format::text_to_rich_segments(text));
+    match session_key.kind {
+        SessionKind::Group => OneBotAction::send_group_msg(session_key.id, segments),
+        SessionKind::Private => OneBotAction::send_private_msg(session_key.id, segments),
+    }
+}
+
+fn client_reply_to(session_key: &SessionKey, speaker: i64, text: &str, reply_to: Option<i64>) -> Vec<OneBotAction> {
+    let speaker_at = [speaker];
+    let at: &[i64] = if matches!(session_key.kind, SessionKind::Group) {
+        &speaker_at
+    } else {
+        &[]
+    };
+    vec![session_text_action(session_key, text, reply_to, at)]
+}
+
+fn client_reply(event: &OneBotEvent, session_key: &SessionKey, text: &str, reply_to: Option<i64>) -> Vec<OneBotAction> {
+    client_reply_to(session_key, event.user_id.unwrap_or(0), text, reply_to)
+}
+
+fn truncate_error(e: &str, max_chars: usize) -> String {
+    if e.chars().count() <= max_chars {
+        e.to_string()
+    } else {
+        e.chars().take(max_chars).collect()
+    }
+}
+
+async fn member_in_group(state: &Arc<SharedState>, group_id: i64, user_id: i64) -> bool {
+    call_api(
+        state,
+        OneBotAction::get_group_member_info(group_id, user_id, uuid::Uuid::new_v4().to_string()),
+    )
+    .await
+    .is_ok()
+}
+
+fn plan_server_error(
+    session_key: &SessionKey,
+    counterpart: i64,
+    reply_to: Option<i64>,
+    phrase: &str,
+    detail: &str,
+    admins: &[i64],
+    member_admins: &[i64],
+) -> Vec<OneBotAction> {
+    let mut dm_targets: Vec<i64> = admins.to_vec();
+    let (session_text, at): (String, &[i64]) = match session_key.kind {
+        SessionKind::Group => (phrase.to_string(), member_admins),
+        SessionKind::Private if admins.contains(&counterpart) => {
+            dm_targets.retain(|&id| id != counterpart);
+            (format!("{phrase}\n{detail}"), &[])
+        }
+        SessionKind::Private => (phrase.to_string(), &[]),
+    };
+    let mut actions = vec![session_text_action(session_key, &session_text, reply_to, at)];
+    let dm_body = format!("会话 {session_key} 出错：{detail}");
+    for admin in dm_targets {
+        actions.push(OneBotAction::send_private_msg(
+            admin,
+            format::text_to_rich_segments(&dm_body),
+        ));
+    }
+    actions
+}
+
+async fn server_error_actions(
+    state: &Arc<SharedState>,
+    session_key: &SessionKey,
+    counterpart: i64,
+    reply_to: Option<i64>,
+    error: &str,
+) -> Vec<OneBotAction> {
+    let phrase = pick_slot(state, ReplySlot::ServerError).await;
+    let detail = truncate_error(error, 2000);
+    let admins = state.config.admin_users.clone();
+    let mut member_admins = Vec::new();
+    if matches!(session_key.kind, SessionKind::Group) {
+        for admin in &admins {
+            if member_in_group(state, session_key.id, *admin).await {
+                member_admins.push(*admin);
+            }
+        }
+    }
+    plan_server_error(
+        session_key,
+        counterpart,
+        reply_to,
+        &phrase,
+        &detail,
+        &admins,
+        &member_admins,
+    )
+}
+
+async fn server_error_for_event(
+    event: &OneBotEvent,
+    state: &Arc<SharedState>,
+    session_key: &SessionKey,
+    reply_to: Option<i64>,
+    error: &str,
+) -> Vec<OneBotAction> {
+    server_error_actions(state, session_key, event.user_id.unwrap_or(0), reply_to, error).await
+}
+
 fn build_reply(event: &OneBotEvent, text: &str, reply_to_id: Option<i64>) -> Vec<OneBotAction> {
     let mut segments = Vec::new();
     if let Some(id) = reply_to_id {
@@ -2175,15 +2343,6 @@ fn build_reply(event: &OneBotEvent, text: &str, reply_to_id: Option<i64>) -> Vec
     } else {
         let user_id = event.user_id.unwrap_or(0);
         vec![OneBotAction::send_private_msg(user_id, segments)]
-    }
-}
-
-fn truncate_args(args: &str, max_len: usize) -> String {
-    let shown = crate::util::take_bytes_at_char_boundary(args, max_len);
-    if shown.len() < args.len() {
-        format!("{shown}...")
-    } else {
-        shown.to_string()
     }
 }
 
@@ -2307,5 +2466,107 @@ mod tests {
         // round is stamped with when it came in, not when the round began.
         assert_eq!(carried[1].received_at, 7);
         assert_eq!(carried[1].text, "我也要");
+    }
+
+    fn ats_in(action: &super::OneBotAction) -> Vec<i64> {
+        action.params["message"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|seg| seg["type"] == "at")
+            .filter_map(|seg| seg["data"]["qq"].as_str()?.parse().ok())
+            .collect()
+    }
+
+    fn session_text(action: &super::OneBotAction) -> String {
+        action.params["message"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|seg| seg["type"] == "text")
+            .filter_map(|seg| seg["data"]["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn dm_targets(actions: &[super::OneBotAction]) -> Vec<i64> {
+        // The first action is always the session message. A private 5xx
+        // uses `send_private_msg` for that too, so counting every private
+        // send would treat the counterpart as a DM target of themselves.
+        actions
+            .iter()
+            .skip(1)
+            .filter(|action| action.action == "send_private_msg")
+            .filter_map(|action| action.params["user_id"].as_i64())
+            .collect()
+    }
+
+    /// A group 5xx @s only the admins who are in the room, and DMs every
+    /// configured admin with the detail. The session line itself never carries
+    /// `{e}`.
+    #[test]
+    fn a_group_5xx_ats_member_admins_and_dms_every_admin() {
+        let session = super::SessionKey::group(100);
+        let actions = super::plan_server_error(&session, 7, Some(99), "这边出了点问题。", "db exploded", &[1, 2], &[1]);
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].action, "send_group_msg");
+        assert_eq!(ats_in(&actions[0]), vec![1]);
+        assert!(
+            session_text(&actions[0]).contains("这边出了点问题。"),
+            "{}",
+            session_text(&actions[0])
+        );
+        assert!(
+            !session_text(&actions[0]).contains("db exploded"),
+            "{}",
+            session_text(&actions[0])
+        );
+        assert_eq!(dm_targets(&actions), vec![1, 2]);
+        assert!(
+            session_text(&actions[1]).contains("db exploded"),
+            "{}",
+            session_text(&actions[1])
+        );
+        assert!(
+            session_text(&actions[1]).contains("group:100"),
+            "{}",
+            session_text(&actions[1])
+        );
+    }
+
+    /// A private chat with an admin counterpart carries the detail in the
+    /// session message and does not DM that same person.
+    #[test]
+    fn a_private_admin_gets_the_detail_in_session_and_is_not_self_dm() {
+        let session = super::SessionKey::private(1);
+        let actions = super::plan_server_error(&session, 1, None, "phrase", "detail", &[1, 2], &[]);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].action, "send_private_msg");
+        assert_eq!(actions[0].params["user_id"], 1);
+        let body = session_text(&actions[0]);
+        assert!(body.contains("phrase"), "{body}");
+        assert!(body.contains("detail"), "{body}");
+        assert_eq!(dm_targets(&actions), vec![2]);
+    }
+
+    /// No admins means the phrase only — nothing is claimed to have been
+    /// reported.
+    #[test]
+    fn empty_admins_send_only_the_phrase() {
+        let session = super::SessionKey::group(100);
+        let actions = super::plan_server_error(&session, 7, None, "phrase", "detail", &[], &[]);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, "send_group_msg");
+        assert!(ats_in(&actions[0]).is_empty());
+        assert_eq!(session_text(&actions[0]), "phrase");
+    }
+
+    #[test]
+    fn truncate_error_counts_chars_not_bytes() {
+        let cjk = "出错".repeat(1001);
+        assert_eq!(cjk.chars().count(), 2002);
+        let cut = super::truncate_error(&cjk, 2000);
+        assert_eq!(cut.chars().count(), 2000);
+        assert!(cjk.starts_with(&cut));
     }
 }

@@ -755,6 +755,7 @@ async fn headless_chat_inner(
             // are rejected by providers, and only this one actually sends).
             session_tools: qq_tools.filter(|_| supports_tools).map(|q| q.session_tools()),
             command_shell,
+            forbidden_effects: super::qq_tools::QQ_FORBIDDEN_EFFECTS,
         };
         crate::agent::turn_config::resolve_on(sea, tool_registry, input).await?
     };
@@ -989,11 +990,11 @@ async fn headless_chat_inner(
         db: sea.clone(),
         turn_id: turn_id.to_string(),
     };
-    // `unattended`: a QQ approval is a message in a chat that nobody may be
-    // reading, which is why most of them end in a timeout today. So a review
-    // that cannot reach a verdict refuses rather than falling back to asking —
-    // there is nobody to ask. Needs `services`, which the tests do not build;
-    // without it the asker is left exactly as it was.
+    // QQ writes always go through the reviewer, even when the desktop toggle
+    // is off. A missed verdict on a write falls back to a Y card (`unattended:
+    // false`); `qq_manage_replies` is fail-closed instead, because a Y card in
+    // a group is self-approval of a voice hijack. Needs `services`, which the
+    // tests do not build; without it the asker is left exactly as it was.
     let approvals = match services {
         Some(services) => {
             crate::agent::auto_review::AutoReviewed::wrap(
@@ -1017,7 +1018,10 @@ async fn headless_chat_inner(
                     // task nobody asked for and refuse everything.
                     multi_party: qq_tools
                         .is_some_and(|q| matches!(q.session_kind(), crate::onebot::session::SessionKind::Group)),
-                    unattended: true,
+                    unattended: false,
+                    force_review: true,
+                    review_model_fallback: Some(format!("{provider_id}:{effective_model}")),
+                    fail_closed: super::qq_tools::FAIL_CLOSED_TOOLS,
                 },
             )
             .await?

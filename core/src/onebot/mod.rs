@@ -5,13 +5,17 @@ mod command;
 mod extract;
 mod format;
 mod handler;
+mod labels;
 mod media;
 mod notice;
 mod protocol;
 mod qq_tools;
 mod quote;
+pub mod replies;
 mod session;
 mod stickers;
+
+pub use replies::{ReplyBank, ReplySeeds};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -21,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::sea::cap::Db;
+use crate::db::sea::cap::{Db, WriteTx};
 use crate::listen_guard::{constant_time_eq, validate_listen_config};
 use crate::services::Services;
 use crate::turn::{Busy, TurnCoordinator, TurnLease, TurnOrigin};
@@ -1170,53 +1174,74 @@ pub async fn load_config(db: &Db) -> Result<OneBotConfig, String> {
 /// 内存里还是旧策略，而重启之后生效的却是写进去的那一半。对普通设置那是难看，
 /// 对 `voice_capture_sessions` 那是"用户以为关掉了而它还在录"。
 pub async fn save_config(db: &Db, config: &OneBotConfig) -> Result<(), String> {
-    use crate::db::sea::ops::preference::set_preference;
-
     validate_scope_list("onebot.voice_capture_sessions", &config.voice_capture_sessions, false)?;
     validate_scope_list("onebot.voice_send_groups", &config.voice_send_groups, true)?;
-    let now = now_ms();
-    let admin_users = serde_json::to_string(&config.admin_users)
-        .map_err(|error| format!("could not serialize onebot.admin_users: {error}"))?;
-    let voice_capture_sessions = serde_json::to_string(&config.voice_capture_sessions)
-        .map_err(|error| format!("could not serialize onebot.voice_capture_sessions: {error}"))?;
-    let voice_send_groups = serde_json::to_string(&config.voice_send_groups)
-        .map_err(|error| format!("could not serialize onebot.voice_send_groups: {error}"))?;
+    db.write(async |tx| save_config_in(tx, config).await)
+        .await
+        .map_err(|e| e.to_string())
+}
 
+/// Config plus the hot reply bank, one transaction. The send path reads the
+/// bank each time, so this write is live without a listener restart.
+pub async fn save_settings(db: &Db, config: &OneBotConfig, replies: &ReplyBank) -> Result<(), String> {
+    validate_scope_list("onebot.voice_capture_sessions", &config.voice_capture_sessions, false)?;
+    validate_scope_list("onebot.voice_send_groups", &config.voice_send_groups, true)?;
+    replies.validate()?;
     db.write(async |tx| {
-        set_preference(tx, "onebot.enabled", if config.enabled { "true" } else { "false" }, now).await?;
-        set_preference(tx, "onebot.host", &config.host, now).await?;
-        set_preference(tx, "onebot.port", &config.port.to_string(), now).await?;
-        set_preference(
-            tx,
-            "onebot.access_token",
-            config.access_token.as_deref().unwrap_or(""),
-            now,
-        )
-        .await?;
-        set_preference(
-            tx,
-            "onebot.assistant_id",
-            config.assistant_id.as_deref().unwrap_or(""),
-            now,
-        )
-        .await?;
-        set_preference(tx, "onebot.admin_users", &admin_users, now).await?;
-        set_preference(tx, "onebot.ack_emoji_id", &config.ack_emoji_id, now).await?;
-        set_preference(tx, "onebot.voice_capture_sessions", &voice_capture_sessions, now).await?;
-        set_preference(
-            tx,
-            "onebot.voice_send_enabled",
-            if config.voice_send_enabled { "true" } else { "false" },
-            now,
-        )
-        .await?;
-        set_preference(tx, "onebot.voice_send_groups", &voice_send_groups, now).await?;
-        set_preference(tx, "onebot.voice_tts_model", &config.voice_tts_model, now).await?;
-        set_preference(tx, "onebot.voice_tts_reference_id", &config.voice_tts_reference_id, now).await?;
-        Ok::<(), sea_orm::DbErr>(())
+        save_config_in(tx, config).await?;
+        replies::save_in(tx, replies)
+            .await
+            .map_err(crate::db::sea::DbErr::Custom)?;
+        Ok::<(), crate::db::sea::DbErr>(())
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+async fn save_config_in(tx: &WriteTx, config: &OneBotConfig) -> Result<(), crate::db::sea::DbErr> {
+    use crate::db::sea::ops::preference::set_preference;
+
+    let now = now_ms();
+    let admin_users = serde_json::to_string(&config.admin_users)
+        .map_err(|error| crate::db::sea::DbErr::Custom(format!("could not serialize onebot.admin_users: {error}")))?;
+    let voice_capture_sessions = serde_json::to_string(&config.voice_capture_sessions).map_err(|error| {
+        crate::db::sea::DbErr::Custom(format!("could not serialize onebot.voice_capture_sessions: {error}"))
+    })?;
+    let voice_send_groups = serde_json::to_string(&config.voice_send_groups).map_err(|error| {
+        crate::db::sea::DbErr::Custom(format!("could not serialize onebot.voice_send_groups: {error}"))
+    })?;
+
+    set_preference(tx, "onebot.enabled", if config.enabled { "true" } else { "false" }, now).await?;
+    set_preference(tx, "onebot.host", &config.host, now).await?;
+    set_preference(tx, "onebot.port", &config.port.to_string(), now).await?;
+    set_preference(
+        tx,
+        "onebot.access_token",
+        config.access_token.as_deref().unwrap_or(""),
+        now,
+    )
+    .await?;
+    set_preference(
+        tx,
+        "onebot.assistant_id",
+        config.assistant_id.as_deref().unwrap_or(""),
+        now,
+    )
+    .await?;
+    set_preference(tx, "onebot.admin_users", &admin_users, now).await?;
+    set_preference(tx, "onebot.ack_emoji_id", &config.ack_emoji_id, now).await?;
+    set_preference(tx, "onebot.voice_capture_sessions", &voice_capture_sessions, now).await?;
+    set_preference(
+        tx,
+        "onebot.voice_send_enabled",
+        if config.voice_send_enabled { "true" } else { "false" },
+        now,
+    )
+    .await?;
+    set_preference(tx, "onebot.voice_send_groups", &voice_send_groups, now).await?;
+    set_preference(tx, "onebot.voice_tts_model", &config.voice_tts_model, now).await?;
+    set_preference(tx, "onebot.voice_tts_reference_id", &config.voice_tts_reference_id, now).await?;
+    Ok(())
 }
 
 /// 把配置里那一行行文本解析成授权范围。

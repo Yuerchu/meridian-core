@@ -144,10 +144,53 @@ pub struct Context {
     /// narrows a private chat by `is_admin` for the same reason it can — one
     /// counterpart cannot change under the session.
     pub multi_party: bool,
-    /// True when nothing would be drawn if this fell back to asking. QQ and
-    /// any headless runner; false for the desktop and for a phone attached to
-    /// it, both of which can put a card in front of somebody.
+    /// True when nothing would be drawn if this fell back to asking. QQ used
+    /// to set this so a missed review denied; QQ writes now fall back to a Y
+    /// card (`false`) and only [`fail_closed`] tools still refuse on a miss.
     pub unattended: bool,
+    /// Review even when the desktop toggle is off. QQ writes always go through
+    /// the reviewer; the desktop must leave this false so an off toggle stays off.
+    pub force_review: bool,
+    /// QQ may name the conversation's own model when `autoreview.model` is
+    /// empty. The desktop must not: that would bill a review at the answering
+    /// model. Trimmed empty is treated as absent.
+    pub review_model_fallback: Option<String>,
+    /// Tool names that refuse when the reviewer produces no verdict, even if
+    /// a card could be drawn. QQ's `qq_manage_replies` is here: a Y card in a
+    /// group is self-approval of a voice hijack.
+    pub fail_closed: &'static [&'static str],
+}
+
+/// Whether this wrapper should actually review. Force-review still constructs
+/// an active wrapper when no model is named, so [`refuses_on_miss`] can deny
+/// `fail_closed` tools instead of becoming a Y card.
+pub(crate) fn activate_settings(
+    mut settings: Settings,
+    force_review: bool,
+    fallback: Option<String>,
+) -> Option<Settings> {
+    let named = |model: &Option<String>| {
+        model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+    };
+    if force_review {
+        if !named(&settings.model) {
+            settings.model = fallback.filter(|model| !model.trim().is_empty());
+        }
+        return Some(settings);
+    }
+    if !settings.enabled || !named(&settings.model) {
+        None
+    } else {
+        Some(settings)
+    }
+}
+
+pub(crate) fn refuses_on_miss(unattended: bool, fail_closed: &[&str], name: &str) -> bool {
+    unattended || fail_closed.contains(&name)
 }
 
 #[derive(Debug, Default)]
@@ -215,21 +258,26 @@ async fn admin_roster(db: &impl DbRead) -> Result<Vec<i64>, String> {
 }
 
 impl<'a> AutoReviewed<'a> {
-    /// Put automatic review in front of an asker, or don't.
-    ///
-    /// Always returns a wrapper, and the wrapper is inert unless the feature is
-    /// on and a model is named — so a call site is one line with no branch. A
-    /// configured model is part of being on: without one there is nothing to
-    /// ask, and silently falling back to the conversation's own model would
-    /// bill a review at whatever the user picked for answering.
     /// A wrapper that reviews nothing, for a runner that has no [`Services`] to
     /// review with — the OneBot tests, and nothing else today.
     pub fn inert(inner: &'a dyn Approvals) -> Self {
         AutoReviewed { inner, active: None }
     }
 
+    /// Put automatic review in front of an asker, or don't.
+    ///
+    /// Always returns a wrapper. The wrapper is inert unless the feature is on
+    /// and a model is named — so a call site is one line with no branch — or
+    /// the runner asked for [`Context::force_review`]. A configured model is
+    /// part of being on the desktop: without one there is nothing to ask,
+    /// and silently falling back to the conversation's own model would bill a
+    /// review at whatever the user picked for answering. QQ is the carve-out:
+    /// `force_review` plus `review_model_fallback` keep writes reviewed when
+    /// the desktop toggle is off.
     pub async fn wrap(inner: &'a dyn Approvals, context: Context) -> Result<Self, String> {
         let multi_party = context.multi_party;
+        let force_review = context.force_review;
+        let fallback = context.review_model_fallback.clone();
         // The settings and the roster at one instant.
         let read = context
             .services
@@ -239,9 +287,9 @@ impl<'a> AutoReviewed<'a> {
                     Ok(settings) => settings,
                     Err(error) => return Ok::<_, DbErr>(Err(error)),
                 };
-                if !settings.enabled || settings.model.is_none() {
+                let Some(settings) = activate_settings(settings, force_review, fallback.clone()) else {
                     return Ok(Ok(None));
-                }
+                };
                 let admins = match multi_party {
                     true => match admin_roster(tx).await {
                         Ok(admins) => admins,
@@ -696,7 +744,13 @@ impl Approvals for AutoReviewed<'_> {
                     },
                 );
                 return self
-                    .unresolved(active.context.unattended, assistant_message_id, call, retry, &e)
+                    .unresolved(
+                        refuses_on_miss(active.context.unattended, active.context.fail_closed, &call.name),
+                        assistant_message_id,
+                        call,
+                        retry,
+                        &e,
+                    )
                     .await;
             }
         };
@@ -741,8 +795,14 @@ impl Approvals for AutoReviewed<'_> {
                 // for it — including what the escalating pass looked at before
                 // giving up.
                 active.announce(assistant_message_id, call, &event_verdict);
-                self.unresolved(active.context.unattended, assistant_message_id, call, retry, why)
-                    .await
+                self.unresolved(
+                    refuses_on_miss(active.context.unattended, active.context.fail_closed, &call.name),
+                    assistant_message_id,
+                    call,
+                    retry,
+                    why,
+                )
+                .await
             }
         }
     }
@@ -756,13 +816,13 @@ impl AutoReviewed<'_> {
     /// `Services` to reach it would mean nobody did.
     async fn unresolved(
         &self,
-        unattended: bool,
+        refuse: bool,
         assistant_message_id: &str,
         call: &ToolCall,
         retry: Option<crate::agent::engine::Escalation<'_>>,
         why: &str,
     ) -> Result<Option<ApprovalDecision>, String> {
-        if unattended {
+        if refuse {
             return Ok(Some(ApprovalDecision::Denied(Some(format!(
                 "自动审查没有给出结论（{why}），且当前没有人可以确认，因此拒绝。"
             )))));
@@ -884,6 +944,52 @@ mod tests {
             name: name.into(),
             arguments: "{}".into(),
         }
+    }
+
+    #[test]
+    fn force_review_activates_without_the_toggle_and_falls_back_to_the_named_model() {
+        let off = Settings::default();
+        assert!(activate_settings(off.clone(), false, Some("p:m".into())).is_none());
+
+        let forced = activate_settings(off.clone(), true, Some("p:m".into())).unwrap();
+        assert_eq!(forced.model.as_deref(), Some("p:m"));
+
+        let already = Settings {
+            model: Some("a:b".into()),
+            ..Settings::default()
+        };
+        let kept = activate_settings(already, true, Some("p:m".into())).unwrap();
+        assert_eq!(kept.model.as_deref(), Some("a:b"));
+    }
+
+    #[test]
+    fn force_review_without_a_model_still_activates() {
+        let activated = activate_settings(Settings::default(), true, None);
+        assert!(activated.is_some());
+        assert!(activated.unwrap().model.is_none());
+    }
+
+    #[test]
+    fn desktop_stays_inert_when_the_toggle_is_off() {
+        let named = Settings {
+            model: Some("a:b".into()),
+            ..Settings::default()
+        };
+        assert!(activate_settings(named, false, None).is_none());
+        let on = Settings {
+            enabled: true,
+            model: Some("a:b".into()),
+            ..Settings::default()
+        };
+        assert!(activate_settings(on, false, None).is_some());
+    }
+
+    #[test]
+    fn manage_replies_miss_is_a_refusal_even_with_a_card() {
+        assert!(refuses_on_miss(true, &[], "run_command"));
+        assert!(!refuses_on_miss(false, &[], "run_command"));
+        assert!(refuses_on_miss(false, &["qq_manage_replies"], "qq_manage_replies"));
+        assert!(!refuses_on_miss(false, &["qq_manage_replies"], "qq_set_group_ban"));
     }
 
     /// Off, or unconfigured. Every call goes through untouched, which is what
