@@ -40,19 +40,26 @@ pub struct BoardTaskChangeset<'a> {
     pub now: EpochMs,
 }
 
-async fn last_position(tx: &WriteTx, stage: BoardStage) -> Result<Option<i32>, DbErr> {
-    board_task::Entity::find()
+async fn last_position(tx: &WriteTx, stage: BoardStage, except: Option<&str>) -> Result<Option<i32>, DbErr> {
+    let mut find = board_task::Entity::find()
         .select_only()
         .column_as(board_task::Column::Position.max(), "position")
-        .filter(board_task::Column::Stage.eq(stage))
-        .into_tuple::<Option<i32>>()
+        .filter(board_task::Column::Stage.eq(stage));
+    if let Some(id) = except {
+        find = find.filter(board_task::Column::Id.ne(id));
+    }
+    find.into_tuple::<Option<i32>>()
         .one(tx.conn()?)
         .await
         .map(Option::flatten)
 }
 
+fn next_position(last: Option<i32>) -> i32 {
+    last.map_or(0, |last| last + 1)
+}
+
 pub async fn insert(tx: &WriteTx, row: &BoardTaskInsert<'_>) -> Result<board_task::Model, DbErr> {
-    let position = last_position(tx, row.stage).await?.map_or(0, |last| last + 1);
+    let position = next_position(last_position(tx, row.stage, None).await?);
     let model = board_task::ActiveModel {
         id: Set(row.id.to_string()),
         project_id: Set(row.project_id.to_string()),
@@ -104,6 +111,9 @@ pub async fn worktree_for_conversation(db: &impl Read, conversation_id: &str) ->
 /// Start a card: written once. A card that already has a conversation answers
 /// 0 rather than being given a second one.
 pub async fn set_started(tx: &WriteTx, id: &str, start: &BoardTaskStartChangeset<'_>) -> Result<u64, DbErr> {
+    // Append in running: a card keeps the position it had in backlog otherwise,
+    // and a later card created after the first start also sits at 0.
+    let position = next_position(last_position(tx, BoardStage::Running, Some(id)).await?);
     let done = board_task::Entity::update_many()
         .col_expr(
             board_task::Column::ConversationId,
@@ -115,6 +125,7 @@ pub async fn set_started(tx: &WriteTx, id: &str, start: &BoardTaskStartChangeset
             Expr::value(start.worktree_path.to_string()),
         )
         .col_expr(board_task::Column::Stage, Expr::value(BoardStage::Running))
+        .col_expr(board_task::Column::Position, Expr::value(position))
         .col_expr(board_task::Column::UpdatedAt, Expr::value(start.now))
         .filter(board_task::Column::Id.eq(id))
         .filter(board_task::Column::ConversationId.is_null())
@@ -310,6 +321,7 @@ mod tests {
         let card = get(&db, "a").await.unwrap().unwrap();
         assert_eq!(card.stage, BoardStage::Running);
         assert_eq!(card.agent_kind, Some(BoardAgentKind::Native));
+        assert_eq!(card.position, 0);
         assert_eq!(
             worktree_for_conversation(&db, "c1").await.unwrap().as_deref(),
             Some("/r.worktrees/a/app")
@@ -319,6 +331,42 @@ mod tests {
         // One card per conversation.
         let twice = db.write(async |tx| set_started(tx, "b", &start("c1")).await);
         assert!(twice.await.is_err());
+    }
+
+    /// Starting appends in running. A card created after the first start would
+    /// otherwise keep backlog position 0 and collide with the card already there.
+    #[tokio::test]
+    async fn starting_appends_in_the_running_column() {
+        let db = board().await;
+        add(&db, "a", BoardStage::Backlog).await;
+        db.write(async |tx| set_started(tx, "a", &start("c1")).await)
+            .await
+            .unwrap();
+        add(&db, "b", BoardStage::Backlog).await;
+        db.write(async |tx| {
+            set_started(
+                tx,
+                "b",
+                &BoardTaskStartChangeset {
+                    conversation_id: "c2",
+                    agent_kind: BoardAgentKind::Native,
+                    worktree_path: "/r.worktrees/b/app",
+                    now: 21,
+                },
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(column(&db, BoardStage::Running).await, ["a", "b"]);
+        let positions: Vec<i32> = list(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|card| card.stage == BoardStage::Running)
+            .map(|card| card.position)
+            .collect();
+        assert_eq!(positions, [0, 1]);
     }
 
     #[tokio::test]
