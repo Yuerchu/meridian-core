@@ -54,33 +54,26 @@ pub enum WorkspaceRoot {
 /// The directory a conversation is configured to work in, before the
 /// filesystem is asked whether it exists.
 ///
-/// A hosted conversation's agent writes wherever its session was opened, so
-/// `acp_sessions.cwd` outranks the project for `agent_kind = 'claude_code'`;
-/// a native conversation's tools resolve against the project's path, so the
-/// panel shows the same tree the tools can reach. The `bool` says whether a
-/// project row existed at all, which is what separates `NoProject` from
-/// `NoPath` when the answer is `None`.
+/// A conversation that works an agent board card works in the card's worktree,
+/// not in the project it was made from: that is what keeps agents running at
+/// once out of each other's files. A card whose worktree a person removed is
+/// an error rather than the project's path — there is nowhere left for it to
+/// work, and falling back would set it loose in the main checkout. The card
+/// is checked before a hosted session's cwd: after removal that cwd still
+/// names the deleted directory, and answering with it would reopen the
+/// adapter there.
 ///
-/// A native conversation that works an agent board card works in the card's
-/// worktree, not in the project it was made from: that is what keeps agents
-/// running at once out of each other's files. A card whose worktree a person
-/// removed is an error rather than the project's path — there is nowhere left
-/// for it to work, and falling back would set it loose in the main checkout.
-/// (A hosted card needs nothing here: its session was opened in the worktree,
-/// so `acp_sessions.cwd` already says so.)
+/// A hosted conversation that is not a card writes wherever its session was
+/// opened, so `acp_sessions.cwd` outranks the project for
+/// `agent_kind = 'claude_code'`. A native conversation's tools resolve
+/// against the project's path, so the panel shows the same tree the tools can
+/// reach. The `bool` says whether a project row existed at all, which is what
+/// separates `NoProject` from `NoPath` when the answer is `None`.
 pub async fn configured_dir_in(db: &impl Snapshot, conversation_id: &str) -> Result<(Option<PathBuf>, bool), String> {
     let conv = sea_ops::conversation::get_conversation(db, conversation_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("conversation {conversation_id} not found"))?;
-
-    if conv.agent_kind.as_deref() == Some("claude_code") {
-        let cwd = sea_ops::acp_session::get(db, conversation_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .map(|row| PathBuf::from(row.cwd));
-        return Ok((cwd, false));
-    }
 
     if let Some(card) = sea_ops::board_task::for_conversation(db, conversation_id)
         .await
@@ -93,6 +86,14 @@ pub async fn configured_dir_in(db: &impl Snapshot, conversation_id: &str) -> Res
                 card.title
             )),
         };
+    }
+
+    if conv.agent_kind.as_deref() == Some("claude_code") {
+        let cwd = sea_ops::acp_session::get(db, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|row| PathBuf::from(row.cwd));
+        return Ok((cwd, false));
     }
 
     match conv.project_id.as_deref() {
@@ -260,5 +261,50 @@ mod tests {
         let refused = resolve_workspace_dir(&db, "removed").await.unwrap_err();
         assert!(refused.contains("worktree was removed"), "{refused}");
         assert!(resolve_workspace_root(&db, "removed").await.is_err());
+    }
+
+    /// A hosted card is the card first: its session cwd is ignored while the
+    /// worktree stands, and refused once a person removed it — even if that cwd
+    /// still names the deleted directory or the project's path.
+    #[tokio::test]
+    async fn a_hosted_board_card_does_not_answer_from_its_session_cwd() {
+        let db = sea_test_db().await;
+        let project = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_string_lossy().replace('\'', "''");
+        let worktree_path = worktree.path().to_string_lossy().replace('\'', "''");
+        execute_for_tests(
+            &db,
+            &format!(
+                "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES ('p', 'P', '{project_path}', 1, 1);
+                 INSERT INTO conversations (id, project_id, agent_kind, created_at, updated_at) VALUES
+                     ('hosted-card', 'p', 'claude_code', 1, 1),
+                     ('hosted-gone', 'p', 'claude_code', 1, 1),
+                     ('hosted-plain', 'p', 'claude_code', 1, 1);
+                 INSERT INTO acp_sessions (conversation_id, cwd, created_at, updated_at) VALUES
+                     ('hosted-card', '{project_path}', 1, 1),
+                     ('hosted-gone', '{project_path}', 1, 1),
+                     ('hosted-plain', '{project_path}', 1, 1);
+                 INSERT INTO board_tasks (id, project_id, conversation_id, source, title, stage, position,
+                                          agent_kind, worktree_path, created_at, updated_at, worktree_removed_at)
+                 VALUES ('t-live', 'p', 'hosted-card', 'local', 'fix', 'running', 0, 'claude_code', '{worktree_path}', 1, 1, NULL),
+                        ('t-gone', 'p', 'hosted-gone', 'local', 'old', 'done', 0, 'claude_code', NULL, 1, 1, 5)"
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resolve_workspace_dir(&db, "hosted-card").await.unwrap(),
+            Some(PathBuf::from(worktree.path())),
+            "the card's worktree outranks the session cwd"
+        );
+        let refused = resolve_workspace_dir(&db, "hosted-gone").await.unwrap_err();
+        assert!(refused.contains("worktree was removed"), "{refused}");
+        assert_eq!(
+            resolve_workspace_dir(&db, "hosted-plain").await.unwrap(),
+            Some(PathBuf::from(project.path())),
+            "a hosted conversation that is not a card keeps its session cwd"
+        );
     }
 }

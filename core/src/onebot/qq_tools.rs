@@ -2,9 +2,12 @@
 //!
 //! Security: the target group/user is fixed to the current session at
 //! construction time and is NOT part of the tool parameters, so the model
-//! cannot read or act on other chats. Action tools are admin-only and go
-//! through the Y/N chat approval flow — the approver is the message sender,
-//! so handing them to non-admins would let users approve themselves.
+//! cannot read or act on other chats. Action tools (mute, kick, …) are
+//! admin-only and go through the Y/N chat approval flow — the approver is
+//! the message sender, so handing them to non-admins would let users approve
+//! themselves. `qq_manage_replies` is the exception: it is not admin-only, so
+//! the assistant can maintain its own voice on a member's turn; the reviewer
+//! is the gate, and a miss is a denial rather than a Y card.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,6 +21,21 @@ use crate::db::entity::emoji::EmojiSource;
 const MAX_HISTORY_COUNT: i64 = 50;
 const MAX_OUTPUT_CHARS: usize = 8000;
 const MAX_LIKE_TIMES: i64 = 20;
+
+/// Effects QQ cannot host. `PlanTransitions` re-resolves mid-turn, so the
+/// filter lives on the resolve request rather than at a call site a rebuild
+/// would undo. Interactive is `ask_user`; ModeTransition is plan enter/exit;
+/// Delegate is `run_agent`.
+pub const QQ_FORBIDDEN_EFFECTS: &[crate::tools::spec::Effect] = &[
+    crate::tools::spec::Effect::Interactive,
+    crate::tools::spec::Effect::ModeTransition,
+    crate::tools::spec::Effect::Delegate,
+];
+
+/// Review-miss on these is a denial, even when a Y card could be drawn. A
+/// group card for `qq_manage_replies` is the speaker approving their own
+/// hijack of the bot's voice.
+pub const FAIL_CLOSED_TOOLS: &[&str] = &["qq_manage_replies"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
@@ -59,6 +77,8 @@ enum QqTool {
     QqSetGroupCard,
     QqSetGroupName,
     QqSendGroupNotice,
+    QqListReplies,
+    QqManageReplies,
 }
 
 struct QqSpec {
@@ -183,6 +203,16 @@ impl QqTool {
                 admin_only: true,
                 needs_approval: true,
                 scope: Scope::GroupOnly,
+            },
+            Self::QqListReplies => QqSpec {
+                admin_only: false,
+                needs_approval: false,
+                scope: Scope::Any,
+            },
+            Self::QqManageReplies => QqSpec {
+                admin_only: false,
+                needs_approval: true,
+                scope: Scope::Any,
             },
         }
     }
@@ -479,6 +509,31 @@ impl QqToolExecutor {
                     "required": ["content"],
                 }),
             ),
+            QqTool::QqListReplies => (
+                "查看当前 QQ 会话使用的固定回复措辞（空回复、忙碌、服务端错误、批准/拒绝回执）。空槽位会回落到内置默认句。".to_string(),
+                no_params,
+            ),
+            QqTool::QqManageReplies => (
+                "维护 QQ 会话的固定回复措辞。action 为 add、remove 或 reset；slot 为 empty_reply、busy、server_error、ack_approved、ack_denied。add/remove 需要 text。这是助手自己的声音，不是群设置。".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "add、remove 或 reset",
+                        },
+                        "slot": {
+                            "type": "string",
+                            "description": "empty_reply、busy、server_error、ack_approved 或 ack_denied",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "add 或 remove 时的那一句，reset 不需要",
+                        },
+                    },
+                    "required": ["action", "slot"],
+                }),
+            ),
         };
         crate::provider::ToolDefinition {
             name: tool.name().into(),
@@ -601,6 +656,8 @@ impl QqToolExecutor {
                 .await?;
                 Ok("已发布群公告".into())
             }
+            QqTool::QqListReplies => self.list_replies().await,
+            QqTool::QqManageReplies => self.manage_replies(&args).await,
         }
     }
 
@@ -986,6 +1043,41 @@ impl QqToolExecutor {
         }
         Ok(truncate_head(lines.join("\n")))
     }
+
+    async fn list_replies(&self) -> Result<String, String> {
+        let bank = super::replies::load(&self.state.services.db).await?;
+        Ok(bank.format_listing())
+    }
+
+    async fn manage_replies(&self, args: &serde_json::Value) -> Result<String, String> {
+        let action = super::replies::ManageAction::parse(
+            args.get("action")
+                .and_then(|v| v.as_str())
+                .ok_or("missing required parameter: action")?,
+        )?;
+        let slot = super::replies::ReplySlot::parse(
+            args.get("slot")
+                .and_then(|v| v.as_str())
+                .ok_or("missing required parameter: slot")?,
+        )?;
+        let text = args.get("text").and_then(|v| v.as_str()).map(str::to_string);
+        self.state
+            .services
+            .db
+            .write(async move |tx| {
+                let mut bank = super::replies::load_in(tx)
+                    .await
+                    .map_err(crate::db::sea::DbErr::Custom)?;
+                bank.apply(action, slot, text.as_deref())
+                    .map_err(crate::db::sea::DbErr::Custom)?;
+                super::replies::save_in(tx, &bank)
+                    .await
+                    .map_err(crate::db::sea::DbErr::Custom)?;
+                Ok::<String, crate::db::sea::DbErr>(bank.format_listing())
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// What the generated tool catalog (`tools::catalog`) says about each QQ tool:
@@ -1001,9 +1093,14 @@ pub fn spec_catalog() -> Vec<serde_json::Value> {
                 Scope::GroupOnly => "group",
                 Scope::PrivateOnly => "private",
             };
+            let effect = match t {
+                QqTool::QqManageReplies => "app_state",
+                _ if has_effects(t.name()) => "messaging",
+                _ => "read",
+            };
             serde_json::json!({
                 "name": t.name(),
-                "effect": if has_effects(t.name()) { "messaging" } else { "read" },
+                "effect": effect,
                 "admin_only": s.admin_only,
                 "needs_approval": s.needs_approval,
                 "scope": scope,
@@ -1250,9 +1347,9 @@ fn format_history(messages: &[serde_json::Value]) -> String {
 mod tests {
     use super::*;
 
-    fn names(kind: SessionKind, is_admin: bool) -> Vec<&'static str> {
+    fn names(kind: &SessionKind, is_admin: bool) -> Vec<&'static str> {
         QqTool::all()
-            .filter(|t| spec_available(*t, &kind, is_admin, SessionPolicy { voice_send: true }))
+            .filter(|t| spec_available(*t, kind, is_admin, SessionPolicy { voice_send: true }))
             .map(QqTool::name)
             .collect()
     }
@@ -1287,14 +1384,14 @@ mod tests {
     /// turn.
     #[test]
     fn a_group_shows_one_tool_set_whoever_spoke() {
-        let shown_to_admin = names(SessionKind::Group, shown_as_admin(&SessionKind::Group, true));
-        let shown_to_member = names(SessionKind::Group, shown_as_admin(&SessionKind::Group, false));
+        let shown_to_admin = names(&SessionKind::Group, shown_as_admin(&SessionKind::Group, true));
+        let shown_to_member = names(&SessionKind::Group, shown_as_admin(&SessionKind::Group, false));
         assert_eq!(shown_to_admin, shown_to_member);
 
         // And the widening stops at what is shown: an ordinary member may still
-        // only run the read-only ones, which is what `ordinary_names` returns
-        // and the loop checks before dispatch.
-        let permitted = names(SessionKind::Group, false);
+        // only run the tools that are not admin-only. Writes stay admin-only;
+        // the reply-bank pair is the exception that is both shown and runnable.
+        let permitted = names(&SessionKind::Group, false);
         assert!(permitted.len() < shown_to_member.len());
         assert!(permitted.iter().all(|n| shown_to_member.contains(n)));
         assert!(!permitted.contains(&"qq_set_group_ban"));
@@ -1305,8 +1402,8 @@ mod tests {
     /// tools they will only be refused.
     #[test]
     fn a_private_chat_shows_nothing_its_counterpart_cannot_run() {
-        let shown = names(SessionKind::Private, shown_as_admin(&SessionKind::Private, false));
-        assert_eq!(shown, names(SessionKind::Private, false));
+        let shown = names(&SessionKind::Private, shown_as_admin(&SessionKind::Private, false));
+        assert_eq!(shown, names(&SessionKind::Private, false));
         assert!(!shown.contains(&"qq_delete_msg"));
     }
 
@@ -1343,7 +1440,7 @@ mod tests {
 
     #[test]
     fn test_non_admin_group_gets_query_tools_only() {
-        let n = names(SessionKind::Group, false);
+        let n = names(&SessionKind::Group, false);
         assert!(n.contains(&"list_stickers"));
         assert!(n.contains(&"send_sticker"));
         assert!(n.contains(&QqTool::QqGetChatHistory.name()));
@@ -1351,11 +1448,13 @@ mod tests {
         assert!(!n.contains(&"qq_get_user_info"), "private-only tool absent in groups");
         assert!(!n.contains(&"qq_set_group_ban"), "action tools are admin-only");
         assert!(!n.contains(&"qq_get_friend_list"), "bot-global reads are admin-only");
+        assert!(n.contains(&"qq_list_replies"));
+        assert!(n.contains(&"qq_manage_replies"));
     }
 
     #[test]
     fn test_non_admin_private_scope() {
-        let n = names(SessionKind::Private, false);
+        let n = names(&SessionKind::Private, false);
         assert!(n.contains(&QqTool::QqGetChatHistory.name()));
         assert!(n.contains(&"qq_get_user_info"));
         assert!(!n.contains(&"qq_get_group_member_list"));
@@ -1364,7 +1463,7 @@ mod tests {
 
     #[test]
     fn test_admin_group_gets_action_tools() {
-        let n = names(SessionKind::Group, true);
+        let n = names(&SessionKind::Group, true);
         assert!(n.contains(&"qq_set_group_ban"));
         assert!(n.contains(&"qq_send_group_notice"));
         assert!(n.contains(&"qq_get_friend_list"));
@@ -1373,7 +1472,7 @@ mod tests {
 
     #[test]
     fn test_admin_private_excludes_group_actions() {
-        let n = names(SessionKind::Private, true);
+        let n = names(&SessionKind::Private, true);
         assert!(n.contains(&"qq_delete_msg"));
         assert!(n.contains(&"qq_send_poke"));
         assert!(!n.contains(&"qq_set_group_kick"));
@@ -1407,6 +1506,8 @@ mod tests {
                 "qq_set_group_card",
                 "qq_set_group_name",
                 "qq_send_group_notice",
+                "qq_list_replies",
+                "qq_manage_replies",
             ]
         );
         for tool in QqTool::all() {
@@ -1425,13 +1526,49 @@ mod tests {
         assert!(!approval_needed.contains(&QqTool::QqGetChatHistory.name()));
         assert!(!approval_needed.contains(&"send_sticker"));
         assert!(!approval_needed.contains(&"qq_get_group_member_list"));
-        // Every approval-gated tool is also admin-only.
+        assert!(!approval_needed.contains(&"qq_list_replies"));
+        assert!(approval_needed.contains(&"qq_manage_replies"));
+        // Writes stay admin-only. `qq_manage_replies` is the reviewer-gated
+        // exception: it is offered on a member's turn so the assistant can
+        // maintain its own voice, and a miss is a denial rather than a Y card.
+        assert!(!QqTool::QqManageReplies.spec().admin_only);
         assert!(
             QqTool::all()
-                .map(QqTool::spec)
-                .filter(|s| s.needs_approval)
-                .all(|s| s.admin_only)
+                .filter(|t| t.spec().needs_approval && *t != QqTool::QqManageReplies)
+                .all(|t| t.spec().admin_only)
         );
+    }
+
+    #[test]
+    fn reply_tools_are_offered_to_ordinary_members_and_only_manage_asks() {
+        for kind in [SessionKind::Group, SessionKind::Private] {
+            let n = names(&kind, false);
+            assert!(n.contains(&"qq_list_replies"), "{kind:?}");
+            assert!(n.contains(&"qq_manage_replies"), "{kind:?}");
+        }
+        assert!(!QqTool::QqListReplies.spec().needs_approval);
+        assert!(QqTool::QqManageReplies.spec().needs_approval);
+        assert!(!QqTool::QqListReplies.spec().admin_only);
+        assert!(!QqTool::QqManageReplies.spec().admin_only);
+    }
+
+    #[test]
+    fn manage_replies_is_app_state_not_messaging() {
+        let catalog = spec_catalog();
+        let manage = catalog
+            .iter()
+            .find(|entry| entry["name"] == "qq_manage_replies")
+            .expect("qq_manage_replies is in the spec catalog");
+        assert_eq!(manage["effect"], "app_state");
+        assert_eq!(manage["admin_only"], false);
+        assert_eq!(manage["needs_approval"], true);
+        let list = catalog
+            .iter()
+            .find(|entry| entry["name"] == "qq_list_replies")
+            .expect("qq_list_replies is in the spec catalog");
+        assert_eq!(list["effect"], "read");
+        assert_eq!(list["needs_approval"], false);
+        assert_eq!(list["admin_only"], false);
     }
 
     /// 白名单关掉时，`send_voice` 从**两边同时**消失。
@@ -1493,6 +1630,8 @@ mod tests {
         assert!(!takes_one(QqTool::QqGetChatHistory.name()));
         assert!(!takes_one("qq_get_group_member_list"));
         assert!(!takes_one("list_stickers"));
+        assert!(!takes_one("qq_list_replies"));
+        assert!(takes_one("qq_manage_replies"));
 
         // The rule, not the list: anything that stops for a person describes
         // itself, so adding a spec cannot quietly leave one out.

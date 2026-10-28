@@ -86,6 +86,13 @@ pub struct TurnConfigResolveRequest {
     /// shell line. `None` where there is no command executor (the reviewer,
     /// Android), in which case the line is absent along with the tool.
     pub command_shell: Option<crate::tools::command_shell::CommandShell>,
+    /// Effects this runner cannot host. QQ has nowhere to draw `ask_user`,
+    /// nowhere to switch modes, and no sub-agent port — `PlanTransitions`
+    /// re-resolves mid-turn, so the filter lives here rather than at a call
+    /// site that a rebuild would undo. MCP and custom tools have no
+    /// [`crate::tools::spec::ToolSpec`] and stay. `'static` because this
+    /// request has no lifetime.
+    pub forbidden_effects: &'static [crate::tools::spec::Effect],
 }
 
 /// A runner's own tools: the names it owns (removed from the registry set even
@@ -127,6 +134,7 @@ pub async fn resolve(
         context_blocks,
         session_tools,
         command_shell,
+        forbidden_effects,
     } = input;
 
     let tool_defs = if exposure != ToolExposure::None {
@@ -204,6 +212,14 @@ pub async fn resolve(
         if let Some(session) = session_tools {
             defs.retain(|definition| !session.owned.contains(&definition.name));
             defs.extend(session.definitions);
+        }
+        if !forbidden_effects.is_empty() {
+            defs.retain(|definition| {
+                registry
+                    .builtin_spec(&definition.name)
+                    .map(|spec| !forbidden_effects.contains(&spec.effect))
+                    .unwrap_or(true)
+            });
         }
         defs
     } else {
@@ -409,6 +425,7 @@ mod tests {
             context_blocks: Vec::new(),
             session_tools: None,
             command_shell: None,
+            forbidden_effects: &[],
         }
     }
 
@@ -889,6 +906,22 @@ mod tests {
         let cfg = resolve_ok(&db, &reg, i).await;
         let names: HashSet<&str> = cfg.tool_defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, HashSet::from(["web_search", "qq_get_chat_history"]));
+    }
+
+    #[tokio::test]
+    async fn forbidden_effects_strip_interactive_tools_and_leave_mcp() {
+        let (db, reg) = setup().await;
+        let mut req = input(switchable(None), None);
+        req.forbidden_effects = &[crate::tools::spec::Effect::Interactive];
+        req.mcp_defs = vec![ToolDefinition {
+            name: "mcp__weather__forecast".into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }];
+        let cfg = resolve_ok(&db, &reg, req).await;
+        assert!(!cfg.offered.contains("ask_user"));
+        assert!(cfg.offered.contains("mcp__weather__forecast"));
+        assert!(cfg.offered.contains("read_file"));
     }
 
     /// The shell line comes from the request, and only when there is a

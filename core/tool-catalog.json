@@ -1308,6 +1308,20 @@
       "name": "qq_send_group_notice",
       "needs_approval": true,
       "scope": "group"
+    },
+    {
+      "admin_only": false,
+      "effect": "read",
+      "name": "qq_list_replies",
+      "needs_approval": false,
+      "scope": "any"
+    },
+    {
+      "admin_only": false,
+      "effect": "app_state",
+      "name": "qq_manage_replies",
+      "needs_approval": true,
+      "scope": "any"
     }
   ]
 }

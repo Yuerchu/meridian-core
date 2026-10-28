@@ -685,6 +685,7 @@ async fn build_config(
         session_tools: None,
         // No shell either — see `hook-gates.md`.
         command_shell: None,
+        forbidden_effects: &[],
     };
     crate::agent::turn_config::resolve_on(&state.services.db, &state.services.tools, input).await
 }
