@@ -10,6 +10,7 @@
 //! is the gate, and a miss is a denial rather than a Y card.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::protocol::MessageSegment;
@@ -37,7 +38,7 @@ pub const QQ_FORBIDDEN_EFFECTS: &[crate::tools::spec::Effect] = &[
 /// hijack of the bot's voice.
 pub const FAIL_CLOSED_TOOLS: &[&str] = &["qq_manage_replies"];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scope {
     Any,
     GroupOnly,
@@ -61,6 +62,7 @@ enum QqTool {
     ListStickers,
     SendSticker,
     SendVoice,
+    QqStaySilent,
     QqGetChatHistory,
     QqGetGroupInfo,
     QqGetGroupMemberList,
@@ -118,6 +120,11 @@ impl QqTool {
             // 私聊/群的区别 `Scope` 表达不了：那是配置决定的，不是工具的性质。
             // 由 `send_policy` 在运行时回答，三处共用同一个判断。
             Self::SendVoice => QqSpec {
+                admin_only: false,
+                needs_approval: false,
+                scope: Scope::Any,
+            },
+            Self::QqStaySilent => QqSpec {
                 admin_only: false,
                 needs_approval: false,
                 scope: Scope::Any,
@@ -233,6 +240,8 @@ pub struct QqToolExecutor {
     /// 出站策略的代。合成前和派发前各比一次——模型可能在看到旧描述之后、
     /// 配置已经换掉时才调用。
     send_generation: u64,
+    /// 本轮不向 QQ 发收尾文字。按轮：Continue 会 `new` 一个 executor。
+    stay_silent: AtomicBool,
 }
 
 impl QqToolExecutor {
@@ -256,7 +265,12 @@ impl QqToolExecutor {
             },
             send_readiness,
             send_generation,
+            stay_silent: AtomicBool::new(false),
         }
+    }
+
+    pub fn stay_silent(&self) -> bool {
+        self.stay_silent.load(Ordering::SeqCst)
     }
 
     fn available(&self, tool: QqTool) -> bool {
@@ -337,7 +351,8 @@ impl QqToolExecutor {
         let no_params = serde_json::json!({ "type": "object", "properties": {} });
         let (description, parameters) = match tool {
             QqTool::ListStickers => (
-                "列出当前 QQ 机器人账号已确认语义、可发送的表情。返回的 sticker_id 只用于 send_sticker。".to_string(),
+                "列出已确认可发送的表情。一般直接给 send_sticker 一个 query；已经知道是哪一个时才用这里的 sticker_id。"
+                    .to_string(),
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -365,13 +380,35 @@ impl QqToolExecutor {
                 }),
             ),
             QqTool::SendSticker => (
-                "把一个已确认表情作为独立消息发到当前 QQ 会话。每个助手回合最多成功一次，可同时回复文字。".to_string(),
+                "按心情、名称或标签从已确认表情里挑一个发出去。表情发出去就是回复，不要再写「已发送」。\
+                 每个助手回合最多成功一次。"
+                    .to_string(),
                 serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "sticker_id": { "type": "string", "description": "list_stickers 返回的精确 id" }
-                    },
-                    "required": ["sticker_id"]
+                        "query": {
+                            "type": "string",
+                            "description": "心情、名称或标签；工具从花名册里挑最匹配的一个"
+                        },
+                        "sticker_id": {
+                            "type": "string",
+                            "description": "list_stickers 返回的精确 id；和 query 一起给时用 id"
+                        }
+                    }
+                }),
+            ),
+            QqTool::QqStaySilent => (
+                "本轮不向 QQ 发送文字回复。表情、语音、戳一戳已经发出去的仍在。没要说的话、或动作本身就是回复时调用，\
+                 不要写「好的」「收到」「已发送」。可选 reason 只留在对话记录里，不会发到 QQ。"
+                    .to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "为何不发文字，只留在对话记录里"
+                        }
+                    }
                 }),
             ),
             QqTool::QqGetChatHistory => (
@@ -559,6 +596,7 @@ impl QqToolExecutor {
             QqTool::ListStickers => self.list_stickers(&args).await,
             QqTool::SendSticker => self.send_sticker(&args).await,
             QqTool::SendVoice => self.send_voice(&args).await,
+            QqTool::QqStaySilent => Ok(self.stay_silent_this_round(&args)),
             QqTool::QqGetChatHistory => self.get_chat_history(&args).await,
             QqTool::QqGetGroupInfo => self.get_group_info().await,
             QqTool::QqGetGroupMemberList => self.get_group_member_list().await,
@@ -825,14 +863,15 @@ impl QqToolExecutor {
         Err("the voice settings changed while this was being prepared; try again".into())
     }
 
+    fn stay_silent_this_round(&self, args: &serde_json::Value) -> String {
+        self.stay_silent.store(true, Ordering::SeqCst);
+        stay_silent_ack(args.get("reason").and_then(|value| value.as_str()))
+    }
+
     async fn send_sticker(&self, args: &serde_json::Value) -> Result<String, String> {
         static SENT_TURNS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-        let sticker_id = args
-            .get("sticker_id")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .ok_or("missing required parameter: sticker_id")?
-            .to_string();
+        let sticker_id = args.get("sticker_id").and_then(|value| value.as_str());
+        let query = args.get("query").and_then(|value| value.as_str());
         {
             let sent = SENT_TURNS
                 .get_or_init(Default::default)
@@ -844,25 +883,19 @@ impl QqToolExecutor {
         }
         let self_id = self.self_id.ok_or("OneBot event did not include self_id")?.to_string();
         let data_dir = self.state.services.paths.data_dir.clone();
-        // The pool and the sticker are read in one snapshot: two reads joined.
-        let (pack, sticker) = self
+        let stickers = self
             .state
             .services
             .db
-            .read(async |tx| {
-                let pack = crate::db::sea::ops::emoji_pack::get_by_source_account(tx, &self_id).await?;
-                let sticker = crate::db::sea::ops::emoji::get_emoji(tx, &sticker_id).await?;
-                Ok::<_, sea_orm::DbErr>((pack, sticker))
-            })
+            .read(
+                async |tx| match crate::db::sea::ops::emoji_pack::get_by_source_account(tx, &self_id).await? {
+                    Some(pack) => crate::db::sea::ops::emoji::list_confirmed_for_packs(tx, &[pack.id]).await,
+                    None => Ok(Vec::new()),
+                },
+            )
             .await
             .map_err(|e| e.to_string())?;
-        let pack = pack.ok_or("No sticker pool exists for this bot account")?;
-        let sticker = sticker.ok_or("Unknown sticker id")?;
-        if sticker.pack_id != pack.id
-            || sticker.semantic_status != crate::db::entity::emoji::EmojiSemanticStatus::Confirmed
-        {
-            return Err("That sticker is not in this bot account's confirmed roster".into());
-        }
+        let sticker = crate::tools::sticker::pick_from_roster(&stickers, sticker_id, query)?.clone();
 
         let payload = sticker.native_payload();
         let cached_image = || -> Result<MessageSegment, String> {
@@ -1094,7 +1127,7 @@ pub fn spec_catalog() -> Vec<serde_json::Value> {
                 Scope::PrivateOnly => "private",
             };
             let effect = match t {
-                QqTool::QqManageReplies => "app_state",
+                QqTool::QqManageReplies | QqTool::QqStaySilent => "app_state",
                 _ if has_effects(t.name()) => "messaging",
                 _ => "read",
             };
@@ -1248,8 +1281,22 @@ fn spec_available(tool: QqTool, kind: &SessionKind, is_admin: bool, policy: Sess
 /// and it still lands in somebody's chat window.
 fn has_effects(name: &str) -> bool {
     // `send_sticker` 与 `send_voice` 是仅有的两个加法——它们不为任何人停下，
-    // 而结果都落在别人的聊天窗口里。
+    // 而结果都落在别人的聊天窗口里。`qq_stay_silent` 只改本轮出站，不进这里。
     QqTool::parse(name).is_some_and(|t| matches!(t, QqTool::SendSticker | QqTool::SendVoice) || t.spec().needs_approval)
+}
+
+fn stay_silent_ack(reason: Option<&str>) -> String {
+    match reason.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(reason) => {
+            let truncated: String = reason.chars().take(200).collect();
+            if reason.chars().count() > 200 {
+                format!("本轮不向 QQ 发送文字。已记下：{truncated}...")
+            } else {
+                format!("本轮不向 QQ 发送文字。已记下：{truncated}")
+            }
+        }
+        None => "本轮不向 QQ 发送文字。".into(),
+    }
 }
 
 /// Fold that property into a spec's parameters.
@@ -1443,6 +1490,7 @@ mod tests {
         let n = names(&SessionKind::Group, false);
         assert!(n.contains(&"list_stickers"));
         assert!(n.contains(&"send_sticker"));
+        assert!(n.contains(&"qq_stay_silent"));
         assert!(n.contains(&QqTool::QqGetChatHistory.name()));
         assert!(n.contains(&"qq_get_group_member_list"));
         assert!(!n.contains(&"qq_get_user_info"), "private-only tool absent in groups");
@@ -1490,6 +1538,7 @@ mod tests {
                 "list_stickers",
                 "send_sticker",
                 "send_voice",
+                "qq_stay_silent",
                 "qq_get_chat_history",
                 "qq_get_group_info",
                 "qq_get_group_member_list",
@@ -1525,6 +1574,7 @@ mod tests {
         assert!(approval_needed.contains(&"qq_delete_msg"));
         assert!(!approval_needed.contains(&QqTool::QqGetChatHistory.name()));
         assert!(!approval_needed.contains(&"send_sticker"));
+        assert!(!approval_needed.contains(&"qq_stay_silent"));
         assert!(!approval_needed.contains(&"qq_get_group_member_list"));
         assert!(!approval_needed.contains(&"qq_list_replies"));
         assert!(approval_needed.contains(&"qq_manage_replies"));
@@ -1569,6 +1619,40 @@ mod tests {
         assert_eq!(list["effect"], "read");
         assert_eq!(list["needs_approval"], false);
         assert_eq!(list["admin_only"], false);
+    }
+
+    #[test]
+    fn stay_silent_is_app_state_and_asks_nobody() {
+        let spec = QqTool::QqStaySilent.spec();
+        assert!(!spec.admin_only);
+        assert!(!spec.needs_approval);
+        assert_eq!(spec.scope, Scope::Any);
+        let catalog = spec_catalog();
+        let silent = catalog
+            .iter()
+            .find(|entry| entry["name"] == "qq_stay_silent")
+            .expect("qq_stay_silent is in the spec catalog");
+        assert_eq!(silent["effect"], "app_state");
+        assert_eq!(silent["needs_approval"], false);
+        assert_eq!(silent["admin_only"], false);
+        for kind in [SessionKind::Group, SessionKind::Private] {
+            assert!(names(&kind, false).contains(&"qq_stay_silent"), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn stay_silent_ack_keeps_reason_off_qq() {
+        assert_eq!(stay_silent_ack(None), "本轮不向 QQ 发送文字。");
+        assert_eq!(stay_silent_ack(Some("  ")), "本轮不向 QQ 发送文字。");
+        assert_eq!(
+            stay_silent_ack(Some("表情已经够了")),
+            "本轮不向 QQ 发送文字。已记下：表情已经够了"
+        );
+        let long: String = "啊".repeat(201);
+        let ack = stay_silent_ack(Some(&long));
+        assert!(ack.starts_with("本轮不向 QQ 发送文字。已记下："));
+        assert!(ack.ends_with("..."));
+        assert_eq!(ack.chars().filter(|&c| c == '啊').count(), 200);
     }
 
     /// 白名单关掉时，`send_voice` 从**两边同时**消失。
@@ -1631,6 +1715,7 @@ mod tests {
         assert!(!takes_one("qq_get_group_member_list"));
         assert!(!takes_one("list_stickers"));
         assert!(!takes_one("qq_list_replies"));
+        assert!(!takes_one("qq_stay_silent"));
         assert!(takes_one("qq_manage_replies"));
 
         // The rule, not the list: anything that stops for a person describes
