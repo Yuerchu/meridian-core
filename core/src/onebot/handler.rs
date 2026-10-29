@@ -748,19 +748,22 @@ pub(super) async fn run_agent_turn(
         let failure = outcome.reply.as_ref().err().cloned();
         running.record(outcome.progress);
 
+        let silent = qq_tools.stay_silent();
         let actions: Vec<OneBotAction> = match outcome.reply {
-            Ok(reply_text) if reply_text.is_empty() => vec![],
-            Ok(reply_text) => {
-                let chunks = format::split_long_message(&reply_text);
-                chunks
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(i, chunk)| {
-                        let reply_id = if i == 0 { reply_anchor } else { None };
-                        build_session_reply(session_key, chunk, reply_id)
-                    })
-                    .collect()
-            }
+            Ok(reply_text) => match outbound_qq_text(silent, &reply_text) {
+                None => vec![],
+                Some(reply_text) => {
+                    let chunks = format::split_long_message(reply_text);
+                    chunks
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(i, chunk)| {
+                            let reply_id = if i == 0 { reply_anchor } else { None };
+                            build_session_reply(session_key, chunk, reply_id)
+                        })
+                        .collect()
+                }
+            },
             Err(e) => {
                 tracing::error!("Chat error for {}: {e}", session_key);
                 server_error_actions(state, session_key, initiator_user_id, reply_anchor, &e).await
@@ -2329,6 +2332,13 @@ async fn server_error_for_event(
     server_error_actions(state, session_key, event.user_id.unwrap_or(0), reply_to, error).await
 }
 
+/// The final QQ text of a round, if any. An empty completion and an explicit
+/// `qq_stay_silent` both mean no text is sent; stickers / voice / poke already
+/// dispatched stay.
+fn outbound_qq_text(silent: bool, reply: &str) -> Option<&str> {
+    if silent || reply.is_empty() { None } else { Some(reply) }
+}
+
 fn build_reply(event: &OneBotEvent, text: &str, reply_to_id: Option<i64>) -> Vec<OneBotAction> {
     let mut segments = Vec::new();
     if let Some(id) = reply_to_id {
@@ -2405,6 +2415,14 @@ mod tests {
             .collect();
 
         assert_eq!(merged, vec![None, None, Some("id-c".into())]);
+    }
+
+    #[test]
+    fn outbound_qq_text_drops_empty_and_silent_rounds() {
+        assert_eq!(super::outbound_qq_text(false, "你好"), Some("你好"));
+        assert_eq!(super::outbound_qq_text(false, ""), None);
+        assert_eq!(super::outbound_qq_text(true, "好的"), None);
+        assert_eq!(super::outbound_qq_text(true, ""), None);
     }
 
     /// Whoever triggered a turn is not the only person in it, and authority is

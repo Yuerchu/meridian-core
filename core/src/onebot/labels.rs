@@ -55,6 +55,7 @@ const LABELS: &[(&str, &str)] = &[
     ("qq_manage_replies", "维护回复措辞"),
     ("list_stickers", "查看可用表情"),
     ("send_sticker", "发送表情"),
+    ("qq_stay_silent", "本轮沉默"),
     ("Agent", "子 Agent"),
     ("Bash", "运行命令"),
     ("Read", "读取文件"),

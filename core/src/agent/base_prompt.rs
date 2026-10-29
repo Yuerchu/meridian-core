@@ -23,8 +23,9 @@ pub fn base_prompt(tool_defs: &[ToolDefinition], command_shell: Option<&CommandS
     let has_todos = has("update_todos");
     let shell = command_shell.filter(|_| has("run_command"));
     let has_stickers = has("send_sticker");
+    let has_silence = has("qq_stay_silent");
 
-    if !has_editing && !has_todos && shell.is_none() && !has_stickers {
+    if !has_editing && !has_todos && shell.is_none() && !has_stickers && !has_silence {
         return None;
     }
 
@@ -41,19 +42,32 @@ pub fn base_prompt(tool_defs: &[ToolDefinition], command_shell: Option<&CommandS
     if has_stickers {
         sections.push(sticker_section());
     }
+    if has_silence {
+        sections.push(qq_replies_section());
+    }
     Some(sections.join("\n\n"))
 }
 
 /// The one thing the sticker tools' own descriptions do not say: what *not* to
-/// do. The mechanics (pick an id with `list_stickers`, send it with
-/// `send_sticker`) are on the definitions themselves; the invented inline tag
+/// do. Sending is a short query on `send_sticker`; the invented inline tag
 /// was the failure this line exists for.
 fn sticker_section() -> String {
     [
         "# Stickers",
         "",
-        "Stickers are sent with `send_sticker` after picking an id from `list_stickers`; never \
-         write `[emoji:...]` tags or sticker names into your text.",
+        "Send a sticker with `send_sticker` and a short query (name, tag, or mood). The sticker \
+         is already in the chat; do not narrate that it was sent. Never write `[emoji:...]` tags \
+         or sticker names into your text.",
+    ]
+    .join("\n")
+}
+
+fn qq_replies_section() -> String {
+    [
+        "# QQ replies",
+        "",
+        "An empty final reply is not sent. After a sticker, poke, or voice, or when there is \
+         nothing to add, call `qq_stay_silent` rather than writing 好的 / 收到 / 已发送.",
     ]
     .join("\n")
 }
@@ -202,8 +216,19 @@ mod tests {
     fn send_sticker_adds_the_sticker_guidance() {
         let p = base_prompt(&[def("send_sticker")], None).unwrap();
         assert!(p.contains("# Stickers"), "{p}");
+        assert!(p.contains("short query"), "{p}");
         assert!(p.contains("`[emoji:...]`"), "{p}");
+        assert!(!p.contains("list_stickers"), "{p}");
         assert!(base_prompt(&[def("list_stickers")], None).is_none());
+    }
+
+    #[test]
+    fn qq_stay_silent_adds_the_reply_guidance() {
+        let p = base_prompt(&[def("qq_stay_silent")], None).unwrap();
+        assert!(p.contains("# QQ replies"), "{p}");
+        assert!(p.contains("`qq_stay_silent`"), "{p}");
+        assert!(!p.contains("# Stickers"), "{p}");
+        assert!(base_prompt(&[def("qq_send_poke")], None).is_none());
     }
 
     #[test]

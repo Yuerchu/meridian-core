@@ -474,7 +474,7 @@
     },
     {
       "bridged": false,
-      "description": "List the confirmed stickers this assistant may send. The roster is dynamic; use the returned id with send_sticker.",
+      "description": "List the confirmed stickers this assistant may send. Prefer send_sticker with a query; use a returned id only when you already know which one.",
       "name": "list_stickers",
       "parameters": {
         "properties": {
@@ -949,7 +949,7 @@
     },
     {
       "bridged": false,
-      "description": "Send one confirmed sticker as a separate visual message part. At most one call may succeed per assistant turn; text may accompany it.",
+      "description": "Send one confirmed sticker as a separate visual message part. Pass a short query (name, tag, or mood); the tool picks the best match. At most one call may succeed per assistant turn. A sticker is already in the chat; do not narrate that it was sent.",
       "name": "send_sticker",
       "parameters": {
         "properties": {
@@ -957,14 +957,15 @@
             "description": "One short line saying what this call does and why, written for the user to read — in the language they are writing in. It is shown in place of the raw arguments on the tool card and in the approval prompt.",
             "type": "string"
           },
+          "query": {
+            "description": "Name, tag, or mood to pick from the confirmed roster",
+            "type": "string"
+          },
           "sticker_id": {
-            "description": "Exact id returned by list_stickers",
+            "description": "Exact id from list_stickers; wins over query when both are given",
             "type": "string"
           }
         },
-        "required": [
-          "sticker_id"
-        ],
         "type": "object"
       },
       "permission": "always",
@@ -1194,6 +1195,13 @@
       "admin_only": false,
       "effect": "messaging",
       "name": "send_voice",
+      "needs_approval": false,
+      "scope": "any"
+    },
+    {
+      "admin_only": false,
+      "effect": "app_state",
+      "name": "qq_stay_silent",
       "needs_approval": false,
       "scope": "any"
     },
