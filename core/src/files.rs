@@ -256,7 +256,11 @@ pub fn classify_attachment(uri: &str, files_root: &Path) -> Result<AttachmentFor
 /// Path text the model is sent when the file cannot go as a native part.
 /// Format is a function of the canonical path and size only.
 pub fn attachment_path_text(path: &Path, len: u64) -> String {
-    format!("[attachment: {} ({len} bytes)]", dunce::simplified(path).display())
+    // `dunce` is a Windows-only dependency (verbatim `\\?\` prefixes). Unix
+    // canonicalize already yields a path that is safe to print.
+    #[cfg(windows)]
+    let path = dunce::simplified(path);
+    format!("[attachment: {} ({len} bytes)]", path.display())
 }
 
 /// Resolve a `file://` URI for inlining into a provider request. Only regular

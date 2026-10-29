@@ -1386,11 +1386,15 @@ mod capability_contract_tests {
     fn provider_capabilities_are_a_closed_complete_wire_contract() {
         let value = serde_json::to_value(ProviderCapabilities::default()).unwrap();
         let object = value.as_object().unwrap();
-        // 20 since `responses_lite`. It stays out of the IPC response
+        // 19 since `readable_mime_types` replaced `supports_images` +
+        // `supports_pdf`. `responses_lite` stays out of the IPC response
         // (`ProviderCapabilitiesInfoResponse`) on purpose: it decides a request
         // shape rather than anything a settings page can offer, and a capability
         // gaining a public field by accident is what this count exists to stop.
-        assert_eq!(object.len(), 20);
+        assert_eq!(object.len(), 19);
+        assert!(object.get("readable_mime_types").is_some());
+        assert!(object.get("supports_images").is_none());
+        assert!(object.get("supports_pdf").is_none());
         assert_eq!(object.get("thinking_style"), Some(&serde_json::json!("none")));
         assert!(object.get("supported_efforts").is_some());
 
