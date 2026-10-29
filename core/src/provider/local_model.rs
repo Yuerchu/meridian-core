@@ -176,8 +176,7 @@ pub async fn apply_capabilities(
 
 pub fn narrow_to_adapter(caps: &mut super::ProviderCapabilities) {
     // 模型文件能力不能打开当前适配器尚未实现的图像/音频或采样参数。
-    caps.supports_images = false;
-    caps.supports_pdf = false;
+    caps.readable_mime_types.clear();
     caps.supports_temperature = false;
     caps.supports_top_p = false;
     caps.max_temperature = None;

@@ -438,15 +438,26 @@ fn responses_user_content(content: &str) -> Result<Vec<serde_json::Value>, Provi
                 "type": "input_text",
                 "text": text,
             })),
-            MessageContentPart::ImageUrl { image_url } => Ok(serde_json::json!({
-                "type": "input_image",
-                "image_url": image_url.url,
-            })),
-            MessageContentPart::File { file } => Ok(serde_json::json!({
-                "type": "input_file",
-                "file_data": file.url,
-                "filename": file.name,
-            })),
+            MessageContentPart::ImageUrl { image_url } => {
+                super::require_wire_attachment_url(&image_url.url, "responses")?;
+                Ok(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": image_url.url,
+                }))
+            }
+            MessageContentPart::File { file } => {
+                if !file.url.starts_with("data:") {
+                    return Err(ProviderError::Parse(format!(
+                        "unresolved attachment url reached the responses adapter ({})",
+                        file.url
+                    )));
+                }
+                Ok(serde_json::json!({
+                    "type": "input_file",
+                    "file_data": file.url,
+                    "filename": file.name,
+                }))
+            }
             MessageContentPart::Sticker { .. } => Err(ProviderError::Parse(
                 "unresolved sticker part reached the OpenAI Responses adapter".into(),
             )),

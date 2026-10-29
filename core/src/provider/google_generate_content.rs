@@ -297,8 +297,8 @@ fn rendered_parts(content: &str) -> Result<Vec<serde_json::Value>, ProviderError
         .into_iter()
         .map(|part| match part {
             MessageContentPart::Text { text } => Ok(serde_json::json!({ "text": text })),
-            MessageContentPart::ImageUrl { image_url } => Ok(media_part(Some(&image_url.url))),
-            MessageContentPart::File { file } => Ok(media_part(Some(&file.url))),
+            MessageContentPart::ImageUrl { image_url } => media_part(Some(&image_url.url)),
+            MessageContentPart::File { file } => media_part(Some(&file.url)),
             MessageContentPart::Sticker { .. } => Err(ProviderError::Parse(
                 "unresolved sticker part reached the Google GenerateContent adapter".into(),
             )),
@@ -306,16 +306,17 @@ fn rendered_parts(content: &str) -> Result<Vec<serde_json::Value>, ProviderError
         .collect()
 }
 
-fn media_part(url: Option<&str>) -> serde_json::Value {
+fn media_part(url: Option<&str>) -> Result<serde_json::Value, ProviderError> {
     let Some(url) = url else {
-        return serde_json::json!({ "text": "[Unavailable attachment]" });
+        return Ok(serde_json::json!({ "text": "[Unavailable attachment]" }));
     };
     if let Some(data) = url.strip_prefix("data:")
         && let Some((mime_type, payload)) = data.split_once(";base64,")
     {
-        return serde_json::json!({ "inlineData": { "mimeType": mime_type, "data": payload } });
+        return Ok(serde_json::json!({ "inlineData": { "mimeType": mime_type, "data": payload } }));
     }
-    serde_json::json!({ "fileData": { "fileUri": url } })
+    super::require_wire_attachment_url(url, "gemini-generate-content")?;
+    Ok(serde_json::json!({ "fileData": { "fileUri": url } }))
 }
 
 /// A tool result as the text of its `functionResponse`, and the parts that
@@ -331,7 +332,7 @@ fn tool_result_wire(message: &ChatMessage) -> Result<(String, Vec<serde_json::Va
                 let id = message.tool_call_id.as_deref().unwrap_or("");
                 media.push(serde_json::json!({ "text": super::tool_media_caption(id) }));
             }
-            media.push(media_part(Some(url)));
+            media.push(media_part(Some(url))?);
         }
     }
     Ok((super::tool_result_wire_text(&parts), media))
@@ -1025,5 +1026,11 @@ mod tests {
         .err()
         .expect("candidates is required");
         assert!(error.to_string().contains("missing field `candidates`"));
+    }
+
+    #[test]
+    fn leftover_file_uri_does_not_become_empty_mimetype_filedata() {
+        let error = media_part(Some("file:///C:/data/files/a.png")).unwrap_err();
+        assert!(error.to_string().contains("unresolved attachment"), "{error}");
     }
 }

@@ -193,6 +193,17 @@ fn content_value(role: &str, content: &str) -> Result<serde_json::Value, Provide
     if role == "user"
         && let Some(parts) = super::decode_message_parts(content).map_err(ProviderError::Parse)?
     {
+        for part in &parts {
+            match part {
+                super::MessageContentPart::File { .. } => {
+                    return Err(ProviderError::Parse("chat-completions cannot take a file part".into()));
+                }
+                super::MessageContentPart::ImageUrl { image_url } => {
+                    super::require_wire_attachment_url(&image_url.url, "openai-compat")?;
+                }
+                _ => {}
+            }
+        }
         return serde_json::to_value(parts).map_err(|error| ProviderError::Parse(error.to_string()));
     }
     Ok(serde_json::Value::String(content.to_string()))
@@ -1893,5 +1904,19 @@ mod openai_tests {
             ])
         );
         assert_eq!(wire[4]["role"], "assistant");
+    }
+
+    #[test]
+    fn a_user_file_part_is_refused_on_chat_completions() {
+        let content = r#"[{"type":"file","file":{"url":"data:application/pdf;base64,AAAA","mime_type":"application/pdf","name":"a.pdf"}}]"#;
+        let error = serialize_openai_messages(&[ChatMessage::user(content)]).unwrap_err();
+        assert!(error.to_string().contains("cannot take a file part"), "{error}");
+    }
+
+    #[test]
+    fn a_leftover_file_uri_on_an_image_is_refused() {
+        let content = r#"[{"type":"image_url","image_url":{"url":"file:///C:/data/files/a.png"}}]"#;
+        let error = serialize_openai_messages(&[ChatMessage::user(content)]).unwrap_err();
+        assert!(error.to_string().contains("unresolved attachment"), "{error}");
     }
 }

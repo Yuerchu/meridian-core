@@ -491,8 +491,8 @@ fn rendered_parts(content: &str) -> Result<Vec<Value>, ProviderError> {
         .into_iter()
         .map(|part| match part {
             MessageContentPart::Text { text } => Ok(json!({ "type": "text", "text": text })),
-            MessageContentPart::ImageUrl { image_url } => Ok(interaction_media("image", &image_url.url)),
-            MessageContentPart::File { file } => Ok(interaction_media("document", &file.url)),
+            MessageContentPart::ImageUrl { image_url } => interaction_media("image", &image_url.url),
+            MessageContentPart::File { file } => interaction_media("document", &file.url),
             MessageContentPart::Sticker { .. } => Err(ProviderError::Parse(
                 "unresolved sticker part reached the Google Interactions adapter".into(),
             )),
@@ -503,25 +503,26 @@ fn rendered_parts(content: &str) -> Result<Vec<Value>, ProviderError> {
 /// A `function_result.result`: the same content list a user input takes, so
 /// pictures a tool returned go back inside the result they belong to.
 fn function_result_content(message: &ChatMessage) -> Result<Vec<Value>, ProviderError> {
-    Ok(match super::tool_result_parts(message).map_err(ProviderError::Parse)? {
-        None => vec![json!({ "type": "text", "text": message.content })],
+    match super::tool_result_parts(message).map_err(ProviderError::Parse)? {
+        None => Ok(vec![json!({ "type": "text", "text": message.content })]),
         Some(parts) => parts
             .into_iter()
             .map(|part| match part {
-                super::ToolWirePart::Text(text) => json!({ "type": "text", "text": text }),
+                super::ToolWirePart::Text(text) => Ok(json!({ "type": "text", "text": text })),
                 super::ToolWirePart::Image(url) => interaction_media("image", &url),
             })
             .collect(),
-    })
+    }
 }
 
-fn interaction_media(kind: &str, url: &str) -> Value {
+fn interaction_media(kind: &str, url: &str) -> Result<Value, ProviderError> {
     if let Some(data) = url.strip_prefix("data:")
         && let Some((mime_type, payload)) = data.split_once(";base64,")
     {
-        return json!({ "type": kind, "data": payload, "mime_type": mime_type });
+        return Ok(json!({ "type": kind, "data": payload, "mime_type": mime_type }));
     }
-    json!({ "type": kind, "uri": url })
+    super::require_wire_attachment_url(url, "gemini-interactions")?;
+    Ok(json!({ "type": kind, "uri": url }))
 }
 
 #[derive(Debug, Deserialize)]

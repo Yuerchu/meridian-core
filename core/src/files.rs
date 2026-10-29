@@ -79,18 +79,200 @@ pub fn resolve_file_uri(uri: &str) -> Option<PathBuf> {
 /// Largest attachment that may be inlined (base64) into a provider request.
 pub const MAX_INLINE_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Canonical IANA types this app can store under `{data_dir}/files`.
+///
+/// The model's `readable_mime_types` is a subset of this list: a type we cannot
+/// store cannot be declared readable. Aliases (`image/jpg`, `audio/mp3`) fold
+/// into the canonical member at parse time and never appear as the stored value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ReadableMime {
+    #[serde(rename = "image/jpeg")]
+    ImageJpeg,
+    #[serde(rename = "image/png")]
+    ImagePng,
+    #[serde(rename = "image/gif")]
+    ImageGif,
+    #[serde(rename = "image/webp")]
+    ImageWebp,
+    #[serde(rename = "video/mp4")]
+    VideoMp4,
+    #[serde(rename = "video/webm")]
+    VideoWebm,
+    #[serde(rename = "audio/mpeg")]
+    AudioMpeg,
+    #[serde(rename = "audio/wav")]
+    AudioWav,
+    #[serde(rename = "audio/ogg")]
+    AudioOgg,
+    #[serde(rename = "application/pdf")]
+    ApplicationPdf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaCategory {
+    Image,
+    Document,
+    Video,
+    Audio,
+}
+
+impl ReadableMime {
+    pub const ALL: &[Self] = &[
+        Self::ImageJpeg,
+        Self::ImagePng,
+        Self::ImageGif,
+        Self::ImageWebp,
+        Self::VideoMp4,
+        Self::VideoWebm,
+        Self::AudioMpeg,
+        Self::AudioWav,
+        Self::AudioOgg,
+        Self::ApplicationPdf,
+    ];
+
+    pub const IMAGES: &[Self] = &[Self::ImageJpeg, Self::ImagePng, Self::ImageGif, Self::ImageWebp];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ImageJpeg => "image/jpeg",
+            Self::ImagePng => "image/png",
+            Self::ImageGif => "image/gif",
+            Self::ImageWebp => "image/webp",
+            Self::VideoMp4 => "video/mp4",
+            Self::VideoWebm => "video/webm",
+            Self::AudioMpeg => "audio/mpeg",
+            Self::AudioWav => "audio/wav",
+            Self::AudioOgg => "audio/ogg",
+            Self::ApplicationPdf => "application/pdf",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::ImageJpeg => "jpg",
+            Self::ImagePng => "png",
+            Self::ImageGif => "gif",
+            Self::ImageWebp => "webp",
+            Self::VideoMp4 => "mp4",
+            Self::VideoWebm => "webm",
+            Self::AudioMpeg => "mp3",
+            Self::AudioWav => "wav",
+            Self::AudioOgg => "ogg",
+            Self::ApplicationPdf => "pdf",
+        }
+    }
+
+    pub fn category(self) -> MediaCategory {
+        match self {
+            Self::ImageJpeg | Self::ImagePng | Self::ImageGif | Self::ImageWebp => MediaCategory::Image,
+            Self::ApplicationPdf => MediaCategory::Document,
+            Self::VideoMp4 | Self::VideoWebm => MediaCategory::Video,
+            Self::AudioMpeg | Self::AudioWav | Self::AudioOgg => MediaCategory::Audio,
+        }
+    }
+
+    /// Strip parameters and fold aliases onto the canonical member.
+    pub fn parse(mime: &str) -> Option<Self> {
+        let canonical = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        Some(match canonical.as_str() {
+            "image/png" => Self::ImagePng,
+            "image/jpeg" | "image/jpg" => Self::ImageJpeg,
+            "image/webp" => Self::ImageWebp,
+            "image/gif" => Self::ImageGif,
+            "video/mp4" => Self::VideoMp4,
+            "video/webm" => Self::VideoWebm,
+            "audio/mpeg" | "audio/mp3" => Self::AudioMpeg,
+            "audio/wav" | "audio/x-wav" | "audio/wave" => Self::AudioWav,
+            "audio/ogg" => Self::AudioOgg,
+            "application/pdf" => Self::ApplicationPdf,
+            _ => return None,
+        })
+    }
+}
+
+pub fn image_mimes() -> Vec<ReadableMime> {
+    ReadableMime::IMAGES.to_vec()
+}
+
+pub fn vision_and_pdf_mimes() -> Vec<ReadableMime> {
+    let mut mimes = image_mimes();
+    mimes.push(ReadableMime::ApplicationPdf);
+    mimes
+}
+
+/// A file inside the attachment root, classified for send-time inlining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachmentForSend {
+    Inline { path: PathBuf, len: u64 },
+    Oversize { path: PathBuf, len: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentError {
+    pub path: String,
+    pub reason: &'static str,
+}
+
+impl AttachmentError {
+    pub fn message(&self) -> String {
+        format!(
+            "could not open attachment for the model: {} ({})",
+            self.reason, self.path
+        )
+    }
+}
+
+/// Split oversize from missing. [`resolve_attachment_uri`] stays the Option
+/// wrapper over [`AttachmentForSend::Inline`] for remote `/assets`.
+pub fn classify_attachment(uri: &str, files_root: &Path) -> Result<AttachmentForSend, AttachmentError> {
+    let display = resolve_file_uri(uri)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| uri.to_string());
+    let fail = |reason: &'static str| AttachmentError {
+        path: display.clone(),
+        reason,
+    };
+    if resolve_file_uri(uri).is_none() {
+        return Err(fail("not a file URI"));
+    }
+    let path = resolve_file_uri(uri).expect("checked above");
+    let canonical = std::fs::canonicalize(&path).map_err(|_| fail("canonicalize failed"))?;
+    let root = std::fs::canonicalize(files_root).map_err(|_| fail("files root is unreadable"))?;
+    if !canonical.starts_with(&root) {
+        return Err(fail("outside the attachment root"));
+    }
+    let meta = std::fs::metadata(&canonical).map_err(|_| fail("metadata failed"))?;
+    if !meta.is_file() {
+        return Err(fail("not a regular file"));
+    }
+    let len = meta.len();
+    if len > MAX_INLINE_ATTACHMENT_BYTES {
+        Ok(AttachmentForSend::Oversize { path: canonical, len })
+    } else {
+        Ok(AttachmentForSend::Inline { path: canonical, len })
+    }
+}
+
+/// Path text the model is sent when the file cannot go as a native part.
+/// Format is a function of the canonical path and size only.
+pub fn attachment_path_text(path: &Path, len: u64) -> String {
+    // `dunce` is a Windows-only dependency (verbatim `\\?\` prefixes). Unix
+    // canonicalize already yields a path that is safe to print.
+    #[cfg(windows)]
+    let path = dunce::simplified(path);
+    format!("[attachment: {} ({len} bytes)]", path.display())
+}
+
 /// Resolve a `file://` URI for inlining into a provider request. Only regular
 /// files inside the app-managed attachment root are accepted (canonical
 /// containment), capped at `MAX_INLINE_ATTACHMENT_BYTES` — message content is
 /// model-influenced, so an unrestricted URI here would let a response exfiltrate
 /// arbitrary local files on the next request.
 pub fn resolve_attachment_uri(uri: &str, files_root: &Path) -> Option<PathBuf> {
-    let canonical = resolve_managed_file(uri, files_root)?;
-    let meta = std::fs::metadata(&canonical).ok()?;
-    if meta.len() > MAX_INLINE_ATTACHMENT_BYTES {
-        return None;
+    match classify_attachment(uri, files_root).ok()? {
+        AttachmentForSend::Inline { path, .. } => Some(path),
+        AttachmentForSend::Oversize { .. } => None,
     }
-    Some(canonical)
 }
 
 /// The same containment, without the size cap: a regular file inside the
@@ -124,28 +306,7 @@ pub const MAX_TOOL_MEDIA_ITEMS: usize = 8;
 /// protocol, the preview), so an unknown one would come back as something
 /// nobody can show.
 pub fn media_extension(mime: &str) -> Option<&'static str> {
-    Some(
-        match mime
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "image/png" => "png",
-            "image/jpeg" | "image/jpg" => "jpg",
-            "image/webp" => "webp",
-            "image/gif" => "gif",
-            "video/mp4" => "mp4",
-            "video/webm" => "webm",
-            "audio/mpeg" | "audio/mp3" => "mp3",
-            "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
-            "audio/ogg" => "ogg",
-            "application/pdf" => "pdf",
-            _ => return None,
-        },
-    )
+    ReadableMime::parse(mime).map(ReadableMime::extension)
 }
 
 /// [`resolve_managed_file`] narrowed to one conversation's directory. What a
@@ -230,5 +391,63 @@ mod tests {
         assert!(alloc_dest(dir.path(), "conv-1", r"png\x").is_err());
         assert!(alloc_dest(dir.path(), "conv-1", "").is_err());
         assert!(alloc_dest(dir.path(), "conv-1", "thisistoolong").is_err());
+    }
+
+    #[test]
+    fn readable_mime_matches_media_extension() {
+        for mime in ReadableMime::ALL {
+            assert_eq!(
+                media_extension(mime.as_str()),
+                Some(mime.extension()),
+                "{}",
+                mime.as_str()
+            );
+            assert_eq!(ReadableMime::parse(mime.as_str()), Some(*mime));
+        }
+        assert_eq!(ReadableMime::parse("image/jpg"), Some(ReadableMime::ImageJpeg));
+        assert_eq!(ReadableMime::parse("audio/mp3"), Some(ReadableMime::AudioMpeg));
+        assert_eq!(
+            ReadableMime::parse("image/png; charset=binary"),
+            Some(ReadableMime::ImagePng)
+        );
+        assert_eq!(media_extension("image/jpg"), Some("jpg"));
+        assert!(ReadableMime::parse("application/zip").is_none());
+        assert!(media_extension("application/zip").is_none());
+    }
+
+    #[test]
+    fn classify_attachment_splits_oversize_from_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir_all(root.join("conv1")).unwrap();
+        let small = root.join("conv1").join("a.png");
+        std::fs::write(&small, b"hello").unwrap();
+        let inline = match classify_attachment(&to_uri(&small), &root).unwrap() {
+            AttachmentForSend::Inline { path, len } => {
+                assert_eq!(len, 5);
+                path
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        };
+        assert_eq!(resolve_attachment_uri(&to_uri(&small), &root), Some(inline.clone()));
+
+        let big = root.join("conv1").join("big.bin");
+        std::fs::write(&big, vec![0u8; (MAX_INLINE_ATTACHMENT_BYTES + 1) as usize]).unwrap();
+        match classify_attachment(&to_uri(&big), &root).unwrap() {
+            AttachmentForSend::Oversize { len, .. } => assert_eq!(len, MAX_INLINE_ATTACHMENT_BYTES + 1),
+            other => panic!("expected Oversize, got {other:?}"),
+        }
+        assert!(resolve_attachment_uri(&to_uri(&big), &root).is_none());
+
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        assert!(classify_attachment(&to_uri(&outside), &root).is_err());
+        assert!(classify_attachment("file:///definitely/not/here.bin", &root).is_err());
+        assert!(classify_attachment("https://example.com/a.txt", &root).is_err());
+
+        let text = attachment_path_text(&canonicalize(&small).unwrap(), 5);
+        assert!(text.starts_with("[attachment: "));
+        assert!(text.ends_with(" (5 bytes)]"));
+        assert!(!text.contains(r"\\?\"));
     }
 }

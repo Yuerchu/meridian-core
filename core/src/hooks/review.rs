@@ -589,7 +589,14 @@ async fn run_turn(
         approval_rule: engine::ApprovalRule::ByReach { accept_edits: false },
         withheld: engine::WithheldWording::Explained,
         files_root: None,
-        supports_images: params.caps.supports_images,
+        user_media: match crate::provider::registry::WireMediaPolicy::from_resolved(
+            &provider.1.provider_type,
+            &provider.1.api_format,
+            &params.caps,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => return engine::TurnOutcome::failed(error),
+        },
         stickers: None,
         interrupted: None,
         compaction: engine::CompactionPolicy::Desktop {

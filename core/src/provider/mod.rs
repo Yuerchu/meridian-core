@@ -572,6 +572,16 @@ pub(crate) fn decode_message_parts(content: &str) -> Result<Option<Vec<MessageCo
     Ok(Some(parts))
 }
 
+pub(crate) fn require_wire_attachment_url(url: &str, adapter: &str) -> Result<(), ProviderError> {
+    if url.starts_with("data:") || url.starts_with("https://") || url.starts_with("http://") {
+        Ok(())
+    } else {
+        Err(ProviderError::Parse(format!(
+            "unresolved attachment url reached the {adapter} adapter ({url})"
+        )))
+    }
+}
+
 pub(crate) fn encode_message_parts(parts: &[MessageContentPart]) -> Result<String, String> {
     if parts.is_empty() {
         return Err("invalid persisted message content parts: the array must not be empty".into());
@@ -1214,10 +1224,12 @@ pub struct ProviderCapabilities {
     pub supports_thinking: bool,
     /// Whether the thinking control may explicitly be set to off.
     pub supports_thinking_off: bool,
-    pub supports_images: bool,
+    /// Canonical IANA types this model can consume as native input parts.
+    /// Empty means text only. Replaces the old `supports_images` / `supports_pdf`
+    /// booleans so a new readable type is a list entry, not a new field.
+    pub readable_mime_types: Vec<crate::files::ReadableMime>,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
-    pub supports_pdf: bool,
     pub supports_temperature: bool,
     pub supports_top_p: bool,
     pub max_temperature: Option<f32>,
@@ -1252,6 +1264,18 @@ pub struct ProviderCapabilities {
     /// endpoint has never heard of it, and sending a `additional_tools` item
     /// there would be an input item it refuses.
     pub responses_lite: bool,
+}
+
+impl ProviderCapabilities {
+    pub fn can_read_mime(&self, mime: &str) -> bool {
+        crate::files::ReadableMime::parse(mime).is_some_and(|parsed| self.readable_mime_types.contains(&parsed))
+    }
+
+    pub fn reads_any_image(&self) -> bool {
+        self.readable_mime_types
+            .iter()
+            .any(|mime| mime.category() == crate::files::MediaCategory::Image)
+    }
 }
 
 /// Returned by the non-streaming `chat_with_tools` path, which no caller has
@@ -1362,11 +1386,15 @@ mod capability_contract_tests {
     fn provider_capabilities_are_a_closed_complete_wire_contract() {
         let value = serde_json::to_value(ProviderCapabilities::default()).unwrap();
         let object = value.as_object().unwrap();
-        // 20 since `responses_lite`. It stays out of the IPC response
+        // 19 since `readable_mime_types` replaced `supports_images` +
+        // `supports_pdf`. `responses_lite` stays out of the IPC response
         // (`ProviderCapabilitiesInfoResponse`) on purpose: it decides a request
         // shape rather than anything a settings page can offer, and a capability
         // gaining a public field by accident is what this count exists to stop.
-        assert_eq!(object.len(), 20);
+        assert_eq!(object.len(), 19);
+        assert!(object.get("readable_mime_types").is_some());
+        assert!(object.get("supports_images").is_none());
+        assert!(object.get("supports_pdf").is_none());
         assert_eq!(object.get("thinking_style"), Some(&serde_json::json!("none")));
         assert!(object.get("supported_efforts").is_some());
 

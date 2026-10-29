@@ -84,8 +84,7 @@ struct CatalogEntry {
     supports_streaming_tools: Option<bool>,
     supports_thinking: Option<bool>,
     supports_thinking_off: Option<bool>,
-    supports_images: Option<bool>,
-    supports_pdf: Option<bool>,
+    readable_mime_types: Option<Vec<crate::files::ReadableMime>>,
     supports_temperature: Option<bool>,
     supports_top_p: Option<bool>,
     max_context_tokens: Option<u32>,
@@ -124,11 +123,8 @@ fn apply(base: &mut ProviderCapabilities, entry: &CatalogEntry) {
     if let Some(v) = entry.supports_thinking_off {
         base.supports_thinking_off = v;
     }
-    if let Some(v) = entry.supports_images {
-        base.supports_images = v;
-    }
-    if let Some(v) = entry.supports_pdf {
-        base.supports_pdf = v;
+    if let Some(ref v) = entry.readable_mime_types {
+        base.readable_mime_types = v.clone();
     }
     if let Some(v) = entry.supports_temperature {
         base.supports_temperature = v;
@@ -194,8 +190,7 @@ fn anthropic_default() -> ProviderCapabilities {
         supports_streaming_tools: true,
         supports_thinking: true,
         supports_thinking_off: true,
-        supports_images: true,
-        supports_pdf: true,
+        readable_mime_types: crate::files::vision_and_pdf_mimes(),
         supports_temperature: true,
         supports_top_p: true,
         max_context_tokens: Some(200_000),
@@ -212,7 +207,7 @@ fn openai_responses_default() -> ProviderCapabilities {
         supports_streaming_tools: true,
         supports_thinking: true,
         supports_thinking_off: true,
-        supports_images: true,
+        readable_mime_types: crate::files::image_mimes(),
         supports_temperature: true,
         supports_top_p: true,
         max_context_tokens: Some(200_000),
@@ -258,7 +253,7 @@ fn xai_default() -> ProviderCapabilities {
         supports_streaming_tools: true,
         supports_thinking: true,
         supports_thinking_off: false,
-        supports_images: true,
+        readable_mime_types: crate::files::image_mimes(),
         supports_temperature: true,
         supports_top_p: true,
         max_context_tokens: Some(256_000),
@@ -315,8 +310,7 @@ fn google_default() -> ProviderCapabilities {
         supports_streaming_tools: true,
         supports_thinking: true,
         supports_thinking_off: false,
-        supports_images: true,
-        supports_pdf: false,
+        readable_mime_types: crate::files::image_mimes(),
         supports_temperature: false,
         supports_top_p: false,
         max_context_tokens: Some(1_048_576),
@@ -553,8 +547,7 @@ pub struct ProviderCapabilityOverrides {
     supports_streaming_tools: OverrideField<bool>,
     supports_thinking: OverrideField<bool>,
     supports_thinking_off: OverrideField<bool>,
-    supports_images: OverrideField<bool>,
-    supports_pdf: OverrideField<bool>,
+    readable_mime_types: OverrideField<Vec<crate::files::ReadableMime>>,
     supports_temperature: OverrideField<bool>,
     supports_top_p: OverrideField<bool>,
     supports_fast: OverrideField<bool>,
@@ -589,6 +582,12 @@ impl ProviderCapabilityOverrides {
             let unique: std::collections::BTreeSet<ServerToolKind> = tools.iter().copied().collect();
             if unique.len() != tools.len() {
                 return Err("capability_overrides.server_tools cannot contain duplicates".into());
+            }
+        }
+        if let OverrideField::Set(mimes) = &self.readable_mime_types {
+            let unique: std::collections::BTreeSet<crate::files::ReadableMime> = mimes.iter().copied().collect();
+            if unique.len() != mimes.len() {
+                return Err("capability_overrides.readable_mime_types cannot contain duplicates".into());
             }
         }
         for (field, value) in [
@@ -633,8 +632,7 @@ pub fn apply_overrides(caps: &mut ProviderCapabilities, overrides: Option<&str>)
     apply_value!(supports_streaming_tools);
     apply_value!(supports_thinking);
     apply_value!(supports_thinking_off);
-    apply_value!(supports_images);
-    apply_value!(supports_pdf);
+    apply_value!(readable_mime_types);
     apply_value!(supports_temperature);
     apply_value!(supports_top_p);
     apply_value!(supports_fast);
@@ -665,6 +663,36 @@ pub fn apply_overrides(caps: &mut ProviderCapabilities, overrides: Option<&str>)
     }
     *caps = updated;
     Ok(())
+}
+
+/// Rewrite a stored `capability_overrides` JSON that still has `supports_images`
+/// / `supports_pdf` into `readable_mime_types`. `None` means the object did not
+/// carry the old keys.
+pub fn rewrite_legacy_media_overrides(raw: &str) -> Result<Option<String>, String> {
+    let mut value: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(raw).map_err(|error| format!("invalid capability_overrides: {error}"))?;
+    let images = value.remove("supports_images");
+    let pdf = value.remove("supports_pdf");
+    if images.is_none() && pdf.is_none() {
+        return Ok(None);
+    }
+    if !value.contains_key("readable_mime_types") {
+        let mut mimes = Vec::new();
+        if images.as_ref() != Some(&serde_json::Value::Bool(false)) {
+            mimes.extend(
+                crate::files::ReadableMime::IMAGES
+                    .iter()
+                    .map(|mime| serde_json::json!(mime.as_str())),
+            );
+        }
+        if pdf.as_ref() == Some(&serde_json::Value::Bool(true)) {
+            mimes.push(serde_json::json!("application/pdf"));
+        }
+        value.insert("readable_mime_types".into(), serde_json::Value::Array(mimes));
+    }
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|error| format!("cannot encode capability_overrides: {error}"))
 }
 
 /// Resolve the effective thinking triple from an assistant's stored defaults
@@ -764,6 +792,11 @@ pub fn filter_params(params: &mut ChatParams, caps: &ProviderCapabilities) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::files::ReadableMime;
+
+    fn has_pdf(caps: &ProviderCapabilities) -> bool {
+        caps.readable_mime_types.contains(&ReadableMime::ApplicationPdf)
+    }
 
     #[test]
     fn catalog_parses() {
@@ -864,6 +897,15 @@ mod tests {
                     ServerToolKind::CodeExecution
                 ]),
             ),
+            (
+                "readableMime",
+                serde_json::json!(
+                    crate::files::ReadableMime::ALL
+                        .iter()
+                        .map(|mime| mime.as_str())
+                        .collect::<Vec<_>>()
+                ),
+            ),
         ] {
             assert_eq!(schema["$defs"][name]["enum"], expected, "schema enum {name} drifted");
         }
@@ -875,6 +917,7 @@ mod tests {
             ("/default_effort", "effortLevel"),
             ("/default_verbosity", "verbosityLevel"),
             ("/server_tools/items", "serverToolKind"),
+            ("/readable_mime_types/items", "readableMime"),
         ] {
             assert_eq!(
                 schema["$defs"]["modelEntry"]["properties"].pointer(path).unwrap()["$ref"],
@@ -947,7 +990,7 @@ mod tests {
 
         assert_eq!(api.supported_efforts, codex.supported_efforts);
         assert_eq!(api.supports_tools, codex.supports_tools);
-        assert_eq!(api.supports_images, codex.supports_images);
+        assert_eq!(api.readable_mime_types, codex.readable_mime_types);
         assert_eq!(api.max_context_tokens, codex.max_context_tokens);
     }
 
@@ -971,8 +1014,8 @@ mod tests {
     fn anthropic_claude_3_haiku_no_thinking() {
         let caps = resolve("anthropic", None, "claude-3-haiku-20240307");
         assert!(!caps.supports_thinking);
-        assert!(caps.supports_images);
-        assert!(!caps.supports_pdf);
+        assert!(caps.reads_any_image());
+        assert!(!has_pdf(&caps));
         assert_eq!(caps.max_output_tokens, Some(4_096));
     }
 
@@ -980,8 +1023,8 @@ mod tests {
     fn anthropic_claude_sonnet_4_has_thinking() {
         let caps = resolve("anthropic", None, "claude-sonnet-4-20250514");
         assert!(caps.supports_thinking);
-        assert!(caps.supports_images);
-        assert!(caps.supports_pdf);
+        assert!(caps.reads_any_image());
+        assert!(has_pdf(&caps));
         assert_eq!(caps.max_output_tokens, Some(64_000));
     }
 
@@ -1123,7 +1166,7 @@ mod tests {
     #[test]
     fn openai_gpt4o_has_vision() {
         let caps = resolve("openai", None, "gpt-4o-2024-11-20");
-        assert!(caps.supports_images);
+        assert!(caps.reads_any_image());
         assert!(!caps.supports_thinking);
         assert!(caps.supports_temperature);
     }
@@ -1163,7 +1206,7 @@ mod tests {
         assert_eq!(caps.supported_efforts, vec!["low", "medium", "high", "xhigh"]);
         assert_eq!(caps.default_effort.as_deref(), Some("high"));
         assert_eq!(caps.max_context_tokens, Some(500_000));
-        assert!(caps.supports_images);
+        assert!(caps.reads_any_image());
         assert!(caps.supports_temperature, "measured: 0.7 is accepted");
         assert!(!caps.supports_fast, "xAI has no priority tier");
     }
@@ -1309,7 +1352,7 @@ mod tests {
         let caps = resolve("openai", None, "some-custom-model-v2");
         assert!(caps.supports_temperature);
         assert!(caps.supports_top_p);
-        assert!(!caps.supports_images);
+        assert!(!caps.reads_any_image());
         assert!(!caps.supports_thinking);
     }
 
@@ -1363,12 +1406,12 @@ mod tests {
     fn longest_prefix_wins() {
         let caps_35_sonnet = resolve("anthropic", None, "claude-3-5-sonnet-20241022");
         assert!(!caps_35_sonnet.supports_thinking);
-        assert!(caps_35_sonnet.supports_pdf);
+        assert!(has_pdf(&caps_35_sonnet));
         assert_eq!(caps_35_sonnet.max_output_tokens, Some(8_192));
 
         let caps_3_sonnet = resolve("anthropic", None, "claude-3-sonnet-20240229");
         assert!(!caps_3_sonnet.supports_thinking);
-        assert!(!caps_3_sonnet.supports_pdf);
+        assert!(!has_pdf(&caps_3_sonnet));
         assert_eq!(caps_3_sonnet.max_output_tokens, Some(4_096));
     }
 
@@ -1514,7 +1557,7 @@ mod tests {
     fn gemma_tool_does_not_inherit_openai_rules() {
         // A gemma_tool provider serving a model called "gpt-4o" is not GPT-4o.
         let caps = resolve("openai", Some("gemma_tool"), "gpt-4o");
-        assert!(!caps.supports_images);
+        assert!(!caps.reads_any_image());
         assert!(!caps.supports_thinking);
         assert!(caps.supported_efforts.is_empty());
     }
@@ -1585,5 +1628,36 @@ mod tests {
             assert_eq!(caps.server_tools, before.server_tools);
         }
         apply_overrides(&mut caps, None).unwrap();
+    }
+
+    #[test]
+    fn rewrite_legacy_media_overrides_freezes_bools_into_a_list() {
+        assert_eq!(
+            rewrite_legacy_media_overrides(r#"{"supports_fast":true}"#).unwrap(),
+            None
+        );
+        let images_off = rewrite_legacy_media_overrides(r#"{"supports_images":false}"#)
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&images_off).unwrap();
+        assert_eq!(parsed["readable_mime_types"], serde_json::json!([]));
+        assert!(parsed.get("supports_images").is_none());
+
+        let both_on =
+            rewrite_legacy_media_overrides(r#"{"supports_images":true,"supports_pdf":true,"supports_fast":true}"#)
+                .unwrap()
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&both_on).unwrap();
+        assert_eq!(
+            parsed["readable_mime_types"],
+            serde_json::json!(["image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"])
+        );
+        assert_eq!(parsed["supports_fast"], true);
+        assert!(apply_overrides(&mut resolve("anthropic", None, "claude-opus-4-8"), Some(&both_on)).is_ok());
+        assert!(
+            rewrite_legacy_media_overrides(r#"{"supports_images":true}"#)
+                .unwrap()
+                .is_some()
+        );
     }
 }

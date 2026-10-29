@@ -129,6 +129,17 @@ fn inject_tool_prompt(messages: &[ChatMessage], tool_prompt: &str) -> Vec<ChatMe
 
 fn content_value(content: &str) -> Result<serde_json::Value, ProviderError> {
     if let Some(parts) = super::decode_message_parts(content).map_err(ProviderError::Parse)? {
+        for part in &parts {
+            match part {
+                super::MessageContentPart::File { .. } => {
+                    return Err(ProviderError::Parse("gemma_tool cannot take a file part".into()));
+                }
+                super::MessageContentPart::ImageUrl { image_url } => {
+                    super::require_wire_attachment_url(&image_url.url, "gemma_tool")?;
+                }
+                _ => {}
+            }
+        }
         return serde_json::to_value(parts).map_err(|error| ProviderError::Parse(error.to_string()));
     }
     Ok(serde_json::Value::String(content.to_string()))

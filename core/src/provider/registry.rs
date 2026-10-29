@@ -497,6 +497,132 @@ pub fn get_capabilities(
     ))
 }
 
+/// Which content-part shapes this door actually has, independent of the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialectMedia {
+    pub image: bool,
+    pub document: bool,
+    pub video: bool,
+    pub audio: bool,
+}
+
+impl DialectMedia {
+    pub fn has(self, category: crate::files::MediaCategory) -> bool {
+        match category {
+            crate::files::MediaCategory::Image => self.image,
+            crate::files::MediaCategory::Document => self.document,
+            crate::files::MediaCategory::Video => self.video,
+            crate::files::MediaCategory::Audio => self.audio,
+        }
+    }
+
+    pub fn from_wire(provider_type: ProviderType, api_format: ApiFormat) -> Self {
+        match (provider_type, api_format) {
+            (ProviderType::Anthropic, ApiFormat::ChatCompletions) => Self {
+                image: true,
+                document: true,
+                video: false,
+                audio: false,
+            },
+            (_, ApiFormat::Responses) => Self {
+                image: true,
+                document: true,
+                video: false,
+                audio: false,
+            },
+            (ProviderType::Google, ApiFormat::GeminiGenerateContent) => Self {
+                image: true,
+                document: true,
+                video: true,
+                audio: true,
+            },
+            (ProviderType::Google, ApiFormat::GeminiInteractions) => Self {
+                image: true,
+                document: true,
+                video: false,
+                audio: false,
+            },
+            (_, ApiFormat::ChatCompletions | ApiFormat::GemmaTool) => Self {
+                image: true,
+                document: false,
+                video: false,
+                audio: false,
+            },
+            (_, ApiFormat::LitertLm | ApiFormat::GeminiGenerateContent | ApiFormat::GeminiInteractions) => Self {
+                image: false,
+                document: false,
+                video: false,
+                audio: false,
+            },
+        }
+    }
+}
+
+/// Send-time policy: the model's readable MIME set intersected with this door's
+/// part shapes. Native send is membership on both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireMediaPolicy {
+    pub readable: Vec<crate::files::ReadableMime>,
+    pub dialect: DialectMedia,
+}
+
+impl WireMediaPolicy {
+    pub fn from_wire(provider_type: ProviderType, api_format: ApiFormat, caps: &ProviderCapabilities) -> Self {
+        Self {
+            readable: caps.readable_mime_types.clone(),
+            dialect: DialectMedia::from_wire(provider_type, api_format),
+        }
+    }
+
+    pub fn from_resolved(provider_type: &str, api_format: &str, caps: &ProviderCapabilities) -> Result<Self, String> {
+        Ok(Self::from_wire(
+            ProviderType::parse(provider_type)?,
+            ApiFormat::parse(api_format)?,
+            caps,
+        ))
+    }
+
+    pub fn native(&self, mime: crate::files::ReadableMime) -> bool {
+        self.readable.contains(&mime) && self.dialect.has(mime.category())
+    }
+
+    pub fn can_read_mime(&self, mime: &str) -> bool {
+        crate::files::ReadableMime::parse(mime).is_some_and(|parsed| self.readable.contains(&parsed))
+    }
+
+    pub fn reads_any_image(&self) -> bool {
+        self.readable
+            .iter()
+            .any(|mime| mime.category() == crate::files::MediaCategory::Image)
+    }
+
+    /// Tool-row / sticker tests: the model accepts the stored image types over a
+    /// door that has an image part.
+    pub fn native_images() -> Self {
+        Self {
+            readable: crate::files::image_mimes(),
+            dialect: DialectMedia {
+                image: true,
+                document: false,
+                video: false,
+                audio: false,
+            },
+        }
+    }
+
+    pub fn none() -> Self {
+        Self {
+            readable: Vec::new(),
+            dialect: DialectMedia {
+                image: false,
+                document: false,
+                video: false,
+                audio: false,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +864,58 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    fn caps_with(mimes: Vec<crate::files::ReadableMime>) -> ProviderCapabilities {
+        ProviderCapabilities {
+            readable_mime_types: mimes,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dialect_shapes_are_a_fact_about_the_door() {
+        let anthropic = DialectMedia::from_wire(ProviderType::Anthropic, ApiFormat::ChatCompletions);
+        assert!(anthropic.document && anthropic.image);
+        let openai_chat = DialectMedia::from_wire(ProviderType::Openai, ApiFormat::ChatCompletions);
+        assert!(openai_chat.image && !openai_chat.document);
+        let openai_responses = DialectMedia::from_wire(ProviderType::Openai, ApiFormat::Responses);
+        assert!(openai_responses.document);
+        let gemini = DialectMedia::from_wire(ProviderType::Google, ApiFormat::GeminiGenerateContent);
+        assert!(gemini.video && gemini.audio && gemini.document);
+        let litert = DialectMedia::from_wire(ProviderType::LitertLm, ApiFormat::LitertLm);
+        assert!(!litert.image);
+    }
+
+    #[test]
+    fn native_send_is_the_intersection() {
+        let pdf = vec![crate::files::ReadableMime::ApplicationPdf];
+        let jpeg = crate::files::image_mimes();
+        let anthropic = WireMediaPolicy::from_wire(
+            ProviderType::Anthropic,
+            ApiFormat::ChatCompletions,
+            &caps_with(pdf.clone()),
+        );
+        assert!(anthropic.native(crate::files::ReadableMime::ApplicationPdf));
+
+        let openai_chat = WireMediaPolicy::from_wire(
+            ProviderType::Openai,
+            ApiFormat::ChatCompletions,
+            &caps_with(pdf.clone()),
+        );
+        assert!(!openai_chat.native(crate::files::ReadableMime::ApplicationPdf));
+
+        let openai_responses = WireMediaPolicy::from_wire(ProviderType::Openai, ApiFormat::Responses, &caps_with(pdf));
+        assert!(openai_responses.native(crate::files::ReadableMime::ApplicationPdf));
+
+        let no_images = WireMediaPolicy::from_wire(
+            ProviderType::Anthropic,
+            ApiFormat::ChatCompletions,
+            &caps_with(Vec::new()),
+        );
+        assert!(!no_images.native(crate::files::ReadableMime::ImageJpeg));
+
+        let litert = WireMediaPolicy::from_wire(ProviderType::LitertLm, ApiFormat::LitertLm, &caps_with(jpeg));
+        assert!(!litert.native(crate::files::ReadableMime::ImageJpeg));
     }
 }

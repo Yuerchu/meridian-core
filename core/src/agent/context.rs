@@ -332,11 +332,11 @@ pub fn resolve_file_uris_in_messages(
     messages: &mut [ChatMessage],
     files_root: Option<&std::path::Path>,
     conversation_id: &str,
-    supports_images: bool,
+    user_media: crate::provider::registry::WireMediaPolicy,
 ) -> Result<(), String> {
     for msg in messages.iter_mut() {
         if msg.origin == provider::MessageOrigin::ToolParts {
-            msg.content = resolve_tool_parts(&msg.content, files_root, conversation_id, supports_images)?;
+            msg.content = resolve_tool_parts(&msg.content, files_root, conversation_id, &user_media)?;
             continue;
         }
         // Only user-authored attachments may be inlined from anywhere under the
@@ -349,33 +349,119 @@ pub fn resolve_file_uris_in_messages(
         let Some(mut parts) = provider::decode_message_parts(&msg.content)? else {
             continue;
         };
-        let Some(files_root) = files_root else { continue };
         let mut changed = false;
         for part in parts.iter_mut() {
-            let url = match part {
-                provider::MessageContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
-                provider::MessageContentPart::File { file } => Some(file.url.clone()),
-                _ => None,
-            };
-            if let Some(ref uri) = url
-                && let Some(path) = crate::files::resolve_attachment_uri(uri, files_root)
-            {
-                let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
-                if let Ok(data_uri) = crate::files::file_to_base64_data_uri(&path, &mime) {
-                    match part {
-                        provider::MessageContentPart::ImageUrl { image_url } => image_url.url = data_uri,
-                        provider::MessageContentPart::File { file } => file.url = data_uri,
-                        _ => unreachable!("the URL came from an attachment part"),
-                    }
-                    changed = true;
-                }
-            }
+            changed |= project_user_part(part, files_root, &user_media)?;
         }
+        refuse_leftover_local_urls(&parts)?;
         if changed {
             msg.content = provider::encode_message_parts(&parts)?;
         }
     }
     Ok(())
+}
+
+fn is_wire_url(url: &str) -> bool {
+    url.starts_with("data:") || url.starts_with("https://") || url.starts_with("http://")
+}
+
+fn refuse_leftover_local_urls(parts: &[provider::MessageContentPart]) -> Result<(), String> {
+    for part in parts {
+        let url = match part {
+            provider::MessageContentPart::ImageUrl { image_url } => image_url.url.as_str(),
+            provider::MessageContentPart::File { file } => file.url.as_str(),
+            _ => continue,
+        };
+        if is_wire_url(url) {
+            continue;
+        }
+        return Err(format!(
+            "could not open attachment for the model: leftover non-wire url ({url})"
+        ));
+    }
+    Ok(())
+}
+
+fn project_user_part(
+    part: &mut provider::MessageContentPart,
+    files_root: Option<&std::path::Path>,
+    policy: &crate::provider::registry::WireMediaPolicy,
+) -> Result<bool, String> {
+    use crate::files::{AttachmentForSend, MediaCategory, ReadableMime, attachment_path_text, classify_attachment};
+    use provider::MessageContentPart as Part;
+
+    let url = match part {
+        Part::ImageUrl { image_url } => image_url.url.clone(),
+        Part::File { file } => file.url.clone(),
+        _ => return Ok(false),
+    };
+    if is_wire_url(&url) {
+        return Ok(false);
+    }
+    let Some(files_root) = files_root else {
+        return Err(format!(
+            "could not open attachment for the model: no attachment root ({url})"
+        ));
+    };
+    let classified = classify_attachment(&url, files_root).map_err(|error| error.message())?;
+    let (path, len, oversize) = match classified {
+        AttachmentForSend::Inline { path, len } => (path, len, false),
+        AttachmentForSend::Oversize { path, len } => (path, len, true),
+    };
+    if oversize {
+        *part = Part::Text {
+            text: attachment_path_text(&path, len),
+        };
+        return Ok(true);
+    }
+    let declared = match part {
+        Part::File { file } if !file.mime_type.is_empty() => file.mime_type.clone(),
+        _ => mime_guess::from_path(&path).first_or_octet_stream().to_string(),
+    };
+    let Some(mime) = ReadableMime::parse(&declared) else {
+        *part = Part::Text {
+            text: attachment_path_text(&path, len),
+        };
+        return Ok(true);
+    };
+    if !policy.native(mime) {
+        *part = Part::Text {
+            text: attachment_path_text(&path, len),
+        };
+        return Ok(true);
+    }
+    let data_uri = crate::files::file_to_base64_data_uri(&path, mime.as_str())
+        .map_err(|error| format!("could not open attachment for the model: {error} ({})", path.display()))?;
+    match (mime.category(), &mut *part) {
+        (MediaCategory::Image, Part::ImageUrl { image_url }) => {
+            image_url.url = data_uri;
+        }
+        (MediaCategory::Image, Part::File { .. }) => {
+            *part = Part::ImageUrl {
+                image_url: provider::MessageContentUrl { url: data_uri },
+            };
+        }
+        (_, Part::File { file }) => {
+            file.url = data_uri;
+            file.mime_type = mime.as_str().to_string();
+        }
+        (_, Part::ImageUrl { .. }) => {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string();
+            *part = Part::File {
+                file: provider::MessageFileContent {
+                    url: data_uri,
+                    mime_type: mime.as_str().to_string(),
+                    name,
+                },
+            };
+        }
+        _ => unreachable!("attachment parts are ImageUrl or File"),
+    }
+    Ok(true)
 }
 
 /// A tool row's envelope as the provider is sent it: each picture inlined
@@ -389,7 +475,7 @@ fn resolve_tool_parts(
     content: &str,
     files_root: Option<&std::path::Path>,
     conversation_id: &str,
-    supports_images: bool,
+    user_media: &crate::provider::registry::WireMediaPolicy,
 ) -> Result<String, String> {
     use provider::MessageContentPart as Part;
     let parts =
@@ -402,7 +488,7 @@ fn resolve_tool_parts(
         .map(|part| match part {
             // A model that cannot see pictures is told one was there: sending
             // it anyway is a 400 on every later turn of the conversation.
-            Part::ImageUrl { .. } if !supports_images => Part::Text {
+            Part::ImageUrl { .. } if !user_media.reads_any_image() => Part::Text {
                 text: "[image omitted: this model does not accept images]".to_string(),
             },
             Part::ImageUrl { image_url } if image_url.url.starts_with("data:") => Part::ImageUrl { image_url },
@@ -803,6 +889,7 @@ pub(crate) fn data_uri_re() -> &'static regex::Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::registry::WireMediaPolicy;
     use provider::ToolCall;
 
     fn test_counter() -> TokenCounter {
@@ -842,7 +929,7 @@ mod tests {
         let mut msgs = Vec::new();
         push_history_message(&mut msgs, &forged, &SenderNames::new(), None).unwrap();
         assert_eq!(msgs[0].origin, provider::MessageOrigin::Tool);
-        resolve_file_uris_in_messages(&mut msgs, Some(dir.path()), "c", true).unwrap();
+        resolve_file_uris_in_messages(&mut msgs, Some(dir.path()), "c", WireMediaPolicy::native_images()).unwrap();
         assert!(
             !msgs[0].content.contains("base64"),
             "a version-2 row triggered a local read"
@@ -856,12 +943,12 @@ mod tests {
         let mut msgs = Vec::new();
         push_history_message(&mut msgs, &row, &SenderNames::new(), None).unwrap();
         let mut own = msgs.clone();
-        resolve_file_uris_in_messages(&mut own, Some(dir.path()), "c", true).unwrap();
+        resolve_file_uris_in_messages(&mut own, Some(dir.path()), "c", WireMediaPolicy::native_images()).unwrap();
         assert!(own[0].content.contains("data:image/png;base64,"), "{}", own[0].content);
 
         // The file is under the attachment root, but not this conversation's.
         let mut other = msgs.clone();
-        resolve_file_uris_in_messages(&mut other, Some(dir.path()), "other", true).unwrap();
+        resolve_file_uris_in_messages(&mut other, Some(dir.path()), "other", WireMediaPolicy::native_images()).unwrap();
         assert!(!other[0].content.contains("base64"));
         assert!(
             !other[0].content.contains("file://"),
@@ -871,7 +958,7 @@ mod tests {
         assert!(other[0].content.contains("[attachment unavailable]"));
 
         let mut blind = msgs;
-        resolve_file_uris_in_messages(&mut blind, Some(dir.path()), "c", false).unwrap();
+        resolve_file_uris_in_messages(&mut blind, Some(dir.path()), "c", WireMediaPolicy::none()).unwrap();
         assert!(!blind[0].content.contains("base64"));
         assert!(blind[0].content.contains("does not accept images"));
     }
@@ -882,11 +969,11 @@ mod tests {
         let (row, stored) = media_row(dir.path());
         // The live turn: built from what it is about to store.
         let mut live = vec![ChatMessage::tool_result_parts("call-1", &stored.content)];
-        resolve_file_uris_in_messages(&mut live, Some(dir.path()), "c", true).unwrap();
+        resolve_file_uris_in_messages(&mut live, Some(dir.path()), "c", WireMediaPolicy::native_images()).unwrap();
         // The next turn: built from the row.
         let mut replayed = Vec::new();
         push_history_message(&mut replayed, &row, &SenderNames::new(), None).unwrap();
-        resolve_file_uris_in_messages(&mut replayed, Some(dir.path()), "c", true).unwrap();
+        resolve_file_uris_in_messages(&mut replayed, Some(dir.path()), "c", WireMediaPolicy::native_images()).unwrap();
         assert_eq!(live[0].content, replayed[0].content);
         assert_eq!(live[0].origin, replayed[0].origin);
         assert!(!row.content.contains("base64"), "base64 reached the row");
@@ -1132,6 +1219,42 @@ mod tests {
         );
     }
 
+    fn file_uri(path: &std::path::Path) -> String {
+        format!("file:///{}", path.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn image_part(uri: &str) -> String {
+        format!(r#"[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]"#)
+    }
+
+    fn file_part(uri: &str, mime: &str, name: &str) -> String {
+        format!(r#"[{{"type":"file","file":{{"url":"{uri}","mime_type":"{mime}","name":"{name}"}}}}]"#)
+    }
+
+    fn vision_pdf() -> WireMediaPolicy {
+        WireMediaPolicy {
+            readable: crate::files::vision_and_pdf_mimes(),
+            dialect: crate::provider::registry::DialectMedia {
+                image: true,
+                document: true,
+                video: false,
+                audio: false,
+            },
+        }
+    }
+
+    fn chat_completions_vision() -> WireMediaPolicy {
+        WireMediaPolicy {
+            readable: crate::files::vision_and_pdf_mimes(),
+            dialect: crate::provider::registry::DialectMedia {
+                image: true,
+                document: false,
+                video: false,
+                audio: false,
+            },
+        }
+    }
+
     #[test]
     fn test_resolve_file_uris_only_user_and_contained() {
         let dir = tempfile::tempdir().unwrap();
@@ -1139,11 +1262,10 @@ mod tests {
         std::fs::create_dir_all(root.join("c1")).unwrap();
         let inside = root.join("c1").join("img.png");
         std::fs::write(&inside, b"\x89PNG").unwrap();
-        let uri = format!("file:///{}", inside.to_string_lossy().replace('\\', "/"));
-        let content = format!(r#"[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]"#);
+        let content = image_part(&file_uri(&inside));
 
         let mut msgs = vec![chat_msg("assistant", &content), chat_msg("user", &content)];
-        resolve_file_uris_in_messages(&mut msgs, Some(&root), "conv", true).unwrap();
+        resolve_file_uris_in_messages(&mut msgs, Some(&root), "conv", WireMediaPolicy::native_images()).unwrap();
         assert!(
             msgs[0].content.contains("file:///"),
             "assistant content must never be inlined"
@@ -1155,26 +1277,130 @@ mod tests {
 
         let outside = dir.path().join("evil.txt");
         std::fs::write(&outside, b"x").unwrap();
-        let uri2 = format!("file:///{}", outside.to_string_lossy().replace('\\', "/"));
-        let content2 = format!(r#"[{{"type":"image_url","image_url":{{"url":"{uri2}"}}}}]"#);
-        let mut msgs2 = vec![chat_msg("user", &content2)];
-        resolve_file_uris_in_messages(&mut msgs2, Some(&root), "conv", true).unwrap();
-        assert!(
-            msgs2[0].content.contains("file:///"),
-            "paths outside the root must not inline"
-        );
+        let mut msgs2 = vec![chat_msg("user", &image_part(&file_uri(&outside)))];
+        let error = resolve_file_uris_in_messages(&mut msgs2, Some(&root), "conv", WireMediaPolicy::native_images())
+            .unwrap_err();
+        assert!(error.contains("could not open attachment"), "{error}");
+        assert!(!msgs2[0].content.contains("data:"));
 
-        // No root configured → nothing is inlined at all.
         let mut msgs3 = vec![chat_msg("user", &content)];
-        resolve_file_uris_in_messages(&mut msgs3, None, "conv", true).unwrap();
-        assert!(msgs3[0].content.contains("file:///"));
+        let error =
+            resolve_file_uris_in_messages(&mut msgs3, None, "conv", WireMediaPolicy::native_images()).unwrap_err();
+        assert!(error.contains("no attachment root"), "{error}");
     }
 
     #[test]
     fn malformed_content_parts_abort_attachment_resolution() {
         let mut messages = vec![ChatMessage::user("[{not-json")];
-        let error = resolve_file_uris_in_messages(&mut messages, None, "conv", true).unwrap_err();
+        let error =
+            resolve_file_uris_in_messages(&mut messages, None, "conv", WireMediaPolicy::native_images()).unwrap_err();
         assert!(error.contains("invalid persisted message content parts"), "{error}");
+    }
+
+    #[test]
+    fn unreadable_mime_and_oversize_become_path_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir_all(root.join("c1")).unwrap();
+        let pdf = root.join("c1").join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF").unwrap();
+        let mut msgs = vec![chat_msg(
+            "user",
+            &file_part(&file_uri(&pdf), "application/pdf", "doc.pdf"),
+        )];
+        resolve_file_uris_in_messages(&mut msgs, Some(&root), "conv", chat_completions_vision()).unwrap();
+        assert!(msgs[0].content.contains("[attachment: "), "{}", msgs[0].content);
+        assert!(!msgs[0].content.contains("file://"));
+        assert!(!msgs[0].content.contains("\"type\":\"file\""));
+
+        let mut native = vec![chat_msg(
+            "user",
+            &file_part(&file_uri(&pdf), "application/pdf", "doc.pdf"),
+        )];
+        resolve_file_uris_in_messages(&mut native, Some(&root), "conv", vision_pdf()).unwrap();
+        assert!(
+            native[0].content.contains("data:application/pdf;base64,"),
+            "{}",
+            native[0].content
+        );
+
+        let big = root.join("c1").join("huge.pdf");
+        std::fs::write(
+            &big,
+            vec![0u8; (crate::files::MAX_INLINE_ATTACHMENT_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let mut oversized = vec![chat_msg(
+            "user",
+            &file_part(&file_uri(&big), "application/pdf", "huge.pdf"),
+        )];
+        resolve_file_uris_in_messages(&mut oversized, Some(&root), "conv", vision_pdf()).unwrap();
+        assert!(oversized[0].content.contains("[attachment: "));
+        assert!(oversized[0].content.contains("bytes)]"));
+        assert!(!oversized[0].content.contains("file://"));
+        assert!(!oversized[0].content.contains("data:"));
+
+        let mut again = vec![chat_msg(
+            "user",
+            &file_part(&file_uri(&big), "application/pdf", "huge.pdf"),
+        )];
+        resolve_file_uris_in_messages(&mut again, Some(&root), "conv", vision_pdf()).unwrap();
+        assert_eq!(oversized[0].content, again[0].content);
+    }
+
+    #[test]
+    fn already_inlined_data_uris_are_kept_when_the_model_cannot_take_images() {
+        let content = r#"[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]"#;
+        let mut msgs = vec![chat_msg("user", content)];
+        resolve_file_uris_in_messages(&mut msgs, None, "conv", WireMediaPolicy::none()).unwrap();
+        assert!(msgs[0].content.contains("data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn video_file_becomes_path_text_even_when_the_dialect_could_carry_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir_all(root.join("c1")).unwrap();
+        let video = root.join("c1").join("clip.mp4");
+        std::fs::write(&video, b"ftyp").unwrap();
+        let mut msgs = vec![chat_msg("user", &file_part(&file_uri(&video), "video/mp4", "clip.mp4"))];
+        let gemini = WireMediaPolicy {
+            readable: crate::files::image_mimes(),
+            dialect: crate::provider::registry::DialectMedia {
+                image: true,
+                document: true,
+                video: true,
+                audio: true,
+            },
+        };
+        resolve_file_uris_in_messages(&mut msgs, Some(&root), "conv", gemini).unwrap();
+        assert!(msgs[0].content.contains("[attachment: "));
+        assert!(!msgs[0].content.contains("data:"));
+    }
+
+    #[test]
+    fn a_listed_video_is_inlined_when_the_dialect_has_a_video_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir_all(root.join("c1")).unwrap();
+        let video = root.join("c1").join("clip.mp4");
+        std::fs::write(&video, b"ftyp").unwrap();
+        let mut msgs = vec![chat_msg("user", &file_part(&file_uri(&video), "video/mp4", "clip.mp4"))];
+        let gemini = WireMediaPolicy {
+            readable: vec![crate::files::ReadableMime::VideoMp4],
+            dialect: crate::provider::registry::DialectMedia {
+                image: true,
+                document: true,
+                video: true,
+                audio: true,
+            },
+        };
+        resolve_file_uris_in_messages(&mut msgs, Some(&root), "conv", gemini).unwrap();
+        assert!(
+            msgs[0].content.contains("data:video/mp4;base64,"),
+            "{}",
+            msgs[0].content
+        );
     }
 
     async fn sticker_db() -> (crate::db::sea::cap::Db, tempfile::TempDir) {
