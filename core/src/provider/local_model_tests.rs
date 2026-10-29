@@ -67,8 +67,7 @@ fn main_and_media_backends_obey_their_own_constraints() {
 #[test]
 fn adapter_narrowing_never_invents_limits_or_input_support() {
     let mut caps = super::super::ProviderCapabilities {
-        supports_images: true,
-        supports_pdf: true,
+        readable_mime_types: crate::files::vision_and_pdf_mimes(),
         supports_temperature: true,
         supports_top_p: true,
         max_temperature: Some(2.0),
@@ -77,7 +76,7 @@ fn adapter_narrowing_never_invents_limits_or_input_support() {
         ..Default::default()
     };
     narrow_to_adapter(&mut caps);
-    assert!(!caps.supports_images && !caps.supports_pdf);
+    assert!(caps.readable_mime_types.is_empty());
     assert!(!caps.supports_temperature && !caps.supports_top_p);
     assert_eq!(caps.max_context_tokens, None);
     assert_eq!(caps.max_output_tokens, None);

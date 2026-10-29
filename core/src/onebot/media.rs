@@ -237,7 +237,7 @@ async fn resolve_supports_images(
         .or_else(|| assistant.as_ref().and_then(|a| a.model_id.clone()))
         .unwrap_or(resolved_model);
     crate::provider::registry::get_capabilities(&provider_type, &api_format, &transport_profile, &model)
-        .is_ok_and(|caps| caps.supports_images)
+        .is_ok_and(|caps| caps.reads_any_image())
 }
 
 async fn fetch_and_store_image(state: &Arc<SharedState>, conversation_id: &str, url: &str) -> Result<String, String> {

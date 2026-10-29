@@ -351,9 +351,10 @@ pub struct TurnSetup<'a> {
     /// Where a steered message's `file://` parts resolve against, and where a
     /// tool's media is stored.
     pub files_root: Option<std::path::PathBuf>,
-    /// Whether the model is sent the pictures a tool returns, or a line of
-    /// text in their place. Fixed for a model, so a replay agrees with the turn.
-    pub supports_images: bool,
+    /// Send-time media policy for this turn: the model's readable MIME set
+    /// intersected with this door's part shapes. Fixed for a model and a wire,
+    /// so a replay agrees with the turn.
+    pub user_media: crate::provider::registry::WireMediaPolicy,
     /// What a steered message's sticker parts render against. `None` for a
     /// runner whose messages never carry one.
     pub stickers: Option<StickerRendering>,
@@ -545,7 +546,7 @@ async fn run(
         approval_rule,
         withheld,
         files_root,
-        supports_images,
+        user_media,
         stickers,
         mut interrupted,
         compaction,
@@ -1007,6 +1008,7 @@ async fn run(
                 &mut chat_messages,
                 files_root.as_deref(),
                 stickers.as_ref(),
+                user_media.clone(),
             )
             .await?;
             narrow_offered(&mut offered, ports.steering);
@@ -1206,7 +1208,7 @@ async fn run(
                             &settled.stored,
                             files_root.as_deref(),
                             &conversation_id,
-                            supports_images,
+                            user_media.clone(),
                         )?);
                     }
                 }
@@ -1283,7 +1285,7 @@ async fn run(
                         &settled.stored,
                         files_root.as_deref(),
                         &conversation_id,
-                        supports_images,
+                        user_media.clone(),
                     )?);
 
                     if turn_aborted {
@@ -1685,7 +1687,7 @@ async fn run(
                 &settled.stored,
                 files_root.as_deref(),
                 &conversation_id,
-                supports_images,
+                user_media.clone(),
             )?);
 
             if turn_aborted {
@@ -1712,6 +1714,7 @@ async fn run(
                     &mut chat_messages,
                     files_root.as_deref(),
                     stickers.as_ref(),
+                    user_media.clone(),
                 )
                 .await?;
                 narrow_offered(&mut offered, ports.steering);
@@ -1836,12 +1839,12 @@ fn tool_message(
     stored: &crate::agent::tool_media::StoredToolResult,
     files_root: Option<&std::path::Path>,
     conversation_id: &str,
-    supports_images: bool,
+    user_media: crate::provider::registry::WireMediaPolicy,
 ) -> Result<ChatMessage, String> {
     Ok(match outcome {
         ToolOutcome::Success if stored.schema_version == crate::agent::tool_media::TOOL_PARTS_SCHEMA_VERSION => {
             let mut message = [ChatMessage::tool_result_parts(call_id, &stored.content)];
-            crate::agent::resolve_file_uris_in_messages(&mut message, files_root, conversation_id, supports_images)?;
+            crate::agent::resolve_file_uris_in_messages(&mut message, files_root, conversation_id, user_media)?;
             let [message] = message;
             message
         }
@@ -1859,6 +1862,7 @@ async fn inject_steering(
     chat_messages: &mut Vec<ChatMessage>,
     files_root: Option<&std::path::Path>,
     stickers: Option<&StickerRendering>,
+    user_media: crate::provider::registry::WireMediaPolicy,
 ) -> Result<(), String> {
     for item in items {
         let sender = match &item.origin {
@@ -1912,8 +1916,9 @@ async fn inject_steering(
             )
             .await?;
         }
-        // Steered messages are a person's, and the flag only governs tool rows.
-        crate::agent::resolve_file_uris_in_messages(&mut injected, files_root, conversation_id, true)?;
+        // Steered messages are a person's: use the same policy the turn was
+        // opened with, not a hardcoded "accept images".
+        crate::agent::resolve_file_uris_in_messages(&mut injected, files_root, conversation_id, user_media.clone())?;
         chat_messages.extend(injected);
     }
     Ok(())
@@ -2447,7 +2452,7 @@ mod tests {
             approval_rule: ApprovalRule::ByReach { accept_edits: false },
             withheld: WithheldWording::Explained,
             files_root: None,
-            supports_images: true,
+            user_media: crate::provider::registry::WireMediaPolicy::native_images(),
             stickers: None,
             interrupted: None,
             compaction: CompactionPolicy::OneBot,

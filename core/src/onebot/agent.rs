@@ -681,7 +681,9 @@ async fn headless_chat_inner(
     // per-model capability the user wrote was ignored here while every other
     // parameter of the same request honoured it.
     let supports_tools = turn_params.caps.supports_tools;
-    let supports_images = turn_params.caps.supports_images;
+    let user_media =
+        crate::provider::registry::WireMediaPolicy::from_resolved(&provider_type, &api_format, &turn_params.caps)?;
+    let supports_images = user_media.reads_any_image();
     if !supports_tools {
         tracing::info!(model = %effective_model, "the model cannot take tools; none are offered this turn");
     }
@@ -873,7 +875,7 @@ async fn headless_chat_inner(
         &mut chat_messages,
         files_root.as_deref(),
         conversation_id,
-        supports_images,
+        user_media.clone(),
     )?;
     // Compaction replaces the history; this is only the floor beneath it.
     trim_to_context_limit(&mut chat_messages, context_limit, keep_recent, &budget.counter);
@@ -1095,7 +1097,7 @@ async fn headless_chat_inner(
             // Steering resolves image URIs against this, which is why it is here
             // rather than only in the setup above.
             files_root,
-            supports_images,
+            user_media,
             stickers: services.map(|s| engine::StickerRendering {
                 db: s.db.clone(),
                 data_dir: s.paths.data_dir.clone(),
