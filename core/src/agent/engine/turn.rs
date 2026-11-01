@@ -754,7 +754,17 @@ async fn run(
                     )
                     .await;
                 let read = match opened {
-                    Ok(stream) => consume_stream(stream, &cancel, emit, &assistant_msg_id, &conversation_id).await,
+                    Ok(stream) => {
+                        consume_stream(
+                            stream,
+                            &cancel,
+                            emit,
+                            ports.interim,
+                            &assistant_msg_id,
+                            &conversation_id,
+                        )
+                        .await
+                    }
                     Err(e) => Err(e.to_string()),
                 };
                 match read {
@@ -830,9 +840,16 @@ async fn run(
                             )
                             .await
                             .map_err(|e| format!("Context overflow recovery failed: {e}"))?;
-                        let recovered = consume_stream(stream, &cancel, emit, &assistant_msg_id, &conversation_id)
-                            .await
-                            .map_err(|e| format!("Context overflow recovery failed: {e}"))?;
+                        let recovered = consume_stream(
+                            stream,
+                            &cancel,
+                            emit,
+                            ports.interim,
+                            &assistant_msg_id,
+                            &conversation_id,
+                        )
+                        .await
+                        .map_err(|e| format!("Context overflow recovery failed: {e}"))?;
                         // The same rule, and reachable without the request above
                         // ever having succeeded: a provider that refuses an
                         // oversized request outright makes this the first stream
@@ -957,7 +974,7 @@ async fn run(
         )
         .await?;
 
-        last_assistant_text = result.text.clone();
+        last_assistant_text = result.unflushed().to_string();
 
         // `pause_turn`: the upstream stopped while one of its own tools was
         // running long, and wants the same request back with this round's
@@ -1018,11 +1035,12 @@ async fn run(
 
         // Only the final iteration's text is returned to the caller, so on a
         // runner that does not stream, everything said on the way to a tool call
-        // would otherwise exist solely in the database.
-        if !result.text.is_empty()
+        // would otherwise exist solely in the database. Server-tool beats
+        // already left through `consume_stream`; say only the remainder.
+        if !last_assistant_text.is_empty()
             && let Some(interim) = ports.interim
         {
-            interim.say(result.text.clone()).await;
+            interim.say(last_assistant_text.clone()).await;
         }
 
         let mut assistant_msg = ChatMessage::assistant_with_tools(

@@ -26,6 +26,11 @@ pub(crate) struct StreamResult {
     /// milliseconds in is not one. `finish_reason` will not do instead — plenty
     /// of providers close the stream without ever sending a stop event.
     pub(crate) ran_to_completion: bool,
+    /// Bytes of `text` already sent through `Commentary` at a server-tool
+    /// boundary. The turn loop returns the remainder as the round's reply so
+    /// OneBot does not send those beats a second time. Always 0 when nobody is
+    /// listening (`interim` is `None`).
+    pub(crate) flushed_up_to: usize,
 }
 
 impl StreamResult {
@@ -41,7 +46,16 @@ impl StreamResult {
             finish_reason: None,
             response_model: None,
             ran_to_completion: false,
+            flushed_up_to: 0,
         }
+    }
+
+    /// The visible text that has not yet gone out through `Commentary`.
+    ///
+    /// `flushed_up_to` is only ever advanced to `text.len()` after a complete
+    /// `push_str`, so the split is always a char boundary.
+    pub(crate) fn unflushed(&self) -> &str {
+        self.text.get(self.flushed_up_to..).unwrap_or("")
     }
 }
 

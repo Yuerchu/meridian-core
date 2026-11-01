@@ -4,9 +4,11 @@
 //! `commands/chat.rs` and `onebot/agent.rs` — the only difference being how each
 //! of them sent the events out. That difference is now the `Emit` port.
 
+use std::collections::HashSet;
+
 use tokio_util::sync::CancellationToken;
 
-use super::Emit;
+use super::{Commentary, Emit};
 use crate::agent::{InlineHiddenTagParser, InlineTagSpec, StreamResult};
 use crate::events::ChatStreamEvent;
 use crate::provider;
@@ -22,10 +24,18 @@ pub(crate) const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration:
 /// `emit` is `None` when nobody is watching. When it is `Some`, a send that
 /// fails ends the read — which of the two runners that actually happens for is
 /// the adapter's decision, not this function's.
+///
+/// `interim` is OneBot's mid-turn mouth. A provider-side tool is not a client
+/// `ToolCall`, so the turn loop would otherwise concatenate every visible beat
+/// and send it once at the end. The first `ServerToolCall` of a given id is
+/// the boundary: whatever has been said so far goes out here, and the round's
+/// reply is only the remainder. The desktop passes `None` — it already streamed
+/// every character to the window.
 pub(crate) async fn consume_stream(
     mut stream: provider::ChatStream,
     cancel: &CancellationToken,
     emit: Option<&dyn Emit>,
+    interim: Option<&dyn Commentary>,
     message_id: &str,
     conversation_id: &str,
 ) -> Result<StreamResult, String> {
@@ -45,6 +55,8 @@ pub(crate) async fn consume_stream(
     let mut usage = None;
     let mut finish_reason = None;
     let mut response_model: Option<String> = None;
+    let mut flushed_up_to = 0usize;
+    let mut flushed_ids: HashSet<String> = HashSet::new();
     // Some OpenAI-compatible providers inline reasoning as <think> tags in the
     // text stream instead of a separate reasoning field; route it accordingly.
     let mut think_parser = InlineHiddenTagParser::new_streaming(vec![InlineTagSpec {
@@ -139,6 +151,20 @@ pub(crate) async fn consume_stream(
                                 call: call.clone(),
                             })?;
                         }
+                        // First announcement of this id is the beat boundary
+                        // for a runner that does not stream. The `done`
+                        // revision of the same card is skipped even if more
+                        // text arrived while the search ran — that text is
+                        // still this beat, not a new one.
+                        if let Some(interim) = interim
+                            && flushed_ids.insert(call.id.clone())
+                        {
+                            let pending = &text[flushed_up_to..];
+                            if !pending.trim().is_empty() {
+                                interim.say(pending.to_string()).await;
+                                flushed_up_to = text.len();
+                            }
+                        }
                     }
                     Ok(Some(Ok(provider::StreamEvent::UsageUpdate { usage: ref u }))) => {
                         usage = Some(u.clone());
@@ -219,6 +245,7 @@ pub(crate) async fn consume_stream(
         finish_reason,
         response_model,
         ran_to_completion,
+        flushed_up_to,
     })
 }
 
@@ -322,6 +349,7 @@ mod tests {
             events(vec![StreamEvent::Text { content: "hi".into() }]),
             &cancel,
             None,
+            None,
             "m1",
             "c1",
         )
@@ -344,7 +372,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let r = consume_stream(never(), &cancel, None, "m1", "c1").await.unwrap();
+        let r = consume_stream(never(), &cancel, None, None, "m1", "c1").await.unwrap();
 
         assert!(!r.ran_to_completion, "stopped is not finished");
     }
@@ -360,6 +388,7 @@ mod tests {
                 message: "context_length_exceeded".into(),
             }]),
             &cancel,
+            None,
             None,
             "m1",
             "c1",
@@ -402,7 +431,7 @@ mod tests {
             },
         ]);
 
-        let r = consume_stream(stream, &cancel, Some(&stopper), "m1", "c1")
+        let r = consume_stream(stream, &cancel, Some(&stopper), None, "m1", "c1")
             .await
             .unwrap();
 
@@ -429,7 +458,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let desktop = Recorder::fatal_from(1);
-        let stopped = consume_stream(script(), &cancel, Some(&desktop), "m1", "c1").await;
+        let stopped = consume_stream(script(), &cancel, Some(&desktop), None, "m1", "c1").await;
         assert!(
             stopped.is_err(),
             "the desktop's events are the answer; losing one ends the turn"
@@ -437,7 +466,7 @@ mod tests {
         assert_eq!(desktop.kinds().len(), 2, "and it stops at the one that failed");
 
         let onebot = Recorder::best_effort_from(1);
-        let carried_on = consume_stream(script(), &cancel, Some(&onebot), "m1", "c1")
+        let carried_on = consume_stream(script(), &cancel, Some(&onebot), None, "m1", "c1")
             .await
             .expect("a QQ turn's answer does not travel over these events");
         assert_eq!(carried_on.text, "onetwothree");
@@ -464,9 +493,13 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let a = Recorder::watching();
-        let ra = consume_stream(script(), &cancel, Some(&a), "m1", "c1").await.unwrap();
+        let ra = consume_stream(script(), &cancel, Some(&a), None, "m1", "c1")
+            .await
+            .unwrap();
         let b = Recorder::best_effort_from(usize::MAX);
-        let rb = consume_stream(script(), &cancel, Some(&b), "m1", "c1").await.unwrap();
+        let rb = consume_stream(script(), &cancel, Some(&b), None, "m1", "c1")
+            .await
+            .unwrap();
 
         assert_eq!(a.kinds(), b.kinds());
         assert_eq!(ra.text, rb.text);
@@ -474,5 +507,147 @@ mod tests {
         // And the inline <think> really was routed away from the text.
         assert!(!ra.text.contains("hidden"));
         assert!(ra.reasoning.contains("hidden"));
+    }
+
+    fn server_search(id: &str, completed: bool) -> StreamEvent {
+        StreamEvent::ServerToolCall(provider::ServerToolCall {
+            id: id.into(),
+            name: "web_search".into(),
+            arguments: None,
+            sources: Vec::new(),
+            completed,
+        })
+    }
+
+    struct Says(Mutex<Vec<String>>);
+
+    impl Says {
+        fn new() -> Self {
+            Self(Mutex::new(Vec::new()))
+        }
+
+        fn all(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Commentary for Says {
+        async fn say(&self, text: String) {
+            self.0.lock().unwrap().push(text);
+        }
+    }
+
+    async fn read_with_says(items: Vec<StreamEvent>, says: &Says) -> StreamResult {
+        let cancel = CancellationToken::new();
+        consume_stream(events(items), &cancel, None, Some(says), "m1", "c1")
+            .await
+            .unwrap()
+    }
+
+    /// Visible text on either side of two distinct searches is three beats:
+    /// the first two leave through Commentary, the last is the round's reply.
+    #[tokio::test]
+    async fn a_new_server_tool_flushes_the_text_said_so_far() {
+        let says = Says::new();
+        let r = read_with_says(
+            vec![
+                StreamEvent::Text {
+                    content: "先查房价。".into(),
+                },
+                server_search("ws_a", false),
+                StreamEvent::Text {
+                    content: "三套。".into(),
+                },
+                server_search("ws_b", false),
+                StreamEvent::Text {
+                    content: "不能换。".into(),
+                },
+            ],
+            &says,
+        )
+        .await;
+
+        assert_eq!(says.all(), ["先查房价。", "三套。"]);
+        assert_eq!(r.text, "先查房价。三套。不能换。");
+        assert_eq!(r.unflushed(), "不能换。");
+    }
+
+    /// The `done` revision of the same id is not a second boundary, even when
+    /// more text arrived while the search ran. Dropping the id set makes this
+    /// fire twice.
+    #[tokio::test]
+    async fn the_done_revision_of_the_same_search_does_not_flush_again() {
+        let says = Says::new();
+        let r = read_with_says(
+            vec![
+                StreamEvent::Text {
+                    content: "先查。".into(),
+                },
+                server_search("ws_a", false),
+                StreamEvent::Text {
+                    content: "搜的时候又说了。".into(),
+                },
+                server_search("ws_a", true),
+            ],
+            &says,
+        )
+        .await;
+
+        assert_eq!(says.all(), ["先查。"]);
+        assert_eq!(r.unflushed(), "搜的时候又说了。");
+    }
+
+    /// xAI's typical shape: searches first, then one message. Nothing to say
+    /// at the boundary, and the whole paragraph is still the round's reply.
+    #[tokio::test]
+    async fn a_search_with_nothing_said_yet_does_not_flush() {
+        let says = Says::new();
+        let r = read_with_says(
+            vec![
+                server_search("ws_a", false),
+                server_search("ws_a", true),
+                server_search("ws_b", false),
+                server_search("ws_b", true),
+                StreamEvent::Text {
+                    content: "我先查了一下，三套，不能换。".into(),
+                },
+            ],
+            &says,
+        )
+        .await;
+
+        assert!(says.all().is_empty());
+        assert_eq!(r.flushed_up_to, 0);
+        assert_eq!(r.unflushed(), "我先查了一下，三套，不能换。");
+        assert_eq!(r.text, r.unflushed());
+    }
+
+    /// The desktop has no Commentary. The concatenated text is the reply.
+    #[tokio::test]
+    async fn without_commentary_a_server_tool_does_not_split_the_reply() {
+        let cancel = CancellationToken::new();
+        let r = consume_stream(
+            events(vec![
+                StreamEvent::Text {
+                    content: "先查房价。".into(),
+                },
+                server_search("ws_a", false),
+                StreamEvent::Text {
+                    content: "不能换。".into(),
+                },
+            ]),
+            &cancel,
+            None,
+            None,
+            "m1",
+            "c1",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(r.flushed_up_to, 0);
+        assert_eq!(r.text, "先查房价。不能换。");
+        assert_eq!(r.unflushed(), r.text);
     }
 }
