@@ -123,6 +123,42 @@ pub fn vision_preview_data_uri(path: &Path) -> Result<String, String> {
     ))
 }
 
+/// Bytes to hand an embedding engine: a PNG contact sheet for GIF/APNG so a
+/// reaction's frames stay visible; the file's own bytes for stills, which
+/// LiteRT-LM patchifies itself.
+pub fn embedding_image_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match extension.as_str() {
+        "gif" => vision_preview_png(path),
+        "png" | "apng" => {
+            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            let decoder =
+                image::codecs::png::PngDecoder::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
+            if decoder.is_apng().map_err(|e| e.to_string())? {
+                vision_preview_png(path)
+            } else {
+                std::fs::read(path).map_err(|e| e.to_string())
+            }
+        }
+        _ => std::fs::read(path).map_err(|e| e.to_string()),
+    }
+}
+
+fn vision_preview_png(path: &Path) -> Result<Vec<u8>, String> {
+    let uri = vision_preview_data_uri(path)?;
+    let encoded = uri
+        .strip_prefix("data:image/png;base64,")
+        .ok_or("sticker preview was not a PNG")?;
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| e.to_string())
+}
+
 fn decode_gif_frames(path: &Path) -> Result<Vec<image::RgbaImage>, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     if bytes.len() < 13 || !matches!(&bytes[..6], b"GIF87a" | b"GIF89a") {
@@ -413,5 +449,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let preview = vision_preview_data_uri(&path).unwrap();
         assert!(preview.starts_with("data:image/png;base64,"));
+        let still = embedding_image_bytes(&path).unwrap();
+        assert_eq!(&still[..8], b"\x89PNG\r\n\x1a\n");
     }
 }

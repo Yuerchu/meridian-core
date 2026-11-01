@@ -17,6 +17,11 @@ opaque! {
     LiteRtLmConversationOptionalArgs,
     LiteRtLmStreamChunk,
     LiteRtLmLoadedFile,
+    LiteRtLmEmbeddingEngine,
+    LiteRtLmEmbeddingEngineSettings,
+    LiteRtLmEmbeddingOptions,
+    LiteRtLmEmbeddingResponse,
+    LiteRtLmInputData,
 }
 
 pub type StreamCallback = unsafe extern "C" fn(user_data: *mut c_void, chunk: *const LiteRtLmStreamChunk);
@@ -71,6 +76,35 @@ type FileModalityVector = unsafe extern "C" fn(*mut LiteRtLmLoadedFile, c_int, *
 type LastErrorMessage = unsafe extern "C" fn() -> *const c_char;
 type LastErrorCode = unsafe extern "C" fn() -> c_int;
 type ClearLastError = unsafe extern "C" fn();
+type EmbeddingSettingsCreate = unsafe extern "C" fn(
+    model_path: *const c_char,
+    backend: *const c_char,
+    vision_backend: *const c_char,
+    audio_backend: *const c_char,
+) -> *mut LiteRtLmEmbeddingEngineSettings;
+type EmbeddingSettingsDelete = unsafe extern "C" fn(*mut LiteRtLmEmbeddingEngineSettings);
+type EmbeddingSettingsSetInt = unsafe extern "C" fn(*mut LiteRtLmEmbeddingEngineSettings, c_int);
+type EmbeddingSettingsSetStr = unsafe extern "C" fn(*mut LiteRtLmEmbeddingEngineSettings, *const c_char);
+type EmbeddingEngineCreate =
+    unsafe extern "C" fn(*const LiteRtLmEmbeddingEngineSettings) -> *mut LiteRtLmEmbeddingEngine;
+type EmbeddingEngineDelete = unsafe extern "C" fn(*mut LiteRtLmEmbeddingEngine);
+type EmbeddingOptionsCreate = unsafe extern "C" fn() -> *mut LiteRtLmEmbeddingOptions;
+type EmbeddingOptionsDelete = unsafe extern "C" fn(*mut LiteRtLmEmbeddingOptions);
+type EmbeddingOptionsSetBool = unsafe extern "C" fn(*mut LiteRtLmEmbeddingOptions, bool);
+type EmbeddingCompute = unsafe extern "C" fn(
+    *mut LiteRtLmEmbeddingEngine,
+    *const *const LiteRtLmInputData,
+    usize,
+    *const LiteRtLmEmbeddingOptions,
+) -> *mut LiteRtLmEmbeddingResponse;
+type EmbeddingResponseDelete = unsafe extern "C" fn(*mut LiteRtLmEmbeddingResponse);
+type EmbeddingResponseSize = unsafe extern "C" fn(*const LiteRtLmEmbeddingResponse) -> usize;
+type EmbeddingResponseValues = unsafe extern "C" fn(*const LiteRtLmEmbeddingResponse) -> *const f32;
+type InputDataCreate = unsafe extern "C" fn(c_int, *const c_void, usize) -> *mut LiteRtLmInputData;
+type InputDataDelete = unsafe extern "C" fn(*mut LiteRtLmInputData);
+
+pub const INPUT_DATA_TYPE_TEXT: c_int = 0;
+pub const INPUT_DATA_TYPE_IMAGE: c_int = 1;
 
 /// 动态加载的签名只对应 v0.18.0 / C ABI 0.2.0，不接受 main 的新 ABI。
 #[derive(Clone)]
@@ -136,6 +170,22 @@ pub(crate) struct Symbols {
     pub get_last_error_message: LastErrorMessage,
     pub get_last_error_code: LastErrorCode,
     pub clear_last_error: ClearLastError,
+
+    pub embedding_engine_settings_create: EmbeddingSettingsCreate,
+    pub embedding_engine_settings_delete: EmbeddingSettingsDelete,
+    pub embedding_engine_settings_set_num_threads: EmbeddingSettingsSetInt,
+    pub embedding_engine_settings_set_cache_dir: EmbeddingSettingsSetStr,
+    pub embedding_engine_create: EmbeddingEngineCreate,
+    pub embedding_engine_delete: EmbeddingEngineDelete,
+    pub embedding_options_create: EmbeddingOptionsCreate,
+    pub embedding_options_delete: EmbeddingOptionsDelete,
+    pub embedding_options_set_normalize: EmbeddingOptionsSetBool,
+    pub embedding_engine_compute_embedding: EmbeddingCompute,
+    pub embedding_response_delete: EmbeddingResponseDelete,
+    pub embedding_response_get_size: EmbeddingResponseSize,
+    pub embedding_response_get_values: EmbeddingResponseValues,
+    pub input_data_create: InputDataCreate,
+    pub input_data_delete: InputDataDelete,
 }
 
 macro_rules! load_sym {
@@ -241,6 +291,37 @@ impl Symbols {
             get_last_error_message: load_sym!(lib, "get_last_error_message", LastErrorMessage),
             get_last_error_code: load_sym!(lib, "get_last_error_code", LastErrorCode),
             clear_last_error: load_sym!(lib, "clear_last_error", ClearLastError),
+            embedding_engine_settings_create: load_sym!(
+                lib,
+                "embedding_engine_settings_create",
+                EmbeddingSettingsCreate
+            ),
+            embedding_engine_settings_delete: load_sym!(
+                lib,
+                "embedding_engine_settings_delete",
+                EmbeddingSettingsDelete
+            ),
+            embedding_engine_settings_set_num_threads: load_sym!(
+                lib,
+                "embedding_engine_settings_set_num_threads",
+                EmbeddingSettingsSetInt
+            ),
+            embedding_engine_settings_set_cache_dir: load_sym!(
+                lib,
+                "embedding_engine_settings_set_cache_dir",
+                EmbeddingSettingsSetStr
+            ),
+            embedding_engine_create: load_sym!(lib, "embedding_engine_create", EmbeddingEngineCreate),
+            embedding_engine_delete: load_sym!(lib, "embedding_engine_delete", EmbeddingEngineDelete),
+            embedding_options_create: load_sym!(lib, "embedding_options_create", EmbeddingOptionsCreate),
+            embedding_options_delete: load_sym!(lib, "embedding_options_delete", EmbeddingOptionsDelete),
+            embedding_options_set_normalize: load_sym!(lib, "embedding_options_set_normalize", EmbeddingOptionsSetBool),
+            embedding_engine_compute_embedding: load_sym!(lib, "embedding_engine_compute_embedding", EmbeddingCompute),
+            embedding_response_delete: load_sym!(lib, "embedding_response_delete", EmbeddingResponseDelete),
+            embedding_response_get_size: load_sym!(lib, "embedding_response_get_size", EmbeddingResponseSize),
+            embedding_response_get_values: load_sym!(lib, "embedding_response_get_values", EmbeddingResponseValues),
+            input_data_create: load_sym!(lib, "input_data_create", InputDataCreate),
+            input_data_delete: load_sym!(lib, "input_data_delete", InputDataDelete),
         })
     }
 }
