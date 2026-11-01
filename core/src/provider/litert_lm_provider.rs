@@ -89,6 +89,10 @@ fn is_real_dll(path: &Path) -> bool {
     path.metadata().map(|m| m.len() > 1024).unwrap_or(false)
 }
 
+pub(crate) fn runtime_for_embedder() -> Result<Runtime, String> {
+    get_or_init_runtime().cloned()
+}
+
 pub(super) fn get_or_init_runtime() -> Result<&'static Runtime, String> {
     RUNTIME
         .get_or_init(|| {

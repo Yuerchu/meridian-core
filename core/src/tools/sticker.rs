@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -50,6 +51,22 @@ pub fn pick_from_roster<'a, T: RosterItem>(
     sticker_id: Option<&str>,
     query: Option<&str>,
 ) -> Result<&'a T, String> {
+    pick_from_roster_with_vectors(roster, sticker_id, query, None, |_| None)
+}
+
+/// Same as [`pick_from_roster`], with optional query/item vectors.
+///
+/// An exact name still wins. When a query vector is present, cosine
+/// similarity ranks items that have a vector (including over name-contains
+/// and tag matches). Missing vectors or a failed embedder leave the lexical
+/// path unchanged.
+pub fn pick_from_roster_with_vectors<'a, 'v, T: RosterItem>(
+    roster: &'a [T],
+    sticker_id: Option<&str>,
+    query: Option<&str>,
+    query_vec: Option<&[f32]>,
+    item_vec: impl Fn(&T) -> Option<&'v [f32]>,
+) -> Result<&'a T, String> {
     let sticker_id = sticker_id.map(str::trim).filter(|s| !s.is_empty());
     let query = query.map(str::trim).filter(|s| !s.is_empty());
 
@@ -80,11 +97,57 @@ pub fn pick_from_roster<'a, T: RosterItem>(
         }
     }
 
+    if let Some((rank, item)) = best {
+        if rank == 3 {
+            return Ok(item);
+        }
+        if query_vec.is_none() {
+            return Ok(item);
+        }
+    }
+
+    if let Some(query_vec) = query_vec {
+        let mut best_cos: Option<(f32, &'a T)> = None;
+        for item in roster {
+            let Some(vec) = item_vec(item) else {
+                continue;
+            };
+            let Some(score) = cosine_similarity(query_vec, vec) else {
+                continue;
+            };
+            match best_cos {
+                Some((best_score, _)) if score <= best_score => {}
+                _ => best_cos = Some((score, item)),
+            }
+        }
+        if let Some((_, item)) = best_cos {
+            return Ok(item);
+        }
+    }
+
     if let Some((_, item)) = best {
         return Ok(item);
     }
 
     Err(miss_message(roster))
+}
+
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return None;
+    }
+    Some(dot / (na.sqrt() * nb.sqrt()))
 }
 
 fn match_rank<T: RosterItem>(item: &T, q: &str) -> Option<u8> {
@@ -198,12 +261,14 @@ impl Tool for ListStickersTool {
 
 pub struct SendStickerTool {
     sent_turns: Mutex<HashSet<String>>,
+    data_dir: PathBuf,
 }
 
 impl SendStickerTool {
-    pub fn new() -> Self {
+    pub fn new(data_dir: PathBuf) -> Self {
         Self {
             sent_turns: Mutex::new(HashSet::new()),
+            data_dir,
         }
     }
 }
@@ -270,7 +335,8 @@ impl Tool for SendStickerTool {
             })
             .await
             .map_err(|e| e.to_string())?;
-        let sticker = pick_from_roster(&stickers, sticker_id, query)?;
+        let sticker =
+            super::sticker_embed::try_pick_emojis(&stickers, sticker_id, query, db, Some(&self.data_dir)).await?;
 
         let mut sent = self.sent_turns.lock().unwrap_or_else(|e| e.into_inner());
         if sent.contains(&turn_id) {
@@ -286,7 +352,7 @@ impl Tool for SendStickerTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RosterItem, pick_from_roster};
+    use super::{RosterItem, cosine_similarity, pick_from_roster};
 
     #[derive(Debug)]
     struct Item {
@@ -395,6 +461,76 @@ mod tests {
         let roster: [Item; 0] = [];
         let err = pick_from_roster(&roster, None, Some("点赞")).unwrap_err();
         assert!(err.contains("No confirmed stickers"), "{err}");
+    }
+
+    #[test]
+    fn exact_name_beats_a_closer_vector() {
+        let roster = [item("wave", "挥手", None), item("thumbs", "点赞", None)];
+        let query = [1.0f32, 0.0];
+        let wave = [1.0f32, 0.0];
+        let thumbs = [0.0f32, 1.0];
+        let picked =
+            super::pick_from_roster_with_vectors(&roster, None, Some("点赞"), Some(&query), |item| match item.id {
+                "wave" => Some(wave.as_slice()),
+                "thumbs" => Some(thumbs.as_slice()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(picked.id, "thumbs");
+    }
+
+    #[test]
+    fn cosine_picks_when_names_do_not_match() {
+        let roster = [item("question", "黑人问号", Some("尴尬")), item("thumbs", "点赞", None)];
+        let query = [0.0f32, 1.0];
+        let question = [0.1f32, 0.9];
+        let thumbs = [1.0f32, 0.0];
+        let picked =
+            super::pick_from_roster_with_vectors(&roster, None, Some("有点无语"), Some(&query), |item| match item.id
+            {
+                "question" => Some(question.as_slice()),
+                "thumbs" => Some(thumbs.as_slice()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(picked.id, "question");
+    }
+
+    #[test]
+    fn missing_vectors_keep_the_lexical_pick() {
+        let roster = [item("a", "点赞一下", None), item("b", "点赞", None)];
+        let query = [1.0f32, 0.0];
+        let picked = super::pick_from_roster_with_vectors(&roster, None, Some("点赞"), Some(&query), |_| None).unwrap();
+        assert_eq!(picked.id, "b");
+    }
+
+    #[test]
+    fn missing_item_vectors_keep_a_contains_match() {
+        let roster = [item("a", "点赞一下", None)];
+        let query = [1.0f32, 0.0];
+        let picked = super::pick_from_roster_with_vectors(&roster, None, Some("点赞"), Some(&query), |_| None).unwrap();
+        assert_eq!(picked.id, "a");
+    }
+
+    #[test]
+    fn cosine_tie_keeps_roster_order() {
+        let roster = [item("first", "甲", None), item("second", "乙", None)];
+        let query = [1.0f32, 0.0];
+        let same = [1.0f32, 0.0];
+        let picked = super::pick_from_roster_with_vectors(&roster, None, Some("无语"), Some(&query), |_| {
+            Some(same.as_slice())
+        })
+        .unwrap();
+        assert_eq!(picked.id, "first");
+    }
+
+    #[test]
+    fn cosine_rejects_mismatched_or_zero_vectors() {
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), None);
+        assert_eq!(cosine_similarity(&[], &[]), None);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), None);
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]).unwrap() - 1.0).abs() < 1e-6);
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).unwrap().abs() < 1e-6);
     }
 
     #[test]

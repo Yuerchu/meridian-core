@@ -14,6 +14,7 @@ struct Probe {
     deleted_files: usize,
     backend_values: Vec<i32>,
     max_output: Option<i32>,
+    input_types: Vec<c_int>,
 }
 
 thread_local! {
@@ -218,8 +219,74 @@ fn runtime() -> Runtime {
         get_last_error_message: last_message,
         get_last_error_code: last_code,
         clear_last_error: clear,
+        embedding_engine_settings_create: embedding_settings_create,
+        embedding_engine_settings_delete: embedding_settings_delete,
+        embedding_engine_settings_set_num_threads: embedding_set_int,
+        embedding_engine_settings_set_cache_dir: embedding_set_str,
+        embedding_engine_create,
+        embedding_engine_delete,
+        embedding_options_create,
+        embedding_options_delete,
+        embedding_options_set_normalize: embedding_options_set_bool,
+        embedding_engine_compute_embedding: embedding_compute,
+        embedding_response_delete,
+        embedding_response_get_size: embedding_response_size,
+        embedding_response_get_values: embedding_response_values,
+        input_data_create,
+        input_data_delete,
     })
 }
+
+unsafe extern "C" fn embedding_settings_create(
+    _: *const c_char,
+    backend: *const c_char,
+    vision: *const c_char,
+    audio: *const c_char,
+) -> *mut LiteRtLmEmbeddingEngineSettings {
+    unsafe { settings_create(ptr::null(), backend, vision, audio) }.cast()
+}
+unsafe extern "C" fn embedding_settings_delete(_: *mut LiteRtLmEmbeddingEngineSettings) {}
+unsafe extern "C" fn embedding_set_int(_: *mut LiteRtLmEmbeddingEngineSettings, _: c_int) {}
+unsafe extern "C" fn embedding_set_str(_: *mut LiteRtLmEmbeddingEngineSettings, _: *const c_char) {}
+unsafe extern "C" fn embedding_engine_create(
+    _: *const LiteRtLmEmbeddingEngineSettings,
+) -> *mut LiteRtLmEmbeddingEngine {
+    PROBE.with_borrow_mut(|probe| {
+        if probe.fail_engine {
+            probe.error = Some(c"GPU driver unavailable".to_owned());
+            ptr::null_mut()
+        } else {
+            ptr::dangling_mut()
+        }
+    })
+}
+unsafe extern "C" fn embedding_engine_delete(_: *mut LiteRtLmEmbeddingEngine) {}
+unsafe extern "C" fn embedding_options_create() -> *mut LiteRtLmEmbeddingOptions {
+    ptr::dangling_mut()
+}
+unsafe extern "C" fn embedding_options_delete(_: *mut LiteRtLmEmbeddingOptions) {}
+unsafe extern "C" fn embedding_options_set_bool(_: *mut LiteRtLmEmbeddingOptions, _: bool) {}
+unsafe extern "C" fn embedding_compute(
+    _: *mut LiteRtLmEmbeddingEngine,
+    _: *const *const LiteRtLmInputData,
+    _: usize,
+    _: *const LiteRtLmEmbeddingOptions,
+) -> *mut LiteRtLmEmbeddingResponse {
+    ptr::dangling_mut()
+}
+unsafe extern "C" fn embedding_response_delete(_: *mut LiteRtLmEmbeddingResponse) {}
+unsafe extern "C" fn embedding_response_size(_: *const LiteRtLmEmbeddingResponse) -> usize {
+    2
+}
+unsafe extern "C" fn embedding_response_values(_: *const LiteRtLmEmbeddingResponse) -> *const f32 {
+    static VALUES: [f32; 2] = [0.6, 0.8];
+    VALUES.as_ptr()
+}
+unsafe extern "C" fn input_data_create(kind: c_int, _: *const c_void, _: usize) -> *mut LiteRtLmInputData {
+    PROBE.with_borrow_mut(|probe| probe.input_types.push(kind));
+    ptr::dangling_mut()
+}
+unsafe extern "C" fn input_data_delete(_: *mut LiteRtLmInputData) {}
 
 #[test]
 fn selected_backends_reach_the_c_api_without_fallback() {
@@ -308,6 +375,40 @@ fn native_diagnostics_are_thread_local() {
     });
     assert!(first.join().unwrap().contains("first thread"));
     assert!(second.join().unwrap().contains("second thread"));
+}
+
+#[test]
+fn embed_text_copies_the_response_floats() {
+    use crate::embedding::{EmbeddingConfig, EmbeddingEngine};
+    let rt = runtime();
+    let engine = EmbeddingEngine::new(&rt, &EmbeddingConfig::new("embed.litertlm", Backend::Cpu)).unwrap();
+    assert_eq!(
+        engine.embed_text("task: search query | query: 无语").unwrap(),
+        vec![0.6, 0.8]
+    );
+    PROBE.with_borrow(|probe| assert_eq!(probe.input_types, [INPUT_DATA_TYPE_TEXT]));
+}
+
+#[test]
+fn embedding_engine_requests_the_vision_backend_and_image_bytes() {
+    use crate::embedding::{EmbeddingConfig, EmbeddingEngine, EmbeddingPart};
+    let rt = runtime();
+    let mut config = EmbeddingConfig::new("embed.litertlm", Backend::Cpu);
+    config.vision_backend = Some(Backend::Cpu);
+    let engine = EmbeddingEngine::new(&rt, &config).unwrap();
+    PROBE.with_borrow(|probe| {
+        assert_eq!(probe.calls, [("cpu".into(), Some("cpu".into()), None)]);
+    });
+    let png = b"\x89PNG";
+    assert_eq!(
+        engine
+            .embed_parts(&[EmbeddingPart::Image(png), EmbeddingPart::Text("黑人问号")])
+            .unwrap(),
+        vec![0.6, 0.8]
+    );
+    PROBE.with_borrow(|probe| {
+        assert_eq!(probe.input_types, [INPUT_DATA_TYPE_IMAGE, INPUT_DATA_TYPE_TEXT]);
+    });
 }
 
 #[cfg(windows)]

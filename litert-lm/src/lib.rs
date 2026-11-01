@@ -2,6 +2,7 @@ mod error;
 mod sys;
 
 pub mod conversation;
+pub mod embedding;
 pub mod engine;
 pub mod model_info;
 pub mod runtime;

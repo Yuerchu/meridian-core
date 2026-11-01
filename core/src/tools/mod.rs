@@ -25,6 +25,7 @@ pub mod search_files;
 pub mod skill;
 pub mod spec;
 pub mod sticker;
+pub mod sticker_embed;
 pub mod sub_agent;
 pub mod todo;
 pub mod usage;
@@ -650,6 +651,11 @@ impl ToolRegistry {
         logs_dir: std::path::PathBuf,
         redaction_engine: Arc<crate::redaction::RedactionEngine>,
     ) -> Self {
+        // emoji_packs lives next to skills/ under the app data dir.
+        let data_dir = skills_root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| skills_root.clone());
         #[allow(unused_mut)]
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ask_user::AskUserTool),
@@ -672,7 +678,7 @@ impl ToolRegistry {
             Arc::new(memory::DeleteMemoryTool),
             Arc::new(todo::UpdateTodosTool),
             Arc::new(sticker::ListStickersTool),
-            Arc::new(sticker::SendStickerTool::new()),
+            Arc::new(sticker::SendStickerTool::new(data_dir)),
             Arc::new(plan::EnterPlanTool),
             Arc::new(plan::ReadPlanTool),
             Arc::new(plan::UpdatePlanTool),
