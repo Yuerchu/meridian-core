@@ -4,6 +4,26 @@ use image::AnimationDecoder;
 
 const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024; // 5MB
 
+/// `provider_id:model_id` for `suggest_sticker_semantics`. Empty means the
+/// default assistant, which is what that command used before this existed.
+pub const SUGGEST_MODEL_PREFERENCE: &str = "emoji.suggest.model";
+
+/// Absent is no choice. Anything stored has to be a canonical pair; malformed
+/// is an error, never "unset", or a broken setting would silently send sticker
+/// images to the default assistant.
+pub fn parse_suggest_model(raw: Option<String>) -> Result<Option<(String, String)>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let invalid = || format!("preference `{SUGGEST_MODEL_PREFERENCE}` must be a canonical provider:model pair");
+    let (provider_id, model_id) = raw.split_once(':').ok_or_else(invalid)?;
+    if provider_id.is_empty() || model_id.is_empty() || provider_id.trim() != provider_id || model_id.trim() != model_id
+    {
+        return Err(invalid());
+    }
+    Ok(Some((provider_id.to_string(), model_id.to_string())))
+}
+
 pub fn packs_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("emoji_packs")
 }
@@ -451,5 +471,25 @@ mod tests {
         assert!(preview.starts_with("data:image/png;base64,"));
         let still = embedding_image_bytes(&path).unwrap();
         assert_eq!(&still[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn an_absent_suggest_model_is_no_choice() {
+        assert_eq!(parse_suggest_model(None), Ok(None));
+    }
+
+    #[test]
+    fn a_stored_suggest_model_is_read_back() {
+        assert_eq!(
+            parse_suggest_model(Some("p1:claude-haiku-5".into())),
+            Ok(Some(("p1".into(), "claude-haiku-5".into())))
+        );
+    }
+
+    #[test]
+    fn a_malformed_suggest_model_is_an_error() {
+        for bad in ["", "p1", "p1:", ":m", " p1:m", "p1:m "] {
+            assert!(parse_suggest_model(Some(bad.into())).is_err(), "{bad:?}");
+        }
     }
 }
