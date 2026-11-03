@@ -15,7 +15,7 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, DbErr, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect};
 
 use crate::db::entity::{conversation, message};
-use crate::db::models::message::MessageUsage;
+use crate::db::models::message::{MessageUsage, StreamTiming};
 use crate::db::sea::cap::sealed::Access;
 use crate::db::sea::cap::{Read, WriteTx};
 use crate::db::sea::ops::audit;
@@ -81,6 +81,8 @@ pub fn new_row(id: &str, conversation_id: &str, role: &str, content: &str, creat
         server_tool_calls: None,
         tool_diffs: None,
         response_model_id: None,
+        ttft_ms: None,
+        generation_ms: None,
     }
 }
 
@@ -212,6 +214,7 @@ pub async fn update_assistant_message(
     provider_state: Option<&str>,
     usage: &MessageUsage,
     response_model_id: Option<&str>,
+    timing: StreamTiming,
 ) -> Result<(), DbErr> {
     let affected = message::Entity::update_many()
         .set(message::ActiveModel {
@@ -225,6 +228,8 @@ pub async fn update_assistant_message(
             cache_write_tokens: Set(usage.cache_write_tokens),
             server_tool_calls: Set(usage.server_tool_calls),
             response_model_id: Set(response_model_id.map(str::to_owned)),
+            ttft_ms: Set(timing.ttft_ms),
+            generation_ms: Set(timing.generation_ms),
             ..Default::default()
         })
         .filter(message::Column::Id.eq(id))
@@ -778,6 +783,8 @@ mod tests {
             server_tool_calls: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         }
     }
 
@@ -933,6 +940,8 @@ mod tests {
             server_tool_calls: Some(47),
             tool_diffs: None,
             response_model_id: Some("deepseek-chat-0324".into()),
+            ttft_ms: Some(120),
+            generation_ms: Some(3400),
         };
         append(&db, full, Some(&root.id)).await;
 
@@ -967,6 +976,8 @@ mod tests {
             server_tool_calls,
             tool_diffs,
             response_model_id,
+            ttft_ms,
+            generation_ms,
         } = stored(&db, "m1").await;
         assert_eq!(
             (id.as_str(), conversation_id.as_str(), role.as_str()),
@@ -1000,6 +1011,7 @@ mod tests {
         );
         assert_eq!((auto_review, tool_diffs), (None, None));
         assert_eq!(response_model_id.as_deref(), Some("deepseek-chat-0324"));
+        assert_eq!((ttft_ms, generation_ms), (Some(120), Some(3400)));
     }
 
     #[tokio::test]
@@ -1100,7 +1112,21 @@ mod tests {
             server_tool_calls: Some(3),
         };
         db.write(async |tx| {
-            update_assistant_message(tx, "m1", "done", Some("why"), Some("[]"), Some("s"), &usage, Some("r")).await
+            update_assistant_message(
+                tx,
+                "m1",
+                "done",
+                Some("why"),
+                Some("[]"),
+                Some("s"),
+                &usage,
+                Some("r"),
+                StreamTiming {
+                    ttft_ms: Some(90),
+                    generation_ms: Some(1100),
+                },
+            )
+            .await
         })
         .await
         .unwrap();
@@ -1125,8 +1151,11 @@ mod tests {
             ),
             (Some(5), Some(6), Some(1), Some(2), Some(3))
         );
+        assert_eq!((m.ttft_ms, m.generation_ms), (Some(90), Some(1100)));
         let missing = db
-            .write(async |tx| update_assistant_message(tx, "nope", "", None, None, None, &usage, None).await)
+            .write(async |tx| {
+                update_assistant_message(tx, "nope", "", None, None, None, &usage, None, StreamTiming::default()).await
+            })
             .await;
         assert!(matches!(missing, Err(DbErr::RecordNotFound(_))));
     }

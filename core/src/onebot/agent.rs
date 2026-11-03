@@ -1224,6 +1224,8 @@ mod tests {
                 auto_review: None,
                 tool_diffs: None,
                 response_model_id: None,
+                ttft_ms: None,
+                generation_ms: None,
             };
             let replay = crate::db::sea::ops::message::ActiveContext {
                 path: vec![stored],

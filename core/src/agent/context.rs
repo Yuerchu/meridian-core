@@ -1011,6 +1011,8 @@ mod tests {
             auto_review: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         }
     }
 
@@ -1708,6 +1710,8 @@ mod injected_context_tests {
             auto_review: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         }
     }
 
@@ -1988,6 +1992,8 @@ mod injected_context_tests {
             auto_review: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         }];
         let context = crate::db::sea::ops::message::ActiveContext {
             path: Vec::new(),

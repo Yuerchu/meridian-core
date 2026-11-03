@@ -939,6 +939,7 @@ impl Shared {
             // opinion about any of them.
             MessageUsage::default(),
             None,
+            crate::db::models::message::StreamTiming::default(),
         )
         .await
         {

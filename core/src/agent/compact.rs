@@ -1188,6 +1188,8 @@ mod tests {
             auto_review: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         };
         let result =
             render_compact_sections(&prepare_compact_input(&[&msg], &HashMap::new(), &Default::default()).unwrap());
@@ -1228,6 +1230,8 @@ mod tests {
             auto_review: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         };
         let item = crate::db::entity::message_context_item::Model {
             id: "ctx1".into(),
@@ -1335,6 +1339,8 @@ mod tests {
             auto_review: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         };
         let result = render_compact_sections(&prepare_compact_input(&[&row], &HashMap::new(), &names).unwrap());
         assert!(
@@ -1427,6 +1433,8 @@ mod tests {
             auto_review: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         };
         assert!(
             prepare_compact_input(&[&row], &HashMap::new(), &Default::default())

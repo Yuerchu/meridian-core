@@ -22,6 +22,7 @@ pub mod m0006_local_inference_backend;
 pub mod m0007_compact_keep_recent_tokens;
 pub mod m0008_mcp_disabled_tools;
 pub mod m0009_readable_mime_overrides;
+pub mod m0010_stream_timing;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -45,6 +46,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0007CompactKeepRecentTokens),
             Box::new(M0008McpDisabledTools),
             Box::new(M0009ReadableMimeOverrides),
+            Box::new(M0010StreamTiming),
         ]
     }
 }
@@ -100,6 +102,7 @@ pub fn sqlite_statements() -> Vec<String> {
     all.extend(m0007_compact_keep_recent_tokens::sqlite_statements());
     all.extend(m0008_mcp_disabled_tools::sqlite_statements());
     all.extend(m0009_readable_mime_overrides::sqlite_statements());
+    all.extend(m0010_stream_timing::sqlite_statements());
     all
 }
 
@@ -328,6 +331,34 @@ impl MigrationTrait for M0008McpDisabledTools {
             ));
         }
         for statement in m0008_mcp_disabled_tools::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0010StreamTiming;
+
+impl MigrationName for M0010StreamTiming {
+    fn name(&self) -> &str {
+        "m0010_stream_timing"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0010StreamTiming {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "m0010_stream_timing adds SQLite INTEGER columns; other backends are not shipped yet".into(),
+            ));
+        }
+        for statement in m0010_stream_timing::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;
         }
         Ok(())
