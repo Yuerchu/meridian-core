@@ -23,7 +23,7 @@
 use std::future::Future;
 
 use crate::db::entity::message;
-use crate::db::models::message::MessageUsage;
+use crate::db::models::message::{MessageUsage, StreamTiming};
 use crate::db::models::turn::TurnPhase;
 use crate::db::sea::cap::Db;
 use crate::db::sea::ops::{audit, message as message_ops};
@@ -64,6 +64,8 @@ fn turn_row(id: &str, conversation_id: &str, turn_id: &str, role: &str, content:
         server_tool_calls: None,
         tool_diffs: None,
         response_model_id: None,
+        ttft_ms: None,
+        generation_ms: None,
     }
 }
 
@@ -114,6 +116,7 @@ pub(crate) async fn complete_assistant(
     provider_state: Option<&str>,
     usage: MessageUsage,
     response_model_id: Option<&str>,
+    timing: StreamTiming,
 ) -> Result<(), String> {
     db.write(async |tx| {
         message_ops::update_assistant_message(
@@ -125,6 +128,7 @@ pub(crate) async fn complete_assistant(
             provider_state,
             &usage,
             response_model_id,
+            timing,
         )
         .await?;
         match message_ops::get_message(tx, message_id).await {
@@ -387,6 +391,10 @@ mod tests {
             Some(r#"{"version":1,"producer":{"vendor":"anthropic","protocol":"messages","model":"m"},"kind":"anthropic_thinking_signature","payload":{"signature":"sig"}}"#),
             usage(),
             None,
+            StreamTiming {
+                ttft_ms: Some(180),
+                generation_ms: Some(2400),
+            },
         )
         .await
         .unwrap();
@@ -409,6 +417,7 @@ mod tests {
             (Some(7), Some(11), Some(41), Some(43), Some(47))
         );
         assert_eq!(row.turn_id.as_deref(), Some("t1"));
+        assert_eq!((row.ttft_ms, row.generation_ms), (Some(180), Some(2400)));
     }
 
     /// A reply reaches the audit log when it is finished, not when its row is
@@ -421,9 +430,19 @@ mod tests {
             audit::list_recent(&db, 10).await.unwrap().is_empty(),
             "an empty placeholder is not worth recording"
         );
-        complete_assistant(&db, &id, "the answer", None, None, None, usage(), None)
-            .await
-            .unwrap();
+        complete_assistant(
+            &db,
+            &id,
+            "the answer",
+            None,
+            None,
+            None,
+            usage(),
+            None,
+            StreamTiming::default(),
+        )
+        .await
+        .unwrap();
 
         let logged = audit::list_recent(&db, 10).await.unwrap();
         assert_eq!(logged.len(), 1);
@@ -467,9 +486,19 @@ mod tests {
         let id = begin_assistant(&db, "c1", "t1", (None, None), "m", None).await.unwrap();
         execute_for_tests(&db, "PRAGMA query_only=ON").await.unwrap();
         assert!(
-            complete_assistant(&db, &id, "the answer", None, None, None, MessageUsage::default(), None)
-                .await
-                .is_err()
+            complete_assistant(
+                &db,
+                &id,
+                "the answer",
+                None,
+                None,
+                None,
+                MessageUsage::default(),
+                None,
+                StreamTiming::default(),
+            )
+            .await
+            .is_err()
         );
         execute_for_tests(&db, "PRAGMA query_only=OFF").await.unwrap();
         assert_eq!(rows(&db).await[0].content, "", "and it really did not land");

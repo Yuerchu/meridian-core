@@ -980,6 +980,8 @@ mod tests {
             server_tool_calls: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         }
     }
 

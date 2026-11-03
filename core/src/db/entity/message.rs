@@ -51,6 +51,11 @@ pub struct Model {
     pub server_tool_calls: Option<i32>,
     pub tool_diffs: Option<String>,
     pub response_model_id: Option<String>,
+    /// Milliseconds from the request going out to the first model token.
+    /// NULL until a native stream records it.
+    pub ttft_ms: Option<i64>,
+    /// Milliseconds from that first token to the stream ending.
+    pub generation_ms: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -153,6 +158,8 @@ mod tests {
             server_tool_calls: None,
             tool_diffs: None,
             response_model_id: None,
+            ttft_ms: None,
+            generation_ms: None,
         }
     }
 

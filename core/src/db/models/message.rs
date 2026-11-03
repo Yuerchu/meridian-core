@@ -52,3 +52,19 @@ pub struct MessageUsage {
     /// itself. Not a token count: charged per call, on top of the tokens.
     pub server_tool_calls: Option<i32>,
 }
+
+/// How long one streamed reply took, measured on this machine.
+///
+/// A value rather than two parameters for the same reason [`MessageUsage`] is:
+/// both fields are `Option<i64>` and swapping them would still type-check.
+/// `None` is a row written before this was recorded, a round that never
+/// produced a token, or a hosted session this app does not time. `Some(0)` is
+/// a first token that landed in the same millisecond the request went out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamTiming {
+    /// Milliseconds from the request going out to the first model token
+    /// (visible text, thinking, or a tool-call start).
+    pub ttft_ms: Option<i64>,
+    /// Milliseconds from that first token to the stream ending.
+    pub generation_ms: Option<i64>,
+}

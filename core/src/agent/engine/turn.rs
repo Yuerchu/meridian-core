@@ -743,6 +743,7 @@ async fn run(
                 // conversation plus a full-size output allowance is a request
                 // they have to refuse — while the conversation itself would
                 // have fitted perfectly well.
+                let started = std::time::Instant::now();
                 let opened = provider
                     .stream_chat_with_tools(
                         chat_messages.clone(),
@@ -762,6 +763,7 @@ async fn run(
                             ports.interim,
                             &assistant_msg_id,
                             &conversation_id,
+                            started,
                         )
                         .await
                     }
@@ -829,6 +831,7 @@ async fn run(
                                 message_id: assistant_msg_id.clone(),
                             });
                         }
+                        let started = std::time::Instant::now();
                         let stream = provider
                             .stream_chat_with_tools(
                                 chat_messages.clone(),
@@ -847,6 +850,7 @@ async fn run(
                             ports.interim,
                             &assistant_msg_id,
                             &conversation_id,
+                            started,
                         )
                         .await
                         .map_err(|e| format!("Context overflow recovery failed: {e}"))?;
@@ -971,6 +975,7 @@ async fn run(
             provider_state_json.as_deref(),
             row_usage(result.usage.as_ref()),
             result.response_model.as_deref(),
+            result.timing,
         )
         .await?;
 

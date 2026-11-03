@@ -2,6 +2,7 @@
 // NOTICE: This file contains code derived from the OpenAI Codex project.
 // Changes: gate on error-string markers instead of a typed error code; clamp to 60s.
 
+use crate::db::models::message::StreamTiming;
 use crate::provider;
 
 pub(crate) struct StreamResult {
@@ -11,6 +12,7 @@ pub(crate) struct StreamResult {
     pub(crate) tool_calls: Vec<provider::ToolCall>,
     pub(crate) usage: Option<provider::TokenUsage>,
     pub(crate) finish_reason: Option<String>,
+    pub(crate) timing: StreamTiming,
     /// The model the upstream reported it used. `None` when the provider did
     /// not say.
     pub(crate) response_model: Option<String>,
@@ -45,6 +47,7 @@ impl StreamResult {
             usage: None,
             finish_reason: None,
             response_model: None,
+            timing: StreamTiming::default(),
             ran_to_completion: false,
             flushed_up_to: 0,
         }

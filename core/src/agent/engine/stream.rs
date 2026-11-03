@@ -5,11 +5,13 @@
 //! of them sent the events out. That difference is now the `Emit` port.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
 use super::{Commentary, Emit};
 use crate::agent::{InlineHiddenTagParser, InlineTagSpec, StreamResult};
+use crate::db::models::message::StreamTiming;
 use crate::events::ChatStreamEvent;
 use crate::provider;
 
@@ -38,6 +40,7 @@ pub(crate) async fn consume_stream(
     interim: Option<&dyn Commentary>,
     message_id: &str,
     conversation_id: &str,
+    started: Instant,
 ) -> Result<StreamResult, String> {
     use futures::StreamExt;
 
@@ -57,6 +60,7 @@ pub(crate) async fn consume_stream(
     let mut response_model: Option<String> = None;
     let mut flushed_up_to = 0usize;
     let mut flushed_ids: HashSet<String> = HashSet::new();
+    let mut first_token_at: Option<Instant> = None;
     // Some OpenAI-compatible providers inline reasoning as <think> tags in the
     // text stream instead of a separate reasoning field; route it accordingly.
     let mut think_parser = InlineHiddenTagParser::new_streaming(vec![InlineTagSpec {
@@ -80,6 +84,7 @@ pub(crate) async fn consume_stream(
                     Ok(Some(Ok(provider::StreamEvent::Text { content: ref s }))) => {
                         let chunk = think_parser.push_str(s);
                         if !chunk.visible_text.is_empty() {
+                            mark_first_token(&mut first_token_at);
                             text.push_str(&chunk.visible_text);
                             send(ChatStreamEvent::Text {
                                 content: chunk.visible_text.clone(),
@@ -88,6 +93,9 @@ pub(crate) async fn consume_stream(
                             })?;
                         }
                         for tag in &chunk.extracted {
+                            if !tag.content.is_empty() {
+                                mark_first_token(&mut first_token_at);
+                            }
                             reasoning.push_str(&tag.content);
                             send(ChatStreamEvent::Reasoning {
                                 content: tag.content.clone(),
@@ -97,6 +105,9 @@ pub(crate) async fn consume_stream(
                         }
                     }
                     Ok(Some(Ok(provider::StreamEvent::Reasoning { content: ref s }))) => {
+                        if !s.is_empty() {
+                            mark_first_token(&mut first_token_at);
+                        }
                         reasoning.push_str(s);
                         send(ChatStreamEvent::Reasoning {
                             content: s.clone(),
@@ -113,17 +124,20 @@ pub(crate) async fn consume_stream(
                         if index >= 256 {
                             return Err(format!("tool call index {index} out of range"));
                         }
+                        mark_first_token(&mut first_token_at);
                         while tool_acc.len() <= index {
                             tool_acc.push((String::new(), String::new(), String::new()));
                         }
                         tool_acc[index] = (id.clone(), name.clone(), String::new());
                     }
                     Ok(Some(Ok(provider::StreamEvent::ToolCallDelta { index, ref arguments }))) => {
+                        mark_first_token(&mut first_token_at);
                         if let Some(entry) = tool_acc.get_mut(index) {
                             entry.2.push_str(arguments);
                         }
                     }
                     Ok(Some(Ok(provider::StreamEvent::ToolCallDone { index, ref arguments }))) => {
+                        mark_first_token(&mut first_token_at);
                         if let Some(entry) = tool_acc.get_mut(index) {
                             entry.2 = arguments.clone();
                         }
@@ -200,6 +214,7 @@ pub(crate) async fn consume_stream(
     let tail = think_parser.finish();
     if !cancel.is_cancelled() {
         if !tail.visible_text.is_empty() {
+            mark_first_token(&mut first_token_at);
             send(ChatStreamEvent::Text {
                 content: tail.visible_text.clone(),
                 message_id: message_id.to_string(),
@@ -207,6 +222,9 @@ pub(crate) async fn consume_stream(
             })?;
         }
         for tag in &tail.extracted {
+            if !tag.content.is_empty() {
+                mark_first_token(&mut first_token_at);
+            }
             send(ChatStreamEvent::Reasoning {
                 content: tag.content.clone(),
                 message_id: message_id.to_string(),
@@ -214,8 +232,14 @@ pub(crate) async fn consume_stream(
             })?;
         }
     }
+    if !tail.visible_text.is_empty() {
+        mark_first_token(&mut first_token_at);
+    }
     text.push_str(&tail.visible_text);
     for tag in tail.extracted {
+        if !tag.content.is_empty() {
+            mark_first_token(&mut first_token_at);
+        }
         reasoning.push_str(&tag.content);
     }
 
@@ -244,16 +268,49 @@ pub(crate) async fn consume_stream(
         usage,
         finish_reason,
         response_model,
+        timing: stream_timing(started, first_token_at, Instant::now()),
         ran_to_completion,
         flushed_up_to,
     })
 }
 
+fn mark_first_token(slot: &mut Option<Instant>) {
+    if slot.is_none() {
+        *slot = Some(Instant::now());
+    }
+}
+
+fn elapsed_ms(from: Instant, to: Instant) -> i64 {
+    i64::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(i64::MAX)
+}
+
+fn stream_timing(started: Instant, first_token_at: Option<Instant>, ended: Instant) -> StreamTiming {
+    match first_token_at {
+        Some(first) => StreamTiming {
+            ttft_ms: Some(elapsed_ms(started, first)),
+            generation_ms: Some(elapsed_ms(first, ended)),
+        },
+        None => StreamTiming::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{Commentary, Emit};
+    use crate::db::models::message::StreamTiming;
+    use crate::provider;
     use crate::provider::StreamEvent;
     use std::sync::Mutex;
+    use std::time::Instant;
+
+    async fn consume(
+        stream: provider::ChatStream,
+        cancel: &CancellationToken,
+        emit: Option<&dyn Emit>,
+    ) -> Result<StreamResult, String> {
+        consume_stream(stream, cancel, emit, None, "m1", "c1", Instant::now()).await
+    }
 
     fn events(items: Vec<StreamEvent>) -> provider::ChatStream {
         Box::pin(futures::stream::iter(items.into_iter().map(Ok)))
@@ -345,16 +402,11 @@ mod tests {
     #[tokio::test]
     async fn a_stream_that_ran_out_did_run_to_completion() {
         let cancel = CancellationToken::new();
-        let r = consume_stream(
-            events(vec![StreamEvent::Text { content: "hi".into() }]),
-            &cancel,
-            None,
-            None,
-            "m1",
-            "c1",
-        )
-        .await
-        .unwrap();
+        let r = consume(events(vec![StreamEvent::Text { content: "hi".into() }]), &cancel, None)
+            .await
+            .unwrap();
+        assert!(r.timing.ttft_ms.is_some(), "visible text is a first token");
+        assert!(r.timing.generation_ms.is_some());
 
         assert!(r.ran_to_completion);
         assert_eq!(r.text, "hi");
@@ -372,9 +424,10 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let r = consume_stream(never(), &cancel, None, None, "m1", "c1").await.unwrap();
+        let r = consume(never(), &cancel, None).await.unwrap();
 
         assert!(!r.ran_to_completion, "stopped is not finished");
+        assert_eq!(r.timing, StreamTiming::default(), "nothing arrived");
     }
 
     /// A provider that answers 200 and then refuses over SSE processed nothing.
@@ -383,15 +436,12 @@ mod tests {
     #[tokio::test]
     async fn an_error_inside_the_stream_is_not_a_completion() {
         let cancel = CancellationToken::new();
-        let r = consume_stream(
+        let r = consume(
             events(vec![StreamEvent::Error {
                 message: "context_length_exceeded".into(),
             }]),
             &cancel,
             None,
-            None,
-            "m1",
-            "c1",
         )
         .await;
 
@@ -431,9 +481,7 @@ mod tests {
             },
         ]);
 
-        let r = consume_stream(stream, &cancel, Some(&stopper), None, "m1", "c1")
-            .await
-            .unwrap();
+        let r = consume(stream, &cancel, Some(&stopper)).await.unwrap();
 
         assert_eq!(r.text, "on it —", "what the user watched arrive is still there");
         assert!(r.tool_calls.is_empty(), "and the file is not edited");
@@ -458,7 +506,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let desktop = Recorder::fatal_from(1);
-        let stopped = consume_stream(script(), &cancel, Some(&desktop), None, "m1", "c1").await;
+        let stopped = consume(script(), &cancel, Some(&desktop)).await;
         assert!(
             stopped.is_err(),
             "the desktop's events are the answer; losing one ends the turn"
@@ -466,7 +514,7 @@ mod tests {
         assert_eq!(desktop.kinds().len(), 2, "and it stops at the one that failed");
 
         let onebot = Recorder::best_effort_from(1);
-        let carried_on = consume_stream(script(), &cancel, Some(&onebot), None, "m1", "c1")
+        let carried_on = consume(script(), &cancel, Some(&onebot))
             .await
             .expect("a QQ turn's answer does not travel over these events");
         assert_eq!(carried_on.text, "onetwothree");
@@ -493,13 +541,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let a = Recorder::watching();
-        let ra = consume_stream(script(), &cancel, Some(&a), None, "m1", "c1")
-            .await
-            .unwrap();
+        let ra = consume(script(), &cancel, Some(&a)).await.unwrap();
         let b = Recorder::best_effort_from(usize::MAX);
-        let rb = consume_stream(script(), &cancel, Some(&b), None, "m1", "c1")
-            .await
-            .unwrap();
+        let rb = consume(script(), &cancel, Some(&b)).await.unwrap();
 
         assert_eq!(a.kinds(), b.kinds());
         assert_eq!(ra.text, rb.text);
@@ -507,6 +551,60 @@ mod tests {
         // And the inline <think> really was routed away from the text.
         assert!(!ra.text.contains("hidden"));
         assert!(ra.reasoning.contains("hidden"));
+        assert!(ra.timing.ttft_ms.is_some(), "thinking inside <think> is a first token");
+    }
+
+    #[tokio::test]
+    async fn thinking_alone_is_a_first_token() {
+        let cancel = CancellationToken::new();
+        let r = consume(
+            events(vec![StreamEvent::Reasoning {
+                content: "working".into(),
+            }]),
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(r.timing.ttft_ms.is_some());
+        assert!(r.timing.generation_ms.is_some());
+        assert!(r.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_provider_side_tool_is_not_a_first_token() {
+        let cancel = CancellationToken::new();
+        let r = consume(
+            events(vec![StreamEvent::ServerToolCall(crate::provider::ServerToolCall {
+                id: "s1".into(),
+                name: "web_search".into(),
+                arguments: None,
+                sources: Vec::new(),
+                completed: true,
+            })]),
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.timing, StreamTiming::default());
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_start_is_a_first_token() {
+        let cancel = CancellationToken::new();
+        let r = consume(
+            events(vec![StreamEvent::ToolCallStart {
+                index: 0,
+                id: "c1".into(),
+                name: "read_file".into(),
+            }]),
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(r.timing.ttft_ms.is_some());
     }
 
     fn server_search(id: &str, completed: bool) -> StreamEvent {
@@ -540,7 +638,7 @@ mod tests {
 
     async fn read_with_says(items: Vec<StreamEvent>, says: &Says) -> StreamResult {
         let cancel = CancellationToken::new();
-        consume_stream(events(items), &cancel, None, Some(says), "m1", "c1")
+        consume_stream(events(items), &cancel, None, Some(says), "m1", "c1", Instant::now())
             .await
             .unwrap()
     }
@@ -642,6 +740,7 @@ mod tests {
             None,
             "m1",
             "c1",
+            Instant::now(),
         )
         .await
         .unwrap();
