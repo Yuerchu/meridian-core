@@ -1,8 +1,9 @@
 //! JNI bridge to the Android side (FileBridge.kt / MainActivity.kt).
 //! Only compiled on Android. SAF file operations and permission queries live here.
 //!
-//! ndk-context is initialized by `initNdkContext` (called from MainActivity.onCreate
-//! via lib.rs `Java_..._initNdkContext`), NOT by Tauri/tao itself.
+//! ndk-context is initialized by tao (`Rust.onCreate` / `ndk_glue::onCreate`).
+//! `initNdkContext` only borrows the slot long enough to set android-keyring,
+//! then releases it so tao's assert still holds.
 #![cfg(target_os = "android")]
 
 use std::collections::HashMap;
@@ -507,6 +508,27 @@ pub async fn content_copy(uri: &str, dest_abs: &str) -> Result<(), String> {
                 "contentCopy",
                 "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
                 &[JValue::Object(context), JValue::Object(&juri), JValue::Object(&jdest)],
+            )?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("task failed: {e}"))?
+}
+
+/// Copy a local file into a `content://` document created by the save picker.
+pub async fn content_write(src_abs: &str, uri: &str) -> Result<(), String> {
+    let (src, uri) = (src_abs.to_string(), uri.to_string());
+    tokio::task::spawn_blocking(move || {
+        with_env(|env, context| {
+            let cls = bridge_class(env, context)?;
+            let jsrc = env.new_string(&src)?;
+            let juri = env.new_string(&uri)?;
+            env.call_static_method(
+                &cls,
+                "contentWrite",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(context), JValue::Object(&jsrc), JValue::Object(&juri)],
             )?;
             Ok(())
         })
