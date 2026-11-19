@@ -192,16 +192,31 @@ fn validate_env_name(kind: &str, owner: &str, name: &str) -> Result<(), String> 
 }
 
 impl DaemonConfig {
-    pub fn parse(source: &str) -> Result<Self, String> {
-        let config: Self = toml::from_str(source).map_err(|error| format!("invalid configuration: {error}"))?;
-        config.validate()?;
+    fn parse_with<E>(
+        source: &str,
+        decode_error: impl FnOnce(toml::de::Error) -> E,
+        validation_error: impl FnOnce(String) -> E,
+    ) -> Result<Self, E> {
+        let config: Self = toml::from_str(source).map_err(decode_error)?;
+        config.validate().map_err(validation_error)?;
         Ok(config)
     }
 
-    pub fn read(path: &Path) -> Result<Self, String> {
-        let source =
-            std::fs::read_to_string(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        Self::parse(&source)
+    #[cfg(test)]
+    pub fn parse(source: &str) -> Result<Self, String> {
+        Self::parse_with(source, |error| error.to_string(), |error| error)
+    }
+
+    pub fn read(path: &Path) -> Result<Self, &'static str> {
+        let source = std::fs::read_to_string(path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => "configuration file not found",
+            _ => "configuration file could not be read",
+        })?;
+        Self::parse_with(
+            &source,
+            |_| "invalid TOML or configuration schema",
+            |_| "configuration failed validation",
+        )
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -367,6 +382,29 @@ mod tests {
         assert_eq!(
             notify.balance_interval_minutes, 360,
             "an absent key means the core default, not a restated one"
+        );
+    }
+
+    #[test]
+    fn startup_configuration_errors_have_distinct_safe_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sentinel-private-name");
+        assert_eq!(DaemonConfig::read(&path).unwrap_err(), "configuration file not found");
+        std::fs::write(&path, "invalid = [sentinel-token").unwrap();
+        assert_eq!(
+            DaemonConfig::read(&path).unwrap_err(),
+            "invalid TOML or configuration schema"
+        );
+        std::fs::write(
+            &path,
+            "[notify]
+enabled = true
+# sentinel-token",
+        )
+        .unwrap();
+        assert_eq!(
+            DaemonConfig::read(&path).unwrap_err(),
+            "configuration failed validation"
         );
     }
 

@@ -252,7 +252,7 @@ impl QqToolExecutor {
         self_id: Option<i64>,
         turn_id: String,
     ) -> Self {
-        let send_readiness = self_id.and_then(|bot| state.services.corpus.send_policy(bot, &session.to_string()));
+        let send_readiness = self_id.and_then(|bot| state.services.corpus.send_policy(bot, &session.room_key()));
         let send_generation = state.services.corpus.send_generation();
         Self {
             state,
@@ -926,13 +926,8 @@ impl QqToolExecutor {
             EmojiSource::OnebotMface => MessageSegment::raw("mface", payload),
             EmojiSource::OnebotImage | EmojiSource::Local => cached_image()?,
         };
-        let direct = call_api(&self.state, send(first, echo())).await;
-        if let Err(error) = direct {
-            if sticker.source != EmojiSource::OnebotMface {
-                return Err(error);
-            }
-            call_api(&self.state, send(cached_image()?, echo())).await?;
-        }
+        // A timeout/disconnect may follow delivery. Never send a fallback blindly.
+        call_api(&self.state, send(first, echo())).await?;
 
         let mut sent = SENT_TURNS
             .get_or_init(Default::default)

@@ -1,3 +1,4 @@
+use crate::client::{ReqwestTransport, bounded};
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -62,10 +63,8 @@ impl StreamableHttpTransport {
     }
 
     async fn parse_sse_response(&self, resp: reqwest::Response) -> Result<serde_json::Value, TransportError> {
-        let mut event_stream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(std::io::Error::other))
-            .eventsource();
+        let bytes = resp.bytes_stream().map(|r| r.map_err(ReqwestTransport::map_error));
+        let mut event_stream = bounded::sse(Box::pin(bytes), bounded::SSE_LIMITS).eventsource();
 
         while let Some(event) = event_stream.next().await {
             // The stream broke apart mid-response. Unlike stdio this costs no
@@ -118,13 +117,20 @@ impl McpTransport for StreamableHttpTransport {
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| TransportError::Broken(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| {
+                TransportError::Broken(format!(
+                    "HTTP request failed: {}",
+                    ReqwestTransport::map_error(e).kind()
+                ))
+            })?;
 
         // A status the server chose to send is an answer, not a transport
         // failure — the connection did its job.
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = bounded::error_body(resp, bounded::ERROR_BYTES)
+                .await
+                .unwrap_or_default();
             return Err(TransportError::Rpc(format!("HTTP {}: {}", status, text)));
         }
 
@@ -140,11 +146,10 @@ impl McpTransport for StreamableHttpTransport {
         if content_type.contains("text/event-stream") {
             self.parse_sse_response(resp).await
         } else {
-            let text = resp
-                .text()
+            let bytes = bounded::body(resp, bounded::BODY_BYTES)
                 .await
                 .map_err(|e| TransportError::Broken(format!("read body: {e}")))?;
-            let rpc_resp: JsonRpcResponse = serde_json::from_str(&text)
+            let rpc_resp: JsonRpcResponse = serde_json::from_slice(&bytes)
                 .map_err(|e| TransportError::Rpc(format!("parse JSON-RPC response: {e}")))?;
             if let Some(err) = rpc_resp.error {
                 return Err(TransportError::Rpc(format!("MCP error {}: {}", err.code, err.message)));

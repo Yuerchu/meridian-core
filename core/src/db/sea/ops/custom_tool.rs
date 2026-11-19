@@ -38,6 +38,7 @@ async fn get_tool(db: &impl Read, id: &str) -> Result<custom_tool::Model, DbErr>
 
 /// Inserts the row the caller built and reads it back.
 pub async fn create_tool(tx: &WriteTx, model: custom_tool::Model) -> Result<custom_tool::Model, DbErr> {
+    validate_execution(model.execution.as_ref(), model.is_enabled, model.timeout_ms)?;
     let id = model.id.clone();
     custom_tool::Entity::insert(model.into_active_model())
         .exec_without_returning(tx.conn()?)
@@ -48,9 +49,32 @@ pub async fn create_tool(tx: &WriteTx, model: custom_tool::Model) -> Result<cust
 /// `RecordNotFound` when there is no such row, before anything is written.
 pub async fn update_tool(tx: &WriteTx, id: &str, changeset: CustomToolChangeset) -> Result<custom_tool::Model, DbErr> {
     let existing = get_tool(tx, id).await?;
+    validate_execution(
+        changeset.execution.as_ref().unwrap_or(&existing.execution).as_ref(),
+        changeset.is_enabled.unwrap_or(existing.is_enabled),
+        changeset.timeout_ms.unwrap_or(existing.timeout_ms),
+    )?;
     let mut row = changeset.into_active_model();
     row.id = Unchanged(existing.id);
     row.update(tx.conn()?).await
+}
+
+fn validate_execution(
+    execution: Option<&crate::db::types::Json<crate::tools::custom::CustomToolExecution>>,
+    enabled: SqlBool,
+    timeout_ms: Option<i32>,
+) -> Result<(), DbErr> {
+    if let Some(execution) = execution {
+        execution.validate().map_err(DbErr::Custom)?;
+        if timeout_ms.is_some_and(|timeout| timeout <= 0) {
+            return Err(DbErr::Custom("Custom tool timeout must be positive".into()));
+        }
+    } else if enabled.get() {
+        return Err(DbErr::Custom(
+            "Legacy custom tools cannot be enabled without a safe execution definition".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// How many rows went: 0 for an id that was already gone.
@@ -80,6 +104,10 @@ mod tests {
             parameters_schema: Json(serde_json::json!({"type": "object"}).as_object().unwrap().clone()),
             command: "echo".into(),
             args_template: Some("{{x}}".into()),
+            execution: Some(Json(crate::tools::custom::CustomToolExecution::Executable {
+                program: "echo".into(),
+                args: vec![],
+            })),
             working_directory: None,
             timeout_ms: Some(1000),
             permission: Permission::Never,
@@ -92,6 +120,74 @@ mod tests {
 
     async fn insert(db: &Db, model: custom_tool::Model) -> custom_tool::Model {
         db.write(async |tx| create_tool(tx, model).await).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_drafts_remain_editable_but_cannot_be_enabled() {
+        let db = sea_test_db().await;
+        let mut legacy = tool("legacy", 0, false, None);
+        legacy.execution = None;
+        insert(&db, legacy).await;
+        let changed = db
+            .write(async |tx| {
+                update_tool(
+                    tx,
+                    "legacy",
+                    CustomToolChangeset {
+                        command: Some("printf '%s'".into()),
+                        args_template: Some(Some("\"{{x}}\"".into())),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(changed.command, "printf '%s'");
+        assert!(!changed.is_enabled.get());
+        assert!(
+            db.write(async |tx| update_tool(
+                tx,
+                "legacy",
+                CustomToolChangeset {
+                    is_enabled: Some(SqlBool::TRUE),
+                    ..Default::default()
+                }
+            )
+            .await)
+                .await
+                .is_err()
+        );
+        let converted = db
+            .write(async |tx| {
+                update_tool(
+                    tx,
+                    "legacy",
+                    CustomToolChangeset {
+                        execution: Some(tool("safe", 0, true, None).execution),
+                        is_enabled: Some(SqlBool::TRUE),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert!(converted.is_enabled.get());
+        assert!(
+            db.write(async |tx| update_tool(
+                tx,
+                "legacy",
+                CustomToolChangeset {
+                    execution: Some(None),
+                    ..Default::default()
+                }
+            )
+            .await)
+                .await
+                .is_err()
+        );
+        assert!(list_enabled_tools(&db).await.unwrap()[0].execution.is_some());
     }
 
     #[tokio::test]

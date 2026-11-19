@@ -480,10 +480,11 @@ fn append_capped(dst: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
 /// result carries.
 pub type OutputTee = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
 
-/// Unified command execution entry point. On Windows with a restricting policy
-/// the command runs under the restricted-token sandbox; everywhere else it runs
-/// unsandboxed — but always with a bounded capture, a timeout that kills the
-/// whole process tree, and cancellation support.
+/// Unified command execution entry point. The policy selects a container,
+/// Windows restricted token, or host execution. A Windows restricting policy
+/// with no writable roots fails before spawning; it never falls back to the
+/// host. Capture is bounded, and timeout/cancellation use the backend's own
+/// termination boundary (the whole session container for Docker).
 pub async fn execute(
     command: &[String],
     cwd: &Path,
@@ -570,25 +571,6 @@ pub async fn execute_teed(
     }
 }
 
-/// Run a client process with the bounded capture, timeout and cancellation the
-/// host path already has.
-///
-/// Exists for [`crate::container`], whose `docker` invocation is an ordinary
-/// child process and wants all of that — while everything those mechanisms do
-/// applies to the *client* and not to the command inside, which is the whole
-/// reason that module needs a cancellation of its own.
-pub(crate) async fn run_client(
-    program: &str,
-    args: &[String],
-    timeout: Duration,
-    cancel: &CancellationToken,
-) -> Result<ExecResult, ExecError> {
-    let mut argv = Vec::with_capacity(args.len() + 1);
-    argv.push(program.to_string());
-    argv.extend_from_slice(args);
-    execute_unsandboxed(&argv, Path::new("."), timeout, cancel, None).await
-}
-
 #[cfg(unix)]
 fn kill_group(pid: Option<u32>, signal: i32) {
     let Some(pid) = pid else { return };
@@ -650,7 +632,16 @@ async fn execute_unsandboxed(
     tee: Option<OutputTee>,
 ) -> Result<ExecResult, ExecError> {
     let mut cmd = tokio::process::Command::new(&command[0]);
+    #[cfg(not(target_os = "windows"))]
     cmd.args(&command[1..]);
+    #[cfg(target_os = "windows")]
+    if sandbox_windows::winutil::is_msys_shell(&command[0]) {
+        for arg in &command[1..] {
+            cmd.raw_arg(sandbox_windows::winutil::quote_msys_arg(arg));
+        }
+    } else {
+        cmd.args(&command[1..]);
+    }
     cmd.current_dir(cwd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
@@ -746,6 +737,32 @@ async fn execute_unsandboxed(
     })
 }
 
+/// Resolve writable roots before any sandbox setup or process creation. An
+/// unavailable sandbox is an error, never permission to launch on the host.
+#[cfg(any(target_os = "windows", test))]
+fn windows_writable_roots(
+    project: Option<&Path>,
+    temp: Option<PathBuf>,
+    tmp: Option<PathBuf>,
+) -> Result<Vec<PathBuf>, ExecError> {
+    let mut roots = Vec::new();
+    if let Some(project) = project.filter(|p| !p.as_os_str().is_empty()) {
+        roots.push(project.to_path_buf());
+    }
+    if let Some(temp) = temp
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| tmp.filter(|p| !p.as_os_str().is_empty()))
+    {
+        roots.push(temp);
+    }
+    if roots.is_empty() {
+        return Err(ExecError::Internal(
+            "Windows sandbox requested but no writable root is available; command was not started".into(),
+        ));
+    }
+    Ok(roots)
+}
+
 #[cfg(target_os = "windows")]
 async fn execute_windows_sandboxed(
     command: &[String],
@@ -759,25 +776,11 @@ async fn execute_windows_sandboxed(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    let mut writable_roots = Vec::new();
-    if let Some(ref dir) = policy.project_dir {
-        writable_roots.push(dir.clone());
-    }
-    if let Some(tmp) = std::env::var_os("TEMP").or_else(|| std::env::var_os("TMP")) {
-        writable_roots.push(PathBuf::from(tmp));
-    }
-
-    if writable_roots.is_empty() {
-        // The caller asked for a sandbox and is not getting one. `sandboxed`
-        // comes back false, which also disables the escape detection downstream,
-        // and nothing in the UI says so. OneBot turns land here by construction:
-        // they carry no project_dir, leaving only TEMP.
-        tracing::warn!(
-            has_project_dir = policy.project_dir.is_some(),
-            "sandbox requested but no writable root could be determined; running unsandboxed"
-        );
-        return execute_unsandboxed(command, cwd, timeout, cancel, tee).await;
-    }
+    let writable_roots = windows_writable_roots(
+        policy.project_dir.as_deref(),
+        std::env::var_os("TEMP").map(PathBuf::from),
+        std::env::var_os("TMP").map(PathBuf::from),
+    )?;
 
     let sandbox_home = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -962,6 +965,83 @@ async fn execute_windows_sandboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_roots_missing_or_empty_fail_closed() {
+        for roots in [
+            windows_writable_roots(None, None, None),
+            windows_writable_roots(Some(Path::new("")), Some(PathBuf::new()), Some(PathBuf::new())),
+        ] {
+            let err = roots.unwrap_err();
+            assert!(matches!(err, ExecError::Internal(_)));
+            assert!(err.to_string().contains("command was not started"));
+        }
+    }
+
+    #[test]
+    fn windows_roots_keep_project_and_prefer_nonempty_temp() {
+        let project = Path::new("project");
+        assert_eq!(
+            windows_writable_roots(Some(project), Some("temp".into()), Some("tmp".into())).unwrap(),
+            vec![PathBuf::from("project"), PathBuf::from("temp")]
+        );
+        assert_eq!(
+            windows_writable_roots(None, Some(PathBuf::new()), Some("tmp".into())).unwrap(),
+            vec![PathBuf::from("tmp")]
+        );
+        assert_eq!(
+            windows_writable_roots(Some(project), None, None).unwrap(),
+            vec![PathBuf::from("project")]
+        );
+    }
+
+    // Isolate environment changes in a child test harness: never mutate the
+    // environment of a multithreaded test process.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_no_roots_refuses_before_spawning() {
+        const CHILD: &str = "MERIDIAN_TEST_NO_WRITABLE_ROOTS";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::tests::windows_no_roots_refuses_before_spawning",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("TEMP")
+                .env_remove("TMP")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("WINDOWS_NO_ROOTS_CHECKS_COMPLETE"),
+                "{stdout}"
+            );
+            return;
+        }
+        let policy = SandboxPolicy {
+            backend: SandboxBackend::WindowsRestrictedToken,
+            project_dir: None,
+            ..Default::default()
+        };
+        let tee: OutputTee = std::sync::Arc::new(|_| panic!("a refused command must produce no output"));
+        for tee in [None, Some(tee)] {
+            let err = execute_teed(
+                &["meridian-this-binary-must-not-be-spawned".into()],
+                &std::env::current_dir().unwrap(),
+                Some(&policy),
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+                tee,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ExecError::Internal(_)), "{err}");
+            assert!(err.to_string().contains("no writable root"), "{err}");
+        }
+        println!("WINDOWS_NO_ROOTS_CHECKS_COMPLETE");
+    }
 
     /// `CommandSettings::command_shell` decides the container case from the
     /// mode alone. That is sound only while the container backend comes from

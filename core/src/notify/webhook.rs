@@ -33,12 +33,6 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ATTEMPTS: u32 = 3;
 const RETRY_BASE: Duration = Duration::from_millis(500);
 
-/// How much of an upstream's answer is kept.
-///
-/// Enough to read `{"errcode":310000,"errmsg":"..."}`, not enough to turn a
-/// list of endpoints into a log dump.
-const EXCERPT_CHARS: usize = 300;
-
 pub fn webhook_secret_name(id: &str) -> String {
     format!("NOTIFY_WEBHOOK_SECRET_{}", id.replace('-', "_").to_uppercase())
 }
@@ -284,18 +278,14 @@ fn hmac_base64(key: &[u8], message: &[u8]) -> String {
 /// more than one generation of response shape between them, and refusing an
 /// answer we do not recognise would report a delivered message as failed —
 /// which is the direction that causes a duplicate on the next tick.
-pub fn vendor_error(body: &str) -> Option<String> {
+pub fn vendor_error(body: &str) -> Option<&'static str> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
     for field in ["errcode", "code", "StatusCode"] {
         if let Some(code) = parsed.get(field).and_then(serde_json::Value::as_i64) {
             if code == 0 {
                 return None;
             }
-            let message = ["errmsg", "msg", "StatusMessage"]
-                .iter()
-                .find_map(|name| parsed.get(*name).and_then(serde_json::Value::as_str))
-                .unwrap_or("no message");
-            return Some(format!("upstream rejected the message: {field}={code} ({message})"));
+            return Some("vendor_rejected");
         }
     }
     None
@@ -310,7 +300,7 @@ pub async fn deliver(endpoint: &notification_webhook::Model, secret: Option<&str
     // with its own message instead of posting a document nobody meant.
     let template = match endpoint.body_template() {
         Ok(template) => template,
-        Err(error) => return failed(started, 1, None, error, None),
+        Err(_) => return failed(started, 1, None, "configuration"),
     };
     let prepared = match prepare(
         endpoint.format,
@@ -322,7 +312,7 @@ pub async fn deliver(endpoint: &notification_webhook::Model, secret: Option<&str
         crate::util::now_ms(),
     ) {
         Ok(prepared) => prepared,
-        Err(error) => return failed(started, 1, None, error, None),
+        Err(_) => return failed(started, 1, None, "configuration"),
     };
 
     let transport = ReqwestTransport::shared();
@@ -348,35 +338,31 @@ pub async fn deliver(endpoint: &notification_webhook::Model, secret: Option<&str
                 }
                 // A header this app builds should always be valid; if one is
                 // not, the delivery is wrong rather than merely unsigned.
-                _ => return failed(started, attempts, None, format!("invalid header `{name}`"), None),
+                _ => return failed(started, attempts, None, "configuration"),
             }
         }
 
         match transport.execute(request).await {
             Ok(response) => {
                 let status = response.status.as_u16();
-                let body = String::from_utf8_lossy(&response.body).to_string();
-                let excerpt = excerpt(&body);
                 if prepared.reads_body_for_errors
-                    && let Some(error) = vendor_error(&body)
+                    && let Some(class) = vendor_error(&String::from_utf8_lossy(&response.body))
                 {
                     // A vendor rejection is about the message, not the
                     // connection: sending it again produces the same answer.
-                    return failed(started, attempts, Some(status), error, excerpt);
+                    return failed(started, attempts, Some(status), class);
                 }
                 return DeliveryReport {
                     status: Some(status),
                     duration_ms: elapsed(started),
                     attempts,
                     error: None,
-                    response_excerpt: excerpt,
+                    response_excerpt: None,
                 };
             }
             Err(error) => {
-                let status = http_status(&error);
                 if !retryable(&error) || attempts >= MAX_ATTEMPTS {
-                    let excerpt = http_body(&error).and_then(|body| excerpt(&body));
-                    return failed(started, attempts, status, error.to_string(), excerpt);
+                    return transport_failure(started, attempts, &error);
                 }
                 tokio::time::sleep(backoff(RETRY_BASE, u64::from(attempts))).await;
             }
@@ -391,52 +377,25 @@ fn retryable(error: &TransportError) -> bool {
     match error {
         TransportError::Http { status, .. } => status.as_u16() == 429 || status.is_server_error(),
         TransportError::Timeout | TransportError::Network(_) => true,
-        TransportError::Build(_) | TransportError::RetryLimit => false,
+        TransportError::Build(_) | TransportError::Limit(_) | TransportError::RetryLimit => false,
     }
 }
 
-fn http_status(error: &TransportError) -> Option<u16> {
-    match error {
-        TransportError::Http { status, .. } => Some(status.as_u16()),
-        _ => None,
-    }
-}
-
-fn http_body(error: &TransportError) -> Option<String> {
-    match error {
-        TransportError::Http { body, .. } => body.clone(),
-        _ => None,
-    }
-}
-
-fn excerpt(body: &str) -> Option<String> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.chars().count() <= EXCERPT_CHARS {
-        return Some(trimmed.to_string());
-    }
-    Some(trimmed.chars().take(EXCERPT_CHARS).collect::<String>() + "…")
+fn transport_failure(started: Instant, attempts: u32, error: &TransportError) -> DeliveryReport {
+    failed(started, attempts, error.status(), error.kind())
 }
 
 fn elapsed(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn failed(
-    started: Instant,
-    attempts: u32,
-    status: Option<u16>,
-    error: String,
-    excerpt: Option<String>,
-) -> DeliveryReport {
+fn failed(started: Instant, attempts: u32, status: Option<u16>, class: &'static str) -> DeliveryReport {
     DeliveryReport {
         status,
         duration_ms: elapsed(started),
         attempts,
-        error: Some(error),
-        response_excerpt: excerpt,
+        error: Some(class.into()),
+        response_excerpt: None,
     }
 }
 
@@ -615,8 +574,8 @@ mod wire_tests {
         assert!(!report.is_success());
         assert_eq!(report.status, Some(200));
         assert_eq!(report.attempts, 1, "the same message gets the same rejection");
-        assert!(report.error.as_deref().unwrap().contains("310000"), "{report:?}");
-        assert!(report.response_excerpt.as_deref().unwrap().contains("sign not match"));
+        assert_eq!(report.error.as_deref(), Some("vendor_rejected"));
+        assert_eq!(report.response_excerpt, None);
 
         // And the signing really did reach the URL rather than a header.
         let seen = server.seen.lock().unwrap();
@@ -646,6 +605,8 @@ mod wire_tests {
         let report = deliver(&endpoint(&server.url, NotificationFormat::Slack), None, &test_alert()).await;
         assert!(!report.is_success());
         assert_eq!(report.status, Some(400));
+        assert_eq!(report.error.as_deref(), Some("http"));
+        assert_eq!(report.response_excerpt, None);
         assert_eq!(report.attempts, 1, "repeating a 400 gets the same 400");
         assert_eq!(server.seen.lock().unwrap().len(), 1);
     }
@@ -716,7 +677,7 @@ mod wire_tests {
         let report = deliver(&row, Some("t"), &test_alert()).await;
 
         assert!(!report.is_success());
-        assert!(report.error.as_deref().unwrap().contains("body template"), "{report:?}");
+        assert_eq!(report.error.as_deref(), Some("configuration"));
         assert!(server.seen.lock().unwrap().is_empty());
     }
 }
@@ -1072,6 +1033,15 @@ mod tests {
     }
 
     #[test]
+    fn network_diagnostics_do_not_expose_request_credentials() {
+        let error = TransportError::Network("https://u:p@example.invalid/sentinel-path?token=sentinel-query".into());
+        let report = transport_failure(Instant::now(), 1, &error);
+        assert_eq!(report.error.as_deref(), Some("network"));
+        assert_eq!(report.status, None);
+        assert_eq!(report.response_excerpt, None);
+    }
+
+    #[test]
     fn only_later_is_retried() {
         use http::StatusCode;
         let http = |code: u16| TransportError::Http {
@@ -1092,14 +1062,5 @@ mod tests {
     #[test]
     fn the_secret_name_is_derived_the_way_provider_keys_are() {
         assert_eq!(webhook_secret_name("2b0f-9c1a"), "NOTIFY_WEBHOOK_SECRET_2B0F_9C1A");
-    }
-
-    #[test]
-    fn an_excerpt_is_cut_on_a_character_boundary() {
-        assert_eq!(excerpt("  "), None);
-        assert_eq!(excerpt(" ok "), Some("ok".into()));
-        let long = "错".repeat(400);
-        let cut = excerpt(&long).unwrap();
-        assert_eq!(cut.chars().count(), EXCERPT_CHARS + 1);
     }
 }

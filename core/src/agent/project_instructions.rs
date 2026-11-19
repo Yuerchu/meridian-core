@@ -1,21 +1,28 @@
+#[cfg(not(target_os = "android"))]
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "android"))]
 use std::sync::Mutex;
+#[cfg(not(target_os = "android"))]
 use std::sync::OnceLock;
 
 use super::context::estimate_tokens;
 
 pub(crate) const MAX_FILE_SIZE: u64 = 256 * 1024;
+#[cfg(not(target_os = "android"))]
 const MAX_RULES_FILES: usize = 50;
 
+#[cfg(not(target_os = "android"))]
 struct CachedInstructions {
     content: String,
 }
 
+#[cfg(not(target_os = "android"))]
 static CACHE: OnceLock<Mutex<HashMap<PathBuf, (u64, CachedInstructions)>>> = OnceLock::new();
 
+#[cfg(not(target_os = "android"))]
 fn cache() -> &'static Mutex<HashMap<PathBuf, (u64, CachedInstructions)>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -33,9 +40,6 @@ pub fn instruction_budget(context_limit: usize) -> usize {
 pub async fn load_project_instructions(project_path: Option<&str>, max_tokens: usize) -> Option<String> {
     let root = project_path?;
     let root_path = PathBuf::from(root);
-    if !root_path.is_dir() {
-        return None;
-    }
     let max_tokens = if max_tokens == 0 { return None } else { max_tokens };
 
     let root_owned = root_path.clone();
@@ -50,113 +54,194 @@ pub async fn load_project_instructions(_project_path: Option<&str>, _max_tokens:
     None
 }
 
+#[cfg(not(target_os = "android"))]
+#[derive(Hash)]
+struct InstructionFile {
+    path: PathBuf,
+    content: String,
+}
+
+#[cfg(not(target_os = "android"))]
 fn load_sync(root: &Path, max_tokens: usize) -> Option<String> {
-    let canon_root = std::fs::canonicalize(root).ok()?;
-    let (claude_md, claude_local_md, rule_files) = discover_files(&canon_root);
-
-    let all_paths: Vec<&PathBuf> = claude_md
-        .iter()
-        .chain(claude_local_md.iter())
-        .chain(rule_files.iter())
-        .collect();
-
-    if all_paths.is_empty() {
+    if max_tokens == 0 {
         return None;
     }
-
-    let mtime_hash = compute_mtime_hash(&all_paths);
-
+    let (claude_md, claude_local_md, rule_files) = discover_files(root);
+    let mut hasher = DefaultHasher::new();
+    max_tokens.hash(&mut hasher);
+    claude_md.hash(&mut hasher);
+    claude_local_md.hash(&mut hasher);
+    rule_files.hash(&mut hasher);
+    let snapshot_hash = hasher.finish();
     {
         let guard = cache().lock().ok()?;
-        if let Some((cached_hash, cached)) = guard.get(&canon_root)
-            && *cached_hash == mtime_hash
+        if let Some((cached_hash, cached)) = guard.get(root)
+            && *cached_hash == snapshot_hash
         {
             return Some(cached.content.clone());
         }
     }
-
     let content = format_instructions(
-        &canon_root,
+        root,
         claude_md.as_ref(),
         claude_local_md.as_ref(),
         &rule_files,
         max_tokens,
     );
-
     if content.is_empty() {
         return None;
     }
-
     let result = format!(
-        "\n\n<project_instructions>\n{}\n</project_instructions>",
+        "
+
+<project_instructions>
+{}
+</project_instructions>",
         content.trim()
     );
-
     if let Ok(mut guard) = cache().lock() {
         guard.insert(
-            canon_root,
+            root.to_path_buf(),
             (
-                mtime_hash,
+                snapshot_hash,
                 CachedInstructions {
                     content: result.clone(),
                 },
             ),
         );
     }
-
     Some(result)
 }
 
-fn discover_files(root: &Path) -> (Option<PathBuf>, Option<PathBuf>, Vec<PathBuf>) {
-    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+#[cfg(not(target_os = "android"))]
+const MAX_RULE_DEPTH: usize = 16;
+#[cfg(not(target_os = "android"))]
+const MAX_RULE_ENTRIES: usize = 2048;
 
-    let claude_md = {
-        let top = root.join("CLAUDE.md");
-        if top.is_file() {
-            Some(top)
-        } else {
-            let alt = root.join(".claude").join("CLAUDE.md");
-            if alt.is_file() { Some(alt) } else { None }
+#[cfg(not(target_os = "android"))]
+fn is_link(meta: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        // Includes junctions and other reparse points, not just symlinks.
+        if meta.file_attributes() & 0x400 != 0 {
+            return true;
         }
-    };
-
-    let claude_local = {
-        let p = root.join("CLAUDE.local.md");
-        if p.is_file() { Some(p) } else { None }
-    };
-
-    let mut rules = Vec::new();
-    let rules_dir = root.join(".claude").join("rules");
-    if rules_dir.is_dir() {
-        collect_md_files(&rules_dir, &mut rules, &canon_root);
-        rules.sort();
-        rules.truncate(MAX_RULES_FILES);
     }
-
-    (claude_md, claude_local, rules)
+    meta.file_type().is_symlink()
 }
 
-fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>, root: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Ok(canon) = std::fs::canonicalize(&path)
-            && !canon.starts_with(root)
-        {
-            continue;
-        }
-        if path.is_dir() {
-            if out.len() < MAX_RULES_FILES {
-                collect_md_files(&path, out, root);
-            }
-        } else if path.extension().is_some_and(|ext| ext == "md")
-            && path.is_file()
-            && let Ok(meta) = std::fs::metadata(&path)
-            && meta.len() <= MAX_FILE_SIZE
-        {
-            out.push(path);
+#[cfg(not(target_os = "android"))]
+fn open_directory(parent: &cap_std::fs::Dir, name: &Path) -> Option<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt;
+    // Each call takes exactly one child component. No intermediate component
+    // can be a followed link; the opened handle is checked, not a later path.
+    let dir = parent.open_dir_nofollow(name).ok()?;
+    let meta = dir.dir_metadata().ok()?;
+    (!is_link(&meta)).then_some(dir)
+}
+
+#[cfg(not(target_os = "android"))]
+fn read_instruction(dir: &cap_std::fs::Dir, name: &Path, display: PathBuf) -> Option<InstructionFile> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use std::io::Read;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    // Avoid blocking on a substituted FIFO before checking its opened metadata.
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = dir.open_with(name, &options).ok()?;
+    let meta = file.metadata().ok()?;
+    if is_link(&meta) || !meta.is_file() || meta.len() > MAX_FILE_SIZE {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_SIZE + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_FILE_SIZE {
+        return None;
+    }
+    Some(InstructionFile {
+        path: display,
+        content: String::from_utf8(bytes).ok()?,
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn discover_files(root: &Path) -> (Option<InstructionFile>, Option<InstructionFile>, Vec<InstructionFile>) {
+    // The user-selected root is the sole ambient open. Every subsequent open,
+    // metadata lookup and directory iteration is relative to an owned handle.
+    let Ok(dir) = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()) else {
+        return (None, None, Vec::new());
+    };
+    let claude_dir = open_directory(&dir, Path::new(".claude"));
+    let claude_md = read_instruction(&dir, Path::new("CLAUDE.md"), root.join("CLAUDE.md")).or_else(|| {
+        read_instruction(
+            claude_dir.as_ref()?,
+            Path::new("CLAUDE.md"),
+            root.join(".claude/CLAUDE.md"),
+        )
+    });
+    let local = read_instruction(&dir, Path::new("CLAUDE.local.md"), root.join("CLAUDE.local.md"));
+    let mut rules = Vec::new();
+    if let Some(rules_dir) = claude_dir
+        .as_ref()
+        .and_then(|dir| open_directory(dir, Path::new("rules")))
+    {
+        let mut remaining = MAX_RULE_ENTRIES;
+        // Fail closed if enumeration exhausts the work budget: selecting an
+        // arbitrary OS-order prefix and sorting it afterwards is not stable.
+        if collect_md_files(&rules_dir, &root.join(".claude/rules"), 0, &mut remaining, &mut rules).is_err() {
+            rules.clear();
         }
     }
+    (claude_md, local, rules)
+}
+
+#[cfg(not(target_os = "android"))]
+fn collect_md_files(
+    dir: &cap_std::fs::Dir,
+    display: &Path,
+    depth: usize,
+    remaining: &mut usize,
+    out: &mut Vec<InstructionFile>,
+) -> Result<(), ()> {
+    if out.len() == MAX_RULES_FILES {
+        return Ok(());
+    }
+    let entries = dir.entries().map_err(|_| ())?;
+    let mut names = Vec::new();
+    for entry in entries {
+        *remaining = remaining.checked_sub(1).ok_or(())?;
+        names.push(entry.map_err(|_| ())?.file_name());
+        if *remaining == 0 {
+            return Err(());
+        }
+    }
+    names.sort();
+    for name in names {
+        if out.len() == MAX_RULES_FILES {
+            break;
+        }
+        let name = Path::new(&name);
+        let Ok(meta) = dir.symlink_metadata(name) else { continue };
+        if is_link(&meta) {
+            continue;
+        }
+        if meta.is_dir() && depth < MAX_RULE_DEPTH {
+            if let Some(child) = open_directory(dir, name) {
+                collect_md_files(&child, &display.join(name), depth + 1, remaining, out)?;
+            }
+        } else if meta.is_file()
+            && name.extension().is_some_and(|ext| ext == "md")
+            && let Some(file) = read_instruction(dir, name, display.join(name))
+        {
+            out.push(file);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn compute_mtime_hash(paths: &[&PathBuf]) -> u64 {
@@ -205,11 +290,12 @@ pub(crate) fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
     result
 }
 
+#[cfg(not(target_os = "android"))]
 fn format_instructions(
     root: &Path,
-    claude_md: Option<&PathBuf>,
-    claude_local_md: Option<&PathBuf>,
-    rule_files: &[PathBuf],
+    claude_md: Option<&InstructionFile>,
+    claude_local_md: Option<&InstructionFile>,
+    rule_files: &[InstructionFile],
     max_tokens: usize,
 ) -> String {
     let mut parts = Vec::new();
@@ -218,18 +304,16 @@ fn format_instructions(
     let claude_budget = max_tokens * 70 / 100;
     let local_budget = max_tokens * 10 / 100;
 
-    if let Some(path) = claude_md
-        && let Some(content) = read_file_utf8(path)
-    {
-        let truncated = truncate_to_tokens(&content, claude_budget);
+    if let Some(file) = claude_md {
+        let content = &file.content;
+        let truncated = truncate_to_tokens(content, claude_budget);
         tokens_used += estimate_tokens(&truncated);
         parts.push(format!("# Project Instructions (CLAUDE.md)\n\n{}", truncated));
     }
 
-    if let Some(path) = claude_local_md
-        && let Some(content) = read_file_utf8(path)
-    {
-        let truncated = truncate_to_tokens(&content, local_budget);
+    if let Some(file) = claude_local_md {
+        let content = &file.content;
+        let truncated = truncate_to_tokens(content, local_budget);
         tokens_used += estimate_tokens(&truncated);
         parts.push(format!("# Personal Overrides (CLAUDE.local.md)\n\n{}", truncated));
     }
@@ -241,9 +325,10 @@ fn format_instructions(
             let mut rule_parts = Vec::new();
             let rules_dir = root.join(".claude").join("rules");
 
-            for path in rule_files {
-                let Some(content) = read_file_utf8(path) else { continue };
-                let body = strip_frontmatter(&content);
+            for file in rule_files {
+                let path = &file.path;
+                let content = &file.content;
+                let body = strip_frontmatter(content);
                 if body.trim().is_empty() {
                     continue;
                 }
@@ -265,7 +350,11 @@ fn format_instructions(
     parts.join("\n\n")
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
+#[path = "project_instructions/resource_tests.rs"]
+mod resource_tests;
+
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
 
@@ -324,7 +413,7 @@ mod tests {
         std::fs::write(root.join(".claude").join("CLAUDE.md"), "nested").unwrap();
 
         let (claude, _, _) = discover_files(root);
-        let claude = claude.unwrap();
+        let claude = claude.unwrap().path;
         assert!(claude.ends_with("CLAUDE.md"));
         assert!(!claude.to_string_lossy().contains(".claude"));
     }
@@ -338,7 +427,7 @@ mod tests {
         std::fs::write(root.join(".claude").join("CLAUDE.md"), "nested").unwrap();
 
         let (claude, _, _) = discover_files(root);
-        let claude = claude.unwrap();
+        let claude = claude.unwrap().path;
         assert!(claude.to_string_lossy().contains(".claude"));
     }
 

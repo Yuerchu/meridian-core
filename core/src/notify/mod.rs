@@ -366,11 +366,11 @@ pub fn read_webhook_secret(secrets: &SecretsManager, id: &str) -> Option<String>
     let name = SecretName::new(&webhook_secret_name(id)).ok()?;
     match secrets.get(&secret_scope(), &name) {
         Ok(value) => value.filter(|value| !value.is_empty()),
-        Err(error) => {
+        Err(_) => {
             // Not silently "unsigned": an endpoint configured with a secret and
             // sent an unsigned request is rejected by the vendor, and the
             // reason has to be somewhere.
-            tracing::warn!(webhook_id = %id, %error, "could not read the webhook signing secret");
+            tracing::warn!(webhook_id = %id, class = "secret_read", "could not read the webhook signing secret");
             None
         }
     }
@@ -402,8 +402,8 @@ pub async fn dispatch(services: &Services, alert: &Alert) -> usize {
     // no per-row "unreadable" case left to skip.
     let endpoints = match notification_ops::list_enabled_webhooks(&services.db).await {
         Ok(endpoints) => endpoints,
-        Err(error) => {
-            tracing::warn!(%error, "could not read the notification endpoints");
+        Err(_) => {
+            tracing::warn!(class = "database", "could not read the notification endpoints");
             Vec::new()
         }
     };
@@ -420,8 +420,7 @@ pub async fn dispatch(services: &Services, alert: &Alert) -> usize {
             tracing::warn!(
                 webhook_id = %endpoint.id,
                 status = report.status.unwrap_or(0),
-                attempts = report.attempts,
-                error = report.error.as_deref().unwrap_or(""),
+                class = report.error.as_deref().unwrap_or(""),
                 "a notification endpoint refused an alert"
             );
         }
@@ -444,8 +443,8 @@ async fn record_attempt(services: &Services, id: &str, error: Option<&str>) {
         .db
         .write(async |tx| notification_ops::record_delivery_attempt(tx, id, now, error).await)
         .await;
-    if let Err(error) = written {
-        tracing::warn!(%error, "could not record a webhook delivery attempt");
+    if written.is_err() {
+        tracing::warn!(webhook_id = %id, class = "database", "could not record a webhook delivery attempt");
     }
 }
 
@@ -518,8 +517,8 @@ pub async fn clear(services: &Services, alert_key: &str) {
 pub async fn send_test(services: &Services, endpoint_id: &str) -> Result<DeliveryReport, String> {
     let endpoint = notification_ops::get_webhook(&services.db, endpoint_id)
         .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("notification endpoint `{endpoint_id}` does not exist"))?;
+        .map_err(|_| "notification endpoint lookup failed: database".to_string())?
+        .ok_or_else(|| "notification endpoint lookup failed: not_found".to_string())?;
 
     let format = endpoint.format;
     let alert = Alert {

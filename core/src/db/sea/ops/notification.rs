@@ -21,12 +21,48 @@ use crate::db::sea::cap::sealed::Access;
 use crate::db::sea::cap::{Read, WriteTx};
 use crate::db::types::{EpochMs, SqlBool};
 
+const DELIVERY_ERROR_CLASSES: &[&str] = &[
+    "http",
+    "network",
+    "timeout",
+    "limit",
+    "retry_limit",
+    "build",
+    "configuration",
+    "vendor_rejected",
+    "failed",
+];
+
+/// Data-only startup hygiene, deliberately not a numbered schema migration.
+/// Leave all health counters, timestamps, configuration, NULLs and known classes
+/// untouched. Running this again affects zero already-scrubbed rows.
+pub async fn scrub_legacy_webhook_errors(tx: &WriteTx) -> Result<u64, DbErr> {
+    Ok(notification_webhook::Entity::update_many()
+        .set(notification_webhook::ActiveModel {
+            last_error: Set(Some("failed".to_string())),
+            ..Default::default()
+        })
+        .filter(notification_webhook::Column::LastError.is_not_null())
+        .filter(notification_webhook::Column::LastError.is_not_in(DELIVERY_ERROR_CLASSES.iter().copied()))
+        .exec(tx.conn()?)
+        .await?
+        .rows_affected)
+}
+
+fn safe_health(mut row: notification_webhook::Model) -> notification_webhook::Model {
+    if let Some(error) = &mut row.last_error {
+        *error = delivery_error_class(error).to_string();
+    }
+    row
+}
+
 pub async fn list_webhooks(db: &impl Read) -> Result<Vec<notification_webhook::Model>, DbErr> {
     notification_webhook::Entity::find()
         .order_by_asc(notification_webhook::Column::CreatedAt)
         .order_by_asc(notification_webhook::Column::Id)
         .all(db.conn()?)
         .await
+        .map(|rows| rows.into_iter().map(safe_health).collect())
 }
 
 pub async fn list_enabled_webhooks(db: &impl Read) -> Result<Vec<notification_webhook::Model>, DbErr> {
@@ -36,10 +72,14 @@ pub async fn list_enabled_webhooks(db: &impl Read) -> Result<Vec<notification_we
         .order_by_asc(notification_webhook::Column::Id)
         .all(db.conn()?)
         .await
+        .map(|rows| rows.into_iter().map(safe_health).collect())
 }
 
 pub async fn get_webhook(db: &impl Read, id: &str) -> Result<Option<notification_webhook::Model>, DbErr> {
-    notification_webhook::Entity::find_by_id(id).one(db.conn()?).await
+    notification_webhook::Entity::find_by_id(id)
+        .one(db.conn()?)
+        .await
+        .map(|row| row.map(safe_health))
 }
 
 pub async fn count_webhooks(db: &impl Read) -> Result<u64, DbErr> {
@@ -60,7 +100,7 @@ pub async fn create_webhook(
     model: notification_webhook::Model,
 ) -> Result<notification_webhook::Model, DbErr> {
     let id = model.id.clone();
-    notification_webhook::Entity::insert(model.into_active_model())
+    notification_webhook::Entity::insert(safe_health(model).into_active_model())
         .exec_without_returning(tx.conn()?)
         .await?;
     webhook_or_not_found(tx, &id).await
@@ -75,7 +115,7 @@ pub async fn update_webhook(
     let existing = webhook_or_not_found(tx, id).await?;
     let mut row = changeset.into_active_model();
     row.id = Unchanged(existing.id);
-    row.update(tx.conn()?).await
+    row.update(tx.conn()?).await.map(safe_health)
 }
 
 /// The number of rows removed: zero for an id nothing had.
@@ -112,7 +152,7 @@ pub async fn record_delivery_attempt(tx: &WriteTx, id: &str, now: EpochMs, error
         Some(message) => NotificationWebhookHealthChangeset {
             last_attempt_at: Some(now),
             last_success_at: None,
-            last_error: Some(Some(truncate_error(message))),
+            last_error: Some(Some(delivery_error_class(message).to_owned())),
             consecutive_failures: Some(previous.saturating_add(1)),
             updated_at: Some(now),
         },
@@ -125,14 +165,12 @@ pub async fn record_delivery_attempt(tx: &WriteTx, id: &str, now: EpochMs, error
     Ok(())
 }
 
-/// Upstream error bodies can be long, and this column is read in a list. The
-/// cut is on a character boundary because a byte slice through UTF-8 panics.
-fn truncate_error(message: &str) -> String {
-    const LIMIT: usize = 500;
-    if message.chars().count() <= LIMIT {
-        return message.to_string();
-    }
-    message.chars().take(LIMIT).collect::<String>() + "…"
+pub fn delivery_error_class(message: &str) -> &'static str {
+    DELIVERY_ERROR_CLASSES
+        .iter()
+        .copied()
+        .find(|class| *class == message)
+        .unwrap_or("failed")
 }
 
 pub async fn get_alert_state(
@@ -218,6 +256,59 @@ pub async fn clear_alert(tx: &WriteTx, alert_key: &str) -> Result<u64, DbErr> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn startup_scrubs_legacy_webhook_errors_on_disk() {
+        use crate::db::entity::notification_webhook;
+        use crate::db::sea::cap::sealed::Access;
+        use crate::keyring::SuppliedPassphraseStore;
+        use crate::secrets::SecretsManager;
+        use sea_orm::EntityTrait;
+        use std::sync::Arc;
+
+        crate::logging::init_early();
+        let dir = tempfile::tempdir().unwrap();
+        crate::db::sea::bridge::previous_release_file_with(
+            &dir.path().join("meridian.db"),
+            crate::db::sea::legacy::LEGACY.len(),
+            "INSERT INTO notification_webhooks
+                (id, name, url, format, events, last_error, consecutive_failures, created_at, updated_at)
+             VALUES ('legacy-hook', 'kept name', 'https://example.invalid/kept-config', 'generic', '[]',
+                     'http 500: legacy-secret-body', 3, 10, 20)",
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let store = SuppliedPassphraseStore::new("a passphrase for the test only", "test").unwrap();
+            let secrets = Arc::new(SecretsManager::new_with_keyring_store(
+                dir.path().to_path_buf(),
+                Arc::new(store),
+            ));
+            let services = crate::bootstrap::bootstrap_with_secrets(
+                dir.path().to_path_buf(),
+                crate::events::EventBus::new(),
+                secrets,
+            )
+            .await
+            .unwrap();
+            // Read raw storage: a sanitized getter would hide a missing startup hook.
+            let row = services
+                .db
+                .read(async |tx| {
+                    notification_webhook::Entity::find_by_id("legacy-hook")
+                        .one(tx.conn()?)
+                        .await
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.last_error.as_deref(), Some("failed"));
+            assert_eq!(row.name, "kept name");
+            assert_eq!(row.url, "https://example.invalid/kept-config");
+            assert_eq!(row.consecutive_failures, 3);
+            assert_eq!(row.updated_at, 20);
+        }
+    }
+
     use super::*;
     use crate::db::entity::notification_webhook::{
         BodyTemplate, NotificationEventKind, NotificationEvents, NotificationFormat,
@@ -281,7 +372,7 @@ mod tests {
             Some(100),
             "'it worked at 09:00 and has failed since' is the useful sentence"
         );
-        assert_eq!(row.last_error.as_deref(), Some("boom again"));
+        assert_eq!(row.last_error.as_deref(), Some("failed"));
 
         attempt(&db, "hook-1", 400, None).await;
         let row = get_webhook(&db, "hook-1").await.unwrap().unwrap();
@@ -338,13 +429,96 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn legacy_error_scrub_is_idempotent_and_preserves_other_fields() {
+        let db = sea_test_db().await;
+        for (id, error) in [
+            ("legacy", "http 500: token-in-path/body"),
+            ("known", "vendor_rejected"),
+            ("empty", ""),
+        ] {
+            insert(
+                &db,
+                hook(id, NotificationFormat::Custom, Some(serde_json::json!({"keep": true}))),
+            )
+            .await;
+            attempt(&db, id, 42, Some("network")).await;
+            db.write(async |tx| {
+                notification_webhook::Entity::update_many()
+                    .set(notification_webhook::ActiveModel {
+                        last_error: Set(Some(error.to_string())),
+                        ..Default::default()
+                    })
+                    .filter(notification_webhook::Column::Id.eq(id))
+                    .exec(tx.conn()?)
+                    .await
+            })
+            .await
+            .unwrap();
+        }
+        insert(&db, hook("null", NotificationFormat::Generic, None)).await;
+        let before = db
+            .read(async |tx| {
+                notification_webhook::Entity::find()
+                    .order_by_asc(notification_webhook::Column::Id)
+                    .all(tx.conn()?)
+                    .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            db.write(async |tx| scrub_legacy_webhook_errors(tx).await)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.write(async |tx| scrub_legacy_webhook_errors(tx).await)
+                .await
+                .unwrap(),
+            0
+        );
+        let after = db
+            .read(async |tx| {
+                notification_webhook::Entity::find()
+                    .order_by_asc(notification_webhook::Column::Id)
+                    .all(tx.conn()?)
+                    .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.len(), after.len());
+        for (mut old, new) in before.into_iter().zip(after) {
+            if old.id == "legacy" || old.id == "empty" {
+                old.last_error = Some("failed".into());
+            }
+            assert_eq!(old, new);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_error_is_never_exposed_by_health_reads() {
+        let db = sea_test_db().await;
+        insert(&db, hook("old", NotificationFormat::Generic, None)).await;
+        execute_for_tests(&db, "UPDATE notification_webhooks SET last_error = 'legacy-sentinel'")
+            .await
+            .unwrap();
+        for row in [
+            get_webhook(&db, "old").await.unwrap().unwrap(),
+            list_webhooks(&db).await.unwrap().remove(0),
+            list_enabled_webhooks(&db).await.unwrap().remove(0),
+        ] {
+            assert_eq!(row.last_error.as_deref(), Some("failed"));
+        }
+    }
+
     #[test]
-    fn a_long_upstream_error_is_cut_on_a_character_boundary() {
-        let long = "错".repeat(600);
-        let cut = truncate_error(&long);
-        assert_eq!(cut.chars().count(), 501);
-        assert!(cut.ends_with('…'));
-        assert_eq!(truncate_error("short"), "short");
+    fn only_fixed_classes_are_persisted() {
+        assert_eq!(
+            delivery_error_class("https://user:secret@example.invalid/path-token?query=secret"),
+            "failed"
+        );
+        assert_eq!(delivery_error_class("network"), "network");
     }
 
     /// Lists come back in creation order, with the id as the tie-break, and
@@ -482,6 +656,6 @@ mod tests {
         .unwrap();
         let row = get_webhook(&db, "hook-2").await.unwrap().unwrap();
         assert_eq!(row.consecutive_failures, 1);
-        assert_eq!(row.last_error.as_deref(), Some("refused"));
+        assert_eq!(row.last_error.as_deref(), Some("failed"));
     }
 }

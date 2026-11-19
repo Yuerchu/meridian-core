@@ -1,6 +1,6 @@
 //! Model download: stream the archive to a `.part` file with progress events,
-//! then hand off to `model::unpack_and_install` for verification and the
-//! atomic swap. Cancellation and failure both clean up after themselves.
+//! then hand off to `model::import_archive` for verification and installation.
+//! Cancellation and failure both clean up after themselves.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,9 +17,7 @@ use super::{DEFAULT_MODEL_URL, models_dir};
 /// cancellation instead.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
-/// Hard cap far above the real 127MB archive; a runaway body means a broken
-/// mirror, not a bigger model.
-const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+use super::model::MAX_ARCHIVE_BYTES;
 
 static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -36,8 +34,12 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
     }
 }
 
-fn part_path(app_data_dir: &Path) -> PathBuf {
-    models_dir(app_data_dir).join("download.part")
+struct DownloadPart(PathBuf);
+
+impl Drop for DownloadPart {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Download and install the model. Emits `voice-model-download` progress and a
@@ -46,12 +48,18 @@ pub async fn run(events: EventBus, app_data_dir: PathBuf, url: Option<String>, c
     let url = url
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODEL_URL.to_string());
-    let result = tokio::select! {
-        r = fetch_and_install(&events, &app_data_dir, &url) => r,
+    let fetched = tokio::select! {
+        r = fetch(&events, &app_data_dir, &url) => r,
         _ = cancel.cancelled() => Err("cancelled".to_string()),
     };
-
-    let _ = std::fs::remove_file(part_path(&app_data_dir));
+    // Once installation starts, wait for its result; dropping a blocking task does not cancel it.
+    let result = match fetched {
+        Ok(part) => tokio::task::spawn_blocking(move || super::model::import_archive(&app_data_dir, &part.0))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r),
+        Err(e) => Err(e),
+    };
     let event = match result {
         Ok(()) => VoiceModelDownloadDoneEvent::Completed {},
         Err(error) if error == "cancelled" => VoiceModelDownloadDoneEvent::Cancelled {},
@@ -60,7 +68,7 @@ pub async fn run(events: EventBus, app_data_dir: PathBuf, url: Option<String>, c
     let _ = events.emit_voice_model_download_done(&event);
 }
 
-async fn fetch_and_install(events: &EventBus, app_data_dir: &Path, url: &str) -> Result<(), String> {
+async fn fetch(events: &EventBus, app_data_dir: &Path, url: &str) -> Result<DownloadPart, String> {
     let resp = http_client()?
         .get(url)
         .send()
@@ -71,11 +79,16 @@ async fn fetch_and_install(events: &EventBus, app_data_dir: &Path, url: &str) ->
     }
     let total = resp.content_length();
 
-    let part = part_path(app_data_dir);
-    if let Some(parent) = part.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory: {e}"))?;
+    if total.is_some_and(|n| n > MAX_ARCHIVE_BYTES) {
+        return Err("Download exceeded the size limit; check the mirror URL".into());
     }
-    let mut file = std::fs::File::create(&part).map_err(|e| format!("Cannot write file: {e}"))?;
+    let parent = models_dir(app_data_dir);
+    std::fs::create_dir_all(&parent).map_err(|e| format!("Cannot create directory: {e}"))?;
+    let path = parent.join(format!("download-{}.part", uuid::Uuid::new_v4()));
+    let file = std::fs::File::create_new(&path).map_err(|e| format!("Cannot write file: {e}"))?;
+    let part = DownloadPart(path);
+    // Move the handle after the guard so cancellation closes it before unlinking on Windows.
+    let mut file = file;
 
     let mut resp = resp;
     let mut downloaded: u64 = 0;
@@ -97,13 +110,5 @@ async fn fetch_and_install(events: &EventBus, app_data_dir: &Path, url: &str) ->
     // Final progress tick so the bar lands on 100% before the unpack pause.
     let _ = events.emit_voice_model_download(&VoiceModelDownloadEvent::Progress { downloaded, total });
 
-    let data_dir = app_data_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(part_path(&data_dir)).map_err(|e| format!("Cannot reopen download: {e}"))?;
-        let decoder = bzip2::read::BzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-        super::model::unpack_and_install(&mut archive, &data_dir)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    Ok(part)
 }

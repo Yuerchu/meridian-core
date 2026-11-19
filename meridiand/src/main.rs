@@ -107,10 +107,11 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), String> {
     let args = Args::parse();
+    // A TOML diagnostic can quote the source line, including a credential-bearing URL.
     let config = config::DaemonConfig::read(&args.config)?;
     // Before the database is opened, so `--check` on a machine with no data
     // directory still answers the question it was asked.
-    let notify_config = config.notify_config()?;
+    let notify_config = config.notify_config().map_err(|_| "invalid notification settings")?;
 
     let data_dir = resolve_data_dir(args.data_dir)?;
 
@@ -177,26 +178,16 @@ async fn send_test(services: &meridian_core::services::Services, id: &str) -> Re
         .status
         .map(|status| status.to_string())
         .unwrap_or_else(|| "no response".into());
-    if report.is_success() {
-        println!(
-            "meridiand: {id} accepted the test — HTTP {status} in {}ms, {} attempt(s)",
-            report.duration_ms, report.attempts
-        );
-        if let Some(excerpt) = report.response_excerpt {
-            println!("  it answered: {excerpt}");
+    match report.error.as_deref() {
+        None => {
+            println!("meridiand: {id} accepted — HTTP {status}");
+            Ok(())
         }
-        return Ok(());
+        Some(error) => Err(format!(
+            "{id}: {} — HTTP {status}",
+            meridian_core::db::sea::ops::notification::delivery_error_class(error)
+        )),
     }
-    // The excerpt is the useful half of a refusal — it is where a receiver says
-    // *why* — so it is printed rather than folded into the one-line error.
-    if let Some(excerpt) = &report.response_excerpt {
-        eprintln!("  it answered: {excerpt}");
-    }
-    Err(format!(
-        "{id} refused the test — HTTP {status} after {} attempt(s): {}",
-        report.attempts,
-        report.error.as_deref().unwrap_or("no reason given"),
-    ))
 }
 
 /// Which providers are actually being watched, and what each endpoint's last
@@ -212,44 +203,28 @@ async fn print_status(services: &meridian_core::services::Services) -> Result<()
     // everywhere else.
     let rows = meridian_core::db::sea::ops::notification::list_webhooks(&services.db)
         .await
-        .map_err(|error| format!("could not read the endpoints: {error}"))?;
+        .map_err(|_| "could not read the endpoints: database".to_string())?;
     if rows.is_empty() {
         println!("meridiand: no endpoints are configured");
         return Ok(());
     }
     for row in rows {
-        let events = row
-            .events
-            .iter()
-            .map(|event| event.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        println!(
-            "{}  {}  [{}]  {}",
-            if row.is_enabled.get() { "on " } else { "off" },
-            row.id,
-            events,
-            row.url,
-        );
-        match (row.last_success_at, row.last_attempt_at) {
-            (None, None) => println!("     never attempted"),
-            _ => {
-                println!(
-                    "     last attempt {}   last success {}",
-                    stamp(row.last_attempt_at),
-                    stamp(row.last_success_at),
-                );
-            }
-        }
-        if row.consecutive_failures > 0 {
-            println!(
-                "     {} consecutive failure(s): {}",
-                row.consecutive_failures,
-                row.last_error.as_deref().unwrap_or("no reason recorded"),
-            );
-        }
+        println!("{}", webhook_status_line(&row));
     }
     Ok(())
+}
+
+fn webhook_status_line(row: &meridian_core::db::entity::notification_webhook::Model) -> String {
+    let status = if !row.is_enabled.get() {
+        "disabled"
+    } else if row.consecutive_failures > 0 {
+        meridian_core::db::sea::ops::notification::delivery_error_class(row.last_error.as_deref().unwrap_or("failed"))
+    } else if row.last_success_at.is_some() {
+        "accepted"
+    } else {
+        "never attempted"
+    };
+    format!("{}  {status}", row.id)
 }
 
 /// Which providers a balance can actually be read for.
@@ -277,11 +252,10 @@ async fn print_provider_status(sea: &meridian_core::db::sea::cap::Db) -> Result<
             &provider.base_url,
         ));
         println!(
-            "{}  {}  {}  {}",
+            "{}  {}  {}",
             if provider.is_enabled.get() { "on " } else { "off" },
             provider.id,
             provider.provider_type.as_str(),
-            provider.base_url,
         );
         match vendor {
             Some(vendor) => println!("     balance read as `{}`", vendor.catalog_id()),
@@ -292,13 +266,6 @@ async fn print_provider_status(sea: &meridian_core::db::sea::cap::Db) -> Result<
         println!();
     }
     Ok(())
-}
-
-fn stamp(ms: Option<i64>) -> String {
-    match ms {
-        None => "never".into(),
-        Some(ms) => meridian_core::notify::template::format_timestamp(ms),
-    }
 }
 
 /// Where this daemon keeps its database, secrets and logs.
@@ -429,6 +396,44 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn webhook_test_lookup_never_echoes_a_url_shaped_id() {
+        meridian_core::logging::init_early();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let store = SuppliedPassphraseStore::new("a passphrase for the test only", "test").unwrap();
+        let secrets = Arc::new(SecretsManager::new_with_keyring_store(path.clone(), Arc::new(store)));
+        let services = meridian_core::bootstrap::bootstrap_with_secrets(path, EventBus::new(), secrets)
+            .await
+            .unwrap();
+        let id = "https://sentinel-user:sentinel-password@example.invalid/sentinel-path?token=sentinel-query";
+        assert_eq!(
+            send_test(&services, id).await.unwrap_err(),
+            "notification endpoint lookup failed: not_found"
+        );
+    }
+
+    #[test]
+    fn webhook_status_never_prints_config_or_legacy_errors() {
+        use meridian_core::db::entity::notification_webhook::{self, NotificationEvents, NotificationFormat};
+        let row = notification_webhook::Model {
+            id: "ops".into(),
+            name: "private-name".into(),
+            url: "https://user:password@example.invalid/path-token?secret=query-token".into(),
+            format: NotificationFormat::Generic,
+            events: NotificationEvents::from(vec![]),
+            is_enabled: true.into(),
+            body_template: None,
+            last_attempt_at: Some(1),
+            last_success_at: None,
+            last_error: Some("vendor-body-token".into()),
+            consecutive_failures: 1,
+            created_at: 0,
+            updated_at: 1,
+        };
+        assert_eq!(webhook_status_line(&row), "ops  failed");
+    }
 
     /// `--help` and `--version` are the whole interface, and both have to work
     /// before anything else does.

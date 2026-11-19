@@ -2,6 +2,7 @@
 // NOTICE: This file contains code derived from the OpenAI Codex project.
 // Changes: removed ChatGPT cookie handling, simplified telemetry to plain tracing.
 
+pub(crate) mod bounded;
 mod error;
 mod request;
 mod retry;

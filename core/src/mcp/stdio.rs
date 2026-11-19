@@ -1,3 +1,4 @@
+use crate::client::bounded;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -26,6 +27,40 @@ pub struct StdioTransport {
     stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
+pub(crate) fn launch_command(
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    cwd: Option<&str>,
+) -> Result<tokio::process::Command, String> {
+    let mut cmd = tokio::process::Command::new(command);
+    crate::child_env::clear_and_allow_platform(cmd.as_std_mut());
+    crate::child_env::apply_configured(cmd.as_std_mut(), env)?;
+    cmd.args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        // Was Stdio::null(), which discarded the only explanation a failing
+        // server ever gives.
+        .stderr(std::process::Stdio::piped())
+        // Backstop for every path that drops a transport without going
+        // through shutdown: a superseded connect, an actor that stopped on
+        // a dead transport, a panic. Not a replacement for the shutdown on
+        // exit — `std::process::exit` runs no destructors — but it covers
+        // the cases that shutdown never hears about.
+        .kill_on_drop(true);
+
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    // CREATE_NO_WINDOW: without it every stdio server flashes a console.
+    // `tokio::process::Command` carries this itself on Windows, so the
+    // std extension trait is not needed.
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    Ok(cmd)
+}
+
 impl StdioTransport {
     pub async fn spawn(
         command: &str,
@@ -33,31 +68,7 @@ impl StdioTransport {
         env: &HashMap<String, String>,
         cwd: Option<&str>,
     ) -> Result<Self, String> {
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            // Was Stdio::null(), which discarded the only explanation a failing
-            // server ever gives.
-            .stderr(std::process::Stdio::piped())
-            // Backstop for every path that drops a transport without going
-            // through shutdown: a superseded connect, an actor that stopped on
-            // a dead transport, a panic. Not a replacement for the shutdown on
-            // exit — `std::process::exit` runs no destructors — but it covers
-            // the cases that shutdown never hears about.
-            .kill_on_drop(true)
-            .envs(env);
-
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
-
-        // CREATE_NO_WINDOW: without it every stdio server flashes a console.
-        // `tokio::process::Command` carries this itself on Windows, so the
-        // std extension trait is not needed.
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(0x08000000);
-
+        let mut cmd = launch_command(command, args, env, cwd)?;
         let mut child = cmd.spawn().map_err(|e| {
             // env is deliberately absent: MCP server environments routinely hold
             // tokens.
@@ -84,8 +95,32 @@ impl StdioTransport {
             // pipe blocks the child, which would turn a noisy server into a hung
             // one.
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                // fill_buf caps each piece; discard an oversized line's remainder
+                // while continuing to drain the pipe (never block the child).
+                let mut prefix = Vec::new();
+                let mut oversized = false;
+                while let Ok(input) = reader.fill_buf().await {
+                    let eof = input.is_empty();
+                    if eof && prefix.is_empty() && !oversized {
+                        break;
+                    }
+                    let take = input.iter().position(|&b| b == b'\n').map_or(input.len(), |i| i + 1);
+                    let ended = eof || input[take - 1] == b'\n';
+                    let keep = take.min(STDERR_LINE_CHARS.saturating_sub(prefix.len()));
+                    oversized |= keep < take;
+                    prefix.extend_from_slice(&input[..keep]);
+                    reader.consume(take);
+                    if !ended {
+                        continue;
+                    }
+                    let line = if oversized {
+                        "[stderr line exceeded byte limit]".to_string()
+                    } else {
+                        String::from_utf8_lossy(&prefix).into_owned()
+                    };
+                    prefix.clear();
+                    oversized = false;
                     let line = crate::secrets::sanitizer::redact_secrets(line);
                     let line = crate::util::take_bytes_at_char_boundary(&line, STDERR_LINE_CHARS).to_string();
                     tracing::debug!(command = %command, "mcp stderr: {line}");
@@ -141,14 +176,12 @@ impl StdioTransport {
     /// longer be read in step. A JSON-RPC error *response* is a success as far
     /// as framing goes and is reported separately.
     async fn read_response(&mut self, expected_id: u64) -> Result<Result<serde_json::Value, String>, String> {
+        let mut remaining = bounded::MCP_TOTAL_BYTES;
         loop {
-            let mut line = String::new();
-            let n = self
-                .reader
-                .read_line(&mut line)
+            let line = bounded::frame(&mut self.reader, bounded::MCP_LINE_BYTES, &mut remaining)
                 .await
                 .map_err(|e| format!("read line: {e}"))?;
-            if n == 0 {
+            if line.is_empty() {
                 // The child is gone. Its stderr is the only account of why, and
                 // this is the last moment anyone will ask.
                 let exit_code = self.child.try_wait().ok().flatten().and_then(|s| s.code());
@@ -159,6 +192,7 @@ impl StdioTransport {
                 );
                 return Err("MCP server closed stdout".into());
             }
+            let line = std::str::from_utf8(&line).map_err(|_| "invalid UTF-8 in MCP response")?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;

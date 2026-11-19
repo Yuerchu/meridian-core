@@ -22,7 +22,6 @@
 //!   `stop()`.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use super::SharedState;
 use super::format;
@@ -49,20 +48,35 @@ impl AlertSink for OneBotAlertSink {
         if self.state.config.admin_users.is_empty() {
             return Err("no OneBot admin is configured; there is nobody to tell".into());
         }
-        // A broadcast with no connections behind it succeeds and reaches
-        // nobody. Reported as an error so the alert is not written down as
-        // told — QQ being briefly disconnected across one check is ordinary,
-        // and the next check has to be free to try again.
-        if self.state.connected_clients.load(Ordering::Relaxed) == 0 {
-            return Err("no OneBot client is connected".into());
-        }
+        // Notifications have no event source: ambiguity is an error, never fan-out.
+        let conn = super::selected_connection(&self.state).await?;
 
         let text = message_text(alert);
+        let mut attempted = false;
+        let mut last_error = "no alert recipient accepted delivery".to_string();
         for admin in &self.state.config.admin_users {
             let action = OneBotAction::send_private_msg(*admin, format::text_to_rich_segments(&text));
-            super::send_action_nowait(&self.state, &action).await;
+            match super::call_api_to_conn(&self.state, conn, action, std::time::Duration::from_secs(10)).await {
+                super::DirectedCallOutcome::AdapterAccepted(_) => {
+                    attempted = true;
+                }
+                // May already have been delivered. Do not invite an automatic retry.
+                super::DirectedCallOutcome::DeliveryUnknown => {
+                    attempted = true;
+                    tracing::warn!("OneBot alert delivery unknown; not retrying this batch");
+                }
+                super::DirectedCallOutcome::NotDispatched(reason) => {
+                    tracing::warn!("OneBot alert recipient was not dispatched");
+                    last_error = reason;
+                }
+                super::DirectedCallOutcome::Refused { message, .. } => {
+                    tracing::warn!("OneBot alert recipient refused delivery");
+                    last_error = message;
+                }
+            }
         }
-        Ok(())
+        // Partial/uncertain delivery must not trigger a whole-batch retry.
+        if attempted { Ok(()) } else { Err(last_error) }
     }
 }
 

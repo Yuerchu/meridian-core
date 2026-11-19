@@ -90,6 +90,9 @@ pub async fn bootstrap_with_secrets(
     let sea = db::sea::open(&db_path)
         .await
         .map_err(|error| format!("could not open the database through SeaORM: {error}"))?;
+    sea.write(async |tx| db::sea::ops::notification::scrub_legacy_webhook_errors(tx).await)
+        .await
+        .map_err(|_| "could not scrub legacy webhook status".to_string())?;
     startup_recovery(&sea, &plan_files).await;
     // The preference lives in the database, so the first few lines above
     // are recorded at the default level.

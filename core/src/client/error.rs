@@ -11,6 +11,8 @@ pub enum TransportError {
         headers: Option<HeaderMap>,
         body: Option<String>,
     },
+    #[error("resource limit exceeded: {0}")]
+    Limit(&'static str),
     #[error("retry limit reached")]
     RetryLimit,
     #[error("timeout")]
@@ -29,6 +31,7 @@ impl TransportError {
         match self {
             Self::Http { .. } => "http",
             Self::RetryLimit => "retry_limit",
+            Self::Limit(_) => "limit",
             Self::Timeout => "timeout",
             Self::Network(_) => "network",
             Self::Build(_) => "build",

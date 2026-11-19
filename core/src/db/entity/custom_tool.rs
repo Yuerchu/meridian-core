@@ -9,6 +9,7 @@ use sea_orm::entity::prelude::*;
 
 use crate::db::types::{EpochMs, Json, SqlBool, text_enum_column};
 use crate::tools::Permission;
+use crate::tools::custom::CustomToolExecution;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "custom_tools")]
@@ -22,6 +23,7 @@ pub struct Model {
     pub parameters_schema: Json<serde_json::Map<String, serde_json::Value>>,
     pub command: String,
     pub args_template: Option<String>,
+    pub execution: Option<Json<CustomToolExecution>>,
     pub working_directory: Option<String>,
     pub timeout_ms: Option<i32>,
     pub permission: Permission,
@@ -60,6 +62,7 @@ pub struct CustomToolChangeset {
     pub parameters_schema: Option<Json<serde_json::Map<String, serde_json::Value>>>,
     pub command: Option<String>,
     pub args_template: Option<Option<String>>,
+    pub execution: Option<Option<Json<CustomToolExecution>>>,
     pub working_directory: Option<Option<String>>,
     pub timeout_ms: Option<Option<i32>>,
     pub permission: Option<Permission>,

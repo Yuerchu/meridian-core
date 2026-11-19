@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 use super::format::MediaRef;
 use super::protocol::OneBotAction;
@@ -154,7 +153,10 @@ async fn capture_one(
     permit: &Arc<CapturePermit>,
 ) -> Result<(), String> {
     let data_dir = state.services.paths.data_dir.clone();
-    let mut staged = fetch_to_staging(record, &data_dir).await?;
+    let mut staged = state
+        .media_fetches
+        .run(fetch_to_staging(record, &data_dir, &state.config.private_media_origins))
+        .await?;
 
     // 一次采集可能跑几十秒，而这中间用户可能把这个会话从白名单里拿掉。permit
     // 保证撤权会等我们结束，但不保证写下去的东西还是用户想要的。这里问一次是
@@ -514,70 +516,46 @@ async fn wait_at(pauses: &CommitPauses, point: PausePoint) {
     }
 }
 
-/// 两档获取，边下边算 sha。
-///
-/// **`get_record` 不在其中**：它的 `out_format` 是必填的（必然转码，与"原样
-/// 落盘"矛盾），返回的是**运行适配器那台机器**上的路径（反向 WS 在另一台机器
-/// 时读不到），而"是否同机"没有可靠依据——`onebot.host` 是监听地址不是 peer。
-/// 做对它要引入"授权根目录"让 WS 对端指定 Meridian 去读本机文件，那是一个新的
-/// 攻击面，换一档必然转码的数据。
-async fn fetch_to_staging(record: &MediaRef, data_dir: &Path) -> Result<Staged, String> {
+/// Fetch bytes only: inline data or a bounded public HTTP(S) download.
+/// get_record returns an adapter-local path and requires transcoding, so it is
+/// not a byte API and must never become a local-file fallback here.
+async fn fetch_to_staging(
+    record: &MediaRef,
+    data_dir: &Path,
+    origins: &[super::media::PrivateMediaOrigin],
+) -> Result<Staged, String> {
+    let bytes = if let Some(payload) = record.file.as_deref().and_then(|f| f.strip_prefix("base64://")) {
+        super::media::decode_inline(payload, MAX_RECORD_BYTES)?
+    } else {
+        let url = record
+            .url
+            .as_deref()
+            .or_else(|| {
+                record
+                    .file
+                    .as_deref()
+                    .filter(|f| f.starts_with("http://") || f.starts_with("https://"))
+            })
+            .ok_or("no fetchable audio bytes in the record segment")?;
+        super::media::download_bytes(url, MAX_RECORD_BYTES, FETCH_TIMEOUT, origins).await?
+    };
     let staging = voice_corpus::staging_dir(data_dir);
     tokio::fs::create_dir_all(&staging).await.map_err(|e| e.to_string())?;
-    let path = staging.join(format!("{}.part", uuid::Uuid::new_v4()));
-
-    let url = record
-        .url
-        .as_deref()
-        .filter(|u| u.starts_with("http"))
-        .or_else(|| record.file.as_deref().filter(|f| f.starts_with("http")));
-    let inline = record
-        .file
-        .as_deref()
-        .and_then(|f| f.strip_prefix("base64://"))
-        .filter(|s| !s.is_empty());
-
-    let bytes_written = if let Some(url) = url {
-        match stream_to_file(url, &path).await {
-            Ok(written) => written,
-            // 第 1 档失败回退第 2 档，两档都不成立才放弃。
-            Err(error) => match inline {
-                Some(payload) => {
-                    tracing::debug!(%error, "voice: url fetch failed, falling back to the inline payload");
-                    write_base64(payload, &path).await?
-                }
-                None => {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    return Err(error);
-                }
-            },
-        }
-    } else if let Some(payload) = inline {
-        write_base64(payload, &path).await?
-    } else {
-        let _ = tokio::fs::remove_file(&path).await;
-        // 计数而不是静默：如果某个适配器全落在这里，这个功能对它就是不可用的，
-        // 那要早点知道，而不是等着看空空如也的语料目录。
-        tracing::warn!("voice capture skipped: the segment carries neither a url nor an inline payload");
-        return Err("no fetchable audio in the record segment".into());
+    // Install cleanup before the first write, including cancellation/error paths.
+    let staged = Staged {
+        path: staging.join(format!("{}.part", uuid::Uuid::new_v4())),
+        sha256: sha_hex(&bytes),
+        size: bytes.len() as i64,
+        format: magic_format(&bytes),
     };
-
-    let (sha256, format) = tokio::task::spawn_blocking({
-        let path = path.clone();
-        move || -> Result<(String, &'static str), String> {
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-            Ok((sha_hex(&bytes), magic_format(&bytes)))
-        }
+    tokio::task::spawn_blocking(move || {
+        // The writer owns cleanup until its write really finishes, even when
+        // the async caller is cancelled while the blocking operation runs.
+        std::fs::write(&staged.path, &bytes).map_err(|e| e.to_string())?;
+        Ok(staged)
     })
     .await
-    .map_err(|e| e.to_string())??;
-
-    Ok(Staged {
-        path,
-        sha256,
-        size: bytes_written as i64,
-        format,
-    })
+    .map_err(|e| e.to_string())?
 }
 
 fn sha_hex(bytes: &[u8]) -> String {
@@ -586,43 +564,6 @@ fn sha_hex(bytes: &[u8]) -> String {
         let _ = write!(acc, "{b:02x}");
         acc
     })
-}
-
-async fn stream_to_file(url: &str, path: &Path) -> Result<u64, String> {
-    let response = super::media::http_client()?
-        .get(url)
-        .timeout(FETCH_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}", response.status()));
-    }
-    let mut response = response;
-    let mut file = tokio::fs::File::create(path).await.map_err(|e| e.to_string())?;
-    let mut written: u64 = 0;
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        written += chunk.len() as u64;
-        if written > MAX_RECORD_BYTES {
-            let _ = tokio::fs::remove_file(path).await;
-            return Err("the audio is too large".into());
-        }
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-    }
-    file.flush().await.map_err(|e| e.to_string())?;
-    Ok(written)
-}
-
-async fn write_base64(payload: &str, path: &Path) -> Result<u64, String> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err("the audio is too large".into());
-    }
-    tokio::fs::write(path, &bytes).await.map_err(|e| e.to_string())?;
-    Ok(bytes.len() as u64)
 }
 
 /// 格式**由字节判定**，不信 URL、文件名或 Content-Type——三者都由对端控制，
@@ -657,6 +598,33 @@ mod tests {
     use crate::db::entity::voice_clip;
     use crate::db::sea::file_test_db;
     use crate::voice_corpus::CorpusCoordinator;
+
+    #[tokio::test]
+    async fn inline_capture_ignores_urls_and_cleans_its_part() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let record = MediaRef {
+            url: Some("http://127.0.0.1/unused".into()),
+            file: Some(format!(
+                "base64://{}",
+                base64::engine::general_purpose::STANDARD.encode(BYTES)
+            )),
+        };
+        let staged = fetch_to_staging(&record, dir.path(), &[]).await.unwrap();
+        assert_eq!(staged.format, "amr");
+        assert_eq!(staged.size, BYTES.len() as i64);
+        assert_eq!(std::fs::read(&staged.path).unwrap(), BYTES);
+        let path = staged.path.clone();
+        drop(staged);
+        assert!(!path.exists());
+        for file in ["file:///do-not-read", "C:/do-not-read", "../do-not-read"] {
+            let record = MediaRef {
+                url: None,
+                file: Some(file.into()),
+            };
+            assert!(fetch_to_staging(&record, dir.path(), &[]).await.is_err());
+        }
+    }
 
     /// 格式认的是字节。QQ 的 SILK 常带一个前导字节，所以第二个位置也要看。
     #[test]

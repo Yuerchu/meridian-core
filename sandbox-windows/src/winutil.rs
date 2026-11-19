@@ -24,14 +24,28 @@ pub fn to_wide<S: AsRef<OsStr>>(s: S) -> Vec<u16> {
 
 /// Quote a single Windows command-line argument following the rules used by
 /// CommandLineToArgvW/CRT so that spaces, quotes, and backslashes are preserved.
-/// Reference behavior matches Rust std::process::Command on Windows.
 #[cfg(target_os = "windows")]
 pub fn quote_windows_arg(arg: &str) -> String {
-    let needs_quotes = arg.is_empty() || arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"'));
-    if !needs_quotes {
-        return arg.to_string();
+    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\r', '"']) {
+        return arg.to_owned();
     }
+    quote_msys_arg(arg)
+}
 
+/// MSYS shells expand bare globs/braces while decoding native command lines.
+pub fn is_msys_shell(program: &str) -> bool {
+    matches!(
+        program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(program)
+            .to_ascii_lowercase()
+            .as_str(),
+        "bash" | "bash.exe" | "sh" | "sh.exe"
+    )
+}
+
+pub fn quote_msys_arg(arg: &str) -> String {
     let mut quoted = String::with_capacity(arg.len() + 2);
     quoted.push('"');
     let mut backslashes = 0;
@@ -64,8 +78,15 @@ pub fn quote_windows_arg(arg: &str) -> String {
 /// Build a Windows command line for CreateProcess-style APIs.
 #[cfg(target_os = "windows")]
 pub fn argv_to_command_line(argv: &[String]) -> String {
+    let msys = argv.first().is_some_and(|program| is_msys_shell(program));
     argv.iter()
-        .map(|arg| quote_windows_arg(arg))
+        .map(|arg| {
+            if msys {
+                quote_msys_arg(arg)
+            } else {
+                quote_windows_arg(arg)
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -202,6 +223,22 @@ fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::argv_to_command_line;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn msys_quoting_is_scoped_to_shell_programs() {
+        for program in ["bash", "sh.exe", "C:/Git/bin/BASH.EXE", r"C:\Git\bin\sh.exe"] {
+            assert!(super::is_msys_shell(program));
+            let argv = vec![program.into(), "*".into(), "{{other}}".into(), "line\nnext".into()];
+            assert!(argv_to_command_line(&argv).ends_with("\"*\" \"{{other}}\" \"line\nnext\""));
+        }
+        for program in ["cmd.exe", "pwsh.exe", "argv_probe.exe", "not-bash.exe"] {
+            assert!(!super::is_msys_shell(program));
+            assert_eq!(
+                argv_to_command_line(&[program.into(), "*".into()]),
+                format!("{program} *")
+            );
+        }
+    }
 
     #[test]
     fn argv_to_command_line_quotes_each_argument_independently() {

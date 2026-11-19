@@ -55,9 +55,9 @@ pub async fn handle_message(event: &OneBotEvent, state: &Arc<SharedState>, conn_
 
     if is_group && !format::is_at_bot(message, self_id) {
         if user_id != self_id && !parsed.stickers.is_empty() {
-            super::stickers::capture_in_background(state.clone(), self_id, parsed.stickers.clone());
+            super::stickers::capture_in_background(state.clone(), self_id, conn_id, parsed.stickers.clone());
         }
-        let session_key = SessionKey::group(event.group_id.unwrap_or(0));
+        let session_key = SessionKey::group(event.group_id.unwrap_or(0)).for_account(event.self_id);
         // Only the user who triggered a pending approval may answer it without
         // @mentioning the bot; everyone else's un-addressed messages are ignored.
         let is_initiator = state
@@ -83,9 +83,9 @@ pub async fn handle_message(event: &OneBotEvent, state: &Arc<SharedState>, conn_
     }
 
     if user_id != self_id && !parsed.stickers.is_empty() {
-        parsed.sticker_ids = super::stickers::capture_stickers(state, self_id, &parsed.stickers).await;
+        parsed.sticker_ids = super::stickers::capture_stickers(state, self_id, conn_id, &parsed.stickers).await;
     }
-    super::quote::expand_forwards(state, &mut parsed).await;
+    super::quote::expand_forwards(state, conn_id, &mut parsed).await;
     // A reply is content even when nothing was typed alongside it. On a phone QQ
     // gives no way to @ the bot *and* attach a sticker in one message, so
     // "quote the sticker, @ the bot, say nothing" is how a group member shows it
@@ -114,7 +114,8 @@ async fn handle_text_message(
         SessionKey::group(group_id.unwrap_or(0))
     } else {
         SessionKey::private(user_id)
-    };
+    }
+    .for_account(event.self_id);
 
     let is_admin = state.config.admin_users.contains(&user_id);
 
@@ -273,7 +274,7 @@ async fn handle_text_message(
     };
 
     let mut quoted = match reply_to_message_id {
-        Some(reply_id) => super::quote::fetch(state, reply_id).await,
+        Some(reply_id) => super::quote::fetch(state, conn_id, reply_id).await,
         None => None,
     };
 
@@ -286,7 +287,8 @@ async fn handle_text_message(
         && !quoted.parsed.stickers.is_empty()
     {
         let self_id = event.self_id.unwrap_or(0);
-        quoted.parsed.sticker_ids = super::stickers::capture_stickers(state, self_id, &quoted.parsed.stickers).await;
+        quoted.parsed.sticker_ids =
+            super::stickers::capture_stickers(state, self_id, conn_id, &quoted.parsed.stickers).await;
     }
 
     // The quoted message is processed first because that is where its sentinels
@@ -296,6 +298,7 @@ async fn handle_text_message(
         Some(quoted) => Some(
             super::media::process_media(
                 state,
+                conn_id,
                 Some(quoted.message_id),
                 &quoted.parsed,
                 &conversation_id,
@@ -313,6 +316,7 @@ async fn handle_text_message(
     let spent = quoted_media.as_ref().map_or(0, |m| m.spent);
     let media = super::media::process_media(
         state,
+        conn_id,
         event_message_id,
         &parsed,
         &conversation_id,
@@ -633,6 +637,10 @@ pub(super) async fn run_agent_turn(
         super::TurnStart::Started(turn) => turn,
         // Queued into the running turn; its reply arrives with that turn.
         super::TurnStart::Queued => return vec![],
+        super::TurnStart::Full => {
+            let text = pick_slot(state, ReplySlot::Busy).await;
+            return client_reply_to(session_key, initiator_user_id, &text, reply_to);
+        }
         // Held from the desktop. Saying so beats silence: the inbox is drained
         // only by this runner, so a message put there now would wait for the
         // next QQ message rather than for the desktop turn to end.
@@ -859,6 +867,10 @@ fn build_session_reply(session_key: &SessionKey, text: &str, reply_to_id: Option
 pub async fn handle_request(event: &OneBotEvent, state: &Arc<SharedState>) -> Vec<OneBotAction> {
     use super::{PendingRequest, RequestKind};
 
+    let Ok(conn_id) = super::EVENT_CONNECTION.try_with(|id| *id) else {
+        return vec![];
+    };
+    let Some(self_id) = event.self_id else { return vec![] };
     let Some(flag) = event.flag.clone() else {
         tracing::warn!("request event without flag, ignoring");
         return vec![];
@@ -889,6 +901,8 @@ pub async fn handle_request(event: &OneBotEvent, state: &Arc<SharedState>) -> Ve
         pending.insert(
             id,
             PendingRequest {
+                conn_id,
+                self_id,
                 kind,
                 flag,
                 user_id,
@@ -952,12 +966,27 @@ fn spawn_extraction(
     project_id: String,
     incoming: Vec<super::IncomingMessage>,
 ) {
-    tokio::spawn(async move {
-        let actions = run_extraction_pass(&state, &session_key, &conversation_id, &project_id, &incoming).await;
+    let Ok(conn_id) = super::EVENT_CONNECTION.try_with(|id| *id) else {
+        return;
+    };
+    let Ok(permit) = state.extraction_slots.clone().try_acquire_owned() else {
+        return;
+    };
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::spawn(super::EVENT_CONNECTION.scope(conn_id, async move {
+        let _permit = permit;
+        if *shutdown.borrow() {
+            return;
+        }
+        let actions = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            actions = run_extraction_pass(&state, &session_key, &conversation_id, &project_id, &incoming) => actions,
+        };
         for action in actions {
             super::send_action_nowait(&state, &action).await;
         }
-    });
+    }));
 }
 
 async fn run_extraction_pass(
@@ -1109,7 +1138,15 @@ async fn dispatch_decision(
             // cannot both fire the API.
             let removed = {
                 let mut map = state.pending_requests.lock().await;
-                map.remove(&id)
+                let conn = super::EVENT_CONNECTION.try_with(|id| *id).ok();
+                if map
+                    .get(&id)
+                    .is_some_and(|r| Some(r.conn_id) == conn && Some(r.self_id) == event.self_id)
+                {
+                    map.remove(&id)
+                } else {
+                    None
+                }
             };
             return match removed {
                 Some(req) => Some(handle_request_decision(event, state, decision, req).await),
@@ -1190,20 +1227,24 @@ async fn handle_request_decision(
         RequestKind::GroupInvite => format!("群邀请 #{}(群 {})", decision.target.label(), req.group_id.unwrap_or(0)),
     };
 
-    match call_api(state, action).await {
-        // The request was already removed at intercept time; nothing to do here.
-        Ok(_) => build_reply(event, &format!("已{verb}{what}"), None),
-        Err(e) => {
-            // Put it back so the admin can retry; created_at is preserved, so the
-            // 24h expiry sweep still applies.
+    match super::call_api_to_conn(state, req.conn_id, action, std::time::Duration::from_secs(10)).await {
+        super::DirectedCallOutcome::AdapterAccepted(_) => build_reply(event, &format!("已{verb}{what}"), None),
+        super::DirectedCallOutcome::DeliveryUnknown => build_reply(
+            event,
+            "结果未知，操作可能已执行。请在适配器中核实；不会自动重试。",
+            None,
+        ),
+        outcome => {
+            // Only a definitive refusal/non-dispatch can safely be offered again.
+            let error = match outcome {
+                super::DirectedCallOutcome::NotDispatched(reason) => reason,
+                super::DirectedCallOutcome::Refused { message, .. } => message,
+                _ => unreachable!(),
+            };
             if let command::DecisionTarget::Request(id) = decision.target {
                 state.pending_requests.lock().await.insert(id, req);
             }
-            build_reply(
-                event,
-                &format!("操作失败: {e}\n可稍后重试「{verb} {}」", decision.target.label()),
-                None,
-            )
+            build_reply(event, &format!("操作未执行: {error}"), None)
         }
     }
 }
