@@ -8,6 +8,7 @@ use crate::util::now_ms;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SessionKey {
+    pub account_id: Option<i64>,
     pub kind: SessionKind,
     pub id: i64,
 }
@@ -21,6 +22,7 @@ pub enum SessionKind {
 impl SessionKey {
     pub fn private(user_id: i64) -> Self {
         Self {
+            account_id: None,
             kind: SessionKind::Private,
             id: user_id,
         }
@@ -28,16 +30,28 @@ impl SessionKey {
 
     pub fn group(group_id: i64) -> Self {
         Self {
+            account_id: None,
             kind: SessionKind::Group,
             id: group_id,
         }
     }
 
-    pub fn pref_key(&self) -> String {
+    /// Account-qualified sessions never adopt ambiguous legacy shared history.
+    pub fn for_account(mut self, account_id: Option<i64>) -> Self {
+        self.account_id = account_id;
+        self
+    }
+
+    /// Room-only identifier for APIs whose account is a separate argument.
+    pub fn room_key(&self) -> String {
         match self.kind {
-            SessionKind::Private => format!("onebot.session.private:{}", self.id),
-            SessionKind::Group => format!("onebot.session.group:{}", self.id),
+            SessionKind::Private => format!("private:{}", self.id),
+            SessionKind::Group => format!("group:{}", self.id),
         }
+    }
+
+    pub fn pref_key(&self) -> String {
+        format!("onebot.session.{self}")
     }
 
     pub fn source_type(&self) -> ProjectSource {
@@ -48,12 +62,18 @@ impl SessionKey {
     }
 
     pub fn source_id(&self) -> String {
-        self.id.to_string()
+        match self.account_id {
+            Some(account) => format!("{account}@{}", self.id),
+            None => self.id.to_string(),
+        }
     }
 }
 
 impl std::fmt::Display for SessionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(account) = self.account_id {
+            write!(f, "{account}@")?;
+        }
         match self.kind {
             SessionKind::Private => write!(f, "private:{}", self.id),
             SessionKind::Group => write!(f, "group:{}", self.id),

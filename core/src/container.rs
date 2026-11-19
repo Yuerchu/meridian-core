@@ -14,20 +14,12 @@
 //! turn believes it stopped — with the next command entering a container that
 //! has a predecessor loose in it.
 //!
-//! The mechanism has to reach inside, and the obvious way to do that does not
-//! work: `pkill -f <pattern>` from a second exec kills its own shell, because
-//! its own argv contains the pattern it is searching for. Measured, it exits
-//! 143. So each exec carries an id in its *environment*, and the killer only
-//! ever *names* that id on its command line — matching on `/proc/*/environ`,
-//! which the killer does not have. A pid would be simpler and is not available:
-//! the client is never told one.
-//!
-//! **When the kill cannot be confirmed, the container goes.** Not a "poisoned"
-//! flag for later commands to consult: the whole value of a session container
-//! is that its filesystem is continuous, and a container with an unknown
-//! process still running in it does not have that property in any useful sense.
-//! Removing it costs the writable layer, which is the honest price of not
-//! knowing what is still in there, and the next command starts clean.
+//! Cancellation and timeout stop the entire verified session container by its
+//! immutable ID, then inspect that ID to confirm a stopped state. The writable
+//! layer is retained. Environment markers are not containment: descendants can
+//! erase them. Uncertain failures and dropped execution futures quarantine the
+//! session until verified maintenance recovers it. Per-session locks serialize
+//! execution, reuse, and close.
 //!
 //! # What it does not promise
 //!
@@ -43,11 +35,14 @@
 //!
 //! # Ownership
 //!
-//! Every container carries [`OWNER_LABEL`], so everything this app started can
-//! be found without remembering names — which is what reclaim after a crash
-//! needs, and measured, a label is enough. Names are derived from the
-//! conversation so a restart finds its own containers rather than making
-//! second ones beside them.
+//! Names and labels select candidates, not authorization. Structured inspection
+//! checks owner/version, exact session, configured image tag and digest, and
+//! the sole writable workspace bind before reuse or mutation. Mismatches and
+//! legacy containers lacking workspace labels are left untouched. The image
+//! must be available locally. Cleanup never deletes an unknown target.
+//!
+//! Reconciliation stops verified live sessions and removes verified orphans;
+//! shutdown stops without removing. Both serialize against active executions.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -58,13 +53,112 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::{ExecError, ExecResult, SandboxBackend};
+use crate::sandbox::{ExecError, ExecResult, OutputTee, SandboxBackend};
 
 /// On every container this app creates. The value is the schema version of
 /// what the label means, so a future layout can tell its own containers from
 /// this one's rather than adopting them.
 pub const OWNER_LABEL: &str = "cn.yuxiaoqiu.meridian.owner";
 pub const OWNER_LABEL_VALUE: &str = "1";
+
+const SESSION_LABEL: &str = "cn.yuxiaoqiu.meridian.conversation";
+const SOURCE_LABEL: &str = "cn.yuxiaoqiu.meridian.workspace";
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Inspect {
+    id: String,
+    name: String,
+    image: String,
+    config: Config,
+    mounts: Vec<Mount>,
+    state: State,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Config {
+    image: String,
+    labels: HashMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Mount {
+    #[serde(rename = "Type")]
+    kind: String,
+    source: String,
+    destination: String,
+    #[serde(rename = "RW")]
+    writable: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct State {
+    status: String,
+    running: bool,
+    #[serde(default)]
+    restarting: bool,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    dead: bool,
+}
+
+fn refused() -> ExecError {
+    ExecError::Internal("session container identity or lifecycle does not match policy".into())
+}
+
+fn full_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+impl Inspect {
+    fn verify(
+        &self,
+        conversation: &str,
+        workspace: Option<&str>,
+        image: &str,
+        image_id: &str,
+    ) -> Result<(), ExecError> {
+        let [mount] = self.mounts.as_slice() else {
+            return Err(refused());
+        };
+        if !full_id(&self.id)
+            || !image_id.strip_prefix("sha256:").is_some_and(full_id)
+            || self.image != image_id
+            || self.config.image != image
+            || self.name != format!("/{}", container_name(conversation))
+            || conversation.is_empty()
+            || self.config.labels.get(OWNER_LABEL).map(String::as_str) != Some(OWNER_LABEL_VALUE)
+            || self.config.labels.get(SESSION_LABEL).map(String::as_str) != Some(conversation)
+            || self
+                .config
+                .labels
+                .get(SOURCE_LABEL)
+                .is_none_or(|s| normalized_source(s) != normalized_source(&mount.source))
+            || !absolute_source(&mount.source)
+            || workspace.is_some_and(|w| normalized_source(w) != normalized_source(&mount.source))
+            || mount.kind != "bind"
+            || !mount.writable
+            || mount.destination != WORKSPACE_MOUNT
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
+    fn stopped(&self) -> bool {
+        !self.state.running
+            && !self.state.restarting
+            && !self.state.paused
+            && !self.state.dead
+            && matches!(self.state.status.as_str(), "exited" | "created")
+    }
+}
+
+#[cfg(test)]
+mod identity_tests;
 
 /// Where a conversation's project is mounted inside its container.
 ///
@@ -140,26 +234,26 @@ impl Default for ContainerConfig {
 #[derive(Debug)]
 pub struct DockerConnector {
     config: ContainerConfig,
-    /// Serialises creation. Held only across the create-or-reuse round trip,
-    /// never across a command: two commands in one conversation would otherwise
-    /// both find no container and both try to make one, and the loser's error
-    /// is indistinguishable from the daemon being down.
-    ///
-    /// One lock for every conversation rather than one each, because creation
-    /// is rare, takes about a second, and is not on the path a running command
-    /// takes.
-    creating: tokio::sync::Mutex<HashMap<String, String>>,
+    shutting_down: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    driver: Option<Arc<lifecycle::tests::FakeDocker>>,
 }
 
 impl DockerConnector {
     pub fn new(config: ContainerConfig) -> Arc<Self> {
         Arc::new(Self {
             config,
-            creating: tokio::sync::Mutex::new(HashMap::new()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            driver: None,
         })
     }
 
     async fn docker(&self, args: &[&str]) -> Result<Output, ExecError> {
+        #[cfg(test)]
+        if let Some(driver) = &self.driver {
+            return driver.control(args);
+        }
         let run = Command::new(&self.config.binary)
             .args(args)
             .stdin(Stdio::null())
@@ -187,249 +281,54 @@ impl DockerConnector {
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         })
     }
-
-    /// The container for this conversation, creating it if there is not one.
-    async fn ensure(&self, conversation_id: &str, workspace: &Path) -> Result<String, ExecError> {
-        let name = container_name(conversation_id);
-        let mut known = self.creating.lock().await;
-
-        // Asked of the daemon rather than trusted from the map: a container can
-        // be removed by anything with a Docker client, and a cached name that
-        // no longer exists produces "no such container" on the *command*, which
-        // reads to the user as their command failing.
-        let running = self.docker(&["inspect", "-f", "{{.State.Running}}", &name]).await?;
-        if running.status == 0 && running.stdout == "true" {
-            known.insert(conversation_id.to_string(), name.clone());
-            return Ok(name);
-        }
-        if running.status == 0 {
-            // It exists and is stopped — the app was restarted, or somebody
-            // stopped it. Starting is what keeps the writable layer.
-            let started = self.docker(&["start", &name]).await?;
-            if started.status == 0 {
-                known.insert(conversation_id.to_string(), name.clone());
-                return Ok(name);
-            }
-            // It would not start. Remove it rather than leaving a name that
-            // blocks every later attempt.
-            let _ = self.docker(&["rm", "-f", &name]).await;
-        }
-
-        let mount = mount_argument(workspace)?;
-        let label = format!("{OWNER_LABEL}={OWNER_LABEL_VALUE}");
-        let created = self
-            .docker(&[
-                "run",
-                "-d",
-                "--name",
-                &name,
-                "--label",
-                &label,
-                "-v",
-                &mount,
-                "-w",
-                WORKSPACE_MOUNT,
-                // The container has to outlive each exec, which is the whole
-                // difference between `docker run` and `docker exec`.
-                &self.config.image,
-                "sleep",
-                "infinity",
-            ])
-            .await?;
-
-        if created.status != 0 {
-            return Err(ExecError::Spawn(format!(
-                "could not create a container for this conversation: {}",
-                created.stderr
-            )));
-        }
-        known.insert(conversation_id.to_string(), name.clone());
-        Ok(name)
-    }
-
-    /// Stop trying to kill and take the whole container instead.
-    ///
-    /// See the module note: a container with an unknown process still running
-    /// in it has lost the one property a session container is for.
-    async fn discard(&self, name: &str, conversation_id: &str) {
-        let _ = self.docker(&["rm", "-f", name]).await;
-        self.creating.lock().await.remove(conversation_id);
-    }
-
-    /// Signal an exec by the id it carries, and say whether it is gone.
-    async fn kill_exec(&self, name: &str, exec_id: &str) -> bool {
-        let script = killer_script(exec_id);
-        let killed = self.docker(&["exec", name, "sh", "-c", &script]).await;
-        matches!(killed, Ok(out) if out.status == 0 && out.stdout == "gone")
-    }
-
-    /// The names of every container this app owns, whether or not running.
-    ///
-    /// Names rather than ids, because a name is derived from a conversation
-    /// (`container_name`) and can therefore be compared against the rows that
-    /// still exist — which is what telling an orphan from a survivor takes.
-    async fn owned(&self) -> Vec<String> {
-        let label = format!("label={OWNER_LABEL}={OWNER_LABEL_VALUE}");
-        match self
-            .docker(&["ps", "-a", "--filter", &label, "--format", "{{.Names}}"])
-            .await
-        {
-            Ok(out) if out.status == 0 => out
-                .stdout
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Settle what an earlier run left behind, against the conversations that
-    /// still exist.
-    ///
-    /// For startup. A container whose conversation is gone is removed — nothing
-    /// can ever enter it again, and by-label discovery is what finds it without
-    /// a record this app would have had to survive a crash to keep. A container
-    /// whose conversation *does* still exist is stopped, not removed: its
-    /// writable layer is the conversation's continuity across a restart, and
-    /// `ensure` starts it again on the next command. **Removing everything**,
-    /// which this used to do, contradicted that reuse branch — the two were
-    /// written against each other and whichever ran first won.
-    pub async fn reconcile(&self, live_conversation_ids: &[String]) -> (usize, usize) {
-        let live: std::collections::HashSet<String> =
-            live_conversation_ids.iter().map(|id| container_name(id)).collect();
-        let (mut removed, mut stopped) = (0, 0);
-        for name in self.owned().await {
-            if live.contains(&name) {
-                // Cheap on an already-stopped container, and `-t 1` because the
-                // only thing inside between commands is `sleep`.
-                if self
-                    .docker(&["stop", "-t", "1", &name])
-                    .await
-                    .is_ok_and(|o| o.status == 0)
-                {
-                    stopped += 1;
-                }
-            } else if self.docker(&["rm", "-f", &name]).await.is_ok_and(|o| o.status == 0) {
-                removed += 1;
-            }
-        }
-        if removed > 0 || stopped > 0 {
-            tracing::info!(removed, stopped, "settled containers left behind by an earlier run");
-        }
-        (removed, stopped)
-    }
-
-    /// Stop every owned container that is still running.
-    ///
-    /// For shutdown: `sleep infinity` keeps a conversation's container running
-    /// for as long as the daemon does, and an app that has exited is not coming
-    /// back for it until the next launch. Stopped, not removed — the writable
-    /// layer is what a restart resumes. `reconcile` covers the exits this never
-    /// sees, which is every crash.
-    pub async fn stop_owned(&self) -> usize {
-        let mut stopped = 0;
-        for name in self.owned().await {
-            if self
-                .docker(&["stop", "-t", "1", &name])
-                .await
-                .is_ok_and(|o| o.status == 0)
-            {
-                stopped += 1;
-            }
-        }
-        stopped
-    }
-
-    /// End one conversation's container.
-    pub async fn close(&self, conversation_id: &str) {
-        let name = container_name(conversation_id);
-        // `stop` before `rm`: measured, it returns with the container already
-        // stopped, which is the same invariant `acp::peer` holds for the
-        // adapter — so what follows cannot race a container still shutting down.
-        let _ = self.docker(&["stop", "-t", "5", &name]).await;
-        let _ = self.docker(&["rm", "-f", &name]).await;
-        self.creating.lock().await.remove(conversation_id);
-    }
 }
 
+mod lifecycle;
+
+#[derive(Debug)]
 struct Output {
     status: i32,
     stdout: String,
     stderr: String,
 }
 
-#[async_trait::async_trait]
-impl CommandConnector for DockerConnector {
-    fn backend(&self) -> SandboxBackend {
-        SandboxBackend::Container
-    }
-
-    async fn execute(
-        &self,
-        argv: &[String],
-        cwd: &Path,
-        workspace: &Path,
-        conversation_id: &str,
-        timeout: Duration,
-        cancel: &CancellationToken,
-    ) -> Result<ExecResult, ExecError> {
-        if argv.is_empty() {
-            return Err(ExecError::Spawn("empty command".into()));
-        }
-        // The workspace decides the mount; the cwd is merely resolved against
-        // it, and `container_path` refusing a cwd outside it is the boundary.
-        let name = self.ensure(conversation_id, workspace).await?;
-        let inside = container_path(cwd, workspace)?;
-        let exec_id = uuid::Uuid::new_v4().simple().to_string();
-
-        let mut args: Vec<String> = vec![
-            "exec".into(),
-            "-w".into(),
-            inside,
-            "-e".into(),
-            // The marker the killer looks for. On the *target*, never on the
-            // killer, which is what stops it matching itself.
-            format!("MERIDIAN_EXEC_ID={exec_id}"),
-            name.clone(),
-        ];
-        args.extend_from_slice(argv);
-
-        // The client is an ordinary child process, so the host path's bounded
-        // capture, timeout and cancellation all apply to *it*. What they do not
-        // do is reach the command inside, which is what the rest of this is for.
-        let outcome = crate::sandbox::run_client(&self.config.binary, &args, timeout, cancel).await;
-
-        match outcome {
-            Ok(mut res) => {
-                if res.timed_out {
-                    self.stop_inside(&name, &exec_id, conversation_id).await;
-                }
-                res.ran_under = SandboxBackend::Container;
-                Ok(res)
-            }
-            Err(ExecError::Cancelled) => {
-                self.stop_inside(&name, &exec_id, conversation_id).await;
-                Err(ExecError::Cancelled)
-            }
-            Err(e) => Err(e),
-        }
-    }
+fn absolute_source(source: &str) -> bool {
+    source.starts_with('/')
+        || (cfg!(windows)
+            && source.as_bytes().get(1) == Some(&b':')
+            && source.as_bytes().get(2).is_some_and(|b| matches!(b, b'/' | b'\\')))
 }
 
-impl DockerConnector {
-    /// Make sure the command really stopped, and take the container if it did
-    /// not.
-    async fn stop_inside(&self, name: &str, exec_id: &str, conversation_id: &str) {
-        if self.kill_exec(name, exec_id).await {
-            return;
+fn normalized_source(source: &str) -> String {
+    #[cfg(windows)]
+    {
+        let normalized = source.replace('\\', "/");
+        let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
+        for prefix in ["/run/desktop/mnt/host/", "/host_mnt/"] {
+            if let Some(rest) = normalized.strip_prefix(prefix)
+                && rest.as_bytes().get(1) == Some(&b'/')
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+            {
+                return format!("{}:{}", rest[..1].to_ascii_lowercase(), &rest[1..]);
+            }
         }
-        tracing::warn!(
-            conversation_id,
-            "could not confirm a cancelled command had stopped; discarding the container"
-        );
-        self.discard(name, conversation_id).await;
+        if normalized.as_bytes().get(1) == Some(&b':') {
+            return format!("{}{}", normalized[..1].to_ascii_lowercase(), &normalized[1..]);
+        }
+        normalized.into()
     }
+    #[cfg(not(windows))]
+    source.into()
+}
+
+fn mount_source(workspace: &Path) -> Result<String, ExecError> {
+    let source = workspace
+        .to_str()
+        .ok_or_else(|| ExecError::Spawn("project path is not valid UTF-8".into()))?;
+    if !absolute_source(source) {
+        return Err(ExecError::Spawn("container workspace must be absolute".into()));
+    }
+    Ok(source.into())
 }
 
 /// The container name for a conversation.
@@ -498,33 +397,6 @@ fn container_path(path: &Path, workspace: &Path) -> Result<String, ExecError> {
     Ok(out)
 }
 
-/// Signal whatever carries `exec_id`, then say whether anything still does.
-///
-/// Matches on the environment rather than the command line, because the
-/// killer's own command line contains `exec_id` — measured, `pkill -f` on a
-/// pattern the killer itself carries exits 143, having killed its own shell.
-/// Its environment does not carry it, so `/proc/*/environ` cannot match it.
-fn killer_script(exec_id: &str) -> String {
-    format!(
-        "found=0; \
-         for p in /proc/[0-9]*; do \
-           tr '\\0' '\\n' < $p/environ 2>/dev/null | grep -qx 'MERIDIAN_EXEC_ID={exec_id}' || continue; \
-           found=1; kill -TERM ${{p#/proc/}} 2>/dev/null; \
-         done; \
-         [ $found -eq 0 ] && echo gone && exit 0; \
-         sleep 1; \
-         for p in /proc/[0-9]*; do \
-           tr '\\0' '\\n' < $p/environ 2>/dev/null | grep -qx 'MERIDIAN_EXEC_ID={exec_id}' || continue; \
-           kill -KILL ${{p#/proc/}} 2>/dev/null; \
-         done; \
-         sleep 0.3; \
-         for p in /proc/[0-9]*; do \
-           tr '\\0' '\\n' < $p/environ 2>/dev/null | grep -qx 'MERIDIAN_EXEC_ID={exec_id}' && exit 1; \
-         done; \
-         echo gone"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,21 +443,6 @@ mod tests {
             err.to_string().contains("outside this conversation's workspace"),
             "{err}"
         );
-    }
-
-    /// The killer names the id on its command line and matches on the
-    /// environment. If it ever matched on `cmdline` it would find itself —
-    /// measured, that is an exit 143 and a race over whether the target died.
-    #[test]
-    fn the_killer_matches_the_environment_and_not_the_command_line() {
-        let script = killer_script("abc123");
-        assert!(script.contains("/environ"), "{script}");
-        assert!(!script.contains("cmdline"), "{script}");
-        assert!(!script.contains("pkill"), "{script}");
-        // TERM first, KILL only if it is still there.
-        assert!(script.find("kill -TERM") < script.find("kill -KILL"), "{script}");
-        // And it reports rather than assuming: "gone" is the only success.
-        assert!(script.contains("echo gone"), "{script}");
     }
 
     #[test]

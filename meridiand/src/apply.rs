@@ -45,7 +45,7 @@ pub struct ApplyReport {
 }
 
 /// Read a secret out of the environment, by the name the file gave.
-fn from_env(kind: &str, owner: &str, var: &str) -> Result<String, String> {
+fn from_env(var: &str) -> Result<String, &'static str> {
     match std::env::var(var) {
         Ok(value) if !value.trim().is_empty() => Ok(value),
         // Both the unset and the empty case, deliberately together: an empty
@@ -53,9 +53,7 @@ fn from_env(kind: &str, owner: &str, var: &str) -> Result<String, String> {
         // and treating it as "no secret" would send unsigned requests to a
         // robot that requires a signature and report them as a delivery
         // problem.
-        _ => Err(format!(
-            "{kind} `{owner}` needs ${var}, which is unset or empty in this process"
-        )),
+        _ => Err("credential environment variable is unset or empty"),
     }
 }
 
@@ -63,7 +61,7 @@ fn from_env(kind: &str, owner: &str, var: &str) -> Result<String, String> {
 ///
 /// The check and the claim are one IMMEDIATE write: two daemons starting on
 /// one empty directory cannot both find it empty and both take it.
-async fn claim_data_dir(sea: &Db) -> Result<(), String> {
+async fn claim_data_dir(sea: &Db) -> Result<(), &'static str> {
     sea.write(async |tx| {
         let claimed = preference_ops::get_preference(tx, OWNERSHIP_KEY).await?;
         if claimed.is_some() {
@@ -75,20 +73,18 @@ async fn claim_data_dir(sea: &Db) -> Result<(), String> {
         // install that has ever been configured has at least one.
         let providers = provider_ops::list_providers(tx).await?.len();
         if providers > 0 {
-            return Ok(Err(format!(
-                "this data directory already holds {providers} provider(s) and is not marked as the daemon's. \
-                 Applying a configuration here would switch off everything the file does not name. \
-                 Point --data-dir somewhere of its own, or set `{OWNERSHIP_KEY}` if this really is the daemon's directory."
-            )));
+            return Ok(Err(
+                "data directory is not marked as the daemon's; choose a separate --data-dir",
+            ));
         }
         preference_ops::set_preference(tx, OWNERSHIP_KEY, "true", now_ms()).await?;
         Ok::<_, DbErr>(Ok(()))
     })
     .await
-    .map_err(|error| format!("could not claim the data directory: {error}"))?
+    .map_err(|_| "could not claim data directory: database failure")?
 }
 
-pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) -> Result<ApplyReport, String> {
+pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) -> Result<ApplyReport, &'static str> {
     claim_data_dir(sea).await?;
 
     // Every secret is read before anything is written. A file naming a variable
@@ -97,13 +93,13 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
     // key, which reports as an upstream failure and reads as an outage.
     let mut provider_keys = Vec::with_capacity(config.provider.len());
     for provider in &config.provider {
-        provider_keys.push(from_env("provider", &provider.id, &provider.api_key_env)?);
+        provider_keys.push(from_env(&provider.api_key_env)?);
     }
     let mut webhook_secrets = Vec::with_capacity(config.webhook.len());
     for webhook in &config.webhook {
         webhook_secrets.push(match &webhook.secret_env {
             None => None,
-            Some(var) => Some(from_env("webhook", &webhook.id, var)?),
+            Some(var) => Some(from_env(var)?),
         });
     }
 
@@ -134,12 +130,13 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
         // rule, so re-deriving reaches the same answer and the pass stays
         // idempotent. It also makes the code agree with what `ProviderEntry`
         // and the README have both said all along — omitted means derived.
+        let provider_type = ProviderType::parse(&provider.provider_type).map_err(|_| "invalid provider type")?;
         let catalog_id = provider.vendor.clone().or_else(|| {
-            meridian_core::provider::catalog::identify(&provider.provider_type, &provider.base_url).map(str::to_string)
+            meridian_core::provider::catalog::identify(provider_type.as_str(), &provider.base_url).map(str::to_string)
         });
         let identity = meridian_core::provider::balance::ProviderIdentity::new(
             catalog_id.as_deref(),
-            &provider.provider_type,
+            provider_type.as_str(),
             &provider.base_url,
         );
         if !meridian_core::provider::balance::supports_balance(identity) {
@@ -150,13 +147,11 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
             // relay address identifies nobody and must not be probed.
             tracing::warn!(
                 provider = %provider.id,
-                provider_type = %provider.provider_type,
+                provider_type = provider_type.as_str(),
                 vendor = catalog_id.as_deref().unwrap_or("<unidentified>"),
                 "no balance can be read for this provider; the daemon can watch it for nothing"
             );
         }
-        let provider_type = ProviderType::parse(&provider.provider_type)
-            .map_err(|error| format!("provider `{}`: {error}", provider.id))?;
         let enabled = SqlBool::from(provider.enabled);
         // The existence check and the write are one transaction, so a second
         // apply racing this one cannot both see "absent" and both insert.
@@ -209,13 +204,13 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
             .map(|_| ()),
         })
         .await
-        .map_err(|error| format!("could not write provider `{}`: {error}", provider.id))?;
+        .map_err(|_| "configuration database write failed")?;
 
         let name = SecretName::new(&meridian_core::agent::provider_secret_name(&provider.id))
-            .map_err(|error| format!("provider `{}`: {error}", provider.id))?;
+            .map_err(|_| "invalid credential name")?;
         secrets
             .set(&SecretScope::Global, &name, api_key)
-            .map_err(|error| format!("could not store the key for provider `{}`: {error}", provider.id))?;
+            .map_err(|_| "credential storage failed")?;
         report.providers_written += 1;
     }
 
@@ -244,7 +239,7 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
             Ok::<_, DbErr>(disabled)
         })
         .await
-        .map_err(|error| format!("could not disable providers: {error}"))?;
+        .map_err(|_| "configuration database write failed")?;
     for id in &disabled {
         tracing::info!(provider = %id, "disabled: the configuration no longer names it");
     }
@@ -252,7 +247,10 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
 
     for (webhook, secret) in config.webhook.iter().zip(&webhook_secrets) {
         // Already validated at config parse; typed here, encoded by the row.
-        let template = webhook.body_template()?.map(BodyTemplate::from);
+        let template = webhook
+            .body_template()
+            .map_err(|_| "invalid webhook template")?
+            .map(BodyTemplate::from);
         let events = NotificationEvents::from(webhook.events.clone());
         let enabled = SqlBool::from(webhook.enabled);
         // The existence check and the write are one transaction, so a second
@@ -295,8 +293,9 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
             .map(|_| ()),
         })
         .await
-        .map_err(|error| format!("could not write webhook `{}`: {error}", webhook.id))?;
-        meridian_core::notify::write_webhook_secret(secrets, &webhook.id, secret.as_deref())?;
+        .map_err(|_| "configuration database write failed")?;
+        meridian_core::notify::write_webhook_secret(secrets, &webhook.id, secret.as_deref())
+            .map_err(|_| "credential storage failed")?;
         report.webhooks_written += 1;
     }
 
@@ -306,7 +305,7 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
     // update is idempotent, so the gap changes nothing a later apply would undo.
     for row in notification_ops::list_webhooks(sea)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|_| "configuration database read failed")?
     {
         if named.contains(&row.id.as_str()) || !row.is_enabled.get() {
             continue;
@@ -325,12 +324,17 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
             .await
         })
         .await
-        .map_err(|error| format!("could not disable webhook `{}`: {error}", row.id))?;
+        .map_err(|_| "configuration database write failed")?;
         tracing::info!(webhook = %row.id, "disabled: the configuration no longer names it");
         report.webhooks_disabled += 1;
     }
 
-    meridian_core::notify::save_config(sea, &config.notify_config()?).await?;
+    meridian_core::notify::save_config(
+        sea,
+        &config.notify_config().map_err(|_| "invalid notification settings")?,
+    )
+    .await
+    .map_err(|_| "notification settings write failed")?;
     Ok(report)
 }
 
@@ -519,7 +523,7 @@ mod tests {
         .unwrap();
 
         let error = apply(&sea, &secrets, &config).await.unwrap_err();
-        assert!(error.contains("TEST_ABSENT_KEY"), "{error}");
+        assert_eq!(error, "credential environment variable is unset or empty");
         assert_eq!(
             provider_count(&sea).await,
             0,
@@ -531,7 +535,7 @@ mod tests {
     #[test]
     fn an_empty_environment_variable_is_not_an_absent_secret() {
         unsafe { std::env::set_var("TEST_EMPTY_KEY", "   ") };
-        assert!(from_env("provider", "ds", "TEST_EMPTY_KEY").is_err());
+        assert!(from_env("TEST_EMPTY_KEY").is_err());
     }
 
     /// Pointing the daemon at a desktop install would switch off everything the
@@ -565,7 +569,10 @@ mod tests {
         .await
         .unwrap();
         let error = claim_data_dir(&sea).await.unwrap_err();
-        assert!(error.contains("not marked as the daemon's"), "{error}");
+        assert_eq!(
+            error,
+            "data directory is not marked as the daemon's; choose a separate --data-dir"
+        );
 
         // An empty one is claimed, and stays claimed once it has rows.
         let fresh = sea_test_db().await;

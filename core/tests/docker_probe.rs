@@ -39,13 +39,14 @@
 //!    still writing to the workspace, and the next command entering a container
 //!    that has one of its predecessors loose in it.
 //!
-//! 2. **Cancelling has to find its own exec, and the obvious way does not
-//!    work.** `pkill -f 'sleep 300'` from a second exec exits 143: its own argv
-//!    contains the pattern it is searching for, so it kills its own shell, and
-//!    whether the target died first is a race. What does work is a marker the
-//!    target carries and the killer only *names*: `docker exec -e
-//!    MERIDIAN_EXEC_ID=…`, found by reading `/proc/*/environ`. A pid is not
-//!    available — the client is never told one.
+//! 2. **The historical marker experiment is not a cancellation guarantee.**
+//!    `pkill -f 'sleep 300'` from a second exec exits 143: its own argv contains
+//!    the pattern, so it kills its own shell. A marker in `/proc/*/environ`
+//!    found the cooperative target in this probe, but descendants can clear
+//!    their environment; finding no marker does not prove they stopped. The
+//!    required cancellation boundary is to stop the entire session container
+//!    and inspect its stopped state, preserving its writable layer. This probe
+//!    remains a record of the narrower observation, not proof of containment.
 //!
 //! 3. **The writable layer carries between execs; the working directory does
 //!    not.** A file written by one exec is there for the next; `cd /tmp` in one

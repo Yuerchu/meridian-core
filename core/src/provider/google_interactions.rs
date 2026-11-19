@@ -227,18 +227,24 @@ impl GoogleInteractionsProvider {
             ])
             .send()
             .await
-            .map_err(|error| ProviderError::Upstream(format!("Vertex OAuth token request failed: {error}")))?;
+            .map_err(|error| {
+                ProviderError::Upstream(format!(
+                    "Vertex OAuth token request failed: {}",
+                    crate::client::ReqwestTransport::map_error(error).kind()
+                ))
+            })?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| ProviderError::Upstream(format!("Vertex OAuth token response failed: {error}")))?;
         if !status.is_success() {
+            let body = crate::client::bounded::error_body(response, crate::client::bounded::ERROR_BYTES)
+                .await
+                .unwrap_or_default();
             return Err(ProviderError::Api {
                 status: status.as_u16(),
                 body,
             });
         }
+        let bytes = crate::client::bounded::body(response, crate::client::bounded::ERROR_BYTES).await?;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
         let token: OAuthTokenResponse = serde_json::from_str(&body)
             .map_err(|error| ProviderError::Parse(format!("invalid Vertex OAuth token response: {error}")))?;
         if token.access_token.trim().is_empty() {

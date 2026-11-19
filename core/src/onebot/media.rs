@@ -1,29 +1,34 @@
 //! Media handling for OneBot messages: voice transcription, image download
 //! for vision models, and OCR fallback for non-vision models.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
+
+mod download;
+mod lifecycle;
+pub(super) use lifecycle::MediaGeneration;
+
+/// Local administrator-owned exception: one exact HTTP(S) origin and one
+/// fixed destination. Never constructed from adapter messages or tool input.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateMediaOrigin {
+    pub origin: String,
+    pub ip: std::net::IpAddr,
+}
+
+pub fn validate_private_media_origins(origins: &[PrivateMediaOrigin]) -> Result<(), String> {
+    download::validate_origins(origins)
+}
 
 use super::format::{FORWARD_SENTINEL, IMAGE_SENTINEL, ParsedMessage, RECORD_SENTINEL};
 use super::protocol::OneBotAction;
-use super::{SharedState, call_api_with_timeout};
+use super::{DirectedCallOutcome, SharedState};
 
 pub const MAX_IMAGES: usize = 5;
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_API_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Where an image can be fetched from, if anywhere.
-///
-/// One definition, used both to count the budget and to spend it — two copies
-/// of this rule that drifted would make the count describe a different set of
-/// images than the one being fetched.
-fn image_url(media: &crate::onebot::format::MediaRef) -> Option<&str> {
-    media
-        .url
-        .as_deref()
-        .or_else(|| media.file.as_deref().filter(|f| f.starts_with("http")))
-}
 
 pub struct MediaOutcome {
     /// Message text with voice/OCR results merged in.
@@ -55,6 +60,7 @@ pub struct MediaOutcome {
 /// quoting a nine-image album cannot push the turn to eighteen downloads.
 pub async fn process_media(
     state: &Arc<SharedState>,
+    conn_id: u64,
     record_message_id: Option<i64>,
     parsed: &ParsedMessage,
     conversation_id: &str,
@@ -69,7 +75,7 @@ pub async fn process_media(
         if !parsed.records.is_empty()
             && let Some(mid) = record_message_id
         {
-            return transcribe_record(state, mid).await;
+            return transcribe_record(state, conn_id, mid).await;
         }
         None
     };
@@ -85,24 +91,26 @@ pub async fn process_media(
     // What the budget is actually being spent on, decided by the same rule the
     // futures below use. Counted here because the answer has to survive every
     // way an attempt can come back empty.
-    let spent = parsed
-        .images
-        .iter()
-        .take(image_budget)
-        .filter(|media| image_url(media).is_some())
-        .count();
-
+    let spent = parsed.images.len().min(image_budget);
     let image_futs = parsed.images.iter().enumerate().map(|(i, media)| async move {
-        let Some(url) = image_url(media).filter(|_| i < image_budget) else {
+        if i >= image_budget {
             return (None, None);
+        }
+        let (bytes, ext) = match image_bytes(state, conn_id, media).await {
+            Ok(image) => image,
+            Err(_) => {
+                tracing::debug!("OneBot image unavailable under media fetch policy");
+                return (None, None);
+            }
         };
         if supports_images {
-            match fetch_and_store_image(state, conversation_id, url).await {
+            match store_image_bytes(&state.services, conversation_id, &bytes, &ext).await {
                 Ok(uri) => return (Some(uri), None),
-                Err(e) => tracing::warn!("Image download failed, falling back to OCR: {e}"),
+                Err(_) => tracing::warn!("Image storage failed, falling back to OCR"),
             }
         }
-        (None, ocr_image_text(state, url).await)
+        // Never delegate an untrusted URL/path to the adapter's downloader.
+        (None, ocr_image_text(state, conn_id, &bytes).await)
     });
 
     let (transcript, image_outcomes) = futures::future::join(record_fut, futures::future::join_all(image_futs)).await;
@@ -154,28 +162,30 @@ fn merge_ocr_into_text(text: &str, ocr: &[Option<String>]) -> String {
     out
 }
 
-async fn transcribe_record(state: &Arc<SharedState>, message_id: i64) -> Option<String> {
+async fn transcribe_record(state: &Arc<SharedState>, conn_id: u64, message_id: i64) -> Option<String> {
     let echo = uuid::Uuid::new_v4().to_string();
     let action = OneBotAction::voice_msg_to_text(message_id, echo);
-    match call_api_with_timeout(state, action, MEDIA_API_TIMEOUT).await {
-        Ok(data) => data
+    match super::call_api_to_conn(state, conn_id, action, MEDIA_API_TIMEOUT).await {
+        DirectedCallOutcome::AdapterAccepted(data) => data
             .get("text")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(String::from),
-        Err(e) => {
-            tracing::warn!("voice_msg_to_text failed: {e}");
+        _ => {
+            tracing::debug!("voice_msg_to_text unavailable");
             None
         }
     }
 }
 
-async fn ocr_image_text(state: &Arc<SharedState>, image_url: &str) -> Option<String> {
+async fn ocr_image_text(state: &Arc<SharedState>, conn_id: u64, bytes: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let image = format!("base64://{}", base64::engine::general_purpose::STANDARD.encode(bytes));
     let echo = uuid::Uuid::new_v4().to_string();
-    let action = OneBotAction::ocr_image(image_url, echo);
-    match call_api_with_timeout(state, action, MEDIA_API_TIMEOUT).await {
-        Ok(data) => {
+    let action = OneBotAction::ocr_image(&image, echo);
+    match super::call_api_to_conn(state, conn_id, action, MEDIA_API_TIMEOUT).await {
+        DirectedCallOutcome::AdapterAccepted(data) => {
             let lines: Vec<String> = data
                 .get("texts")?
                 .as_array()?
@@ -185,8 +195,8 @@ async fn ocr_image_text(state: &Arc<SharedState>, image_url: &str) -> Option<Str
                 .collect();
             Some(lines.join("\n")).filter(|s| !s.trim().is_empty())
         }
-        Err(e) => {
-            tracing::warn!("ocr_image failed: {e}");
+        _ => {
+            tracing::debug!("ocr_image unavailable");
             None
         }
     }
@@ -240,44 +250,86 @@ async fn resolve_supports_images(
         .is_ok_and(|caps| caps.reads_any_image())
 }
 
-async fn fetch_and_store_image(state: &Arc<SharedState>, conversation_id: &str, url: &str) -> Result<String, String> {
-    let (bytes, ext) = download_image(url).await?;
-    store_image_bytes(&state.services, conversation_id, bytes, &ext).await
-}
-
-static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
-
-/// Lazily-built shared client. `reqwest::Client::new()` panics if the TLS
-/// backend fails to initialise; building explicitly lets that surface as an
-/// error so the caller degrades to OCR/placeholder instead of aborting.
-pub(super) fn http_client() -> Result<&'static reqwest::Client, String> {
-    match HTTP.get() {
-        Some(c) => Ok(c),
-        None => {
-            let client = reqwest::Client::builder().build().map_err(|e| e.to_string())?;
-            Ok(HTTP.get_or_init(|| client))
-        }
+fn image_extension(bytes: &[u8], fallback: &str) -> String {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "webp"
+    } else if bytes.starts_with(b"BM") {
+        "bmp"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "jpg"
+    } else {
+        fallback
     }
+    .to_string()
 }
 
-pub(crate) async fn download_image(url: &str) -> Result<(Vec<u8>, String), String> {
-    let resp = http_client()?
-        .get(url)
-        .timeout(DOWNLOAD_TIMEOUT)
-        .send()
+fn inline_image(payload: &str) -> Result<(Vec<u8>, String), String> {
+    let bytes = decode_inline(payload.strip_prefix("base64://").unwrap_or(payload), MAX_IMAGE_BYTES)?;
+    let extension = image_extension(&bytes, "jpg");
+    Ok((bytes, extension))
+}
+
+pub(super) fn decode_inline(payload: &str, limit: u64) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    if payload.len() as u64 > limit.div_ceil(3) * 4 {
+        return Err("inline media too large".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| "invalid inline media")?;
+    if bytes.len() as u64 > limit {
+        return Err("inline media too large".into());
+    }
+    Ok(bytes)
+}
+
+pub(super) async fn image_bytes(
+    state: &Arc<SharedState>,
+    conn_id: u64,
+    media: &super::format::MediaRef,
+) -> Result<(Vec<u8>, String), String> {
+    if let Some(payload) = media.file.as_deref().and_then(|f| f.strip_prefix("base64://")) {
+        return inline_image(payload);
+    }
+    // Do not probe get_image/get_record: OB11 returns adapter-local paths, and
+    // nonstandard base64 responses have no negotiated bound (the transport's
+    // message cap is smaller than MAX_IMAGE_BYTES). A future trusted bounded
+    // byte capability must bind media IDs to conn_id before enabling that path.
+    let _ = conn_id;
+    let url = media
+        .url
+        .as_deref()
+        .or_else(|| {
+            media
+                .file
+                .as_deref()
+                .filter(|f| f.starts_with("http://") || f.starts_with("https://"))
+        })
+        .ok_or("no fetchable image bytes")?;
+    state
+        .media_fetches
+        .run(download_image(url, &state.config.private_media_origins))
         .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    if resp.content_length().is_some_and(|len| len > MAX_IMAGE_BYTES) {
-        return Err("image too large".into());
-    }
+}
 
-    let ext = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
+pub(super) async fn download_bytes(
+    url: &str,
+    limit: u64,
+    deadline: Duration,
+    origins: &[PrivateMediaOrigin],
+) -> Result<Vec<u8>, String> {
+    Ok(download::fetch(url, limit, deadline, origins).await?.bytes)
+}
+
+pub(crate) async fn download_image(url: &str, origins: &[PrivateMediaOrigin]) -> Result<(Vec<u8>, String), String> {
+    let result = download::fetch(url, MAX_IMAGE_BYTES, DOWNLOAD_TIMEOUT, origins).await?;
+    let ext = result
+        .content_type
+        .as_deref()
         .and_then(|ct| match ct.split(';').next().unwrap_or("").trim() {
             "image/jpeg" => Some("jpg"),
             "image/png" => Some("png"),
@@ -286,35 +338,22 @@ pub(crate) async fn download_image(url: &str) -> Result<(Vec<u8>, String), Strin
             "image/bmp" => Some("bmp"),
             _ => None,
         })
-        .map(String::from)
-        .or_else(|| {
-            let path = url.split(['?', '#']).next().unwrap_or("");
-            let ext = path.rsplit('.').next().unwrap_or("");
-            matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp").then(|| ext.to_string())
-        })
-        .unwrap_or_else(|| "jpg".into());
-
-    // Stream the body so a missing/false Content-Length can't buffer unbounded data
-    let mut resp = resp;
-    let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        if (bytes.len() + chunk.len()) as u64 > MAX_IMAGE_BYTES {
-            return Err("image too large".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok((bytes, ext))
+        .unwrap_or("jpg")
+        .to_string();
+    let ext = image_extension(&result.bytes, &ext);
+    Ok((result.bytes, ext))
 }
 
 async fn store_image_bytes(
     services: &crate::services::Services,
     conversation_id: &str,
-    bytes: Vec<u8>,
+    bytes: &[u8],
     ext: &str,
 ) -> Result<String, String> {
     let app_data_dir = services.paths.data_dir.clone();
     let conv_id = conversation_id.to_string();
     let ext = ext.to_string();
+    let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || {
         let (dest_path, uri) = crate::files::alloc_dest(&app_data_dir, &conv_id, &ext)?;
         std::fs::write(&dest_path, &bytes).map_err(|e| e.to_string())?;
@@ -328,6 +367,102 @@ async fn store_image_bytes(
 mod tests {
     use super::super::format::IMAGE_SENTINEL;
     use super::merge_ocr_into_text;
+
+    #[test]
+    fn image_signatures_preserve_format_without_trusting_names_or_headers() {
+        for (bytes, ext) in [
+            (b"GIF89a".as_slice(), "gif"),
+            ([137, 80, 78, 71, 13, 10, 26, 10].as_slice(), "png"),
+        ] {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            assert_eq!(super::inline_image(&encoded).unwrap().1, ext);
+            assert_eq!(super::image_extension(bytes, "jpg"), ext);
+        }
+    }
+
+    #[test]
+    fn inline_size_is_checked_before_and_after_decoding() {
+        assert_eq!(super::decode_inline("YWJj", 3).unwrap(), b"abc");
+        assert!(super::decode_inline("YWJj", 2).is_err());
+        assert!(super::decode_inline("YWJjZA==", 3).is_err());
+        assert!(super::decode_inline("!!!!", 3).is_err());
+    }
+
+    async fn answer(
+        state: &std::sync::Arc<super::SharedState>,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        data: serde_json::Value,
+    ) -> serde_json::Value {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let action: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let echo = action["echo"].as_str().unwrap();
+        let pending = state.pending_api_responses.lock().unwrap().remove(echo).unwrap();
+        let response = serde_json::from_value(serde_json::json!({"retcode": 0, "data": data, "echo": echo})).unwrap();
+        pending.tx.send(response).unwrap();
+        action
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_ocr_and_quotes_use_only_the_source_connection() {
+        use super::super::format::MediaRef;
+        use super::super::{OneBotConfig, OneBotServer};
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::services::bare_services(dir.path()).await;
+        let state = OneBotServer::new(services, OneBotConfig::default()).state;
+        let (tx, mut source) = tokio::sync::mpsc::channel(8);
+        let (other_tx, mut other) = tokio::sync::mpsc::channel(8);
+        state.ws_sinks.lock().await.insert(7, tx);
+        state.ws_sinks.lock().await.insert(8, other_tx);
+        let media = MediaRef {
+            file: Some("base64://YWJj".into()),
+            url: Some("http://127.0.0.1/unused".into()),
+        };
+        assert_eq!(super::image_bytes(&state, 7, &media).await.unwrap().0, b"abc");
+        assert!(source.try_recv().is_err());
+        // Arbitrary file paths and unnegotiated handles must not reach adapter
+        // file APIs, even when URL retrieval fails closed.
+        for file in ["C:/do-not-read", "0123456789abcdef0123456789abcdef.png"] {
+            let media = MediaRef {
+                file: Some(file.into()),
+                url: None,
+            };
+            assert!(super::image_bytes(&state, 7, &media).await.is_err());
+        }
+        assert!(source.try_recv().is_err());
+        assert!(other.try_recv().is_err());
+
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { super::ocr_image_text(&state, 7, b"abc").await }
+        });
+        let action = answer(
+            &state,
+            &mut source,
+            serde_json::json!({"texts": [{"text": "synthetic OCR"}]}),
+        )
+        .await;
+        assert_eq!(action["params"]["image"], "base64://YWJj");
+        assert_eq!(task.await.unwrap().as_deref(), Some("synthetic OCR"));
+
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { super::super::quote::fetch(&state, 7, 42).await }
+        });
+        let action = answer(
+            &state,
+            &mut source,
+            serde_json::json!({"sender": {"user_id": 12}, "message": [{"type": "text", "data": {"text": "quoted"}}]}),
+        )
+        .await;
+        assert_eq!(action["action"], "get_msg");
+        assert_eq!(task.await.unwrap().unwrap().parsed.text, "quoted");
+        assert!(other.try_recv().is_err());
+        assert!(state.pending_api_responses.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn test_merge_ocr_all() {

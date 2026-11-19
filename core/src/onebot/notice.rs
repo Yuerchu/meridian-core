@@ -42,7 +42,8 @@ async fn handle_poke(event: &OneBotEvent, state: &Arc<SharedState>, conn_id: u64
     let session_key = match event.group_id {
         Some(gid) => SessionKey::group(gid),
         None => SessionKey::private(user_id),
-    };
+    }
+    .for_account(event.self_id);
 
     // Cooldown is checked and refreshed under the lock so concurrent pokes
     // can't both pass.
@@ -107,7 +108,8 @@ async fn handle_recall(event: &OneBotEvent, state: &Arc<SharedState>) {
             None => return,
         },
         _ => SessionKey::private(user_id),
-    };
+    }
+    .for_account(event.self_id);
 
     // Only report recalls of messages the model actually saw; anything else
     // would be noise (and would hand the model content its author retracted).
@@ -149,7 +151,11 @@ async fn handle_membership(event: &OneBotEvent, state: &Arc<SharedState>) {
         },
         _ => return,
     };
-    push_notice_note(&state.session_states, &SessionKey::group(group_id), text);
+    push_notice_note(
+        &state.session_states,
+        &SessionKey::group(group_id).for_account(event.self_id),
+        text,
+    );
 }
 
 /// Best-effort nickname lookup; falls back to `None` (caller shows the QQ id).

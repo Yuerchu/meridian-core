@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use super::format::{self, FORWARD_SENTINEL, ForwardRef, ParsedMessage};
 use super::protocol::OneBotAction;
-use super::{SharedState, call_api};
+use super::{DirectedCallOutcome, SharedState};
 
 /// How many levels of forward-inside-a-forward are followed. Two covers the
 /// real case — someone forwards a conversation that itself contains a forwarded
@@ -51,9 +51,18 @@ pub struct Quoted {
 ///
 /// `None` when the adapter cannot produce it (an old message it no longer
 /// caches, most often) or when what came back has neither text nor media.
-pub async fn fetch(state: &Arc<SharedState>, message_id: i64) -> Option<Quoted> {
+pub async fn fetch(state: &Arc<SharedState>, conn_id: u64, message_id: i64) -> Option<Quoted> {
     let echo = uuid::Uuid::new_v4().to_string();
-    let data = call_api(state, OneBotAction::get_msg(message_id, echo)).await.ok()?;
+    let DirectedCallOutcome::AdapterAccepted(data) = super::call_api_to_conn(
+        state,
+        conn_id,
+        OneBotAction::get_msg(message_id, echo),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    else {
+        return None;
+    };
 
     let sender_obj = data.get("sender");
     let sender = sender_obj
@@ -70,7 +79,7 @@ pub async fn fetch(state: &Arc<SharedState>, message_id: i64) -> Option<Quoted> 
     // `None` for self_id on purpose: an @mention inside the quoted message is
     // part of what that person wrote, not this turn's way of addressing the bot.
     let mut parsed = format::parse_segments(data.get("message")?, None);
-    expand_forwards(state, &mut parsed).await;
+    expand_forwards(state, conn_id, &mut parsed).await;
 
     if parsed.text.is_empty() && !parsed.has_media() {
         return None;
@@ -85,13 +94,13 @@ pub async fn fetch(state: &Arc<SharedState>, message_id: i64) -> Option<Quoted> 
 
 /// Replace every `FORWARD_SENTINEL` in `parsed.text` with the conversation it
 /// stands for. Does nothing when there are none, which is the common case.
-pub async fn expand_forwards(state: &Arc<SharedState>, parsed: &mut ParsedMessage) {
+pub async fn expand_forwards(state: &Arc<SharedState>, conn_id: u64, parsed: &mut ParsedMessage) {
     if parsed.forwards.is_empty() {
         return;
     }
     let mut rendered = Vec::with_capacity(parsed.forwards.len());
     for forward in &parsed.forwards {
-        rendered.push(render_forward(state, forward, 1).await);
+        rendered.push(render_forward(state, conn_id, forward, 1).await);
     }
     parsed.text = substitute(&parsed.text, FORWARD_SENTINEL, &rendered);
 }
@@ -113,20 +122,27 @@ fn substitute(text: &str, sentinel: char, values: &[String]) -> String {
     out
 }
 
-async fn render_forward(state: &Arc<SharedState>, forward: &ForwardRef, depth: usize) -> String {
+async fn render_forward(state: &Arc<SharedState>, conn_id: u64, forward: &ForwardRef, depth: usize) -> String {
     let messages = match forward.inline.clone() {
         Some(inline) => Some(inline),
         None => match forward.id.as_deref() {
             Some(id) => {
                 let echo = uuid::Uuid::new_v4().to_string();
-                match call_api(state, OneBotAction::get_forward_msg(id, echo)).await {
-                    Ok(data) => data
+                match super::call_api_to_conn(
+                    state,
+                    conn_id,
+                    OneBotAction::get_forward_msg(id, echo),
+                    std::time::Duration::from_secs(15),
+                )
+                .await
+                {
+                    DirectedCallOutcome::AdapterAccepted(data) => data
                         .get("messages")
                         .or_else(|| data.get("message"))
                         .cloned()
                         .or(Some(data)),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "get_forward_msg failed");
+                    _ => {
+                        tracing::debug!("get_forward_msg unavailable");
                         None
                     }
                 }
@@ -168,7 +184,7 @@ async fn render_forward(state: &Arc<SharedState>, forward: &ForwardRef, depth: u
         if !inner.forwards.is_empty() && depth < MAX_FORWARD_DEPTH {
             let mut nested = Vec::with_capacity(inner.forwards.len());
             for forward in &inner.forwards {
-                nested.push(Box::pin(render_forward(state, forward, depth + 1)).await);
+                nested.push(Box::pin(render_forward(state, conn_id, forward, depth + 1)).await);
             }
             inner.text = substitute(&inner.text, FORWARD_SENTINEL, &nested);
         }

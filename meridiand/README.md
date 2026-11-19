@@ -7,6 +7,21 @@ an alert to a webhook when either looks wrong.
 It is the same core the desktop app runs on, minus the window. It listens on
 nothing and serves nothing — configuration is a file, applied on every start.
 
+Desktop OneBot upgrade: an access token is now required even on loopback.
+Set the same token in Meridian and the adapter that reverse-connects to it;
+tokenless installations refuse to start. Saving a rotated token closes old
+sockets; explicitly start OneBot again. meridiand still starts no OneBot listener.
+Desktop private-media exceptions are configured only by the local administrator
+in OneBot settings: one exact HTTP(S) origin plus one fixed IP per line, for
+example `http://adapter.lan:8080 192.168.1.2`. Empty means private media is denied.
+No wildcard/CIDR, redirects, proxies or DNS resolution apply to a granted origin;
+unmatched origins retain public-only DNS checks. Changing the policy stops the
+old OneBot generation, just like rotating its token. `meridiand` has no OneBot
+media policy flag because it starts no OneBot listener.
+
+Account-qualified OneBot sessions start fresh; legacy shared history is retained
+but is not automatically assigned to an account.
+
 ## Why not just leave the app open
 
 Closing the desktop window already hides it to the tray, so "no window" is
@@ -52,28 +67,23 @@ right without waiting for a real condition to occur:
 
 ```
 $ meridiand --config m.toml --test alertpipe
-meridiand: alertpipe accepted the test — HTTP 200 in 13ms, 1 attempt(s)
-  it answered: {"ok":true}
+meridiand: alertpipe accepted — HTTP 200
 ```
 
 `--status` reads what the database holds, in two halves: which providers a
 balance can actually be read for, and what each endpoint's last delivery did.
-`last_success_at` is kept across failures on purpose — "it worked at 09:00 and
-has failed since" is the useful sentence, and clearing it would leave only "it
-is failing":
+Endpoint status shows an ID and a fixed health class, not its URL or the receiver’s reply:
 
 ```
 $ meridiand --config m.toml --status
-on   deepseek-prod  deepseek  https://api.deepseek.com
+on   deepseek-prod  deepseek
      balance read as `deepseek`
-on   kimi-prod  openai  https://api.moonshot.cn/v1
+on   kimi-prod  openai
      balance read as `moonshot`
-on   relay  openai  https://codex-api.example/v1
+on   relay  openai
      no balance: this upstream publishes none, or `vendor` is unset
 
-on   alertpipe  [balance_low,balance_unavailable]  http://alertpipe.internal/webhooks/balance
-     last attempt 2026-09-15T18:57:37.699Z   last success 2026-09-15T18:56:53.001Z
-     1 consecutive failure(s): network error: error sending request
+alertpipe  network
 ```
 
 The provider half is worth reading first, because the failure it shows is
@@ -512,14 +522,12 @@ the same alert again.
 | What you see | |
 |---|---|
 | `error while loading shared libraries` / exit `0xC0000135` | The `.dll`/`.so` files are not beside the binary. |
-| `already holds N provider(s) and is not marked as the daemon's` | `--data-dir` points at another install's directory. |
-| `notify.enabled is true but no webhook is enabled` | Refused at parse: it would watch and have nowhere to report. |
-| `takes the *name* of an environment variable … not its value` | The credential was pasted where its variable's name belongs. The value is not echoed back, in case it is the credential. |
-| `needs $X, which is unset or empty` | The variable did not reach the process. In PowerShell, check you used `$env:X = '…'` and not `$X = '…'`. |
-| `is `custom` but has no `body`` | A `custom` endpoint needs the document it posts; see above. |
-| `a `body_template` only applies to `custom`` | The other formats send their own shape; drop the `body` or change the format. |
-| `is not a placeholder this app substitutes` | A typo, refused at parse. The list is above. |
-| Delivered but the receiver ignores it | Probably the wrong `format`. A vendor format sends *that vendor's* shape and signs the way that vendor signs — pointing one at your own pipe posts a document it will not recognise, unauthenticated. `--test` shows what comes back. |
+| `configuration file not found` / `configuration file could not be read` | Check the path passed to `--config` and the service account's read access. |
+| `invalid TOML or configuration schema` | Check TOML syntax, field names and value types. Source lines are not printed because they can contain credentials. |
+| `configuration failed validation` | Check endpoint URLs and subscriptions, credential variable names, enabled watcher destinations, and the body template for a custom endpoint. |
+| `data directory is not marked as the daemon's; choose a separate --data-dir` | Use a dedicated directory rather than a populated desktop install. |
+| `credential environment variable is unset or empty` | Check that the variables named in the configuration are set for the daemon process. In PowerShell, use `$env:X` rather than `$X`. |
+| Delivered but the receiver ignores it | Check the endpoint's configured format and signing requirements. `--test` reports the endpoint ID, outcome and HTTP status, not the receiver's body. |
 | Starts, logs `is watching`, says nothing | Expected if nothing crossed a threshold. Balance alerting needs `balance_threshold` set *and* a provider a balance can be read for — run `--status`, which says so per provider. Usage alerting needs a ledger this install produced. |
 | `--status` says `no balance` for an upstream that has one | Its `vendor` is unset and its address is not one the catalog recognises — a relay, or a vendor's other site. Name `vendor` and re-run. |
 | `this upstream publishes no balance` | That provider can never produce a balance alert. |

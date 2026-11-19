@@ -14,7 +14,9 @@ mod quote;
 pub mod replies;
 mod session;
 mod stickers;
+mod transport;
 
+pub use media::{PrivateMediaOrigin, validate_private_media_origins};
 pub use replies::{ReplyBank, ReplySeeds};
 
 use std::collections::{HashMap, VecDeque};
@@ -72,6 +74,8 @@ pub struct SharedState {
     /// 它启动时那套权限——重启一次是为了让新设置生效，结果是旧的那一代在新的
     /// 旁边继续跑。
     pub shutdown: watch::Sender<bool>,
+    media_fetches: media::MediaGeneration,
+    pub extraction_slots: Arc<tokio::sync::Semaphore>,
     /// 每有一条连接彻底退出就 +1。`stop()` 等它，而不是轮询——与语料 drain 同
     /// 一个形状。
     pub conn_closed: watch::Sender<u64>,
@@ -610,6 +614,8 @@ pub enum TurnStart {
     /// Another OneBot turn is running for this session and `item` went into its
     /// inbox — that turn will pick it up between tool rounds, or at its end.
     Queued,
+    /// The per-session queued-message/byte budget is exhausted.
+    Full,
     /// Something outside OneBot holds the conversation. Nothing was queued: the
     /// inbox is drained only by the OneBot runner, so a message parked there
     /// while the desktop is answering would sit until the next QQ message
@@ -636,6 +642,18 @@ pub fn try_begin_turn(
 ) -> TurnStart {
     let mut map = states.lock();
     let entry = map.entry(session.to_string()).or_default();
+    if entry.turn_active
+        && (entry.inbox.len() >= 32
+            || entry
+                .inbox
+                .iter()
+                .map(|i| i.text.len())
+                .sum::<usize>()
+                .saturating_add(item.text.len())
+                > 1024 * 1024)
+    {
+        return TurnStart::Full;
+    }
     if !entry.queue_unless_free(item) {
         return TurnStart::Queued;
     }
@@ -750,6 +768,8 @@ impl InboxHandle {
 /// A friend request or group invite waiting for admin approval.
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
+    pub conn_id: u64,
+    pub self_id: i64,
     pub kind: RequestKind,
     pub flag: String,
     pub user_id: i64,
@@ -767,12 +787,56 @@ pub enum RequestKind {
 /// 记下一条连接是哪个账号，并回答"这个号是我们自己的吗"。
 ///
 /// 认第一个报上来的，之后不改——见 `conn_identities` 的说明。
-pub fn note_identity(state: &Arc<SharedState>, conn_id: u64, self_id: i64) {
-    if self_id == 0 {
-        return;
+fn bind_identity(identities: &mut HashMap<u64, i64>, conn_id: u64, self_id: i64) -> bool {
+    if self_id <= 0 {
+        return false;
     }
-    if let Ok(mut identities) = state.conn_identities.lock() {
-        identities.entry(conn_id).or_insert(self_id);
+    if let Some(bound) = identities.get(&conn_id) {
+        return *bound == self_id;
+    }
+    if identities.values().any(|id| *id == self_id) {
+        return false;
+    }
+    identities.insert(conn_id, self_id);
+    true
+}
+
+pub fn note_identity(state: &Arc<SharedState>, conn_id: u64, self_id: i64) -> bool {
+    state
+        .conn_identities
+        .lock()
+        .map(|mut ids| bind_identity(&mut ids, conn_id, self_id))
+        .unwrap_or(false)
+}
+
+tokio::task_local! {
+    /// Only event work inherits this authority; unrelated calls must select uniquely.
+    static EVENT_CONNECTION: u64;
+}
+
+async fn selected_connection(state: &Arc<SharedState>) -> Result<u64, String> {
+    if *state.shutdown.borrow() {
+        return Err("OneBot is stopping".into());
+    }
+    if let Ok(conn) = EVENT_CONNECTION.try_with(|id| *id) {
+        return Ok(conn);
+    }
+    let identities = state.conn_identities.lock().map_err(|_| "identity table poisoned")?;
+    unique_connection(&identities)
+}
+
+fn unique_connection(identities: &HashMap<u64, i64>) -> Result<u64, String> {
+    if identities.len() != 1 {
+        return Err("OneBot call requires exactly one bound adapter".into());
+    }
+    Ok(*identities.keys().next().unwrap())
+}
+
+fn take_reply(pending: &mut HashMap<String, PendingCall>, echo: &str, conn: u64) -> Option<PendingCall> {
+    if pending.get(echo).is_some_and(|call| call.expected_conn == conn) {
+        pending.remove(echo)
+    } else {
+        None
     }
 }
 
@@ -797,10 +861,9 @@ pub fn is_local_bot(state: &Arc<SharedState>, user_id: i64) -> bool {
 /// One API call waiting on a reply.
 ///
 /// `expected_conn` is what makes a call *directed*: only that connection's
-/// answer counts. `None` is the broadcast path, which has no predetermined
-/// target and takes whichever adapter answers first.
+/// answer counts. There is no broadcast waiter.
 pub struct PendingCall {
-    pub expected_conn: Option<u64>,
+    pub expected_conn: u64,
     pub tx: oneshot::Sender<OneBotResponse>,
 }
 
@@ -879,6 +942,9 @@ pub async fn call_api_to_conn_within(
     enqueue_timeout: std::time::Duration,
     timeout: std::time::Duration,
 ) -> DirectedCallOutcome {
+    if *state.shutdown.borrow() {
+        return DirectedCallOutcome::NotDispatched("OneBot is stopping".into());
+    }
     let echo = uuid::Uuid::new_v4().to_string();
     let json = match serde_json::to_string(&action.with_echo(echo.clone())) {
         Ok(json) => json,
@@ -896,7 +962,7 @@ pub async fn call_api_to_conn_within(
         pending.insert(
             echo.clone(),
             PendingCall {
-                expected_conn: Some(conn_id),
+                expected_conn: conn_id,
                 tx,
             },
         );
@@ -932,23 +998,18 @@ pub async fn call_api_to_conn_within(
     }
 }
 
-/// Broadcast a pre-serialized frame to all connected clients. Senders are
-/// cloned out of the ws_sinks lock so a slow client only blocks this task
-/// (never other lock users), and a momentarily full queue backpressures rather
-/// than silently dropping the message.
-async fn broadcast(state: &Arc<SharedState>, json: String) {
-    let sinks: Vec<mpsc::Sender<String>> = state.ws_sinks.lock().await.values().cloned().collect();
-    for sink in sinks {
-        let _ = sink.send(json.clone()).await;
-    }
-}
-
-/// Broadcast an action to all connected clients without waiting for a response.
+/// Event replies go back to their source. Unscoped sends require one adapter.
 pub async fn send_action_nowait(state: &Arc<SharedState>, action: &OneBotAction) {
+    let Ok(conn) = selected_connection(state).await else {
+        return;
+    };
     let Ok(json) = serde_json::to_string(action) else {
         return;
     };
-    broadcast(state, json).await;
+    let sink = state.ws_sinks.lock().await.get(&conn).cloned();
+    if let Some(sink) = sink {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), sink.send(json)).await;
+    }
 }
 
 pub async fn call_api(state: &Arc<SharedState>, action: OneBotAction) -> Result<serde_json::Value, String> {
@@ -960,44 +1021,12 @@ pub async fn call_api_with_timeout(
     action: OneBotAction,
     timeout: std::time::Duration,
 ) -> Result<serde_json::Value, String> {
-    let echo = action.echo.clone().unwrap_or_default();
-    // Serialize before inserting into pending so a serialization failure can't
-    // leave an orphaned pending entry behind.
-    let json = serde_json::to_string(&action).map_err(|e| e.to_string())?;
-    let (tx, rx) = oneshot::channel();
-    {
-        let mut pending = state
-            .pending_api_responses
-            .lock()
-            .map_err(|_| "pending table poisoned")?;
-        pending.insert(
-            echo.clone(),
-            PendingCall {
-                // No particular adapter: this one goes to all of them and the
-                // first answer wins. See `call_api_to_conn` for why anything
-                // answering a specific event should not use this path.
-                expected_conn: None,
-                tx,
-            },
-        );
-    }
-    let _guard = WaiterGuard {
-        state,
-        echo: echo.clone(),
-    };
-    broadcast(state, json).await;
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(resp)) => {
-            if resp.retcode == Some(0) {
-                Ok(resp.data.unwrap_or(serde_json::Value::Null))
-            } else {
-                Err(match resp.complaint() {
-                    Some(why) => format!("API error: {why}"),
-                    None => format!("API error: {:?}", resp.status),
-                })
-            }
-        }
-        _ => Err("API call timed out".into()),
+    let conn = selected_connection(state).await?;
+    match call_api_to_conn(state, conn, action, timeout).await {
+        DirectedCallOutcome::AdapterAccepted(value) => Ok(value),
+        DirectedCallOutcome::NotDispatched(reason) => Err(reason),
+        DirectedCallOutcome::Refused { retcode, message } => Err(format!("API refused ({retcode}): {message}")),
+        DirectedCallOutcome::DeliveryUnknown => Err("OneBot delivery unknown; do not retry automatically".into()),
     }
 }
 
@@ -1011,6 +1040,8 @@ pub struct OneBotConfig {
     pub admin_users: Vec<i64>,
     /// QQ emoji id used to acknowledge group messages; empty or "0" disables.
     pub ack_emoji_id: String,
+    /// Local-only exact origins pinned to fixed IPs. Empty denies private media.
+    pub private_media_origins: Vec<PrivateMediaOrigin>,
     // The balance threshold used to live here, read by a watcher inside this
     // server. It is `notify.balance.threshold` now — see migration 55 for why
     // there is one threshold rather than two, and `balance_watch.rs` for what
@@ -1055,6 +1086,7 @@ impl Default for OneBotConfig {
             assistant_id: None,
             admin_users: vec![],
             ack_emoji_id: default_ack_emoji(),
+            private_media_origins: vec![],
             voice_capture_sessions: vec![],
             voice_send_enabled: false,
             voice_send_groups: vec![],
@@ -1107,6 +1139,17 @@ where
     }
 }
 
+fn require_access_token(config: &OneBotConfig) -> Result<(), String> {
+    if config
+        .access_token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        return Err("OneBot now requires an access token, including on loopback. Configure the same token in Meridian and the reverse-WebSocket adapter before starting.".into());
+    }
+    Ok(())
+}
+
 fn validate_scope_list(key: &str, values: &[String], groups_only: bool) -> Result<(), String> {
     for raw in values {
         let (bot, session) = raw
@@ -1148,7 +1191,14 @@ pub async fn load_config(db: &Db) -> Result<OneBotConfig, String> {
         parse_stored_json("onebot.voice_send_groups", get("onebot.voice_send_groups").await?)?;
     validate_scope_list("onebot.voice_send_groups", &voice_send_groups, true)?;
 
+    let private_media_origins: Vec<PrivateMediaOrigin> = parse_stored_json(
+        "onebot.private_media_origins",
+        get("onebot.private_media_origins").await?,
+    )?;
+    validate_private_media_origins(&private_media_origins)?;
+
     Ok(OneBotConfig {
+        private_media_origins,
         enabled: parse_stored_bool("onebot.enabled", get("onebot.enabled").await?, false)?,
         host: get("onebot.host").await?.unwrap_or_else(|| "127.0.0.1".into()),
         port: parse_stored_port("onebot.port", get("onebot.port").await?, 6700)?,
@@ -1174,6 +1224,10 @@ pub async fn load_config(db: &Db) -> Result<OneBotConfig, String> {
 /// 内存里还是旧策略，而重启之后生效的却是写进去的那一半。对普通设置那是难看，
 /// 对 `voice_capture_sessions` 那是"用户以为关掉了而它还在录"。
 pub async fn save_config(db: &Db, config: &OneBotConfig) -> Result<(), String> {
+    if config.enabled {
+        require_access_token(config)?;
+    }
+    validate_private_media_origins(&config.private_media_origins)?;
     validate_scope_list("onebot.voice_capture_sessions", &config.voice_capture_sessions, false)?;
     validate_scope_list("onebot.voice_send_groups", &config.voice_send_groups, true)?;
     db.write(async |tx| save_config_in(tx, config).await)
@@ -1184,6 +1238,10 @@ pub async fn save_config(db: &Db, config: &OneBotConfig) -> Result<(), String> {
 /// Config plus the hot reply bank, one transaction. The send path reads the
 /// bank each time, so this write is live without a listener restart.
 pub async fn save_settings(db: &Db, config: &OneBotConfig, replies: &ReplyBank) -> Result<(), String> {
+    if config.enabled {
+        require_access_token(config)?;
+    }
+    validate_private_media_origins(&config.private_media_origins)?;
     validate_scope_list("onebot.voice_capture_sessions", &config.voice_capture_sessions, false)?;
     validate_scope_list("onebot.voice_send_groups", &config.voice_send_groups, true)?;
     replies.validate()?;
@@ -1228,6 +1286,9 @@ async fn save_config_in(tx: &WriteTx, config: &OneBotConfig) -> Result<(), crate
         now,
     )
     .await?;
+    let private_media_origins = serde_json::to_string(&config.private_media_origins)
+        .map_err(|e| crate::db::sea::DbErr::Custom(e.to_string()))?;
+    set_preference(tx, "onebot.private_media_origins", &private_media_origins, now).await?;
     set_preference(tx, "onebot.admin_users", &admin_users, now).await?;
     set_preference(tx, "onebot.ack_emoji_id", &config.ack_emoji_id, now).await?;
     set_preference(tx, "onebot.voice_capture_sessions", &voice_capture_sessions, now).await?;
@@ -1365,6 +1426,7 @@ pub const FISH_KEY_SECRET: &str = "SERVICE_FISH_AUDIO_KEY";
 pub struct OneBotServer {
     state: Arc<SharedState>,
     running: Arc<std::sync::atomic::AtomicBool>,
+    listener_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl OneBotServer {
@@ -1384,6 +1446,8 @@ impl OneBotServer {
                 conn_identities: std::sync::Mutex::new(HashMap::new()),
                 connected_clients: AtomicU32::new(0),
                 shutdown: shutdown_tx,
+                media_fetches: media::MediaGeneration::default(),
+                extraction_slots: Arc::new(tokio::sync::Semaphore::new(4)),
                 conn_closed,
                 session_states: Arc::new(SessionStates::default()),
                 alert_sink: Mutex::new(None),
@@ -1392,11 +1456,17 @@ impl OneBotServer {
                 services,
             }),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            listener_task: std::sync::Mutex::new(None),
         }
     }
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    pub fn credentials_changed(&self, config: &OneBotConfig) -> bool {
+        self.state.config.access_token != config.access_token
+            || self.state.config.private_media_origins != config.private_media_origins
     }
 
     pub fn status(&self) -> OneBotStatus {
@@ -1413,9 +1483,10 @@ impl OneBotServer {
         if self.is_running() {
             return Err("OneBot server is already running".into());
         }
-        // Sharper here than for the other two listeners: anyone who can reach
-        // this socket can submit an event with an arbitrary `user_id`, i.e.
-        // impersonate an admin.
+        // OneBot adapters can assert administrator identities, even on loopback.
+        // Existing tokenless installations must explicitly configure both ends.
+        require_access_token(&self.state.config)?;
+        validate_private_media_origins(&self.state.config.private_media_origins)?;
         validate_listen_config(
             &self.state.config.host,
             self.state.config.access_token.as_deref(),
@@ -1424,11 +1495,11 @@ impl OneBotServer {
 
         let state = self.state.clone();
         let running = self.running.clone();
-        let mut shutdown_rx = self.state.shutdown.subscribe();
+        let shutdown_rx = self.state.shutdown.subscribe();
 
         running.store(true, Ordering::Relaxed);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // 把这一代服务的语音策略交给协调器，**开门之前**。协调器活得比服务
             // 久（它在 `Services` 上），所以这是"换掉"而不是"初始化"：上一代的
             // 授权连同它的 generation 一起被这次调用作废。
@@ -1503,80 +1574,11 @@ impl OneBotServer {
                 .register(Arc::new(balance_watch::OneBotAlertSink::new(state.clone())));
             *state.alert_sink.lock().await = Some(sink_id);
 
-            let mut conn_id_counter: u64 = 0;
-
-            loop {
-                tokio::select! {
-                    changed = shutdown_rx.changed() => {
-                        // Err = all senders dropped (this server was replaced);
-                        // either case means stop, so don't hot-spin on a closed channel.
-                        if changed.is_err() || *shutdown_rx.borrow() {
-                            tracing::info!("OneBot WS server shutting down");
-                            break;
-                        }
-                    }
-                    result = listener.accept() => {
-                        match result {
-                            Ok((stream, peer)) => {
-                                conn_id_counter += 1;
-                                let conn_id = conn_id_counter;
-                                let state = state.clone();
-
-                                tokio::spawn(async move {
-                                    use tokio_tungstenite::tungstenite::handshake::server::{
-                                        ErrorResponse, Request, Response,
-                                    };
-                                    use tokio_tungstenite::tungstenite::http::StatusCode;
-
-                                    let expected_token = state.config.access_token.clone();
-                                    let callback = move |req: &Request, resp: Response|
-                                        -> Result<Response, ErrorResponse> {
-                                        let Some(ref expected) = expected_token else {
-                                            return Ok(resp);
-                                        };
-                                        let auth = req.headers().get("authorization")
-                                            .and_then(|v| v.to_str().ok());
-                                        if token_matches(expected, auth, req.uri().query()) {
-                                            Ok(resp)
-                                        } else {
-                                            let mut r = ErrorResponse::new(Some("Unauthorized".into()));
-                                            *r.status_mut() = StatusCode::UNAUTHORIZED;
-                                            Err(r)
-                                        }
-                                    };
-
-                                    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
-                                        Ok(ws) => ws,
-                                        Err(e) => {
-                                            tracing::warn!("WS handshake failed from {peer}: {e}");
-                                            return;
-                                        }
-                                    };
-
-                                    tracing::info!("OneBot client connected from {peer} (id={conn_id})");
-                                    state.connected_clients.fetch_add(1, Ordering::Relaxed);
-
-                                    handle_connection(ws_stream, conn_id, state.clone()).await;
-
-                                    state.connected_clients.fetch_sub(1, Ordering::Relaxed);
-                                    // Decrement first: `stop()` reads the count
-                                    // and then waits for this to move, so a bump
-                                    // ahead of the decrement would let it look
-                                    // once more and see the connection still up.
-                                    state.conn_closed.send_modify(|n| *n += 1);
-                                    tracing::info!("OneBot client disconnected (id={conn_id})");
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to accept connection: {e}");
-                            }
-                        }
-                    }
-                }
-            }
+            transport::serve(listener, state.clone()).await;
 
             running.store(false, Ordering::Relaxed);
         });
+        *self.listener_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
 
         Ok(())
     }
@@ -1608,7 +1610,17 @@ impl OneBotServer {
     /// open; what it can no longer do is receive anything, since its sink is
     /// already gone.
     pub async fn stop(&self) {
-        let _ = self.state.shutdown.send(true);
+        self.state.shutdown.send_replace(true);
+        // Latch before waiting on listener/corpus teardown. Detached jobs keep
+        // this fence, so they cannot start a new request under revoked grants.
+        self.state.media_fetches.stop().await;
+        let task = self.listener_task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut task) = task
+            && tokio::time::timeout(CONNECTION_CLOSE_TIMEOUT, &mut task).await.is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
         self.running.store(false, Ordering::Relaxed);
         // Before the connections are torn down, because what this outlet needs
         // in order to say anything is exactly those connections: left
@@ -1658,48 +1670,58 @@ const CONNECTION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Check an access token against the Authorization header (`Bearer <t>`,
 /// `Token <t>`, or bare) or the `access_token` query parameter.
 fn token_matches(expected: &str, auth_header: Option<&str>, query: Option<&str>) -> bool {
-    if let Some(auth) = auth_header {
-        let token = auth
-            .strip_prefix("Bearer ")
+    if expected.trim().is_empty() {
+        return false;
+    }
+    let header = auth_header.map(|auth| {
+        auth.strip_prefix("Bearer ")
             .or_else(|| auth.strip_prefix("Token "))
             .unwrap_or(auth)
-            .trim();
-        if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-            return true;
+            .trim()
+    });
+    let mut query_token = None;
+    for field in query.unwrap_or("").split('&').filter(|s| !s.is_empty()) {
+        let Some((key, value)) = field.split_once('=') else {
+            return false;
+        };
+        if key != "access_token" {
+            return false;
         }
-    }
-    if let Some(q) = query {
-        for kv in q.split('&') {
-            if let Some(v) = kv.strip_prefix("access_token=") {
-                let decoded = percent_encoding::percent_decode_str(v).decode_utf8_lossy();
-                if constant_time_eq(decoded.as_bytes(), expected.as_bytes()) {
-                    return true;
-                }
-            }
+        if query_token.is_some() {
+            return false;
         }
+        let Ok(decoded) = percent_encoding::percent_decode_str(value).decode_utf8() else {
+            return false;
+        };
+        query_token = Some(decoded);
     }
-    false
+    let matches = |value: &str| constant_time_eq(value.as_bytes(), expected.as_bytes());
+    match (header, query_token.as_deref()) {
+        (Some(h), Some(q)) => matches(h) & matches(q),
+        (Some(h), None) => matches(h),
+        (None, Some(q)) => matches(q),
+        (None, None) => false,
+    }
 }
 
 /// Send actions to one connection. The sender is cloned out of the lock so a
 /// slow client only blocks the calling task, never other ws_sinks users.
 async fn send_to_conn(state: &Arc<SharedState>, conn_id: u64, actions: Vec<OneBotAction>) {
+    if *state.shutdown.borrow() {
+        return;
+    }
     let sink = state.ws_sinks.lock().await.get(&conn_id).cloned();
     let Some(sink) = sink else { return };
     for action in actions {
         if let Ok(json) = serde_json::to_string(&action) {
-            let _ = sink.send(json).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), sink.send(json)).await;
         }
     }
 }
 
-async fn handle_connection(
-    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    conn_id: u64,
-    state: Arc<SharedState>,
-) {
+async fn handle_connection(ws: axum::extract::ws::WebSocket, conn_id: u64, state: Arc<SharedState>) {
+    use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
 
     let (mut write, mut read) = ws.split();
 
@@ -1711,7 +1733,7 @@ async fn handle_connection(
     }
 
     // Spawn outbound writer
-    let write_handle = tokio::spawn(async move {
+    let mut write_handle = tokio::spawn(async move {
         while let Some(msg) = sink_rx.recv().await {
             if write.send(Message::Text(msg.into())).await.is_err() {
                 break;
@@ -1723,6 +1745,8 @@ async fn handle_connection(
     // to stop. `next()` is poll-based and keeps its state in the stream, so
     // losing the race costs nothing.
     let mut shutdown = state.shutdown.subscribe();
+    let mut events = tokio::task::JoinSet::new();
+    let mut writer_finished = false;
     loop {
         if *shutdown.borrow() {
             break;
@@ -1730,6 +1754,8 @@ async fn handle_connection(
         let next = tokio::select! {
             biased;
             _ = shutdown.changed() => break,
+            _ = &mut write_handle => { writer_finished = true; break; },
+            Some(_) = events.join_next(), if !events.is_empty() => continue,
             next = read.next() => next,
         };
         let Some(msg) = next else { break };
@@ -1740,6 +1766,22 @@ async fn handle_connection(
             _ => continue,
         };
 
+        // Check optional self_id on every frame, including API responses.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if let Some(id) = value.get("self_id") {
+            let Some(id) = id.as_i64().filter(|id| *id > 0) else {
+                break;
+            };
+            let matches = state
+                .conn_identities
+                .lock()
+                .is_ok_and(|ids| ids.get(&conn_id).is_none_or(|bound| *bound == id));
+            if !matches {
+                break;
+            }
+        }
         let frame = match protocol::parse_frame(&text) {
             Some(f) => f,
             None => {
@@ -1759,10 +1801,7 @@ async fn handle_connection(
                     // an error, since it has never heard of the message being
                     // asked about. Removing on the way past would leave the
                     // real answer with nobody waiting for it.
-                    let ours = pending
-                        .get(echo)
-                        .is_some_and(|call| call.expected_conn.is_none_or(|want| want == conn_id));
-                    if ours && let Some(call) = pending.remove(echo) {
+                    if let Some(call) = take_reply(&mut pending, echo, conn_id) {
                         let _ = call.tx.send(resp);
                     }
                 }
@@ -1772,8 +1811,8 @@ async fn handle_connection(
         };
 
         // 每个事件都带 self_id，所以身份不需要单独的握手。
-        if let Some(self_id) = event.self_id {
-            note_identity(&state, conn_id, self_id);
+        if !event.self_id.is_some_and(|id| note_identity(&state, conn_id, id)) {
+            break;
         }
 
         match event.post_type.as_str() {
@@ -1785,30 +1824,42 @@ async fn handle_connection(
             }
             "message" => {
                 let state = state.clone();
-                tokio::spawn(async move {
+                if events.len() >= 32 {
+                    break;
+                }
+                events.spawn(EVENT_CONNECTION.scope(conn_id, async move {
                     let actions = handler::handle_message(&event, &state, conn_id).await;
                     send_to_conn(&state, conn_id, actions).await;
-                });
+                }));
             }
             "request" => {
                 let state = state.clone();
-                tokio::spawn(async move {
+                if events.len() >= 32 {
+                    break;
+                }
+                events.spawn(EVENT_CONNECTION.scope(conn_id, async move {
                     let actions = handler::handle_request(&event, &state).await;
                     send_to_conn(&state, conn_id, actions).await;
-                });
+                }));
             }
             "notice" => {
                 let state = state.clone();
-                tokio::spawn(async move {
+                if events.len() >= 32 {
+                    break;
+                }
+                events.spawn(EVENT_CONNECTION.scope(conn_id, async move {
                     let actions = notice::handle_notice(&event, &state, conn_id).await;
                     send_to_conn(&state, conn_id, actions).await;
-                });
+                }));
             }
             _ => {
                 tracing::debug!("Unhandled OneBot event type: {}", event.post_type);
             }
         }
     }
+
+    events.abort_all();
+    while events.join_next().await.is_some() {}
 
     // Cleanup
     {
@@ -1817,17 +1868,24 @@ async fn handle_connection(
     }
     // Retire what was waiting on *this* adapter. Their answers are never
     // coming, and without this they sit until the timeout each — a call whose
-    // connection is already gone has nothing to wait for. Broadcast waiters
-    // (`expected_conn: None`) are left alone: another adapter may still answer.
+    // connection is already gone has nothing to wait for.
     {
         if let Ok(mut pending) = state.pending_api_responses.lock() {
-            pending.retain(|_, call| call.expected_conn != Some(conn_id));
+            pending.retain(|_, call| call.expected_conn != conn_id);
         }
         if let Ok(mut identities) = state.conn_identities.lock() {
             identities.remove(&conn_id);
         }
     }
-    write_handle.abort();
+    state
+        .pending_requests
+        .lock()
+        .await
+        .retain(|_, req| req.conn_id != conn_id);
+    if !writer_finished {
+        write_handle.abort();
+        let _ = write_handle.await;
+    }
 }
 
 /// Start the server if the user has it enabled, and hand it back either way.
@@ -1939,7 +1997,7 @@ mod tests {
         fn started(&self, key: &SessionKey, conv: &str, at: i64) -> SessionTurn {
             match self.begin(key, conv, at) {
                 TurnStart::Started(turn) => turn,
-                TurnStart::Queued => panic!("the session was supposed to be free"),
+                TurnStart::Queued | TurnStart::Full => panic!("the session was supposed to be free"),
                 TurnStart::Elsewhere(b) => panic!("the conversation was supposed to be free: {b}"),
             }
         }
@@ -2545,28 +2603,125 @@ mod tests {
         assert!(s.seen_message_ids.contains(&(SEEN_IDS_CAP as i64 + 9)));
     }
 
-    /// The dispatch rule for directed calls, as a pure decision.
-    ///
-    /// This mirrors the `ours` check in `handle_connection`: with two accounts
-    /// connected, the adapter that was *not* asked answers first — it has never
-    /// heard of the message in question, so it answers with an error. Taking the
-    /// waiter out for that answer leaves the real one with nobody waiting.
-    fn answers_us(expected_conn: Option<u64>, from_conn: u64) -> bool {
-        expected_conn.is_none_or(|want| want == from_conn)
+    #[test]
+    fn tokenless_loopback_upgrade_is_rejected() {
+        let mut config = OneBotConfig::default();
+        assert!(require_access_token(&config).unwrap_err().contains("loopback"));
+        config.access_token = Some("   ".into());
+        assert!(require_access_token(&config).is_err());
+        config.access_token = Some("mock-token".into());
+        assert!(require_access_token(&config).is_ok());
     }
 
     #[test]
-    fn a_directed_call_only_takes_its_own_adapters_answer() {
-        assert!(answers_us(Some(1), 1));
-        assert!(!answers_us(Some(1), 2), "the other account must not be read as ours");
+    fn generic_calls_require_one_bound_account() {
+        let mut ids = HashMap::new();
+        assert!(unique_connection(&ids).is_err());
+        ids.insert(10, 100);
+        assert_eq!(unique_connection(&ids).unwrap(), 10);
+        ids.insert(20, 200);
+        assert!(unique_connection(&ids).is_err());
     }
 
-    /// The broadcast path is unchanged: it has no predetermined target, so the
-    /// first answer from anywhere is the answer.
+    #[tokio::test]
+    async fn wrong_connection_does_not_steal_reply() {
+        let (tx, mut rx) = oneshot::channel();
+        let mut pending = HashMap::from([("mock-echo".into(), PendingCall { expected_conn: 10, tx })]);
+        assert!(take_reply(&mut pending, "mock-echo", 20).is_none());
+        assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        let call = take_reply(&mut pending, "mock-echo", 10).unwrap();
+        let reply = serde_json::from_str(r#"{"status":"ok","retcode":0,"data":{}}"#).unwrap();
+        call.tx.send(reply).unwrap();
+        assert_eq!(rx.await.unwrap().retcode, Some(0));
+        assert!(pending.is_empty());
+    }
+
     #[test]
-    fn a_broadcast_call_still_takes_whoever_answers() {
-        assert!(answers_us(None, 1));
-        assert!(answers_us(None, 7));
+    fn accounts_have_separate_inboxes_and_histories() {
+        let f = Fixture::new();
+        let a = SessionKey::group(7).for_account(Some(100));
+        let b = SessionKey::group(7).for_account(Some(200));
+        assert_ne!(a.pref_key(), b.pref_key());
+        assert_ne!(a.source_id(), b.source_id());
+        let _a = f.started(&a, "mock-conversation-a", 1);
+        let _b = f.started(&b, "mock-conversation-b", 1);
+        assert!(matches!(f.begin(&b, "mock-conversation-b", 2), TurnStart::Queued));
+        assert!(f.states.lock()[&a.to_string()].inbox.is_empty());
+        assert_eq!(f.states.lock()[&b.to_string()].inbox.len(), 1);
+    }
+
+    #[test]
+    fn queued_user_messages_are_bounded() {
+        let f = Fixture::new();
+        let key = SessionKey::private(7);
+        let _turn = f.started(&key, "mock-conversation", 1);
+        for i in 0..32 {
+            assert!(matches!(f.begin(&key, "mock-conversation", i + 2), TurnStart::Queued));
+        }
+        assert!(matches!(f.begin(&key, "mock-conversation", 40), TurnStart::Full));
+        assert_eq!(f.states.lock()[&key.to_string()].inbox.len(), 32);
+    }
+
+    #[test]
+    fn identity_cannot_drift_or_be_claimed_twice() {
+        let mut ids = HashMap::new();
+        assert!(bind_identity(&mut ids, 1, 100));
+        assert!(bind_identity(&mut ids, 1, 100));
+        assert!(!bind_identity(&mut ids, 1, 200));
+        assert!(!bind_identity(&mut ids, 2, 100));
+        assert!(!bind_identity(&mut ids, 2, 0));
+        assert!(bind_identity(&mut ids, 2, 200));
+    }
+
+    #[tokio::test]
+    async fn private_media_config_roundtrips_and_fails_closed() {
+        let db = crate::db::sea::sea_test_db().await;
+        assert!(load_config(&db).await.unwrap().private_media_origins.is_empty());
+        let mut config = OneBotConfig {
+            private_media_origins: vec![PrivateMediaOrigin {
+                origin: "http://adapter.local:8080".into(),
+                ip: "192.168.1.2".parse().unwrap(),
+            }],
+            ..Default::default()
+        };
+        save_config(&db, &config).await.unwrap();
+        assert_eq!(
+            load_config(&db).await.unwrap().private_media_origins,
+            config.private_media_origins
+        );
+        config.private_media_origins[0].origin.push_str("/path");
+        assert!(save_config(&db, &config).await.is_err());
+        assert_eq!(
+            load_config(&db).await.unwrap().private_media_origins[0].origin,
+            "http://adapter.local:8080"
+        );
+        for raw in [
+            "null",
+            "not-json",
+            r#"[{"origin":"http://local.test","ip":"bad"}]"#,
+            r#"[{"origin":"http://local.test","ip":"127.0.0.1","wildcard":true}]"#,
+            r#"[{"origin":"http://local.test/path","ip":"127.0.0.1"}]"#,
+        ] {
+            db.write(async |tx| {
+                crate::db::sea::ops::preference::set_preference(tx, "onebot.private_media_origins", raw, 1).await
+            })
+            .await
+            .unwrap();
+            assert!(load_config(&db).await.is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn credentials_must_agree_and_be_unambiguous() {
+        assert!(!token_matches("", None, Some("access_token=")));
+        assert!(!token_matches("mock", Some("Bearer mock"), Some("access_token=wrong")));
+        assert!(!token_matches("mock", Some("Bearer wrong"), Some("access_token=mock")));
+        assert!(!token_matches(
+            "mock",
+            None,
+            Some("access_token=mock&access_token=mock")
+        ));
+        assert!(token_matches("mock", Some("Bearer mock"), Some("access_token=mock")));
     }
 
     #[test]
@@ -2580,7 +2735,7 @@ mod tests {
     #[test]
     fn test_token_matches_query() {
         assert!(token_matches("secret", None, Some("access_token=secret")));
-        assert!(token_matches("secret", None, Some("foo=1&access_token=secret")));
+        assert!(!token_matches("secret", None, Some("foo=1&access_token=secret")));
         assert!(!token_matches("secret", None, Some("access_token=wrong")));
     }
 

@@ -14,7 +14,7 @@ use crate::db::types::{Json, SqlBool};
 const MAX_CANDIDATES: usize = 500;
 const MAX_CANDIDATE_BYTES: i64 = 500 * 1024 * 1024;
 
-pub fn capture_in_background(state: Arc<SharedState>, self_id: i64, stickers: Vec<StickerRef>) {
+pub fn capture_in_background(state: Arc<SharedState>, self_id: i64, conn_id: u64, stickers: Vec<StickerRef>) {
     static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8))).clone();
     tokio::spawn(async move {
@@ -22,7 +22,7 @@ pub fn capture_in_background(state: Arc<SharedState>, self_id: i64, stickers: Ve
             return;
         };
         let _permit = permit;
-        capture_stickers(&state, self_id, &stickers).await;
+        capture_stickers(&state, self_id, conn_id, &stickers).await;
     });
 }
 
@@ -126,7 +126,12 @@ async fn record_new(state: &SharedState, row: emoji::Model, hint: Option<&str>, 
         .ok()
 }
 
-pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: &[StickerRef]) -> Vec<Option<String>> {
+pub async fn capture_stickers(
+    state: &Arc<SharedState>,
+    self_id: i64,
+    conn_id: u64,
+    stickers: &[StickerRef],
+) -> Vec<Option<String>> {
     if stickers.is_empty() || self_id == 0 {
         return vec![None; stickers.len()];
     }
@@ -158,13 +163,12 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
             None => None,
         };
         if let Some(mut known) = known {
-            let url = sticker
-                .url
-                .as_deref()
-                .or_else(|| sticker.file.as_deref().filter(|value| value.starts_with("http")));
+            let media = super::format::MediaRef {
+                url: sticker.url.clone(),
+                file: sticker.file.clone(),
+            };
             if known.file_name.is_empty()
-                && let Some(url) = url
-                && let Ok((bytes, extension)) = super::media::download_image(url).await
+                && let Ok((bytes, extension)) = super::media::image_bytes(state, conn_id, &media).await
             {
                 let file_name = format!("{}.{}", known.id, extension);
                 let path = crate::emoji::emoji_path(data_dir, &pack_id, &file_name);
@@ -188,14 +192,11 @@ pub async fn capture_stickers(state: &Arc<SharedState>, self_id: i64, stickers: 
             continue;
         }
 
-        let url = sticker
-            .url
-            .as_deref()
-            .or_else(|| sticker.file.as_deref().filter(|value| value.starts_with("http")));
-        let downloaded = match url {
-            Some(url) => super::media::download_image(url).await.ok(),
-            None => None,
+        let media = super::format::MediaRef {
+            url: sticker.url.clone(),
+            file: sticker.file.clone(),
         };
+        let downloaded = super::media::image_bytes(state, conn_id, &media).await.ok();
         let key = sticker.source_key.clone().unwrap_or_else(|| {
             downloaded
                 .as_ref()
@@ -330,8 +331,8 @@ mod tests {
         let first = [sticker.clone()];
         let second = [sticker];
         let (a, b) = tokio::join!(
-            super::capture_stickers(&state, 42, &first),
-            super::capture_stickers(&state, 42, &second),
+            super::capture_stickers(&state, 42, 1, &first),
+            super::capture_stickers(&state, 42, 1, &second),
         );
         assert!(a[0].is_some(), "{a:?}");
         assert_eq!(a, b, "both captures name the same sticker");

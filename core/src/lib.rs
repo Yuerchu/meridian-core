@@ -14,6 +14,7 @@ pub mod approval;
 #[cfg(not(target_os = "android"))]
 pub mod background;
 pub mod bootstrap;
+pub(crate) mod child_env;
 pub mod client;
 pub mod codex_auth;
 /// Running a command in a container rather than on this machine. Desktop only:

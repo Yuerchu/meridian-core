@@ -198,6 +198,28 @@ pub struct AdapterProcess {
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
+pub(crate) fn launch_command(command: &str, args: &[String]) -> tokio::process::Command {
+    // Set on the child, and — when the child is a container launcher —
+    // forwarded past it. `.env` alone stops at the launcher; see
+    // [`HOSTED_MARKER`].
+    let args = forward_marker_into_container(command, args);
+    let mut cmd = tokio::process::Command::new(program_for(command));
+    crate::child_env::clear_and_allow_platform(cmd.as_std_mut());
+    cmd.args(&args)
+        .env(HOSTED_MARKER, "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    // CREATE_NO_WINDOW: without it every adapter launch flashes a console.
+    // `tokio::process::Command` carries this itself, so the std extension
+    // trait is not needed.
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    cmd
+}
+
 impl AdapterProcess {
     /// Start `command` with `args`, wired for JSON-RPC over stdio.
     ///
@@ -206,24 +228,7 @@ impl AdapterProcess {
     /// carry several sessions in different repositories. Launching it inside one
     /// of them would make the first session's directory silently special.
     pub async fn spawn(command: &str, args: &[String]) -> Result<Self, String> {
-        // Set on the child, and — when the child is a container launcher —
-        // forwarded past it. `.env` alone stops at the launcher; see
-        // [`HOSTED_MARKER`].
-        let args = forward_marker_into_container(command, args);
-        let mut cmd = tokio::process::Command::new(program_for(command));
-        cmd.args(&args)
-            .env(HOSTED_MARKER, "1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-
-        // CREATE_NO_WINDOW: without it every adapter launch flashes a console.
-        // `tokio::process::Command` carries this itself, so the std extension
-        // trait is not needed.
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(0x08000000);
-
+        let mut cmd = launch_command(command, args);
         let mut child = cmd.spawn().map_err(|e| {
             tracing::error!(
                 command = %command,

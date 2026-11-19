@@ -75,44 +75,17 @@ impl ReqwestTransport {
         Ok(builder)
     }
 
-    /// Host and path only. A query string routinely carries an API key, and this
-    /// value ends up in a file the user can export.
-    fn safe_url(url: &str) -> String {
-        match reqwest::Url::parse(url) {
-            Ok(parsed) => format!("{}{}", parsed.host_str().unwrap_or("?"), parsed.path()),
-            Err(_) => "?".to_string(),
-        }
-    }
-
-    /// The provider's own error code, when the body is JSON shaped like
-    /// `{"error": {"code": ...}}`. The message beside it can quote the request
-    /// back, so only the code is taken.
-    fn error_code(body: Option<&str>) -> Option<String> {
-        let parsed: serde_json::Value = serde_json::from_str(body?).ok()?;
-        let error = parsed.get("error")?;
-        error
-            .get("code")
-            .or_else(|| error.get("type"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    }
-
-    fn log_http_failure(status: StatusCode, url: &str, body: Option<&str>, streaming: bool) {
-        let code = Self::error_code(body);
-        // This is the single exit every provider's HTTP failure passes through —
-        // 401 on a stale key, 429, 5xx. Without a record here the user sees a red
-        // bubble and the log has nothing to say about it.
+    // Paths and upstream error codes can contain credentials too.
+    fn log_http_failure(status: StatusCode, streaming: bool) {
         tracing::error!(
             status = status.as_u16(),
-            url = %Self::safe_url(url),
-            error_code = code.as_deref().unwrap_or(""),
-            body_len = body.map(str::len).unwrap_or(0),
+            kind = "http",
             streaming,
-            "provider request failed"
+            "upstream request failed"
         );
     }
 
-    fn map_error(err: reqwest::Error) -> TransportError {
+    pub(crate) fn map_error(err: reqwest::Error) -> TransportError {
         // `Timeout` renders as the single word "timeout", which cannot tell a
         // blocked proxy from a slow model. The kind is recorded here because it
         // is the last place that still knows.
@@ -129,16 +102,12 @@ impl ReqwestTransport {
         };
         // Not err.to_string(): reqwest's error chain can carry the full URL,
         // query string included.
-        tracing::warn!(
-            kind,
-            url = %err.url().map(|u| Self::safe_url(u.as_str())).unwrap_or_default(),
-            "provider request could not be completed"
-        );
+        tracing::warn!(kind, "provider request could not be completed");
 
         if err.is_timeout() {
             TransportError::Timeout
         } else {
-            TransportError::Network(err.to_string())
+            TransportError::Network(kind.to_string())
         }
     }
 }
@@ -172,10 +141,9 @@ impl ReqwestTransport {
         let resp = builder.send().await.map_err(Self::map_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let bytes = resp.bytes().await.map_err(Self::map_error)?;
         if !status.is_success() {
-            let body = String::from_utf8(bytes.to_vec()).ok();
-            Self::log_http_failure(status, &url, body.as_deref(), false);
+            let body = super::bounded::error_body(resp, super::bounded::ERROR_BYTES).await;
+            Self::log_http_failure(status, false);
             return Err(TransportError::Http {
                 status,
                 url: Some(url),
@@ -183,6 +151,7 @@ impl ReqwestTransport {
                 body,
             });
         }
+        let bytes = super::bounded::body(resp, super::bounded::BODY_BYTES).await?;
         Ok(Response {
             status,
             headers,
@@ -197,8 +166,8 @@ impl ReqwestTransport {
         let status = resp.status();
         let headers = resp.headers().clone();
         if !status.is_success() {
-            let body = resp.text().await.ok();
-            Self::log_http_failure(status, &url, body.as_deref(), true);
+            let body = super::bounded::error_body(resp, super::bounded::ERROR_BYTES).await;
+            Self::log_http_failure(status, true);
             return Err(TransportError::Http {
                 status,
                 url: Some(url),
@@ -210,7 +179,52 @@ impl ReqwestTransport {
         Ok(StreamResponse {
             status,
             headers,
-            bytes: Box::pin(stream),
+            bytes: super::bounded::sse(Box::pin(stream), super::bounded::SSE_LIMITS),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn oversized_error_diagnostics_preserve_status_and_retry_headers() {
+        for streaming in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                // Only a header: no large allocation or payload needed.
+                let wire = format!(
+                    "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nRetry-After: 7\r\nConnection: close\r\n\r\n",
+                    super::super::bounded::ERROR_BYTES + 1
+                );
+                socket.write_all(wire.as_bytes()).await.unwrap();
+            });
+            let transport = ReqwestTransport::new(reqwest::Client::builder().no_proxy().build().unwrap());
+            let mut request = Request::new(Method::GET, format!("http://{address}"));
+            request.retry = None;
+            request.timeout = Some(std::time::Duration::from_secs(2));
+            let error = if streaming {
+                transport.stream(request).await.err().unwrap()
+            } else {
+                transport.execute(request).await.unwrap_err()
+            };
+            match error {
+                TransportError::Http {
+                    status, headers, body, ..
+                } => {
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(headers.unwrap()["retry-after"], "7");
+                    assert!(body.is_none());
+                }
+                other => panic!("lost HTTP classification: {other:?}"),
+            }
+            server.await.unwrap();
+        }
     }
 }

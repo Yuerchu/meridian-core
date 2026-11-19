@@ -262,6 +262,7 @@ pub async fn save_config(db: &Db, config: &HookConfig) -> Result<(), String> {
 
 pub(crate) struct SharedState {
     pub config: HookConfig,
+    pub review_slots: Arc<tokio::sync::Semaphore>,
     /// Also how a review announces that its conversation exists or has moved on.
     ///
     /// The review loop deliberately streams to nobody — there is no window
@@ -284,7 +285,11 @@ impl HookServer {
         let handshake = Some(services.paths.data_dir.join(HANDSHAKE));
         let (shutdown_tx, _) = watch::channel(false);
         Self {
-            state: Arc::new(SharedState { config, services }),
+            state: Arc::new(SharedState {
+                config,
+                services,
+                review_slots: Arc::new(tokio::sync::Semaphore::new(http::MAX_REVIEWS)),
+            }),
             shutdown_tx,
             running: Arc::new(AtomicBool::new(false)),
             handshake,
@@ -344,6 +349,7 @@ impl HookServer {
                 write_handshake(path, &state.config, generation);
             }
 
+            let connections = Arc::new(tokio::sync::Semaphore::new(http::MAX_CONNECTIONS));
             loop {
                 tokio::select! {
                     changed = shutdown_rx.changed() => {
@@ -357,7 +363,13 @@ impl HookServer {
                     }
                     accepted = listener.accept() => {
                         match accepted {
-                            Ok((stream, peer)) => http::serve(stream, peer, state.clone()),
+                            Ok((stream, peer)) => {
+                                // Never queue or spawn excess connections, even when
+                                // their clients have not sent a single header byte.
+                                if let Some((stream, permit)) = http::admit(stream, &connections) {
+                                    http::serve(stream, peer, state.clone(), permit);
+                                }
+                            }
                             Err(e) => tracing::warn!(error = %e, "hook server accept failed"),
                         }
                     }

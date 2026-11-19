@@ -76,338 +76,170 @@ pub fn delete_pack_dir(app_data_dir: &Path, pack_id: &str) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Provider-safe PNG contact sheet containing at most six chronological frames.
-pub fn vision_preview_data_uri(path: &Path) -> Result<String, String> {
-    use base64::Engine;
-    use std::io::BufReader;
+// Limits are checked before requesting a decoded frame. Only small thumbnails
+// survive each iteration; a long animation deliberately previews a bounded prefix.
+const PREVIEW_CELL: u32 = 192;
+const MAX_DIMENSION: u32 = 4096;
+const MAX_CANVAS_PIXELS: u64 = 16_777_216;
+const MAX_TOTAL_PIXELS: u64 = 64 * 1024 * 1024;
+const MAX_PREVIEW_FRAMES: usize = 120;
+const MAX_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
 
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+fn read_image_input(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut frames: Vec<image::RgbaImage> = match extension.as_str() {
-        "gif" => decode_gif_frames(path)?,
-        "webp" => return crate::files::file_to_base64_data_uri(path, "image/webp"),
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_FILE_SIZE {
+        return Err("sticker must be a regular file of at most 5 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_FILE_SIZE {
+        return Err("sticker exceeds 5 MiB".into());
+    }
+    Ok(bytes)
+}
+
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits
+}
+
+fn canvas_pixels(dimensions: (u32, u32)) -> Result<u64, String> {
+    let (width, height) = dimensions;
+    let pixels = u64::from(width) * u64::from(height);
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION || pixels > MAX_CANVAS_PIXELS {
+        return Err("sticker dimensions are invalid or too large".into());
+    }
+    Ok(pixels)
+}
+
+fn thumbnail_frames(
+    frames: impl Iterator<Item = image::ImageResult<image::Frame>>,
+    pixels: u64,
+) -> Result<Vec<image::RgbaImage>, String> {
+    // The canvas size is validated by the caller before constructing/advancing
+    // the animation iterator. No extra frame is decoded to detect truncation.
+    // Reserve one canvas for an APNG default image excluded from its animation.
+    let count = MAX_PREVIEW_FRAMES.min((MAX_TOTAL_PIXELS / pixels).saturating_sub(1) as usize);
+    frames
+        .take(count)
+        .map(|frame| {
+            let frame = frame.map_err(|e| e.to_string())?;
+            Ok(image::imageops::thumbnail(frame.buffer(), PREVIEW_CELL, PREVIEW_CELL))
+        })
+        .collect()
+}
+
+fn png_decoder(bytes: &[u8]) -> Result<image::codecs::png::PngDecoder<std::io::Cursor<&[u8]>>, String> {
+    // Unlike set_limits after new(), with_limits bounds PNG header/chunk
+    // processing as well as the later APNG buffers.
+    image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(bytes), decode_limits()).map_err(|e| e.to_string())
+}
+
+fn preview_png(bytes: &[u8], extension: &str) -> Result<Vec<u8>, String> {
+    use image::ImageDecoder;
+    let thumbs = match extension {
+        "gif" => {
+            let mut decoder =
+                image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+            let pixels = canvas_pixels(decoder.dimensions())?;
+            let mut limits = decode_limits();
+            // The image backend validates each frame rectangle against these
+            // dimensions before allocating, even if a malformed GIF describes
+            // a frame larger than its logical screen.
+            limits.max_image_width = Some(decoder.dimensions().0);
+            limits.max_image_height = Some(decoder.dimensions().1);
+            decoder.set_limits(limits).map_err(|e| e.to_string())?;
+            thumbnail_frames(decoder.into_frames(), pixels)?
+        }
         "png" | "apng" => {
-            let decoder = image::codecs::png::PngDecoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+            let decoder = png_decoder(bytes)?;
+            let pixels = canvas_pixels(decoder.dimensions())?;
             if decoder.is_apng().map_err(|e| e.to_string())? {
-                decoder
-                    .apng()
-                    .map_err(|e| e.to_string())?
-                    .into_frames()
-                    .take(120)
-                    .map(|frame| frame.map(|value| value.into_buffer()).map_err(|e| e.to_string()))
-                    .collect::<Result<_, _>>()?
+                thumbnail_frames(decoder.apng().map_err(|e| e.to_string())?.into_frames(), pixels)?
             } else {
-                vec![
-                    image::DynamicImage::from_decoder(decoder)
-                        .map_err(|e| e.to_string())?
-                        .to_rgba8(),
-                ]
+                let frame = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+                vec![frame.thumbnail(PREVIEW_CELL, PREVIEW_CELL).to_rgba8()]
             }
         }
-        _ => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
-            return crate::files::file_to_base64_data_uri(path, &mime);
-        }
+        _ => return Err("sticker preview requires GIF or PNG".into()),
     };
-    if frames.is_empty() {
+    contact_sheet(thumbs)
+}
+
+fn contact_sheet(thumbs: Vec<image::RgbaImage>) -> Result<Vec<u8>, String> {
+    if thumbs.is_empty() {
         return Err("sticker contains no decodable frame".into());
     }
-    if frames.len() > 6 {
-        let last = frames.len() - 1;
-        frames = (0..6).map(|index| frames[index * last / 5].clone()).collect();
-    }
-
-    const CELL: u32 = 192;
-    let columns = frames.len().min(3) as u32;
-    let rows = (frames.len() as u32).div_ceil(columns);
-    let mut sheet = image::RgbaImage::new(columns * CELL, rows * CELL);
-    for (index, frame) in frames.into_iter().enumerate() {
-        let thumb = image::imageops::thumbnail(&frame, CELL, CELL);
-        let cell_x = (index as u32 % columns) * CELL;
-        let cell_y = (index as u32 / columns) * CELL;
-        let x = cell_x + (CELL - thumb.width()) / 2;
-        let y = cell_y + (CELL - thumb.height()) / 2;
-        image::imageops::overlay(&mut sheet, &thumb, x.into(), y.into());
+    let count = thumbs.len().min(6);
+    let columns = count.min(3) as u32;
+    let rows = (count as u32).div_ceil(columns);
+    let mut sheet = image::RgbaImage::new(columns * PREVIEW_CELL, rows * PREVIEW_CELL);
+    for index in 0..count {
+        let source = if thumbs.len() > 6 {
+            index * (thumbs.len() - 1) / 5
+        } else {
+            index
+        };
+        let thumb = &thumbs[source];
+        let x = (index as u32 % columns) * PREVIEW_CELL + (PREVIEW_CELL - thumb.width()) / 2;
+        let y = (index as u32 / columns) * PREVIEW_CELL + (PREVIEW_CELL - thumb.height()) / 2;
+        image::imageops::overlay(&mut sheet, thumb, x.into(), y.into());
     }
     let mut bytes = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(sheet)
         .write_to(&mut bytes, image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
+    Ok(bytes.into_inner())
+}
+
+fn extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Provider-safe PNG contact sheet containing at most six chronological frames.
+pub fn vision_preview_data_uri(path: &Path) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = read_image_input(path)?;
+    let extension = extension(path);
+    let (mime, bytes) = match extension.as_str() {
+        "gif" | "png" | "apng" => ("image/png".to_owned(), preview_png(&bytes, &extension)?),
+        _ => (mime_guess::from_path(path).first_or_octet_stream().to_string(), bytes),
+    };
     Ok(format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
 }
 
-/// Bytes to hand an embedding engine: a PNG contact sheet for GIF/APNG so a
-/// reaction's frames stay visible; the file's own bytes for stills, which
-/// LiteRT-LM patchifies itself.
+/// Animated images use the same contact sheet as vision; stills retain their
+/// original bytes for the embedding engine. All paths have the input byte cap.
 pub fn embedding_image_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    use image::ImageDecoder;
+    let bytes = read_image_input(path)?;
+    let extension = extension(path);
     match extension.as_str() {
-        "gif" => vision_preview_png(path),
+        "gif" => preview_png(&bytes, &extension),
         "png" | "apng" => {
-            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            let decoder =
-                image::codecs::png::PngDecoder::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
+            let decoder = png_decoder(&bytes)?;
+            canvas_pixels(decoder.dimensions())?;
             if decoder.is_apng().map_err(|e| e.to_string())? {
-                vision_preview_png(path)
+                preview_png(&bytes, &extension)
             } else {
-                std::fs::read(path).map_err(|e| e.to_string())
+                Ok(bytes)
             }
         }
-        _ => std::fs::read(path).map_err(|e| e.to_string()),
+        _ => Ok(bytes),
     }
-}
-
-fn vision_preview_png(path: &Path) -> Result<Vec<u8>, String> {
-    let uri = vision_preview_data_uri(path)?;
-    let encoded = uri
-        .strip_prefix("data:image/png;base64,")
-        .ok_or("sticker preview was not a PNG")?;
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|e| e.to_string())
-}
-
-fn decode_gif_frames(path: &Path) -> Result<Vec<image::RgbaImage>, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    if bytes.len() < 13 || !matches!(&bytes[..6], b"GIF87a" | b"GIF89a") {
-        return Err("invalid GIF header".into());
-    }
-    let mut cursor = 6usize;
-    let read_u8 = |cursor: &mut usize| -> Result<u8, String> {
-        let value = *bytes.get(*cursor).ok_or("truncated GIF")?;
-        *cursor += 1;
-        Ok(value)
-    };
-    let read_u16 = |cursor: &mut usize| -> Result<u16, String> {
-        let low = read_u8(cursor)? as u16;
-        let high = read_u8(cursor)? as u16;
-        Ok(low | high << 8)
-    };
-    let width = read_u16(&mut cursor)? as u32;
-    let height = read_u16(&mut cursor)? as u32;
-    if width == 0 || height == 0 || width.saturating_mul(height) > 16_777_216 {
-        return Err("GIF dimensions are invalid or too large".into());
-    }
-    let packed = read_u8(&mut cursor)?;
-    let _background = read_u8(&mut cursor)?;
-    let _aspect = read_u8(&mut cursor)?;
-    let read_palette = |cursor: &mut usize, count: usize| -> Result<Vec<[u8; 3]>, String> {
-        let end = cursor.checked_add(count * 3).ok_or("GIF palette overflow")?;
-        let source = bytes.get(*cursor..end).ok_or("truncated GIF palette")?;
-        *cursor = end;
-        Ok(source.as_chunks::<3>().0.to_vec())
-    };
-    let global_palette = if packed & 0x80 != 0 {
-        read_palette(&mut cursor, 2usize << (packed & 0x07))?
-    } else {
-        Vec::new()
-    };
-    let read_sub_blocks = |cursor: &mut usize| -> Result<Vec<u8>, String> {
-        let mut output = Vec::new();
-        loop {
-            let size = read_u8(cursor)? as usize;
-            if size == 0 {
-                break;
-            }
-            let end = cursor.checked_add(size).ok_or("GIF block overflow")?;
-            output.extend_from_slice(bytes.get(*cursor..end).ok_or("truncated GIF block")?);
-            *cursor = end;
-        }
-        Ok(output)
-    };
-
-    #[derive(Clone, Copy, Default)]
-    struct Control {
-        disposal: u8,
-        transparent: Option<u8>,
-    }
-    struct Previous {
-        disposal: u8,
-        rect: (u32, u32, u32, u32),
-        restore: Option<image::RgbaImage>,
-    }
-
-    let mut control = Control::default();
-    let mut canvas = image::RgbaImage::new(width, height);
-    let mut previous: Option<Previous> = None;
-    let mut frames = Vec::new();
-    while cursor < bytes.len() && frames.len() < 120 {
-        match read_u8(&mut cursor)? {
-            0x3B => break,
-            0x21 => {
-                let label = read_u8(&mut cursor)?;
-                if label == 0xF9 {
-                    let size = read_u8(&mut cursor)? as usize;
-                    if size != 4 {
-                        return Err("invalid GIF graphic control extension".into());
-                    }
-                    let flags = read_u8(&mut cursor)?;
-                    let _delay = read_u16(&mut cursor)?;
-                    let transparent = read_u8(&mut cursor)?;
-                    let _terminator = read_u8(&mut cursor)?;
-                    control = Control {
-                        disposal: (flags >> 2) & 0x07,
-                        transparent: (flags & 0x01 != 0).then_some(transparent),
-                    };
-                } else {
-                    let _ = read_sub_blocks(&mut cursor)?;
-                }
-            }
-            0x2C => {
-                if let Some(previous) = previous.take() {
-                    match previous.disposal {
-                        2 => {
-                            let (left, top, frame_width, frame_height) = previous.rect;
-                            for y in top..top.saturating_add(frame_height).min(height) {
-                                for x in left..left.saturating_add(frame_width).min(width) {
-                                    canvas.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
-                                }
-                            }
-                        }
-                        3 => {
-                            if let Some(restored) = previous.restore {
-                                canvas = restored;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let left = read_u16(&mut cursor)? as u32;
-                let top = read_u16(&mut cursor)? as u32;
-                let frame_width = read_u16(&mut cursor)? as u32;
-                let frame_height = read_u16(&mut cursor)? as u32;
-                let image_flags = read_u8(&mut cursor)?;
-                let local_palette;
-                let palette = if image_flags & 0x80 != 0 {
-                    local_palette = read_palette(&mut cursor, 2usize << (image_flags & 0x07))?;
-                    &local_palette
-                } else {
-                    &global_palette
-                };
-                if palette.is_empty() {
-                    return Err("GIF frame has no colour table".into());
-                }
-                let min_code_size = read_u8(&mut cursor)?;
-                let compressed = read_sub_blocks(&mut cursor)?;
-                let decoded = gif_lzw_decode(&compressed, min_code_size, (frame_width * frame_height) as usize)?;
-                let restore = (control.disposal == 3).then(|| canvas.clone());
-                let rows: Vec<u32> = if image_flags & 0x40 != 0 {
-                    [(0, 8), (4, 8), (2, 4), (1, 2)]
-                        .into_iter()
-                        .flat_map(|(start, step)| (start..frame_height).step_by(step))
-                        .collect()
-                } else {
-                    (0..frame_height).collect()
-                };
-                let mut source = 0usize;
-                for row in rows {
-                    for column in 0..frame_width {
-                        let Some(&index) = decoded.get(source) else { break };
-                        source += 1;
-                        if control.transparent == Some(index) {
-                            continue;
-                        }
-                        let Some(rgb) = palette.get(index as usize) else {
-                            continue;
-                        };
-                        let x = left + column;
-                        let y = top + row;
-                        if x < width && y < height {
-                            canvas.put_pixel(x, y, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
-                        }
-                    }
-                }
-                frames.push(canvas.clone());
-                previous = Some(Previous {
-                    disposal: control.disposal,
-                    rect: (left, top, frame_width, frame_height),
-                    restore,
-                });
-                control = Control::default();
-            }
-            _ => return Err("unsupported GIF block".into()),
-        }
-    }
-    if frames.is_empty() {
-        return Err("GIF contains no image frames".into());
-    }
-    Ok(frames)
-}
-
-fn gif_lzw_decode(data: &[u8], minimum_size: u8, expected: usize) -> Result<Vec<u8>, String> {
-    if !(2..=8).contains(&minimum_size) {
-        return Err("invalid GIF LZW code size".into());
-    }
-    let clear = 1usize << minimum_size;
-    let end = clear + 1;
-    let reset = || {
-        let mut dictionary: Vec<Vec<u8>> = (0..clear).map(|value| vec![value as u8]).collect();
-        dictionary.push(Vec::new());
-        dictionary.push(Vec::new());
-        dictionary
-    };
-    let mut dictionary = reset();
-    let mut code_size = minimum_size as usize + 1;
-    let mut bit = 0usize;
-    let mut previous: Option<Vec<u8>> = None;
-    let mut output = Vec::with_capacity(expected);
-    while bit + code_size <= data.len() * 8 {
-        let mut code = 0usize;
-        for offset in 0..code_size {
-            let at = bit + offset;
-            code |= (((data[at / 8] >> (at % 8)) & 1) as usize) << offset;
-        }
-        bit += code_size;
-        if code == clear {
-            dictionary = reset();
-            code_size = minimum_size as usize + 1;
-            previous = None;
-            continue;
-        }
-        if code == end {
-            break;
-        }
-        let entry = if code < dictionary.len() && !dictionary[code].is_empty() {
-            dictionary[code].clone()
-        } else if code == dictionary.len() {
-            let mut value = previous.clone().ok_or("invalid GIF LZW stream")?;
-            value.push(value[0]);
-            value
-        } else {
-            return Err("invalid GIF LZW dictionary reference".into());
-        };
-        output.extend_from_slice(&entry);
-        if let Some(mut prior) = previous {
-            prior.push(entry[0]);
-            if dictionary.len() < 4096 {
-                dictionary.push(prior);
-                if dictionary.len() == (1usize << code_size) && code_size < 12 {
-                    code_size += 1;
-                }
-            }
-        }
-        previous = Some(entry);
-        if output.len() >= expected {
-            break;
-        }
-    }
-    output.truncate(expected);
-    if output.len() < expected {
-        return Err("truncated GIF pixel stream".into());
-    }
-    Ok(output)
 }
 
 fn detect_format(file_name: &str) -> Result<String, String> {
@@ -430,6 +262,10 @@ fn detect_format(file_name: &str) -> Result<String, String> {
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "emoji/resource_tests.rs"]
+mod resource_tests;
 
 #[cfg(test)]
 mod tests {
