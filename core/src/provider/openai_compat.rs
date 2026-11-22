@@ -5,17 +5,53 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, TokenUsage, ToolCall,
-    ToolDefinition,
+    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, ThinkingStyle,
+    TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
 use crate::provider::dto::{ExtraIgnore, embedded_upstream_error, warn_extra_fields};
 use crate::provider::state::GOOGLE_OPENAI_CHAT_PROTOCOL;
 
+/// Preference key selecting how the Google OpenAI-compatible adapter encodes
+/// thinking parameters (`auto`, `google_thinking_config`, or `reasoning_effort`).
+pub const GOOGLE_COMPAT_THINKING_MODE_PREF: &str = "google.compat_thinking_mode";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GoogleCompatThinkingMode {
+    /// Official Google hosts use top-level `google.thinking_config`; third-party
+    /// relays receive standard `reasoning_effort` only.
+    #[default]
+    Auto,
+    /// Always send Google's top-level `google.thinking_config` extension.
+    GoogleThinkingConfig,
+    /// Always send only standard OpenAI `reasoning_effort`.
+    ReasoningEffort,
+}
+
+impl GoogleCompatThinkingMode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "auto" => Ok(Self::Auto),
+            "google_thinking_config" => Ok(Self::GoogleThinkingConfig),
+            "reasoning_effort" => Ok(Self::ReasoningEffort),
+            other => Err(format!("unknown google compat thinking mode `{other}`")),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::GoogleThinkingConfig => "google_thinking_config",
+            Self::ReasoningEffort => "reasoning_effort",
+        }
+    }
+}
+
 pub struct OpenAICompatProvider {
     base_url: String,
     api_key: String,
     flavor: OpenAICompatFlavor,
+    google_thinking_mode: GoogleCompatThinkingMode,
 }
 
 /// What a chat-completions endpoint needs *beyond* the dialect itself.
@@ -38,6 +74,7 @@ impl OpenAICompatProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             flavor: OpenAICompatFlavor::Generic,
+            google_thinking_mode: GoogleCompatThinkingMode::Auto,
         }
     }
 
@@ -46,7 +83,13 @@ impl OpenAICompatProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             flavor: OpenAICompatFlavor::Google,
+            google_thinking_mode: GoogleCompatThinkingMode::Auto,
         }
+    }
+
+    pub fn with_google_thinking_mode(mut self, mode: GoogleCompatThinkingMode) -> Self {
+        self.google_thinking_mode = mode;
+        self
     }
 
     pub fn new_xai(base_url: &str, api_key: &str) -> Self {
@@ -54,6 +97,7 @@ impl OpenAICompatProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             flavor: OpenAICompatFlavor::Xai,
+            google_thinking_mode: GoogleCompatThinkingMode::Auto,
         }
     }
 
@@ -64,6 +108,11 @@ impl OpenAICompatProvider {
         params: &ChatParams,
         stream: bool,
     ) -> Result<Request, ProviderError> {
+        if !params.server_tools.is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "provider-side server tools are not supported by chat-completions".into(),
+            ));
+        }
         let serialized_messages = match self.flavor {
             // Spelled out rather than wildcarded: the next flavor should have
             // to say which serialisation it wants.
@@ -78,20 +127,48 @@ impl OpenAICompatProvider {
         if stream {
             body["stream_options"] = serde_json::json!({"include_usage": true});
         }
-        if self.flavor != OpenAICompatFlavor::Google
-            && let Some(t) = params.temperature
-        {
+        if let Some(t) = params.temperature {
             body["temperature"] = serde_json::json!(t);
         }
-        if self.flavor != OpenAICompatFlavor::Google
-            && let Some(p) = params.top_p
-        {
+        if let Some(p) = params.top_p {
             body["top_p"] = serde_json::json!(p);
         }
         if let Some(m) = params.max_tokens {
             body["max_tokens"] = serde_json::json!(m);
         }
-        if let Some(ref effort) = params.thinking_effort {
+        if self.flavor == OpenAICompatFlavor::Google {
+            if params.thinking_style != ThinkingStyle::None {
+                let use_google_thinking_config = match self.google_thinking_mode {
+                    GoogleCompatThinkingMode::Auto => is_google_api_host(&self.base_url),
+                    GoogleCompatThinkingMode::GoogleThinkingConfig => true,
+                    GoogleCompatThinkingMode::ReasoningEffort => false,
+                };
+                if use_google_thinking_config {
+                    if super::google_generate_content::model_requires_tool_thought_signature(&params.model) {
+                        let mut thinking_config = serde_json::Map::new();
+                        if params.thinking_enabled {
+                            thinking_config.insert("include_thoughts".into(), serde_json::Value::Bool(true));
+                        }
+                        if let Some(ref effort) = params.thinking_effort {
+                            thinking_config.insert("thinking_level".into(), serde_json::json!(effort));
+                        }
+                        if !thinking_config.is_empty() {
+                            body["google"] = serde_json::json!({
+                                "thinking_config": serde_json::Value::Object(thinking_config)
+                            });
+                        }
+                    } else if let Some(ref effort) = params.thinking_effort {
+                        body["reasoning_effort"] = serde_json::json!(effort);
+                    } else if params.thinking_enabled {
+                        body["google"] = serde_json::json!({
+                            "thinking_config": { "include_thoughts": true }
+                        });
+                    }
+                } else if let Some(ref effort) = params.thinking_effort {
+                    body["reasoning_effort"] = serde_json::json!(effort);
+                }
+            }
+        } else if let Some(ref effort) = params.thinking_effort {
             body["reasoning_effort"] = serde_json::json!(effort);
         }
         // A top-level field on chat-completions, unlike the Responses API's
@@ -99,13 +176,6 @@ impl OpenAICompatProvider {
         // whose capabilities do not list it, so this is a pure passthrough.
         if let Some(ref verbosity) = params.verbosity {
             body["verbosity"] = serde_json::json!(verbosity);
-        }
-        if self.flavor == OpenAICompatFlavor::Google {
-            body["extra_body"] = serde_json::json!({
-                "google": {
-                    "thinking_config": { "include_thoughts": true }
-                }
-            });
         }
         if self.flavor != OpenAICompatFlavor::Google && params.fast {
             // The config-facing name is "fast"; the wire value is the priority tier.
@@ -183,6 +253,19 @@ fn is_openai_host(base_url: &str) -> bool {
         .parse::<http::Uri>()
         .ok()
         .and_then(|uri| uri.host().map(|host| host.eq_ignore_ascii_case("api.openai.com")))
+        .unwrap_or(false)
+}
+
+fn is_google_api_host(base_url: &str) -> bool {
+    base_url
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| {
+            uri.host().map(|host| {
+                host.eq_ignore_ascii_case("generativelanguage.googleapis.com")
+                    || host.eq_ignore_ascii_case("aiplatform.googleapis.com")
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -338,7 +421,7 @@ fn serialize_google_messages(messages: &[ChatMessage], model: &str) -> Result<Ve
                     .iter()
                     .any(|item| matches!(item.location, GoogleSignatureLocation::ToolCall { .. }))
             });
-            if !has_tool_signature {
+            if super::google_generate_content::model_requires_tool_thought_signature(model) && !has_tool_signature {
                 let mut content = m.content.clone();
                 for tc in tool_calls {
                     if !content.is_empty() {
@@ -1397,12 +1480,76 @@ mod google_tests {
     }
 
     #[test]
-    fn google_request_uses_effort_and_thought_summaries_without_sampling() {
-        let provider = OpenAICompatProvider::new_google("https://example.test", "key");
+    fn google_request_uses_top_level_google_config_on_official_host_and_effort_on_relay() {
         let params = ChatParams {
             model: "gemini-3.7-flash".into(),
             thinking_enabled: true,
+            thinking_style: ThinkingStyle::EffortOnly,
             thinking_effort: Some("high".into()),
+            ..Default::default()
+        };
+
+        // Official host under Auto sends top-level `google.thinking_config`
+        // (never SDK-only `extra_body`) and omits conflicting `reasoning_effort`.
+        let official =
+            OpenAICompatProvider::new_google("https://generativelanguage.googleapis.com/v1beta/openai", "key");
+        let req = official
+            .build_request(&[ChatMessage::user("hello")], None, &params, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        assert!(body.get("extra_body").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(
+            body["google"]["thinking_config"],
+            serde_json::json!({ "include_thoughts": true, "thinking_level": "high" })
+        );
+
+        // Third-party relay under Auto sends standard `reasoning_effort` only.
+        let relay = OpenAICompatProvider::new_google("https://relay.example/v1", "key");
+        let req = relay
+            .build_request(&[ChatMessage::user("hello")], None, &params, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        assert!(body.get("extra_body").is_none());
+        assert!(body.get("google").is_none());
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // Explicit mode overrides work on any host.
+        let forced_google = relay.with_google_thinking_mode(GoogleCompatThinkingMode::GoogleThinkingConfig);
+        let req = forced_google
+            .build_request(&[ChatMessage::user("hello")], None, &params, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        assert_eq!(
+            body["google"]["thinking_config"],
+            serde_json::json!({ "include_thoughts": true, "thinking_level": "high" })
+        );
+
+        let forced_effort = official.with_google_thinking_mode(GoogleCompatThinkingMode::ReasoningEffort);
+        let req = forced_effort
+            .build_request(&[ChatMessage::user("hello")], None, &params, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body")
+        };
+        assert!(body.get("google").is_none());
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn google_compat_honours_sampling_and_non_thinking_params() {
+        let provider =
+            OpenAICompatProvider::new_google("https://generativelanguage.googleapis.com/v1beta/openai", "key");
+        let params = ChatParams {
+            model: "gemini-2.5-flash".into(),
+            thinking_enabled: false,
+            thinking_style: ThinkingStyle::None,
             temperature: Some(0.8),
             top_p: Some(0.9),
             ..Default::default()
@@ -1413,13 +1560,33 @@ mod google_tests {
         let Some(RequestBody::Json(body)) = req.body else {
             panic!("JSON body")
         };
-        assert_eq!(body["reasoning_effort"], "high");
-        assert_eq!(
-            body["extra_body"]["google"]["thinking_config"]["include_thoughts"],
-            true
+        assert_eq!(body["temperature"], 0.8);
+        assert_eq!(body["top_p"], 0.9);
+        assert!(body.get("google").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn gemini_25_unsigned_tool_calls_stay_native_in_openai_compat() {
+        let assistant = ChatMessage::assistant_with_tools(
+            "",
+            None,
+            vec![ToolCall {
+                id: "call-25".into(),
+                name: "search".into(),
+                arguments: r#"{"q":"rust"}"#.into(),
+            }],
         );
-        assert!(body.get("temperature").is_none());
-        assert!(body.get("top_p").is_none());
+        let wire = serialize_google_messages(
+            &[assistant, ChatMessage::tool_result("call-25", "done")],
+            "gemini-2.5-flash",
+        )
+        .unwrap();
+        assert_eq!(wire[0]["role"], "assistant");
+        assert_eq!(wire[0]["tool_calls"][0]["function"]["name"], "search");
+        assert_eq!(wire[1]["role"], "tool");
+        assert_eq!(wire[1]["tool_call_id"], "call-25");
+        assert_eq!(wire[1]["name"], "search");
     }
 
     #[test]

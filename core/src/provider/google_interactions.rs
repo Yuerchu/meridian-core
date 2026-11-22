@@ -10,40 +10,74 @@
 
 use async_trait::async_trait;
 use base64::Engine;
+use bytes::Bytes;
 use eventsource_stream::Eventsource;
 use futures::stream::StreamExt;
+use ring::digest;
 use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::dto::{ExtraIgnore, embedded_upstream_error, warn_extra_fields, warn_unknown_event};
-use super::state::ProviderStateUpdate;
+use super::state::{ProviderStateAccumulator, ProviderStateUpdate};
 use super::{
     AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, MessageContentPart, ProviderError,
-    SenderRendering, ServerToolCall, ServerToolKind, StreamEvent, TokenUsage, ToolCall, ToolDefinition,
+    SenderRendering, ServerToolCall, ServerToolKind, StreamEvent, ThinkingStyle, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
 
 const DEFAULT_INTERACTIONS_SUFFIX: &str = "/v1beta1/locations/global/interactions";
 const VERTEX_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const DEFAULT_GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+const VERTEX_OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct GoogleInteractionsProvider {
     endpoint: String,
     auth: GoogleInteractionsAuth,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VertexTokenCacheKey {
+    token_uri: String,
+    client_email: String,
+    private_key_sha256: [u8; 32],
+}
+
+impl VertexTokenCacheKey {
+    fn from_credentials(credentials: &ServiceAccountCredentials) -> Self {
+        let token_uri = credentials
+            .token_uri
+            .as_deref()
+            .filter(|uri| !uri.trim().is_empty())
+            .unwrap_or(DEFAULT_GOOGLE_TOKEN_URI)
+            .to_string();
+        let digest = digest::digest(&digest::SHA256, credentials.private_key.as_bytes());
+        let mut private_key_sha256 = [0u8; 32];
+        private_key_sha256.copy_from_slice(digest.as_ref());
+        Self {
+            token_uri,
+            client_email: credentials.client_email.clone(),
+            private_key_sha256,
+        }
+    }
+}
+
+fn vertex_token_cache() -> &'static Mutex<HashMap<VertexTokenCacheKey, CachedAccessToken>> {
+    static CACHE: OnceLock<Mutex<HashMap<VertexTokenCacheKey, CachedAccessToken>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 enum GoogleInteractionsAuth {
     ApiKey(String),
     VertexServiceAccount {
         credentials: ServiceAccountCredentials,
-        cached_token: Arc<Mutex<Option<CachedAccessToken>>>,
+        cache_key: VertexTokenCacheKey,
     },
 }
 
@@ -57,6 +91,7 @@ struct ServiceAccountCredentials {
     token_uri: Option<String>,
 }
 
+#[derive(Clone)]
 struct CachedAccessToken {
     access_token: String,
     expires_at: u64,
@@ -88,12 +123,10 @@ impl GoogleInteractionsProvider {
     pub fn new_vertex(base_url: &str, service_account_json: &str) -> Result<Self, String> {
         let credentials = parse_service_account(service_account_json)?;
         let endpoint = vertex_interactions_endpoint(base_url, &credentials.project_id)?;
+        let cache_key = VertexTokenCacheKey::from_credentials(&credentials);
         Ok(Self {
             endpoint,
-            auth: GoogleInteractionsAuth::VertexServiceAccount {
-                credentials,
-                cached_token: Arc::new(Mutex::new(None)),
-            },
+            auth: GoogleInteractionsAuth::VertexServiceAccount { credentials, cache_key },
         })
     }
 
@@ -104,9 +137,10 @@ impl GoogleInteractionsProvider {
         params: &ChatParams,
         stream: bool,
     ) -> Result<Request, ProviderError> {
-        let (system, input) = serialize_input(messages, &params.model)?;
+        let model = params.model.strip_prefix("models/").unwrap_or(&params.model);
+        let (system, input) = serialize_input(messages, model)?;
         let mut body = Map::new();
-        body.insert("model".into(), json!(params.model));
+        body.insert("model".into(), json!(model));
         body.insert("input".into(), Value::Array(input));
         body.insert("stream".into(), Value::Bool(stream));
         // Meridian persists the canonical history. Keeping a second copy in
@@ -126,10 +160,12 @@ impl GoogleInteractionsProvider {
         if let Some(top_p) = params.top_p {
             generation.insert("top_p".into(), json!(top_p));
         }
-        if let Some(effort) = params.thinking_effort.as_deref() {
+        if params.thinking_style != ThinkingStyle::Budget
+            && let Some(effort) = params.thinking_effort.as_deref()
+        {
             generation.insert("thinking_level".into(), json!(effort));
         }
-        if params.thinking_enabled {
+        if params.thinking_enabled && params.thinking_style != ThinkingStyle::None {
             generation.insert("thinking_summaries".into(), json!("auto"));
         }
         if !generation.is_empty() {
@@ -196,56 +232,39 @@ impl GoogleInteractionsProvider {
     }
 
     async fn vertex_access_token(&self) -> Result<String, ProviderError> {
-        let GoogleInteractionsAuth::VertexServiceAccount {
-            credentials,
-            cached_token,
-        } = &self.auth
-        else {
+        let GoogleInteractionsAuth::VertexServiceAccount { credentials, cache_key } = &self.auth else {
             return Err(ProviderError::InvalidRequest(
                 "Vertex access token requested for an API-key credential".into(),
             ));
         };
         let now = unix_timestamp()?;
         {
-            let cached = cached_token.lock().await;
-            if let Some(token) = cached.as_ref().filter(|token| token.expires_at > now + 60) {
+            let cached = vertex_token_cache().lock().await;
+            if let Some(token) = cached.get(cache_key).filter(|token| token.expires_at > now + 60) {
                 return Ok(token.access_token.clone());
             }
         }
 
         let assertion = service_account_assertion(credentials, now)?;
-        let token_uri = credentials
-            .token_uri
-            .as_deref()
-            .filter(|uri| !uri.trim().is_empty())
-            .unwrap_or(DEFAULT_GOOGLE_TOKEN_URI);
-        let response = reqwest::Client::new()
-            .post(token_uri)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                ("assertion", assertion.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|error| {
-                ProviderError::Upstream(format!(
-                    "Vertex OAuth token request failed: {}",
-                    crate::client::ReqwestTransport::map_error(error).kind()
-                ))
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = crate::client::bounded::error_body(response, crate::client::bounded::ERROR_BYTES)
-                .await
-                .unwrap_or_default();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        let bytes = crate::client::bounded::body(response, crate::client::bounded::ERROR_BYTES).await?;
-        let body = String::from_utf8_lossy(&bytes).into_owned();
-        let token: OAuthTokenResponse = serde_json::from_str(&body)
+        let token_uri = cache_key.token_uri.as_str();
+        let form_body = format!(
+            "grant_type={}&assertion={}",
+            percent_encoding::utf8_percent_encode(
+                "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                percent_encoding::NON_ALPHANUMERIC
+            ),
+            percent_encoding::utf8_percent_encode(&assertion, percent_encoding::NON_ALPHANUMERIC)
+        );
+        let mut request = Request::new(http::Method::POST, token_uri.to_string());
+        request.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        request.body = Some(RequestBody::Raw(Bytes::from(form_body)));
+        request.timeout = Some(VERTEX_OAUTH_TIMEOUT);
+
+        let response = ReqwestTransport::shared().execute(request).await?;
+        let token: OAuthTokenResponse = serde_json::from_slice(&response.body)
             .map_err(|error| ProviderError::Parse(format!("invalid Vertex OAuth token response: {error}")))?;
         if token.access_token.trim().is_empty() {
             return Err(ProviderError::Parse(
@@ -254,11 +273,14 @@ impl GoogleInteractionsProvider {
         }
         let expires_in = token.expires_in.unwrap_or(3600);
         let expires_at = now.saturating_add(expires_in);
-        let mut cached = cached_token.lock().await;
-        *cached = Some(CachedAccessToken {
-            access_token: token.access_token.clone(),
-            expires_at,
-        });
+        let mut cached = vertex_token_cache().lock().await;
+        cached.insert(
+            cache_key.clone(),
+            CachedAccessToken {
+                access_token: token.access_token.clone(),
+                expires_at,
+            },
+        );
         Ok(token.access_token)
     }
 }
@@ -396,6 +418,8 @@ fn interactions_endpoint(base_url: &str) -> String {
 }
 
 fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec<Value>), ProviderError> {
+    let model = model.strip_prefix("models/").unwrap_or(model);
+    let prefixed_model = format!("models/{model}");
     let system = messages
         .iter()
         .filter(|message| message.role == "system")
@@ -421,12 +445,14 @@ fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec
             }));
             continue;
         }
+        consumed_results.clear();
 
         if message.role == "assistant" {
-            let interaction_steps = message
-                .provider_state
-                .as_ref()
-                .and_then(|state| state.google_interaction_steps_for(model));
+            let interaction_steps = message.provider_state.as_ref().and_then(|state| {
+                state
+                    .google_interaction_steps_for(model)
+                    .or_else(|| state.google_interaction_steps_for(&prefixed_model))
+            });
             if let Some(steps) = interaction_steps {
                 for step in steps {
                     let value: Value = serde_json::from_str(&step.step_json).map_err(|error| {
@@ -445,15 +471,12 @@ fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec
                 }));
             }
             if let Some(tool_calls) = message.tool_calls.as_ref() {
-                let recorded_results = messages[message_index + 1..]
+                let decoded_arguments = tool_calls
                     .iter()
-                    .take_while(|next| next.role == "tool")
-                    .filter_map(|next| Some((next.tool_call_id.as_deref()?, next)))
-                    .collect::<HashMap<_, _>>();
-                for call in tool_calls {
-                    let arguments =
-                        super::decode_tool_arguments(&call.arguments, &call.id).map_err(ProviderError::Parse)?;
-                    if interaction_steps.is_none() {
+                    .map(|call| super::decode_tool_arguments(&call.arguments, &call.id).map_err(ProviderError::Parse))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if interaction_steps.is_none() {
+                    for (call, arguments) in tool_calls.iter().zip(decoded_arguments) {
                         input.push(json!({
                             "type": "function_call",
                             "id": call.id,
@@ -461,6 +484,13 @@ fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec
                             "arguments": arguments,
                         }));
                     }
+                }
+                let recorded_results = messages[message_index + 1..]
+                    .iter()
+                    .take_while(|next| next.role == "tool")
+                    .filter_map(|next| Some((next.tool_call_id.as_deref()?, next)))
+                    .collect::<HashMap<_, _>>();
+                for call in tool_calls {
                     let result = match recorded_results.get(call.id.as_str()) {
                         Some(message) => function_result_content(message)?,
                         None => vec![json!({
@@ -577,6 +607,7 @@ impl InteractionUsage {
 struct InteractionParseState {
     model: String,
     message_started: bool,
+    response_model_emitted: bool,
     current_step: Option<String>,
     next_step_index: usize,
     current_step_index: Option<usize>,
@@ -700,13 +731,28 @@ fn announce_server_tool(
     }));
 }
 
+fn plain_text_item(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    object.get("text").and_then(Value::as_str)
+}
+
 fn append_step_content(step: &mut Value, field: &str, content: Value) {
-    let list = step
-        .as_object_mut()
-        .expect("an Interactions step is an object")
-        .entry(field)
-        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(object) = step.as_object_mut() else {
+        return;
+    };
+    let list = object.entry(field).or_insert_with(|| Value::Array(Vec::new()));
     if let Some(items) = list.as_array_mut() {
+        if let Some(incoming_text) = plain_text_item(&content)
+            && let Some(last) = items.last_mut()
+            && plain_text_item(last).is_some()
+            && let Some(existing_text) = last.get("text").and_then(Value::as_str).map(str::to_string)
+        {
+            last["text"] = Value::String(format!("{existing_text}{incoming_text}"));
+            return;
+        }
         items.push(content);
     } else {
         *list = Value::Array(vec![content]);
@@ -721,12 +767,39 @@ fn merge_step_delta(delta: &Value, state: &mut InteractionParseState) {
     match delta_type {
         "text" => {
             if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                append_step_content(step, "content", json!({"type":"text", "text": text}));
+                let field = if state.current_step.as_deref() == Some("thought") {
+                    "summary"
+                } else {
+                    "content"
+                };
+                append_step_content(step, field, json!({"type":"text", "text": text}));
+            }
+        }
+        "thought" => {
+            if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                append_step_content(step, "summary", json!({"type": "text", "text": text}));
+            } else if let Some(content) = delta.get("content") {
+                match content {
+                    Value::Array(items) => {
+                        for item in items {
+                            append_step_content(step, "content", item.clone());
+                        }
+                    }
+                    Value::Object(_) => append_step_content(step, "content", content.clone()),
+                    _ => {}
+                }
             }
         }
         "thought_summary" => {
             if let Some(content) = delta.get("content") {
-                append_step_content(step, "summary", content.clone());
+                match content {
+                    Value::Array(items) => {
+                        for item in items {
+                            append_step_content(step, "summary", item.clone());
+                        }
+                    }
+                    _ => append_step_content(step, "summary", content.clone()),
+                }
             }
         }
         "arguments_delta" => {
@@ -737,17 +810,17 @@ fn merge_step_delta(delta: &Value, state: &mut InteractionParseState) {
         "text_annotation_delta" => {
             if let Some(annotations) = delta.get("annotations")
                 && let Some(items) = step.get_mut("content").and_then(Value::as_array_mut)
-                && let Some(last) = items.last_mut()
+                && let Some(last) = items.last_mut().and_then(Value::as_object_mut)
             {
-                let list = last
-                    .as_object_mut()
-                    .expect("an Interactions content item is an object")
-                    .entry("annotations")
-                    .or_insert_with(|| Value::Array(Vec::new()));
+                let list = last.entry("annotations").or_insert_with(|| Value::Array(Vec::new()));
+                let incoming: Vec<Value> = match annotations {
+                    Value::Array(array) => array.clone(),
+                    other => vec![other.clone()],
+                };
                 if let Some(existing) = list.as_array_mut() {
-                    existing.push(annotations.clone());
+                    existing.extend(incoming);
                 } else {
-                    *list = Value::Array(vec![annotations.clone()]);
+                    *list = Value::Array(incoming);
                 }
             }
         }
@@ -770,19 +843,41 @@ fn merge_step_delta(delta: &Value, state: &mut InteractionParseState) {
     }
 }
 
-fn finish_interaction_step(events: &mut Vec<StreamEvent>, state: &mut InteractionParseState) {
-    let Some(mut step) = state.current_step_value.take() else {
-        state.current_step_index = None;
-        state.current_step_arguments.clear();
-        return;
+fn finish_interaction_step(
+    stop_step: Option<&Value>,
+    events: &mut Vec<StreamEvent>,
+    state: &mut InteractionParseState,
+) {
+    let mut step = match (state.current_step_value.take(), stop_step) {
+        (Some(mut accumulated), Some(stop)) => {
+            if let (Some(target), Some(source)) = (accumulated.as_object_mut(), stop.as_object()) {
+                for (key, value) in source {
+                    if key == "result" || key == "signature" || !target.contains_key(key) {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            accumulated
+        }
+        (Some(accumulated), None) => accumulated,
+        (None, Some(stop)) => stop.clone(),
+        (None, None) => {
+            state.current_step_index = None;
+            state.current_step_arguments.clear();
+            return;
+        }
     };
     if !state.current_step_arguments.is_empty() {
         let arguments = serde_json::from_str::<Value>(&state.current_step_arguments)
             .unwrap_or_else(|_| Value::String(state.current_step_arguments.clone()));
         step["arguments"] = arguments;
     }
+    let position = state.current_step_index.take().unwrap_or_else(|| {
+        let idx = state.next_step_index;
+        state.next_step_index = state.next_step_index.saturating_add(1);
+        idx
+    });
     if !state.model.is_empty()
-        && let Some(position) = state.current_step_index.take()
         && let Ok(step_json) = serde_json::to_string(&step)
     {
         events.push(StreamEvent::ProviderStateUpdate {
@@ -793,7 +888,6 @@ fn finish_interaction_step(events: &mut Vec<StreamEvent>, state: &mut Interactio
             },
         });
     }
-    state.current_step_index = None;
     state.current_step_arguments.clear();
 }
 
@@ -846,8 +940,9 @@ fn parse_step_value(step: &Value, index: usize, events: &mut Vec<StreamEvent>, s
             let id = step
                 .get("id")
                 .and_then(Value::as_str)
-                .unwrap_or("interaction-call")
-                .to_string();
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("interaction-call-{index}"));
             let name = step.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
             state.current_tool_arguments.clear();
             if let Some(arguments) = step.get("arguments") {
@@ -924,6 +1019,20 @@ fn value_as_json_text(value: &Value) -> String {
         .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_else(|_| "{}".into()))
 }
 
+fn normalise_interaction_stop_reason(interaction: Option<&Value>) -> String {
+    let raw = interaction
+        .and_then(|item| item.get("finish_reason").or_else(|| item.get("status")))
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    match raw.to_ascii_lowercase().as_str() {
+        "max_tokens" | "length" | "incomplete" => "max_tokens".into(),
+        "refusal" | "content_filter" | "safety" | "recitation" | "prohibited_content" | "blocklist" => {
+            "content_filter".into()
+        }
+        _ => "completed".into(),
+    }
+}
+
 fn parse_event(value: Value, state: &mut InteractionParseState) -> Vec<StreamEvent> {
     let mut events = Vec::new();
     let event_type = value.get("event_type").and_then(Value::as_str).unwrap_or_default();
@@ -939,8 +1048,21 @@ fn parse_event(value: Value, state: &mut InteractionParseState) -> Vec<StreamEve
         });
         state.message_started = true;
     }
+    if !state.response_model_emitted
+        && let Some(model) = value
+            .get("interaction")
+            .and_then(|interaction| interaction.get("model").or_else(|| interaction.get("model_version")))
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+    {
+        events.push(StreamEvent::ResponseModel {
+            model: model.to_string(),
+        });
+        state.response_model_emitted = true;
+    }
 
     match event_type {
+        "interaction.created" | "interaction.start" => {}
         "step.start" => {
             if let Some(step) = value.get("step") {
                 let index = value
@@ -982,8 +1104,9 @@ fn parse_event(value: Value, state: &mut InteractionParseState) -> Vec<StreamEve
                                 id: delta
                                     .get("id")
                                     .and_then(Value::as_str)
-                                    .unwrap_or("interaction-call")
-                                    .to_string(),
+                                    .filter(|id| !id.is_empty())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| format!("interaction-call-{index}")),
                                 name: delta
                                     .get("name")
                                     .and_then(Value::as_str)
@@ -1011,6 +1134,10 @@ fn parse_event(value: Value, state: &mut InteractionParseState) -> Vec<StreamEve
                     }
                     "thought_summary" => {
                         append_content_events(delta.get("content"), &mut events, true);
+                    }
+                    "thought_signature" => {
+                        // Already folded into `current_step_value["signature"]`
+                        // by `merge_step_delta` for stateless replay.
                     }
                     "arguments_delta" => {
                         let partial = delta
@@ -1124,10 +1251,11 @@ fn parse_event(value: Value, state: &mut InteractionParseState) -> Vec<StreamEve
                     arguments: std::mem::take(&mut state.current_tool_arguments),
                 });
             }
-            finish_interaction_step(&mut events, state);
+            finish_interaction_step(value.get("step"), &mut events, state);
             state.current_step = None;
         }
         "interaction.completed" => {
+            let reason = normalise_interaction_stop_reason(value.get("interaction"));
             if let Some(usage) = parse_usage(
                 value
                     .get("interaction")
@@ -1136,14 +1264,11 @@ fn parse_event(value: Value, state: &mut InteractionParseState) -> Vec<StreamEve
             ) {
                 events.push(StreamEvent::UsageUpdate { usage: usage.clone() });
                 events.push(StreamEvent::Stop {
-                    reason: "completed".into(),
+                    reason,
                     usage: Some(usage),
                 });
             } else {
-                events.push(StreamEvent::Stop {
-                    reason: "completed".into(),
-                    usage: None,
-                });
+                events.push(StreamEvent::Stop { reason, usage: None });
             }
         }
         "interaction.failed" | "interaction.cancelled" => {
@@ -1183,12 +1308,38 @@ fn parse_event(value: Value, state: &mut InteractionParseState) -> Vec<StreamEve
     events
 }
 
-fn parse_response(value: Value) -> Result<AgentResponse, ProviderError> {
+fn parse_response(value: Value, model: &str) -> Result<AgentResponse, ProviderError> {
+    if matches!(
+        value.get("status").and_then(Value::as_str),
+        Some("failed" | "cancelled")
+    ) || value.get("error").is_some_and(|err| !err.is_null())
+    {
+        let message = value
+            .get("error")
+            .and_then(|error| error.get("message").and_then(Value::as_str).or_else(|| error.as_str()))
+            .unwrap_or("Vertex Interactions request failed")
+            .to_string();
+        return Err(ProviderError::Upstream(message));
+    }
+    let model = model.strip_prefix("models/").unwrap_or(model);
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
+    let mut state = ProviderStateAccumulator::default();
+    let mut server_tool_calls = 0i32;
     if let Some(steps) = value.get("steps").and_then(Value::as_array) {
-        for step in steps {
+        for (position, step) in steps.iter().enumerate() {
+            if !model.is_empty()
+                && let Ok(step_json) = serde_json::to_string(step)
+            {
+                state
+                    .apply(ProviderStateUpdate::GoogleInteractionsStep {
+                        model: model.to_string(),
+                        position,
+                        step_json,
+                    })
+                    .map_err(ProviderError::Parse)?;
+            }
             match step.get("type").and_then(Value::as_str) {
                 Some("model_output") => {
                     let mut events = Vec::new();
@@ -1209,31 +1360,38 @@ fn parse_response(value: Value) -> Result<AgentResponse, ProviderError> {
                     }
                 }
                 Some("function_call") => {
+                    let tool_index = tool_calls.len();
                     tool_calls.push(ToolCall {
-                        id: step.get("id").and_then(Value::as_str).unwrap_or_default().into(),
+                        id: step
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("interaction-call-{tool_index}")),
                         name: step.get("name").and_then(Value::as_str).unwrap_or_default().into(),
                         arguments: value_as_json_text(step.get("arguments").unwrap_or(&Value::Object(Map::new()))),
                     });
                 }
                 // Provider-run tools have already been executed and their
                 // results are folded into the interaction. The non-streaming
-                // response has no event sink for a transient tool card.
-                Some("google_search_call")
-                | Some("url_context_call")
-                | Some("google_search_result")
-                | Some("url_context_result") => {}
-                Some(delta_type) => warn_unknown_event("gemini_interactions_delta", delta_type),
-                None => warn_unknown_event("gemini_interactions_delta", "<missing>"),
+                // response has no event sink for a transient tool card, but
+                // each call is still billable.
+                Some("google_search_call") | Some("url_context_call") => {
+                    server_tool_calls = server_tool_calls.saturating_add(1);
+                }
+                Some("google_search_result") | Some("url_context_result") => {}
+                Some(step_type) => warn_unknown_event("gemini_interactions_step", step_type),
+                None => warn_unknown_event("gemini_interactions_step", "<missing>"),
             }
         }
     }
-    let usage = parse_usage(value.get("usage"), None);
+    let usage = parse_usage(value.get("usage"), Some(server_tool_calls));
     Ok(AgentResponse {
         text,
         reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
         tool_calls,
         usage,
-        provider_state: None,
+        provider_state: state.finish(),
     })
 }
 
@@ -1255,8 +1413,13 @@ impl ChatProvider for GoogleInteractionsProvider {
             .authenticated_request(&messages, Some(&tools), &params, true)
             .await?;
         let response = transport.stream(request).await?;
+        let model = params
+            .model
+            .strip_prefix("models/")
+            .unwrap_or(&params.model)
+            .to_string();
         let mut parse_state = InteractionParseState {
-            model: params.model.clone(),
+            model,
             ..Default::default()
         };
         let stream = response
@@ -1299,7 +1462,7 @@ impl ChatProvider for GoogleInteractionsProvider {
                 .map(ProviderError::Upstream)
                 .unwrap_or_else(|| ProviderError::Parse(error.to_string()))
         })?;
-        parse_response(value)
+        parse_response(value, &params.model)
     }
 }
 
@@ -1696,5 +1859,235 @@ mod tests {
         .unwrap();
         assert_eq!(input.iter().filter(|step| step["type"] == "function_call").count(), 1);
         assert_eq!(input.iter().filter(|step| step["type"] == "function_result").count(), 1);
+    }
+
+    #[test]
+    fn streaming_text_and_thought_deltas_merge_instead_of_fragmenting() {
+        let mut state = InteractionParseState {
+            model: "gemini-3.8-flash".into(),
+            ..Default::default()
+        };
+        let _ = parse_event(
+            json!({"event_type":"step.start","index":0,"step":{"type":"thought"}}),
+            &mut state,
+        );
+        let _ = parse_event(
+            json!({"event_type":"step.delta","index":0,"delta":{"type":"thought","text":"part 1 "}}),
+            &mut state,
+        );
+        let _ = parse_event(
+            json!({"event_type":"step.delta","index":0,"delta":{"type":"thought","text":"part 2"}}),
+            &mut state,
+        );
+        let _ = parse_event(
+            json!({"event_type":"step.delta","index":0,"delta":{"type":"thought_signature","signature":"sig-1"}}),
+            &mut state,
+        );
+        let thought_stop = parse_event(json!({"event_type":"step.stop","index":0}), &mut state);
+        let thought_step: Value = match thought_stop.first() {
+            Some(StreamEvent::ProviderStateUpdate {
+                update: ProviderStateUpdate::GoogleInteractionsStep { step_json, .. },
+            }) => serde_json::from_str(step_json).unwrap(),
+            other => panic!("expected step update, got {other:?}"),
+        };
+        assert_eq!(
+            thought_step["summary"],
+            json!([{"type": "text", "text": "part 1 part 2"}])
+        );
+        assert_eq!(thought_step["signature"], "sig-1");
+
+        let _ = parse_event(
+            json!({"event_type":"step.start","index":1,"step":{"type":"model_output"}}),
+            &mut state,
+        );
+        for chunk in ["Hel", "lo ", "world"] {
+            let _ = parse_event(
+                json!({"event_type":"step.delta","index":1,"delta":{"type":"text","text":chunk}}),
+                &mut state,
+            );
+        }
+        let _ = parse_event(
+            json!({
+                "event_type":"step.delta",
+                "index":1,
+                "delta":{"type":"text_annotation_delta","annotations":[{"url":"https://a.test"}]}
+            }),
+            &mut state,
+        );
+        let text_stop = parse_event(json!({"event_type":"step.stop","index":1}), &mut state);
+        let text_step: Value = match text_stop.first() {
+            Some(StreamEvent::ProviderStateUpdate {
+                update: ProviderStateUpdate::GoogleInteractionsStep { step_json, .. },
+            }) => serde_json::from_str(step_json).unwrap(),
+            other => panic!("expected step update, got {other:?}"),
+        };
+        assert_eq!(text_step["content"].as_array().unwrap().len(), 1);
+        assert_eq!(text_step["content"][0]["text"], "Hello world");
+        assert_eq!(
+            text_step["content"][0]["annotations"],
+            json!([{"url": "https://a.test"}])
+        );
+    }
+
+    #[test]
+    fn parallel_tool_history_emits_all_calls_before_results_and_clears_consumed_ids() {
+        let round1 = ChatMessage::assistant_with_tools(
+            "",
+            None,
+            vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "first".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "second".into(),
+                    arguments: "{}".into(),
+                },
+            ],
+        );
+        let round2 = ChatMessage::assistant_with_tools(
+            "",
+            None,
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "third".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        let (_, input) = serialize_input(
+            &[
+                round1,
+                ChatMessage::tool_result("c1", "r1"),
+                ChatMessage::tool_result("c2", "r2"),
+                round2,
+                ChatMessage::tool_result("c1", "r3"),
+            ],
+            "models/gemini-3.8-flash",
+        )
+        .unwrap();
+        let types: Vec<&str> = input.iter().map(|step| step["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "function_call",
+                "function_call",
+                "function_result",
+                "function_result",
+                "function_call",
+                "function_result"
+            ]
+        );
+        assert_eq!(input[5]["result"][0]["text"], "r3");
+    }
+
+    #[test]
+    fn non_streaming_response_preserves_provider_state_and_server_tool_billing() {
+        let resp = parse_response(
+            json!({
+                "status": "completed",
+                "steps": [
+                    {"type": "thought", "summary": [{"type": "text", "text": "plan"}], "signature": "sig"},
+                    {"type": "google_search_call", "id": "s1", "arguments": {"queries": ["rust"]}},
+                    {"type": "google_search_result", "call_id": "s1", "result": [{"url": "https://rust-lang.org"}]},
+                    {"type": "model_output", "content": [{"type": "text", "text": "done"}]}
+                ],
+                "usage": {
+                    "total_input_tokens": 10,
+                    "total_output_tokens": 4,
+                    "total_thought_tokens": 6,
+                    "total_tokens": 20
+                }
+            }),
+            "models/gemini-3.8-flash",
+        )
+        .unwrap();
+        assert_eq!(resp.text, "done");
+        assert_eq!(resp.reasoning_content.as_deref(), Some("plan"));
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.completion_tokens, Some(10));
+        assert_eq!(usage.billable_tool_calls, Some(1));
+        let steps = resp
+            .provider_state
+            .unwrap()
+            .google_interaction_steps_for("gemini-3.8-flash")
+            .unwrap()
+            .to_vec();
+        assert_eq!(steps.len(), 4);
+    }
+
+    #[test]
+    fn request_strips_models_prefix_and_emits_response_model_and_stop_reason() {
+        let provider = GoogleInteractionsProvider::new("https://aiplatform.googleapis.com", "secret");
+        let req = provider
+            .build_request(
+                &[ChatMessage::user("hi")],
+                None,
+                &ChatParams {
+                    model: "models/gemini-3.8-flash".into(),
+                    thinking_style: ThinkingStyle::EffortOnly,
+                    thinking_enabled: true,
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["model"], "gemini-3.8-flash");
+
+        let mut state = InteractionParseState::default();
+        let created = parse_event(
+            json!({
+                "event_type": "interaction.created",
+                "interaction": { "id": "ix-2", "model": "gemini-3.8-flash-001", "status": "in_progress" }
+            }),
+            &mut state,
+        );
+        assert!(created.iter().any(|event| matches!(
+            event,
+            StreamEvent::ResponseModel { model } if model == "gemini-3.8-flash-001"
+        )));
+
+        let truncated = parse_event(
+            json!({
+                "event_type": "interaction.completed",
+                "interaction": { "id": "ix-2", "status": "incomplete" }
+            }),
+            &mut state,
+        );
+        assert!(truncated.iter().any(|event| matches!(
+            event,
+            StreamEvent::Stop { reason, .. } if reason == "max_tokens"
+        )));
+    }
+
+    #[tokio::test]
+    async fn vertex_token_cache_is_shared_across_provider_instances() {
+        let sa = r#"{
+            "type": "service_account",
+            "project_id": "cache-test-project",
+            "client_email": "cache-test@example.iam.gserviceaccount.com",
+            "private_key": "-----BEGIN PRIVATE KEY-----\ncache-test\n-----END PRIVATE KEY-----",
+            "token_uri": "https://oauth2.test.invalid/token"
+        }"#;
+        let first = GoogleInteractionsProvider::new_vertex("https://aiplatform.googleapis.com", sa).unwrap();
+        let second = GoogleInteractionsProvider::new_vertex("https://aiplatform.googleapis.com", sa).unwrap();
+        let GoogleInteractionsAuth::VertexServiceAccount { ref cache_key, .. } = first.auth else {
+            panic!("expected vertex auth");
+        };
+        let future_expiry = unix_timestamp().unwrap().saturating_add(3600);
+        vertex_token_cache().lock().await.insert(
+            cache_key.clone(),
+            CachedAccessToken {
+                access_token: "shared-oauth-token".into(),
+                expires_at: future_expiry,
+            },
+        );
+        let token = second.vertex_access_token().await.unwrap();
+        assert_eq!(token, "shared-oauth-token");
+        vertex_token_cache().lock().await.remove(cache_key);
     }
 }
