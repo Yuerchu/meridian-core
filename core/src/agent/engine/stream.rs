@@ -61,13 +61,21 @@ pub(crate) async fn consume_stream(
     let mut flushed_up_to = 0usize;
     let mut flushed_ids: HashSet<String> = HashSet::new();
     let mut first_token_at: Option<Instant> = None;
-    // Some OpenAI-compatible providers inline reasoning as <think> tags in the
-    // text stream instead of a separate reasoning field; route it accordingly.
-    let mut think_parser = InlineHiddenTagParser::new_streaming(vec![InlineTagSpec {
-        tag: (),
-        open: "<think>",
-        close: "</think>",
-    }]);
+    // Some OpenAI-compatible providers inline reasoning as <think> or <thought>
+    // tags (Google's OpenAI-compat layer uses <thought>) instead of a separate
+    // reasoning field; route both accordingly.
+    let mut think_parser = InlineHiddenTagParser::new_streaming(vec![
+        InlineTagSpec {
+            tag: (),
+            open: "<think>",
+            close: "</think>",
+        },
+        InlineTagSpec {
+            tag: (),
+            open: "<thought>",
+            close: "</thought>",
+        },
+    ]);
     // Set by the one exit that means the model reached the end of its answer:
     // the stream running out. Cancellation leaves it false, and so does every
     // error return, none of which get this far.

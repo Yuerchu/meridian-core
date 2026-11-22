@@ -83,6 +83,18 @@ async fn destination(
     model: String,
 ) -> Result<ResolvedProvider, String> {
     let codex_client_version = codex_client_version(db, provider.codex_request_shape.get()).await;
+    let google_compat_thinking_mode = google_compat_thinking_mode(
+        db,
+        provider.provider_type == provider::registry::ProviderType::Google
+            && provider.api_format == provider::registry::ApiFormat::ChatCompletions,
+    )
+    .await;
+    let google_include_thoughts_when_off = google_include_thoughts_when_off(
+        db,
+        provider.provider_type == provider::registry::ProviderType::Google
+            && provider.api_format == provider::registry::ApiFormat::GeminiGenerateContent,
+    )
+    .await;
     let credential = {
         let secrets = secrets.clone();
         let provider = provider.clone();
@@ -102,6 +114,8 @@ async fn destination(
         codex_request_shape: provider.codex_request_shape.get(),
         local_backend: provider.local_backend,
         codex_client_version,
+        google_compat_thinking_mode,
+        google_include_thoughts_when_off,
     })
 }
 
@@ -174,6 +188,8 @@ pub struct ResolvedProvider {
     /// the ordinary case and takes `codex_identity::DEFAULT_CODEX_CLIENT_VERSION`.
     pub codex_client_version: Option<String>,
     pub local_backend: Option<LocalInferenceBackend>,
+    pub google_compat_thinking_mode: provider::openai_compat::GoogleCompatThinkingMode,
+    pub google_include_thoughts_when_off: bool,
 }
 
 impl ResolvedProvider {
@@ -192,6 +208,8 @@ impl ResolvedProvider {
             codex_request_shape: self.codex_request_shape,
             codex_client_version: self.codex_client_version.as_deref(),
             local_backend: self.local_backend,
+            google_compat_thinking_mode: self.google_compat_thinking_mode,
+            google_include_thoughts_when_off: self.google_include_thoughts_when_off,
         }
     }
 }
@@ -213,6 +231,50 @@ async fn codex_client_version(db: &Db, wanted: bool) -> Option<String> {
             tracing::warn!(error = %error, "could not read the Codex client version override");
             None
         })
+}
+
+async fn google_compat_thinking_mode(db: &Db, wanted: bool) -> provider::openai_compat::GoogleCompatThinkingMode {
+    use provider::openai_compat::{GOOGLE_COMPAT_THINKING_MODE_PREF, GoogleCompatThinkingMode};
+    if !wanted {
+        return GoogleCompatThinkingMode::Auto;
+    }
+    let raw = preference::get_preference(db, GOOGLE_COMPAT_THINKING_MODE_PREF)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "could not read the Google compat thinking mode preference");
+            None
+        });
+    match raw.as_deref() {
+        Some(value) if !value.trim().is_empty() => GoogleCompatThinkingMode::parse(value).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "ignoring invalid Google compat thinking mode preference");
+            GoogleCompatThinkingMode::Auto
+        }),
+        _ => GoogleCompatThinkingMode::Auto,
+    }
+}
+
+async fn google_include_thoughts_when_off(db: &Db, wanted: bool) -> bool {
+    if !wanted {
+        return false;
+    }
+    let raw = preference::get_preference(
+        db,
+        provider::google_generate_content::GOOGLE_INCLUDE_THOUGHTS_WHEN_OFF_PREF,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "could not read the Google include_thoughts_when_off preference");
+        None
+    });
+    preference::parse_bool_preference(
+        provider::google_generate_content::GOOGLE_INCLUDE_THOUGHTS_WHEN_OFF_PREF,
+        raw.as_deref(),
+        false,
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "ignoring invalid Google include_thoughts_when_off preference");
+        false
+    })
 }
 
 /// The credential for a provider row, by whatever route its login uses.
@@ -489,6 +551,9 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
     if codex_request_shape {
         provider::capabilities::narrow_to_codex_shape(&mut caps);
     }
+    if provider_type == "google" {
+        provider::capabilities::narrow_to_google_wire(Some(api_format), model, &mut caps);
+    }
 
     let model_window = model_config
         .as_ref()
@@ -740,6 +805,50 @@ mod tests {
                 assert_eq!(summarising.supports_thinking_off, supports_off, "{model}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn google_override_cannot_reintroduce_server_tools_on_chat_completions() {
+        let db = sea_test_db().await;
+        seed(
+            &db,
+            provider_row(
+                ProviderType::Google,
+                "Google Compat",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                ApiFormat::ChatCompletions,
+            ),
+            Some(FlatModelConfig {
+                model_id: "gemini-3.7-flash",
+                context_window: 1_048_576,
+                compact_threshold: 0,
+                max_output_tokens: Some(65_536),
+                capability_overrides: Some(r#"{"server_tools": ["google_search"], "thinking_style": "budget"}"#),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let assistant = assistant_with(None);
+        let turn = resolve_turn_params(
+            &db,
+            TurnParamsResolveRequest {
+                assistant: Some(&assistant),
+                provider_id: Some("p1"),
+                provider_type: "google",
+                api_format: "chat_completions",
+                transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
+                model: "gemini-3.7-flash",
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(turn.caps.server_tools.is_empty());
+        assert_eq!(turn.caps.thinking_style, provider::ThinkingStyle::EffortOnly);
     }
 
     #[tokio::test]

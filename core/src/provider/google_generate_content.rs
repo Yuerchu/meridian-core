@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::stream::StreamExt;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 
 use super::dto::{ExtraIgnore, embedded_upstream_error, warn_extra_fields};
 use super::state::{
@@ -11,13 +12,19 @@ use super::state::{
 };
 use super::{
     AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, MessageContentPart, ProviderError,
-    SenderRendering, StreamEvent, ThinkingStyle, TokenUsage, ToolCall, ToolDefinition,
+    SenderRendering, ServerToolCall, ServerToolKind, StreamEvent, ThinkingStyle, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
+
+/// Preference key controlling whether `gemini_generate_content` still sends
+/// `includeThoughts: true` when `thinking_enabled` is false (e.g. background
+/// summary/title passes or thinking-off requests on relays that expect it).
+pub const GOOGLE_INCLUDE_THOUGHTS_WHEN_OFF_PREF: &str = "google.include_thoughts_when_off";
 
 pub struct GoogleGenerateContentProvider {
     api_root: String,
     api_key: String,
+    include_thoughts_when_off: bool,
 }
 
 impl GoogleGenerateContentProvider {
@@ -25,7 +32,13 @@ impl GoogleGenerateContentProvider {
         Self {
             api_root: google_api_root(base_url),
             api_key: api_key.to_string(),
+            include_thoughts_when_off: false,
         }
+    }
+
+    pub fn with_include_thoughts_when_off(mut self, include_thoughts_when_off: bool) -> Self {
+        self.include_thoughts_when_off = include_thoughts_when_off;
+        self
     }
 
     fn build_request(
@@ -51,47 +64,76 @@ impl GoogleGenerateContentProvider {
         if let Some(top_p) = params.top_p {
             generation.insert("topP".into(), serde_json::json!(top_p));
         }
-        let mut thinking = serde_json::Map::new();
-        thinking.insert("includeThoughts".into(), serde_json::Value::Bool(true));
-        if params.thinking_style == ThinkingStyle::Budget {
-            if params.thinking_effort.is_some() {
-                return Err(ProviderError::Parse(
-                    "Gemini thinkingBudget does not support thinking effort".into(),
-                ));
-            }
-            // 摘要会再次清除 enabled；不能把无法关闭思考的 Pro 编成预算 0。
-            let budget = if params.thinking_enabled {
-                params.thinking_budget
-            } else {
-                params.supports_thinking_off.then_some(0)
-            };
-            if let Some(budget) = budget {
-                if budget < -1 {
-                    return Err(ProviderError::Parse("Gemini thinkingBudget must be at least -1".into()));
+        if params.thinking_style != ThinkingStyle::None {
+            let mut thinking = serde_json::Map::new();
+            let include_thoughts = params.thinking_enabled || self.include_thoughts_when_off;
+            if params.thinking_style == ThinkingStyle::Budget {
+                if params.thinking_effort.is_some() {
+                    return Err(ProviderError::Parse(
+                        "Gemini thinkingBudget does not support thinking effort".into(),
+                    ));
                 }
-                if budget == 0 && !params.supports_thinking_off {
-                    return Err(ProviderError::Parse(format!(
-                        "thinking cannot be disabled for model '{}'",
-                        params.model
+                // 摘要会再次清除 enabled；不能把无法关闭思考的 Pro 编成预算 0。
+                let budget = if params.thinking_enabled {
+                    params.thinking_budget
+                } else {
+                    params.supports_thinking_off.then_some(0)
+                };
+                if let Some(budget) = budget {
+                    if budget < -1 {
+                        return Err(ProviderError::Parse("Gemini thinkingBudget must be at least -1".into()));
+                    }
+                    if budget == 0 && !params.supports_thinking_off {
+                        return Err(ProviderError::Parse(format!(
+                            "thinking cannot be disabled for model '{}'",
+                            params.model
+                        )));
+                    }
+                    thinking.insert("thinkingBudget".into(), serde_json::json!(budget));
+                }
+                if include_thoughts {
+                    thinking.insert("includeThoughts".into(), serde_json::Value::Bool(true));
+                }
+            } else {
+                if include_thoughts {
+                    thinking.insert("includeThoughts".into(), serde_json::Value::Bool(true));
+                }
+                if let Some(effort) = params.thinking_effort.as_deref() {
+                    // 原生 Gemini REST 的档位枚举使用大写。
+                    thinking.insert("thinkingLevel".into(), serde_json::json!(effort.to_ascii_uppercase()));
+                }
+            }
+            if !thinking.is_empty() {
+                generation.insert("thinkingConfig".into(), serde_json::Value::Object(thinking));
+            }
+        }
+        if !generation.is_empty() {
+            body["generationConfig"] = serde_json::Value::Object(generation);
+        }
+
+        let mut wire_tools = Vec::new();
+        for kind in &params.server_tools {
+            wire_tools.push(match kind {
+                ServerToolKind::GoogleSearch => serde_json::json!({ "googleSearch": {} }),
+                ServerToolKind::UrlContext => serde_json::json!({ "urlContext": {} }),
+                unsupported => {
+                    return Err(ProviderError::InvalidRequest(format!(
+                        "server tool `{unsupported}` is not supported by Gemini GenerateContent"
                     )));
                 }
-                thinking.insert("thinkingBudget".into(), serde_json::json!(budget));
-            }
-        } else if let Some(effort) = params.thinking_effort.as_deref() {
-            // 原生 Gemini REST 的档位枚举使用大写。
-            thinking.insert("thinkingLevel".into(), serde_json::json!(effort.to_ascii_uppercase()));
+            });
         }
-        generation.insert("thinkingConfig".into(), serde_json::Value::Object(thinking));
-        body["generationConfig"] = serde_json::Value::Object(generation);
-
         if let Some(tools) = tools.filter(|items| !items.is_empty()) {
-            body["tools"] = serde_json::json!([{
+            wire_tools.push(serde_json::json!({
                 "functionDeclarations": tools.iter().map(|tool| serde_json::json!({
                     "name": tool.name,
                     "description": tool.description,
                     "parametersJsonSchema": tool.parameters,
                 })).collect::<Vec<_>>()
-            }]);
+            }));
+        }
+        if !wire_tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(wire_tools);
         }
 
         let model = params.model.strip_prefix("models/").unwrap_or(&params.model);
@@ -107,6 +149,18 @@ impl GoogleGenerateContentProvider {
         request.body = Some(RequestBody::Json(body));
         Ok(request)
     }
+}
+
+/// Gemini 3+ models strictly validate `thoughtSignature` on historical tool
+/// calls and reject unsigned calls with a 400. Gemini 2.5 and earlier accept
+/// unsigned native function calls (and emit no signature at all when thinking
+/// is disabled), so flattening them would break ordinary multi-turn tool use.
+pub(crate) fn model_requires_tool_thought_signature(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let id = lower.strip_prefix("models/").unwrap_or(&lower);
+    !["gemini-2.5-", "gemini-2.0-", "gemini-1."]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
 }
 
 pub(crate) fn google_api_root(base_url: &str) -> String {
@@ -181,7 +235,7 @@ fn serialize_contents(
                     .iter()
                     .any(|item| matches!(item.location, GoogleSignatureLocation::ToolCall { .. }))
             });
-            if !has_tool_signature {
+            if model_requires_tool_thought_signature(model) && !has_tool_signature {
                 let mut text = message.content.clone();
                 for call in tool_calls {
                     if !text.is_empty() {
@@ -283,7 +337,7 @@ fn assistant_text_parts(
         // token; moving the signature onto another part changes its meaning.
         parts.push(serde_json::json!({ "text": "", "thoughtSignature": signature }));
     }
-    if parts.is_empty() {
+    if parts.is_empty() && message.tool_calls.is_none() {
         parts.push(serde_json::json!({ "text": "" }));
     }
     parts
@@ -366,10 +420,15 @@ fn push_content(out: &mut Vec<serde_json::Value>, role: &str, parts: Vec<serde_j
     out.push(serde_json::json!({ "role": role, "parts": parts }));
 }
 
+fn default_empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerateContentChunk {
-    candidates: Vec<GeminiCandidate>,
+    candidates: Option<Vec<GeminiCandidate>>,
+    prompt_feedback: Option<GeminiPromptFeedback>,
     usage_metadata: Option<GeminiUsage>,
     response_id: Option<String>,
     model_version: Option<String>,
@@ -380,12 +439,45 @@ struct GenerateContentChunk {
 impl GenerateContentChunk {
     fn warn_ignored_fields(&self) {
         warn_extra_fields("gemini_generate_content", &self.extra);
-        for candidate in &self.candidates {
-            candidate.warn_ignored_fields();
+        if let Some(candidates) = &self.candidates {
+            for candidate in candidates {
+                candidate.warn_ignored_fields();
+            }
+        }
+        if let Some(feedback) = &self.prompt_feedback {
+            feedback.warn_ignored_fields();
         }
         if let Some(usage) = &self.usage_metadata {
             usage.warn_ignored_fields();
         }
+    }
+
+    fn validate(&self, stream_started: bool) -> Result<(), ProviderError> {
+        if self.candidates.is_some() || self.prompt_feedback.is_some() {
+            return Ok(());
+        }
+        if stream_started && self.usage_metadata.is_some() {
+            return Ok(());
+        }
+        Err(ProviderError::Parse("missing field `candidates`".into()))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPromptFeedback {
+    block_reason: Option<String>,
+    #[serde(default, rename = "blockReasonMessage")]
+    _block_reason_message: IgnoredAny,
+    #[serde(default, rename = "safetyRatings")]
+    _safety_ratings: IgnoredAny,
+    #[serde(default, flatten)]
+    extra: ExtraIgnore,
+}
+
+impl GeminiPromptFeedback {
+    fn warn_ignored_fields(&self) {
+        warn_extra_fields("gemini_prompt_feedback", &self.extra);
     }
 }
 
@@ -394,6 +486,22 @@ impl GenerateContentChunk {
 struct GeminiCandidate {
     content: Option<GeminiContent>,
     finish_reason: Option<String>,
+    grounding_metadata: Option<GeminiGroundingMetadata>,
+    url_context_metadata: Option<GeminiUrlContextMetadata>,
+    #[serde(default, rename = "index")]
+    _index: IgnoredAny,
+    #[serde(default, rename = "safetyRatings")]
+    _safety_ratings: IgnoredAny,
+    #[serde(default, rename = "citationMetadata")]
+    _citation_metadata: IgnoredAny,
+    #[serde(default, rename = "avgLogprobs")]
+    _avg_logprobs: IgnoredAny,
+    #[serde(default, rename = "logprobsResult")]
+    _logprobs_result: IgnoredAny,
+    #[serde(default, rename = "finishMessage")]
+    _finish_message: IgnoredAny,
+    #[serde(default, rename = "tokenCount")]
+    _token_count: IgnoredAny,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
 }
@@ -404,12 +512,124 @@ impl GeminiCandidate {
         if let Some(content) = &self.content {
             content.warn_ignored_fields();
         }
+        if let Some(grounding) = &self.grounding_metadata {
+            grounding.warn_ignored_fields();
+        }
+        if let Some(url_context) = &self.url_context_metadata {
+            url_context.warn_ignored_fields();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGroundingMetadata {
+    #[serde(default)]
+    web_search_queries: Vec<String>,
+    #[serde(default)]
+    grounding_chunks: Vec<GeminiGroundingChunk>,
+    #[serde(default, rename = "searchEntryPoint")]
+    _search_entry_point: IgnoredAny,
+    #[serde(default, rename = "groundingSupports")]
+    _grounding_supports: IgnoredAny,
+    #[serde(default, rename = "retrievalMetadata")]
+    _retrieval_metadata: IgnoredAny,
+    #[serde(default, rename = "retrievalQueries")]
+    _retrieval_queries: IgnoredAny,
+    #[serde(default, rename = "googleMapsWidgetContextToken")]
+    _google_maps_widget_context_token: IgnoredAny,
+    #[serde(default, flatten)]
+    extra: ExtraIgnore,
+}
+
+impl GeminiGroundingMetadata {
+    fn warn_ignored_fields(&self) {
+        warn_extra_fields("gemini_grounding_metadata", &self.extra);
+        for chunk in &self.grounding_chunks {
+            chunk.warn_ignored_fields();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGroundingChunk {
+    web: Option<GeminiGroundingWeb>,
+    #[serde(default, rename = "retrievedContext")]
+    _retrieved_context: IgnoredAny,
+    #[serde(default, rename = "maps")]
+    _maps: IgnoredAny,
+    #[serde(default, flatten)]
+    extra: ExtraIgnore,
+}
+
+impl GeminiGroundingChunk {
+    fn warn_ignored_fields(&self) {
+        warn_extra_fields("gemini_grounding_chunk", &self.extra);
+        if let Some(web) = &self.web {
+            web.warn_ignored_fields();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGroundingWeb {
+    uri: Option<String>,
+    #[serde(default, rename = "title")]
+    _title: IgnoredAny,
+    #[serde(default, rename = "domain")]
+    _domain: IgnoredAny,
+    #[serde(default, flatten)]
+    extra: ExtraIgnore,
+}
+
+impl GeminiGroundingWeb {
+    fn warn_ignored_fields(&self) {
+        warn_extra_fields("gemini_grounding_web", &self.extra);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiUrlContextMetadata {
+    #[serde(default)]
+    url_metadata: Vec<GeminiUrlMetadata>,
+    #[serde(default, flatten)]
+    extra: ExtraIgnore,
+}
+
+impl GeminiUrlContextMetadata {
+    fn warn_ignored_fields(&self) {
+        warn_extra_fields("gemini_url_context_metadata", &self.extra);
+        for item in &self.url_metadata {
+            item.warn_ignored_fields();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiUrlMetadata {
+    retrieved_url: Option<String>,
+    #[serde(default, rename = "urlRetrievalStatus")]
+    _url_retrieval_status: IgnoredAny,
+    #[serde(default, flatten)]
+    extra: ExtraIgnore,
+}
+
+impl GeminiUrlMetadata {
+    fn warn_ignored_fields(&self) {
+        warn_extra_fields("gemini_url_metadata", &self.extra);
     }
 }
 
 #[derive(Deserialize)]
 struct GeminiContent {
+    #[serde(default)]
     parts: Vec<GeminiPart>,
+    #[serde(default, rename = "role")]
+    _role: IgnoredAny,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
 }
@@ -447,6 +667,7 @@ impl GeminiPart {
 struct GeminiFunctionCall {
     id: Option<String>,
     name: String,
+    #[serde(default = "default_empty_object")]
     args: serde_json::Value,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
@@ -463,8 +684,20 @@ impl GeminiFunctionCall {
 struct GeminiUsage {
     prompt_token_count: Option<i32>,
     candidates_token_count: Option<i32>,
+    thoughts_token_count: Option<i32>,
+    tool_use_prompt_token_count: Option<i32>,
     total_token_count: Option<i32>,
     cached_content_token_count: Option<i32>,
+    #[serde(default, rename = "promptTokensDetails")]
+    _prompt_tokens_details: IgnoredAny,
+    #[serde(default, rename = "candidatesTokensDetails")]
+    _candidates_tokens_details: IgnoredAny,
+    #[serde(default, rename = "cacheTokensDetails")]
+    _cache_tokens_details: IgnoredAny,
+    #[serde(default, rename = "toolUsePromptTokensDetails")]
+    _tool_use_prompt_tokens_details: IgnoredAny,
+    #[serde(default, rename = "trafficType")]
+    _traffic_type: IgnoredAny,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
 }
@@ -474,18 +707,65 @@ impl GeminiUsage {
         warn_extra_fields("gemini_usage", &self.extra);
     }
 
-    fn normalise(&self) -> TokenUsage {
+    fn normalise(&self, server_tool_calls: Option<i32>) -> TokenUsage {
+        // Gemini's native GenerateContent API reports `thoughtsTokenCount`
+        // beside `candidatesTokenCount` and bills thoughts at the output rate.
+        // Fold them into `completion_tokens` unless `totalTokenCount` proves
+        // the upstream already included thoughts inside `candidatesTokenCount`.
+        let completion_tokens = match (self.candidates_token_count, self.thoughts_token_count) {
+            (Some(candidates), Some(thoughts)) if thoughts > 0 => {
+                let already_included = match (self.total_token_count, self.prompt_token_count) {
+                    (Some(total), Some(prompt)) => {
+                        let tool_use = self.tool_use_prompt_token_count.unwrap_or(0);
+                        total.saturating_sub(prompt).saturating_sub(tool_use) == candidates
+                    }
+                    _ => false,
+                };
+                if already_included {
+                    Some(candidates)
+                } else {
+                    Some(candidates.saturating_add(thoughts))
+                }
+            }
+            (Some(candidates), _) => Some(candidates),
+            (None, Some(thoughts)) => Some(thoughts),
+            (None, None) => None,
+        };
         TokenUsage {
             prompt_tokens: self.prompt_token_count,
-            completion_tokens: self.candidates_token_count,
+            completion_tokens,
             total_tokens: self.total_token_count,
             cache_read_tokens: self.cached_content_token_count,
             cache_write_tokens: None,
-            // Chat-completions has no server-side tools; the Responses adapter is
-            // the only one with anything to report here.
-            billable_tool_calls: None,
+            billable_tool_calls: server_tool_calls.filter(|calls| *calls > 0),
         }
     }
+}
+
+fn normalise_finish_reason(reason: &str) -> String {
+    match reason {
+        "STOP" => "stop".into(),
+        "MAX_TOKENS" => "max_tokens".into(),
+        "SAFETY"
+        | "RECITATION"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT" => "content_filter".into(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+fn push_unique(target: &mut Vec<String>, incoming: impl IntoIterator<Item = String>) -> bool {
+    let mut changed = false;
+    for item in incoming {
+        if !item.is_empty() && !target.iter().any(|existing| existing == &item) {
+            target.push(item);
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[derive(Default)]
@@ -494,8 +774,15 @@ struct GeminiParseState {
     response_model_emitted: bool,
     next_part_index: usize,
     next_tool_index: usize,
+    google_search_announced: bool,
+    google_search_queries: Vec<String>,
+    google_search_sources: Vec<String>,
+    url_context_announced: bool,
+    url_context_urls: Vec<String>,
+    server_tool_calls: i32,
 }
 
+#[cfg(test)]
 fn parse_chunk(chunk: &GenerateContentChunk, model: &str) -> Vec<StreamEvent> {
     parse_chunk_with_state(chunk, model, &mut GeminiParseState::default())
 }
@@ -514,7 +801,8 @@ fn parse_chunk_with_state(chunk: &GenerateContentChunk, model: &str, state: &mut
         events.push(StreamEvent::ResponseModel { model: model.clone() });
         state.response_model_emitted = true;
     }
-    for candidate in &chunk.candidates {
+    let candidates = chunk.candidates.as_deref().unwrap_or(&[]);
+    for candidate in candidates {
         if let Some(content) = &candidate.content {
             for part in &content.parts {
                 let part_index = state.next_part_index;
@@ -559,28 +847,103 @@ fn parse_chunk_with_state(chunk: &GenerateContentChunk, model: &str, state: &mut
                 }
             }
         }
+        if let Some(grounding) = &candidate.grounding_metadata {
+            let queries_changed = push_unique(
+                &mut state.google_search_queries,
+                grounding.web_search_queries.iter().cloned(),
+            );
+            let sources_changed = push_unique(
+                &mut state.google_search_sources,
+                grounding
+                    .grounding_chunks
+                    .iter()
+                    .filter_map(|chunk| chunk.web.as_ref()?.uri.clone()),
+            );
+            if !state.google_search_queries.is_empty() || !state.google_search_sources.is_empty() {
+                let first = !state.google_search_announced;
+                if first {
+                    state.google_search_announced = true;
+                    state.server_tool_calls = state.server_tool_calls.saturating_add(1);
+                }
+                if first || queries_changed || sources_changed {
+                    let arguments = (!state.google_search_queries.is_empty())
+                        .then(|| serde_json::json!({ "queries": state.google_search_queries }).to_string());
+                    events.push(StreamEvent::ServerToolCall(ServerToolCall {
+                        id: "gemini-google-search".into(),
+                        name: "google_search".into(),
+                        arguments,
+                        sources: state.google_search_sources.clone(),
+                        completed: true,
+                    }));
+                }
+            }
+        }
+        if let Some(url_context) = &candidate.url_context_metadata {
+            let urls_changed = push_unique(
+                &mut state.url_context_urls,
+                url_context
+                    .url_metadata
+                    .iter()
+                    .filter_map(|item| item.retrieved_url.clone()),
+            );
+            if !state.url_context_urls.is_empty() {
+                let first = !state.url_context_announced;
+                if first {
+                    state.url_context_announced = true;
+                    state.server_tool_calls = state.server_tool_calls.saturating_add(1);
+                }
+                if first || urls_changed {
+                    let arguments = Some(serde_json::json!({ "urls": state.url_context_urls }).to_string());
+                    events.push(StreamEvent::ServerToolCall(ServerToolCall {
+                        id: "gemini-url-context".into(),
+                        name: "url_context".into(),
+                        arguments,
+                        sources: state.url_context_urls.clone(),
+                        completed: true,
+                    }));
+                }
+            }
+        }
         if let Some(reason) = candidate.finish_reason.as_ref() {
             events.push(StreamEvent::Stop {
-                reason: reason.clone(),
+                reason: normalise_finish_reason(reason),
                 usage: None,
             });
         }
     }
+    if candidates.is_empty()
+        && let Some(block_reason) = chunk
+            .prompt_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.block_reason.as_deref())
+            .filter(|reason| !reason.is_empty())
+    {
+        tracing::info!(
+            block_reason,
+            "Gemini promptFeedback blocked the request; reporting refusal"
+        );
+        events.push(StreamEvent::Stop {
+            reason: "content_filter".into(),
+            usage: None,
+        });
+    }
     if let Some(usage) = &chunk.usage_metadata {
         events.push(StreamEvent::UsageUpdate {
-            usage: usage.normalise(),
+            usage: usage.normalise(Some(state.server_tool_calls)),
         });
     }
     events
 }
 
 fn parse_agent_response(chunk: GenerateContentChunk, model: &str) -> Result<AgentResponse, ProviderError> {
+    chunk.validate(false)?;
     chunk.warn_ignored_fields();
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let mut state = ProviderStateAccumulator::default();
-    for event in parse_chunk(&chunk, model) {
+    let mut parse_state = GeminiParseState::default();
+    for event in parse_chunk_with_state(&chunk, model, &mut parse_state) {
         match event {
             StreamEvent::Text { content } => text.push_str(&content),
             StreamEvent::Reasoning { content } => reasoning.push_str(&content),
@@ -608,7 +971,10 @@ fn parse_agent_response(chunk: GenerateContentChunk, model: &str) -> Result<Agen
         text,
         reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
         tool_calls,
-        usage: chunk.usage_metadata.as_ref().map(GeminiUsage::normalise),
+        usage: chunk
+            .usage_metadata
+            .as_ref()
+            .map(|usage| usage.normalise(Some(parse_state.server_tool_calls))),
         provider_state: state.finish(),
     })
 }
@@ -638,13 +1004,16 @@ impl ChatProvider for GoogleGenerateContentProvider {
             .flat_map(move |event| {
                 let events = match event {
                     Ok(event) => match serde_json::from_str::<GenerateContentChunk>(&event.data) {
-                        Ok(chunk) => {
-                            chunk.warn_ignored_fields();
-                            parse_chunk_with_state(&chunk, &model, &mut parse_state)
-                                .into_iter()
-                                .map(Ok)
-                                .collect()
-                        }
+                        Ok(chunk) => match chunk.validate(parse_state.message_started) {
+                            Ok(()) => {
+                                chunk.warn_ignored_fields();
+                                parse_chunk_with_state(&chunk, &model, &mut parse_state)
+                                    .into_iter()
+                                    .map(Ok)
+                                    .collect()
+                            }
+                            Err(error) => vec![Err(error)],
+                        },
                         Err(error) => vec![Err(embedded_upstream_error(event.data.as_bytes())
                             .map(ProviderError::Upstream)
                             .unwrap_or_else(|| ProviderError::Parse(error.to_string())))],
@@ -700,7 +1069,16 @@ mod tests {
     }
 
     fn thinking_config(params: &ChatParams, stream: bool) -> Result<serde_json::Value, ProviderError> {
-        let provider = GoogleGenerateContentProvider::new("https://relay.example", "secret");
+        thinking_config_with(params, stream, false)
+    }
+
+    fn thinking_config_with(
+        params: &ChatParams,
+        stream: bool,
+        include_thoughts_when_off: bool,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let provider = GoogleGenerateContentProvider::new("https://relay.example", "secret")
+            .with_include_thoughts_when_off(include_thoughts_when_off);
         let request = provider.build_request(&[ChatMessage::user("hi")], None, params, stream)?;
         let Some(RequestBody::Json(body)) = request.body else {
             panic!("expected JSON request body");
@@ -844,16 +1222,29 @@ mod tests {
             let zero = resolved_params(model, Some(0), None);
             let summary = crate::agent::without_thinking(resolved_params(model, Some(4097), None));
             assert!(!off.thinking_enabled);
+            assert!(zero.thinking_enabled);
             assert!(!summary.thinking_enabled);
-            for params in [off, zero, summary] {
+            for params in [&off, &summary] {
                 assert!(params.supports_thinking_off);
                 for stream in [false, true] {
                     assert_eq!(
-                        thinking_config(&params, stream).unwrap(),
-                        serde_json::json!({ "includeThoughts": true, "thinkingBudget": 0 }),
+                        thinking_config(params, stream).unwrap(),
+                        serde_json::json!({ "thinkingBudget": 0 }),
                         "{model}: stream={stream}"
                     );
+                    assert_eq!(
+                        thinking_config_with(params, stream, true).unwrap(),
+                        serde_json::json!({ "includeThoughts": true, "thinkingBudget": 0 }),
+                        "{model}: include_thoughts_when_off stream={stream}"
+                    );
                 }
+            }
+            for stream in [false, true] {
+                assert_eq!(
+                    thinking_config(&zero, stream).unwrap(),
+                    serde_json::json!({ "includeThoughts": true, "thinkingBudget": 0 }),
+                    "{model}: explicit zero stream={stream}"
+                );
             }
         }
     }
@@ -864,14 +1255,18 @@ mod tests {
         let summary = crate::agent::without_thinking(resolved_params("gemini-2.5-pro", Some(4097), None));
         assert!(off.thinking_enabled);
         assert!(!summary.thinking_enabled);
-        for params in [off, summary] {
-            assert!(!params.supports_thinking_off);
-            for stream in [false, true] {
-                assert_eq!(
-                    thinking_config(&params, stream).unwrap(),
-                    serde_json::json!({ "includeThoughts": true })
-                );
-            }
+        assert!(!off.supports_thinking_off);
+        assert!(!summary.supports_thinking_off);
+        for stream in [false, true] {
+            assert_eq!(
+                thinking_config(&off, stream).unwrap(),
+                serde_json::json!({ "includeThoughts": true })
+            );
+            assert_eq!(thinking_config(&summary, stream).unwrap(), serde_json::Value::Null);
+            assert_eq!(
+                thinking_config_with(&summary, stream, true).unwrap(),
+                serde_json::json!({ "includeThoughts": true })
+            );
         }
     }
 
@@ -1020,17 +1415,251 @@ mod tests {
 
     #[test]
     fn missing_candidates_is_rejected() {
-        let error = serde_json::from_value::<GenerateContentChunk>(serde_json::json!({
+        let chunk: GenerateContentChunk = serde_json::from_value(serde_json::json!({
             "usageMetadata": { "totalTokenCount": 3 }
         }))
-        .err()
-        .expect("candidates is required");
+        .unwrap();
+        let error = chunk.validate(false).expect_err("candidates is required");
         assert!(error.to_string().contains("missing field `candidates`"));
+        assert!(
+            chunk.validate(true).is_ok(),
+            "tail usage-only chunk after stream start is valid"
+        );
     }
 
     #[test]
     fn leftover_file_uri_does_not_become_empty_mimetype_filedata() {
         let error = media_part(Some("file:///C:/data/files/a.png")).unwrap_err();
         assert!(error.to_string().contains("unresolved attachment"), "{error}");
+    }
+
+    #[test]
+    fn non_thinking_model_omits_thinking_config() {
+        let params = ChatParams {
+            model: "gemini-2.0-flash".into(),
+            thinking_enabled: false,
+            thinking_style: ThinkingStyle::None,
+            ..Default::default()
+        };
+        assert_eq!(thinking_config(&params, true).unwrap(), serde_json::Value::Null);
+        assert_eq!(
+            thinking_config_with(&params, true, true).unwrap(),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn thoughts_token_count_is_folded_into_completion_tokens_without_double_counting() {
+        let separate: GeminiUsage = serde_json::from_value(serde_json::json!({
+            "promptTokenCount": 25,
+            "candidatesTokenCount": 85,
+            "thoughtsTokenCount": 140,
+            "totalTokenCount": 250
+        }))
+        .unwrap();
+        let norm = separate.normalise(None);
+        assert_eq!(norm.completion_tokens, Some(225));
+        assert_eq!(norm.total_tokens, Some(250));
+
+        let already_included: GeminiUsage = serde_json::from_value(serde_json::json!({
+            "promptTokenCount": 25,
+            "candidatesTokenCount": 225,
+            "thoughtsTokenCount": 140,
+            "totalTokenCount": 250
+        }))
+        .unwrap();
+        assert_eq!(already_included.normalise(None).completion_tokens, Some(225));
+
+        let thoughts_only: GeminiUsage = serde_json::from_value(serde_json::json!({
+            "promptTokenCount": 10,
+            "thoughtsTokenCount": 30,
+            "totalTokenCount": 40
+        }))
+        .unwrap();
+        assert_eq!(thoughts_only.normalise(None).completion_tokens, Some(30));
+    }
+
+    #[test]
+    fn finish_reason_is_normalised_for_truncation_and_refusal() {
+        assert_eq!(normalise_finish_reason("STOP"), "stop");
+        assert_eq!(normalise_finish_reason("MAX_TOKENS"), "max_tokens");
+        for blocked in ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"] {
+            assert_eq!(normalise_finish_reason(blocked), "content_filter", "{blocked}");
+        }
+    }
+
+    #[test]
+    fn prompt_feedback_block_empty_parts_and_omitted_args_parse_cleanly() {
+        let blocked: GenerateContentChunk = serde_json::from_value(serde_json::json!({
+            "promptFeedback": { "blockReason": "SAFETY", "safetyRatings": [] }
+        }))
+        .unwrap();
+        blocked.validate(false).unwrap();
+        let events = parse_chunk(&blocked, "gemini-2.5-flash");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Stop { reason, .. } if reason == "content_filter"
+        )));
+
+        let empty_parts: GenerateContentChunk = serde_json::from_value(serde_json::json!({
+            "candidates": [{
+                "index": 0,
+                "content": { "role": "model" },
+                "finishReason": "SAFETY",
+                "safetyRatings": []
+            }]
+        }))
+        .unwrap();
+        empty_parts.validate(false).unwrap();
+        let events = parse_chunk(&empty_parts, "gemini-2.5-flash");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Stop { reason, .. } if reason == "content_filter"
+        )));
+
+        let no_args_call: GenerateContentChunk = serde_json::from_value(serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{ "functionCall": { "name": "get_time" } }]
+                }
+            }]
+        }))
+        .unwrap();
+        let events = parse_chunk(&no_args_call, "gemini-2.5-flash");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallDelta { arguments, .. } if arguments == "{}"
+        )));
+    }
+
+    #[test]
+    fn standard_response_fields_report_no_ignored_fields() {
+        let chunk: GenerateContentChunk = serde_json::from_value(serde_json::json!({
+            "responseId": "resp-1",
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [{
+                "index": 0,
+                "content": { "role": "model", "parts": [{ "text": "ok" }] },
+                "finishReason": "STOP",
+                "safetyRatings": [],
+                "avgLogprobs": -0.1
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "thoughtsTokenCount": 3,
+                "totalTokenCount": 10,
+                "promptTokensDetails": [],
+                "candidatesTokensDetails": [],
+                "trafficType": "ON_DEMAND"
+            }
+        }))
+        .unwrap();
+        assert!(chunk.extra.is_empty());
+        let candidate = &chunk.candidates.as_ref().unwrap()[0];
+        assert!(candidate.extra.is_empty());
+        assert!(candidate.content.as_ref().unwrap().extra.is_empty());
+        assert!(chunk.usage_metadata.as_ref().unwrap().extra.is_empty());
+    }
+
+    #[test]
+    fn gemini_25_unsigned_tool_calls_stay_native() {
+        let assistant = ChatMessage::assistant_with_tools(
+            "",
+            None,
+            vec![ToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            }],
+        );
+        let (_, contents) = serialize_contents(
+            &[assistant, ChatMessage::tool_result("call-1", "hello")],
+            "gemini-2.5-flash",
+        )
+        .unwrap();
+        assert_eq!(contents[0]["role"], "model");
+        assert_eq!(contents[0]["parts"][0]["functionCall"]["name"], "read_file");
+        assert_eq!(contents[1]["role"], "user");
+        assert_eq!(contents[1]["parts"][0]["functionResponse"]["name"], "read_file");
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["response"]["output"],
+            "hello"
+        );
+    }
+
+    #[test]
+    fn google_search_and_url_context_request_response_and_billing() {
+        let provider = GoogleGenerateContentProvider::new("https://generativelanguage.googleapis.com", "secret");
+        let params = ChatParams {
+            model: "gemini-2.5-flash".into(),
+            server_tools: vec![ServerToolKind::GoogleSearch, ServerToolKind::UrlContext],
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(
+                &[ChatMessage::user("check news")],
+                Some(&[ToolDefinition {
+                    name: "local_fn".into(),
+                    description: "desc".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }]),
+                &params,
+                true,
+            )
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(body["tools"][0], serde_json::json!({ "googleSearch": {} }));
+        assert_eq!(body["tools"][1], serde_json::json!({ "urlContext": {} }));
+        assert_eq!(body["tools"][2]["functionDeclarations"][0]["name"], "local_fn");
+
+        let chunk: GenerateContentChunk = serde_json::from_value(serde_json::json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "Found it." }] },
+                "finishReason": "STOP",
+                "groundingMetadata": {
+                    "webSearchQueries": ["meridian news"],
+                    "groundingChunks": [{ "web": { "uri": "https://example.com/a", "title": "A" } }]
+                },
+                "urlContextMetadata": {
+                    "urlMetadata": [{
+                        "retrievedUrl": "https://example.com/b",
+                        "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"
+                    }]
+                }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        }))
+        .unwrap();
+        let mut state = GeminiParseState::default();
+        let events = parse_chunk_with_state(&chunk, "gemini-2.5-flash", &mut state);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ServerToolCall(call)
+                if call.name == "google_search"
+                    && call.completed
+                    && call.sources == ["https://example.com/a"]
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ServerToolCall(call)
+                if call.name == "url_context"
+                    && call.completed
+                    && call.sources == ["https://example.com/b"]
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::UsageUpdate { usage } if usage.billable_tool_calls == Some(2)
+        )));
+
+        let non_stream = parse_agent_response(chunk, "gemini-2.5-flash").unwrap();
+        assert_eq!(non_stream.usage.unwrap().billable_tool_calls, Some(2));
     }
 }

@@ -347,6 +347,12 @@ pub struct ProviderWire<'a> {
     /// identities for one install. Meaningless unless the shape is on.
     pub codex_client_version: Option<&'a str>,
     pub local_backend: Option<LocalInferenceBackend>,
+    /// How Google's OpenAI-compatible adapter encodes thinking parameters.
+    /// Meaningful only for `provider_type == "google"` with `chat_completions`.
+    pub google_compat_thinking_mode: super::openai_compat::GoogleCompatThinkingMode,
+    /// Whether `gemini_generate_content` keeps `includeThoughts: true` when
+    /// `thinking_enabled` is false (for relays that require it).
+    pub google_include_thoughts_when_off: bool,
 }
 
 /// Pick the adapter for a provider row.
@@ -370,6 +376,8 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
         codex_request_shape,
         codex_client_version,
         local_backend,
+        google_compat_thinking_mode,
+        google_include_thoughts_when_off,
     } = wire;
     let codex_shape = super::openai_responses::CodexShape {
         enabled: codex_request_shape,
@@ -437,7 +445,10 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
             }
         },
         ProviderType::Google => match api_format {
-            ApiFormat::GeminiGenerateContent => Box::new(GoogleGenerateContentProvider::new(base_url, api_key)),
+            ApiFormat::GeminiGenerateContent => Box::new(
+                GoogleGenerateContentProvider::new(base_url, api_key)
+                    .with_include_thoughts_when_off(google_include_thoughts_when_off),
+            ),
             ApiFormat::GeminiInteractions => match credential {
                 super::Credential::ApiKey(api_key) => Box::new(GoogleInteractionsProvider::new(base_url, api_key)),
                 super::Credential::GoogleVertexServiceAccount(json) => {
@@ -445,7 +456,10 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
                 }
                 super::Credential::ChatGpt(_) | super::Credential::None => unreachable!(),
             },
-            ApiFormat::ChatCompletions => Box::new(OpenAICompatProvider::new_google(base_url, api_key)),
+            ApiFormat::ChatCompletions => Box::new(
+                OpenAICompatProvider::new_google(base_url, api_key)
+                    .with_google_thinking_mode(google_compat_thinking_mode),
+            ),
             other => {
                 return Err(format!(
                     "API format `{other:?}` is not supported by provider type `google`"
@@ -653,6 +667,8 @@ mod tests {
             codex_request_shape: false,
             codex_client_version: None,
             local_backend: None,
+            google_compat_thinking_mode: crate::provider::openai_compat::GoogleCompatThinkingMode::Auto,
+            google_include_thoughts_when_off: false,
         }
     }
 

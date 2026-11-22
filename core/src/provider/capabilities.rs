@@ -310,7 +310,7 @@ fn google_default() -> ProviderCapabilities {
         supports_streaming_tools: true,
         supports_thinking: true,
         supports_thinking_off: false,
-        readable_mime_types: crate::files::image_mimes(),
+        readable_mime_types: crate::files::ReadableMime::ALL.to_vec(),
         supports_temperature: false,
         supports_top_p: false,
         max_context_tokens: Some(1_048_576),
@@ -385,6 +385,49 @@ pub fn narrow_to_codex_shape(caps: &mut ProviderCapabilities) {
     caps.supports_top_p = false;
 }
 
+/// Narrow a Google model's capabilities to what the selected wire adapter can
+/// actually put on the wire. Called both after catalog resolution and after
+/// `capability_overrides` so a user patch cannot re-introduce an unsupported
+/// thinking style or server tool on a dialect that cannot speak it.
+pub fn narrow_to_google_wire(api_format: Option<&str>, model: &str, caps: &mut ProviderCapabilities) {
+    match api_format {
+        Some("gemini_generate_content") => {
+            if caps.thinking_style == ThinkingStyle::Budget {
+                caps.supported_efforts.clear();
+                caps.default_effort = None;
+            }
+            caps.server_tools
+                .retain(|tool| matches!(tool, ServerToolKind::GoogleSearch | ServerToolKind::UrlContext));
+        }
+        Some("gemini_interactions") => {
+            if caps.thinking_style == ThinkingStyle::Budget {
+                caps.thinking_style = ThinkingStyle::EffortOnly;
+                caps.supports_thinking_off = false;
+            }
+            if !super::google_generate_content::model_requires_tool_thought_signature(model) {
+                // Gemini 2.5 does not accept `thinking_level` on Interactions.
+                caps.supported_efforts.clear();
+                caps.default_effort = None;
+            }
+            caps.server_tools
+                .retain(|tool| matches!(tool, ServerToolKind::GoogleSearch | ServerToolKind::UrlContext));
+        }
+        Some("chat_completions") => {
+            if caps.thinking_style == ThinkingStyle::Budget {
+                caps.thinking_style = ThinkingStyle::EffortOnly;
+                caps.supports_thinking_off = false;
+            }
+            caps.server_tools.clear();
+        }
+        _ => {
+            if caps.thinking_style == ThinkingStyle::Budget {
+                caps.thinking_style = ThinkingStyle::EffortOnly;
+                caps.supports_thinking_off = false;
+            }
+        }
+    }
+}
+
 fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> ProviderCapabilities {
     // `catalog_provider` scopes the prefix search. gemma_tool deliberately maps
     // to a namespace with no entries so it only ever gets its default.
@@ -419,15 +462,8 @@ fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> 
     if let Some(entry) = find_longest_prefix_match(catalog_provider, model) {
         apply(&mut caps, entry);
     }
-    if catalog_provider == "google" && caps.thinking_style == ThinkingStyle::Budget {
-        if api_format == Some("gemini_generate_content") {
-            caps.supported_efforts.clear();
-            caps.default_effort = None;
-        } else {
-            // 这两条适配器仍使用档位协议，不能宣称会发送原生预算或关闭值。
-            caps.thinking_style = ThinkingStyle::EffortOnly;
-            caps.supports_thinking_off = false;
-        }
+    if catalog_provider == "google" {
+        narrow_to_google_wire(api_format, model, &mut caps);
     }
     caps
 }
@@ -458,10 +494,12 @@ fn server_tools_for(provider_type: &str, api_format: Option<&str>) -> Vec<Server
         // Its compatibility table lists `function` and `web_search` as the
         // supported tool types and says everything else is ignored.
         ("deepseek", Some("responses")) => &[ServerToolKind::WebSearch],
-        // Vertex Gemini Interactions runs these on Google's side. They are
-        // separate from the other providers' `web_search` wire type: the
-        // Interactions schema calls them `google_search` and `url_context`.
-        ("google", Some("gemini_interactions")) => &[ServerToolKind::GoogleSearch, ServerToolKind::UrlContext],
+        // Both native Gemini GenerateContent and Vertex Gemini Interactions run
+        // these on Google's side under `googleSearch`/`google_search` and
+        // `urlContext`/`url_context`.
+        ("google", Some("gemini_generate_content" | "gemini_interactions")) => {
+            &[ServerToolKind::GoogleSearch, ServerToolKind::UrlContext]
+        }
         // Chat-completions has no such thing anywhere — measured: xAI answers
         // "expected `function` or `live_search`" — and nobody else is listed
         // without having been measured.
@@ -727,7 +765,11 @@ pub fn filter_params(params: &mut ChatParams, caps: &ProviderCapabilities) -> Re
             ));
         }
     }
-    params.thinking_style = caps.thinking_style;
+    params.thinking_style = if caps.supports_thinking {
+        caps.thinking_style
+    } else {
+        ThinkingStyle::None
+    };
     params.supports_thinking_off = caps.supports_thinking && caps.supports_thinking_off;
     if !caps.supports_temperature {
         params.temperature = None;
@@ -1074,12 +1116,31 @@ mod tests {
             assert_eq!(native.supports_thinking_off, supports_off, "{model}");
             assert!(native.supported_efforts.is_empty(), "{model}");
             assert_eq!(native.default_effort, None, "{model}");
-            for format in [None, Some("chat_completions"), Some("gemini_interactions")] {
+            assert!(native.supports_temperature, "{model}");
+            assert!(native.supports_top_p, "{model}");
+            assert_eq!(
+                native.server_tools,
+                vec![ServerToolKind::GoogleSearch, ServerToolKind::UrlContext],
+                "{model}"
+            );
+            assert!(has_pdf(&native), "{model}");
+            assert!(native.readable_mime_types.contains(&ReadableMime::AudioMpeg), "{model}");
+            assert!(native.readable_mime_types.contains(&ReadableMime::VideoMp4), "{model}");
+
+            for format in [None, Some("chat_completions")] {
                 let caps = resolve("google", format, model);
                 assert_eq!(caps.thinking_style, ThinkingStyle::EffortOnly, "{model} {format:?}");
                 assert_eq!(caps.supported_efforts, ["low", "medium", "high"]);
                 assert!(!caps.supports_thinking_off, "{model} {format:?}");
             }
+
+            let interactions = resolve("google", Some("gemini_interactions"), model);
+            assert_eq!(interactions.thinking_style, ThinkingStyle::EffortOnly, "{model}");
+            assert!(
+                interactions.supported_efforts.is_empty(),
+                "{model} cannot take thinking_level on Interactions"
+            );
+            assert!(!interactions.supports_thinking_off, "{model}");
         }
     }
 
@@ -1328,8 +1389,12 @@ mod tests {
             resolve("google", Some("gemini_interactions"), "gemini-3.8-flash").server_tools,
             vec![ServerToolKind::GoogleSearch, ServerToolKind::UrlContext]
         );
+        assert_eq!(
+            resolve("google", Some("gemini_generate_content"), "gemini-3.8-flash").server_tools,
+            vec![ServerToolKind::GoogleSearch, ServerToolKind::UrlContext]
+        );
         assert!(
-            resolve("google", Some("gemini_generate_content"), "gemini-3.8-flash")
+            resolve("google", Some("chat_completions"), "gemini-3.8-flash")
                 .server_tools
                 .is_empty()
         );

@@ -99,9 +99,11 @@ fn vertex_interactions_models() -> Vec<ModelInfo> {
         "gemini-3.8-flash",
         "gemini-3.7-flash",
         "gemini-3.6-flash",
+        "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
         "gemini-3.1-pro-preview",
         "gemini-3.1-flash-lite",
+        "gemini-3-pro-preview",
         "gemini-3-flash-preview",
     ]
     .into_iter()
@@ -155,15 +157,24 @@ fn configured_model(codex_home: &std::path::Path) -> Option<String> {
 fn is_google_agent_model(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
     let id = lower.strip_prefix("models/").unwrap_or(&lower);
-    if !["gemini-2.5-", "gemini-3-", "gemini-3."]
-        .iter()
-        .any(|prefix| id.starts_with(prefix))
-    {
-        return false;
+    if matches!(
+        id,
+        "gemini-flash-latest" | "gemini-pro-latest" | "gemini-flash-lite-latest"
+    ) {
+        return true;
     }
     if ["image", "live", "tts", "audio", "embedding", "embed"]
         .iter()
         .any(|part| id.contains(part))
+    {
+        return false;
+    }
+    if id.starts_with("gemini-4-") || id.starts_with("gemini-4.") {
+        return true;
+    }
+    if !["gemini-2.5-", "gemini-3-", "gemini-3."]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
     {
         return false;
     }
@@ -251,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn google_filter_keeps_gemini_2_5_and_3_models() {
+    fn google_filter_keeps_gemini_2_5_3_and_4_models() {
         for id in [
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
@@ -261,9 +272,38 @@ mod tests {
             "gemini-3.7-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.1-pro-preview-customtools",
+            "gemini-4-hydrogen",
+            "gemini-4.0-pro",
+            "gemini-flash-latest",
+            "gemini-pro-latest",
         ] {
             assert!(is_google_agent_model(id), "{id}");
         }
+    }
+
+    #[test]
+    fn standard_google_model_list_reports_no_ignored_fields() {
+        let parsed: super::GoogleModelsResponse = serde_json::from_str(
+            r#"{
+                "models": [{
+                    "name": "models/gemini-2.5-flash",
+                    "version": "001",
+                    "displayName": "Gemini 2.5 Flash",
+                    "description": "Fast multimodal model",
+                    "inputTokenLimit": 1048576,
+                    "outputTokenLimit": 65536,
+                    "supportedGenerationMethods": ["generateContent", "countTokens"],
+                    "temperature": 1.0,
+                    "maxTemperature": 2.0,
+                    "topP": 0.95,
+                    "topK": 64,
+                    "thinking": true
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(parsed.extra.is_empty());
+        assert!(parsed.models[0].extra.is_empty());
     }
 
     #[test]
@@ -317,6 +357,7 @@ struct OpenAIModel {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GoogleModelsResponse {
+    #[serde(default)]
     models: Vec<GoogleModel>,
     next_page_token: Option<String>,
     #[serde(default, flatten)]
@@ -328,6 +369,27 @@ struct GoogleModelsResponse {
 struct GoogleModel {
     name: String,
     display_name: Option<String>,
+    supported_generation_methods: Option<Vec<String>>,
+    #[serde(default, rename = "version")]
+    _version: IgnoredAny,
+    #[serde(default, rename = "baseModelId")]
+    _base_model_id: IgnoredAny,
+    #[serde(default, rename = "description")]
+    _description: IgnoredAny,
+    #[serde(default, rename = "inputTokenLimit")]
+    _input_token_limit: IgnoredAny,
+    #[serde(default, rename = "outputTokenLimit")]
+    _output_token_limit: IgnoredAny,
+    #[serde(default, rename = "temperature")]
+    _temperature: IgnoredAny,
+    #[serde(default, rename = "maxTemperature")]
+    _max_temperature: IgnoredAny,
+    #[serde(default, rename = "topP")]
+    _top_p: IgnoredAny,
+    #[serde(default, rename = "topK")]
+    _top_k: IgnoredAny,
+    #[serde(default, rename = "thinking")]
+    _thinking: IgnoredAny,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
 }
@@ -375,9 +437,16 @@ async fn fetch_google_models(base_url: &str, api_key: &str) -> Result<Vec<ModelI
     }
     let mut models = all_models
         .into_iter()
-        .map(|model| ModelInfo {
-            id: model.name.clone(),
-            name: model.display_name.unwrap_or(model.name),
+        .filter(|model| {
+            model
+                .supported_generation_methods
+                .as_ref()
+                .is_none_or(|methods| methods.iter().any(|method| method == "generateContent"))
+        })
+        .map(|model| {
+            let id = model.name.strip_prefix("models/").unwrap_or(&model.name).to_string();
+            let name = model.display_name.unwrap_or_else(|| id.clone());
+            ModelInfo { id, name }
         })
         .collect::<Vec<_>>();
     models.sort_by(|a, b| a.id.cmp(&b.id));
