@@ -324,7 +324,7 @@ mod tests {
     }
 
     async fn create_conversation(db: &Db, id: &str) {
-        db.write(async |tx| conversation_ops::create_conversation(tx, id, Some("t"), None, None, 1).await)
+        db.write(async |tx| conversation_ops::create(tx, id, Some("t"), None, None, 1).await)
             .await
             .unwrap();
     }

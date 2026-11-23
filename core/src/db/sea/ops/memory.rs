@@ -222,11 +222,11 @@ pub async fn visible_user_memories(
 }
 
 /// Live or in the trash; `None` once purged.
-pub async fn get_memory(db: &impl Read, id: &str) -> Result<Option<memory::Model>, DbErr> {
+pub async fn get(db: &impl Read, id: &str) -> Result<Option<memory::Model>, DbErr> {
     memory::Entity::find_by_id(id).one(db.conn()?).await
 }
 
-pub async fn get_memory_by_key(
+pub async fn get_by_key(
     db: &impl Read,
     scope: MemoryScope,
     scope_id: &str,
@@ -290,7 +290,7 @@ fn scope_quota(scope: MemoryScope) -> usize {
 /// Content length and per-scope quota live here rather than in the tool layer so
 /// the IPC path cannot bypass them. The inner `Err` is the refusal, worded for
 /// whoever tried to write.
-pub async fn validate_memory(
+pub async fn validate(
     tx: &WriteTx,
     scope: MemoryScope,
     scope_id: &str,
@@ -305,7 +305,7 @@ pub async fn validate_memory(
     if key.trim().is_empty() {
         return Ok(Err("Memory key must not be empty".to_string()));
     }
-    if get_memory_by_key(tx, scope, scope_id, key).await?.is_none()
+    if get_by_key(tx, scope, scope_id, key).await?.is_none()
         && count_by_scope(tx, scope, scope_id).await? as usize >= scope_quota(scope)
     {
         return Ok(Err(format!(
@@ -320,8 +320,8 @@ pub async fn validate_memory(
 /// in the trash and a fresh row is created, so restoring never collides and the
 /// delete history survives. An overwrite keeps the live row's id, `created_at`
 /// and `source_session_id`, and takes everything else from `new`.
-pub async fn upsert_memory(tx: &WriteTx, new: memory::Model) -> Result<memory::Model, DbErr> {
-    match get_memory_by_key(tx, new.scope_type, &new.scope_id, &new.key).await? {
+pub async fn upsert(tx: &WriteTx, new: memory::Model) -> Result<memory::Model, DbErr> {
+    match get_by_key(tx, new.scope_type, &new.scope_id, &new.key).await? {
         Some(existing) => {
             memory::ActiveModel {
                 id: Unchanged(existing.id),
@@ -341,32 +341,32 @@ pub async fn upsert_memory(tx: &WriteTx, new: memory::Model) -> Result<memory::M
             memory::Entity::insert(new.into_active_model())
                 .exec_without_returning(tx.conn()?)
                 .await?;
-            get_memory(tx, &id)
+            get(tx, &id)
                 .await?
                 .ok_or_else(|| DbErr::RecordNotFound(format!("memory `{id}`")))
         }
     }
 }
 
-/// [`validate_memory`] and [`upsert_memory`] in the one transaction: what every
+/// [`validate`] and [`upsert`] in the one transaction: what every
 /// writer of a memory calls. Two writers racing for the last slot of a scope
 /// cannot both pass the quota, because the second one's count runs after the
 /// first one's insert.
 pub async fn remember(tx: &WriteTx, new: memory::Model) -> Result<Result<memory::Model, String>, DbErr> {
-    if let Err(refused) = validate_memory(tx, new.scope_type, &new.scope_id, &new.key, &new.content).await? {
+    if let Err(refused) = validate(tx, new.scope_type, &new.scope_id, &new.key, &new.content).await? {
         return Ok(Err(refused));
     }
-    upsert_memory(tx, new).await.map(Ok)
+    upsert(tx, new).await.map(Ok)
 }
 
 /// `RecordNotUpdated` for an id with no row.
-pub async fn update_memory(tx: &WriteTx, id: &str, changeset: MemoryChangeset) -> Result<memory::Model, DbErr> {
+pub async fn update(tx: &WriteTx, id: &str, changeset: MemoryChangeset) -> Result<memory::Model, DbErr> {
     let mut row = changeset.into_active_model();
     row.id = Unchanged(id.to_owned());
     row.update(tx.conn()?).await
 }
 
-pub async fn soft_delete_memories(tx: &WriteTx, ids: &[String], by: DeletedBy, now: EpochMs) -> Result<u64, DbErr> {
+pub async fn soft_delete(tx: &WriteTx, ids: &[String], by: DeletedBy, now: EpochMs) -> Result<u64, DbErr> {
     let mut changed = 0;
     for chunk in ids.chunks(ID_CHUNK) {
         changed += memory::Entity::update_many()
@@ -390,7 +390,7 @@ pub async fn soft_delete_memories(tx: &WriteTx, ids: &[String], by: DeletedBy, n
 /// whose `deleted_at` is gone, and would therefore never mention it again: the
 /// memory exists, the model has been told to forget it, and nothing will ever
 /// tell it otherwise.
-pub async fn restore_memories(tx: &WriteTx, ids: &[String], now: EpochMs) -> Result<u64, DbErr> {
+pub async fn restore(tx: &WriteTx, ids: &[String], now: EpochMs) -> Result<u64, DbErr> {
     let mut changed = 0;
     for chunk in ids.chunks(ID_CHUNK) {
         changed += memory::Entity::update_many()
@@ -405,7 +405,7 @@ pub async fn restore_memories(tx: &WriteTx, ids: &[String], now: EpochMs) -> Res
     Ok(changed)
 }
 
-pub async fn purge_memories(tx: &WriteTx, ids: &[String]) -> Result<u64, DbErr> {
+pub async fn purge(tx: &WriteTx, ids: &[String]) -> Result<u64, DbErr> {
     let mut removed = 0;
     for chunk in ids.chunks(ID_CHUNK) {
         removed += memory::Entity::delete_many()
@@ -431,8 +431,8 @@ pub async fn purge_expired_trash(tx: &WriteTx, now: EpochMs) -> Result<u64, DbEr
 /// Every memory filed under a deleted project. Hard delete, not soft: with the
 /// project gone a tombstone's scope_id points nowhere, so it could be neither
 /// restored nor shown in the trash. Memories carry no foreign key to the
-/// project (scope_id is polymorphic), so `project::delete_project` calls this.
-pub async fn delete_project_memories(tx: &WriteTx, project_id: &str) -> Result<u64, DbErr> {
+/// project (scope_id is polymorphic), so `project::delete` calls this.
+pub async fn delete_for_project(tx: &WriteTx, project_id: &str) -> Result<u64, DbErr> {
     Ok(memory::Entity::delete_many()
         .filter(memory::Column::ScopeType.eq(MemoryScope::Project))
         .filter(memory::Column::ScopeId.eq(project_id))
@@ -443,7 +443,7 @@ pub async fn delete_project_memories(tx: &WriteTx, project_id: &str) -> Result<u
 
 /// Safety net for the case a future migration rebuilds `projects`: foreign keys
 /// are off during migrations, so even a real FK would not have cascaded.
-pub async fn purge_orphan_project_memories(tx: &WriteTx) -> Result<u64, DbErr> {
+pub async fn purge_orphan_projects(tx: &WriteTx) -> Result<u64, DbErr> {
     Ok(memory::Entity::delete_many()
         .filter(memory::Column::ScopeType.eq(MemoryScope::Project))
         .filter(
@@ -584,7 +584,7 @@ pub async fn forget_subject(
         .into_tuple()
         .all(tx.conn()?)
         .await?;
-    soft_delete_memories(tx, &ids, by, now).await
+    soft_delete(tx, &ids, by, now).await
 }
 
 /// A live `normal` memory filed under the subject in the outer query.
@@ -654,7 +654,7 @@ pub async fn enforce_subject_lru(tx: &WriteTx, touched: Option<&str>, now: Epoch
             .all(tx.conn()?)
             .await?;
         let overflow: Vec<String> = kept.into_iter().skip(MAX_MEMORIES_PER_SUBJECT).collect();
-        trimmed = soft_delete_memories(tx, &overflow, DeletedBy::Lru, now).await?;
+        trimmed = soft_delete(tx, &overflow, DeletedBy::Lru, now).await?;
     }
 
     Ok((forgotten, trimmed))
@@ -910,7 +910,7 @@ mod tests {
         mem(&db, "a", 1, Origin::Group, Visibility::Normal).await;
         let scope = onebot_user_scope_id(1);
 
-        db.write(async |tx| soft_delete_memories(tx, &["a".into()], DeletedBy::SelfRemoved, 10).await)
+        db.write(async |tx| soft_delete(tx, &["a".into()], DeletedBy::SelfRemoved, 10).await)
             .await
             .unwrap();
         assert!(
@@ -925,7 +925,7 @@ mod tests {
             (1, Some(DeletedBy::SelfRemoved), Some(10))
         );
 
-        db.write(async |tx| restore_memories(tx, &["a".into()], 9_000).await)
+        db.write(async |tx| restore(tx, &["a".into()], 9_000).await)
             .await
             .unwrap();
         let back = list_by_scope(&db, MemoryScope::OnebotUser, &scope).await.unwrap();
@@ -974,7 +974,7 @@ mod tests {
             (5, Some("s1"))
         );
 
-        db.write(async |tx| soft_delete_memories(tx, &["m1".into()], DeletedBy::Admin, 6).await)
+        db.write(async |tx| soft_delete(tx, &["m1".into()], DeletedBy::Admin, 6).await)
             .await
             .unwrap();
         let fresh = write(
@@ -1088,7 +1088,7 @@ mod tests {
                         Visibility::Normal,
                     );
                     m.updated_at = 10 + i as i64;
-                    upsert_memory(tx, m).await?;
+                    upsert(tx, m).await?;
                 }
             }
             let scope = onebot_user_scope_id(1);
@@ -1101,7 +1101,7 @@ mod tests {
                 Visibility::Normal,
             );
             extra.updated_at = 100;
-            upsert_memory(tx, extra).await?;
+            upsert(tx, extra).await?;
             Ok::<_, DbErr>(())
         })
         .await
@@ -1222,7 +1222,7 @@ mod tests {
                 Visibility::Normal,
             );
             old.content = long;
-            upsert_memory(tx, old).await
+            upsert(tx, old).await
         })
         .await
         .unwrap();
@@ -1231,7 +1231,7 @@ mod tests {
         let check = |content: String| {
             let db = db.clone();
             async move {
-                db.write(async |tx| validate_memory(tx, MemoryScope::Project, "p1", "k", &content).await)
+                db.write(async |tx| validate(tx, MemoryScope::Project, "p1", "k", &content).await)
                     .await
                     .unwrap()
             }
@@ -1271,7 +1271,7 @@ mod tests {
             for (id, at) in [("a", 10), ("b", 10), ("c", 20), ("d", 30)] {
                 let mut m = row(id, MemoryScope::Project, "p1", id, Origin::Desktop, Visibility::Normal);
                 m.updated_at = at;
-                upsert_memory(tx, m).await?;
+                upsert(tx, m).await?;
             }
             Ok::<_, DbErr>(())
         })
@@ -1293,7 +1293,7 @@ mod tests {
         .unwrap();
         assert_eq!(ids(&rows), ["b", "c"]);
 
-        db.write(async |tx| soft_delete_memories(tx, &["a".into(), "d".into()], DeletedBy::Admin, 25).await)
+        db.write(async |tx| soft_delete(tx, &["a".into(), "d".into()], DeletedBy::Admin, 25).await)
             .await
             .unwrap();
         let deleted = list_deleted_by_scopes(
@@ -1362,7 +1362,7 @@ mod tests {
         .await
         .unwrap();
         db.write(async |tx| {
-            upsert_memory(
+            upsert(
                 tx,
                 row(
                     "kept",
@@ -1374,7 +1374,7 @@ mod tests {
                 ),
             )
             .await?;
-            upsert_memory(
+            upsert(
                 tx,
                 row(
                     "gone",
@@ -1386,7 +1386,7 @@ mod tests {
                 ),
             )
             .await?;
-            upsert_memory(
+            upsert(
                 tx,
                 row(
                     "global",
@@ -1401,10 +1401,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let purged = db
-            .write(async |tx| purge_orphan_project_memories(tx).await)
-            .await
-            .unwrap();
+        let purged = db.write(async |tx| purge_orphan_projects(tx).await).await.unwrap();
         assert_eq!(purged, 1);
         let mut left: Vec<String> = list_all(&db).await.unwrap().into_iter().map(|m| m.id).collect();
         left.sort();

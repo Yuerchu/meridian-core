@@ -888,8 +888,7 @@ impl Shared {
             .services
             .db
             .write(async |tx| {
-                let Some(current) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await?
-                else {
+                let Some(current) = crate::db::sea::ops::conversation::get(tx, conversation_id).await? else {
                     return Ok(false);
                 };
                 let current = current.title;
@@ -1377,7 +1376,7 @@ impl Shared {
         // Hung off the head, as a prompt's row would be. A conversation with no
         // head has had no prompt, so there is nothing for the agent to be
         // carrying on from — and nothing sensible to hang a row off.
-        let head = crate::db::sea::ops::conversation::get_conversation(&self.services.db, &self.conversation_id)
+        let head = crate::db::sea::ops::conversation::get(&self.services.db, &self.conversation_id)
             .await
             .map(|conversation| conversation.and_then(|c| c.head_message_id))
             .map_err(|e| e.to_string());
@@ -2247,7 +2246,7 @@ impl AcpSession {
         let project_id = match project {
             ProjectOf::Known(project_id) => project_id.map(str::to_string),
             ProjectOf::Stored => {
-                crate::db::sea::ops::conversation::get_conversation(&services.db, conversation_id)
+                crate::db::sea::ops::conversation::get(&services.db, conversation_id)
                     .await
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("conversation {conversation_id} not found"))?
@@ -3333,12 +3332,10 @@ impl AcpSession {
         let candidates = services
             .db
             .read(async |tx| {
-                let conversation = conversation::get_conversation(tx, &self.conversation_id)
-                    .await?
-                    .ok_or_else(|| {
-                        crate::db::sea::DbErr::RecordNotFound(format!("conversation {}", self.conversation_id))
-                    })?;
-                let history = message::list_messages(tx, &self.conversation_id).await?;
+                let conversation = conversation::get(tx, &self.conversation_id).await?.ok_or_else(|| {
+                    crate::db::sea::DbErr::RecordNotFound(format!("conversation {}", self.conversation_id))
+                })?;
+                let history = message::list(tx, &self.conversation_id).await?;
                 let context = message::active_context(&history, conversation.head_message_id.as_deref());
                 let message_ids = context.path.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
                 let mut by_message = message_context_item::list_for_messages(tx, &message_ids).await?;
@@ -3394,14 +3391,14 @@ impl AcpSession {
         services
             .db
             .write(async |tx| {
-                let head = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+                let head = crate::db::sea::ops::conversation::get(tx, conversation_id)
                     .await?
                     .and_then(|c| c.head_message_id);
                 let row = crate::db::entity::message::Model {
                     turn_id: Some(turn_id.to_string()),
                     ..crate::db::sea::ops::message::new_row(&message_id, conversation_id, "user", text, now)
                 };
-                crate::db::sea::ops::message::append_message(tx, row, head.as_deref()).await?;
+                crate::db::sea::ops::message::append(tx, row, head.as_deref()).await?;
                 crate::db::sea::ops::message_context_item::insert_prepared(tx, &message_id, context, now).await?;
 
                 crate::db::sea::ops::turn::begin(tx, turn_id, conversation_id, TurnOrigin::ClaudeCode, None, now)
@@ -4550,7 +4547,7 @@ mod tests {
         // and `{}` left there is indistinguishable from a call that took no
         // arguments — in the transcript and in the audit copy alike.
         let stored = {
-            crate::db::sea::ops::message::list_messages(&services.db, "c1")
+            crate::db::sea::ops::message::list(&services.db, "c1")
                 .await
                 .unwrap()
                 .into_iter()
@@ -4642,7 +4639,7 @@ mod tests {
         services
             .db
             .write(async |tx| {
-                crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("t"), None, None, 0).await?;
+                crate::db::sea::ops::conversation::create(tx, "c1", Some("t"), None, None, 0).await?;
                 crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::ClaudeCode, None, 1000).await
             })
             .await
@@ -4706,7 +4703,7 @@ mod tests {
         let shared = live_turn(dir.path()).await;
         let sea = shared.services.db.clone();
         let title = async || {
-            crate::db::sea::ops::conversation::get_conversation(&sea, "c1")
+            crate::db::sea::ops::conversation::get(&sea, "c1")
                 .await
                 .unwrap()
                 .unwrap()
@@ -4770,7 +4767,7 @@ mod tests {
             "the prose opened a round of its own"
         );
         let answered = {
-            crate::db::sea::ops::message::list_messages(&shared.services.db, "c1")
+            crate::db::sea::ops::message::list(&shared.services.db, "c1")
                 .await
                 .unwrap()
                 .into_iter()
@@ -5028,7 +5025,7 @@ mod unprompted {
     }
 
     async fn rows(shared: &Shared, turn_id: &str) -> Vec<crate::db::entity::message::Model> {
-        crate::db::sea::ops::message::list_messages(&shared.services.db, "c1")
+        crate::db::sea::ops::message::list(&shared.services.db, "c1")
             .await
             .unwrap()
             .into_iter()

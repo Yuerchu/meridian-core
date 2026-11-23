@@ -183,7 +183,7 @@ async fn take_one(db: &Db, conversation_id: &str, turn_id: &str, now: i64) -> Re
         let Some(item) = queue_ops::next_deliverable(tx, conversation_id, Delivery::Interject).await? else {
             return Ok(None);
         };
-        let head = conversation_ops::get_conversation(tx, conversation_id)
+        let head = conversation_ops::get(tx, conversation_id)
             .await?
             .and_then(|c| c.head_message_id);
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -217,7 +217,7 @@ mod tests {
     use crate::db::sea::sea_test_db;
 
     async fn conversation(db: &Db, id: &str) {
-        db.write(async |tx| conversation_ops::create_conversation(tx, id, Some("q"), None, None, 0).await)
+        db.write(async |tx| conversation_ops::create(tx, id, Some("q"), None, None, 0).await)
             .await
             .unwrap();
     }
@@ -230,7 +230,7 @@ mod tests {
     }
 
     async fn messages(db: &Db) -> Vec<message::Model> {
-        crate::db::sea::ops::message::list_messages(db, "c1").await.unwrap()
+        crate::db::sea::ops::message::list(db, "c1").await.unwrap()
     }
 
     /// Counts what reached the window, per channel.

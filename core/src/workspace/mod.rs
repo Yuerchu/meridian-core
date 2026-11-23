@@ -70,7 +70,7 @@ pub enum WorkspaceRoot {
 /// reach. The `bool` says whether a project row existed at all, which is what
 /// separates `NoProject` from `NoPath` when the answer is `None`.
 pub async fn configured_dir_in(db: &impl Snapshot, conversation_id: &str) -> Result<(Option<PathBuf>, bool), String> {
-    let conv = sea_ops::conversation::get_conversation(db, conversation_id)
+    let conv = sea_ops::conversation::get(db, conversation_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("conversation {conversation_id} not found"))?;
@@ -98,7 +98,7 @@ pub async fn configured_dir_in(db: &impl Snapshot, conversation_id: &str) -> Res
 
     match conv.project_id.as_deref() {
         Some(pid) => {
-            let path = sea_ops::project::get_project(db, pid)
+            let path = sea_ops::project::get(db, pid)
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("project {pid} not found"))?

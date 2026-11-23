@@ -66,7 +66,7 @@ async fn seeded_file(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("poc.sqlite");
     super::bridge::migrate_file(&path).await.unwrap();
     let db = super::open(&path).await.unwrap();
-    db.write(async |tx| super::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await)
+    db.write(async |tx| super::ops::conversation::create(tx, "c1", None, None, None, 1).await)
         .await
         .unwrap();
     path

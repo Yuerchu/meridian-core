@@ -187,7 +187,7 @@ fn parse_stored_u32(key: &str, raw: Option<String>, default: u32) -> Result<u32,
 
 pub async fn load_config(db: &Db) -> Result<HookConfig, String> {
     let get = async |key: &str| -> Result<Option<String>, String> {
-        crate::db::sea::ops::preference::get_preference(db, key)
+        crate::db::sea::ops::preference::get(db, key)
             .await
             .map_err(|error| format!("failed to read preference {key}: {error}"))
     };
@@ -218,36 +218,36 @@ pub async fn load_config(db: &Db) -> Result<HookConfig, String> {
 /// One transaction for the whole block, so a failure part-way leaves the
 /// previous configuration rather than half of each.
 pub async fn save_config(db: &Db, config: &HookConfig) -> Result<(), String> {
-    use crate::db::sea::ops::preference::set_preference;
+    use crate::db::sea::ops::preference;
 
     let now = now_ms();
     db.write(async |tx| {
-        set_preference(tx, "hooks.enabled", if config.enabled { "true" } else { "false" }, now).await?;
-        set_preference(tx, "hooks.host", &config.host, now).await?;
-        set_preference(tx, "hooks.port", &config.port.to_string(), now).await?;
-        set_preference(tx, "hooks.token", config.token.as_deref().unwrap_or(""), now).await?;
-        set_preference(
+        preference::set(tx, "hooks.enabled", if config.enabled { "true" } else { "false" }, now).await?;
+        preference::set(tx, "hooks.host", &config.host, now).await?;
+        preference::set(tx, "hooks.port", &config.port.to_string(), now).await?;
+        preference::set(tx, "hooks.token", config.token.as_deref().unwrap_or(""), now).await?;
+        preference::set(
             tx,
             "hooks.plan_review.model",
             config.review_model.as_deref().unwrap_or(""),
             now,
         )
         .await?;
-        set_preference(
+        preference::set(
             tx,
             "hooks.plan_review.assistant_id",
             config.assistant_id.as_deref().unwrap_or(""),
             now,
         )
         .await?;
-        set_preference(
+        preference::set(
             tx,
             "hooks.plan_review.timeout_secs",
             &clamp_timeout(config.timeout_secs).to_string(),
             now,
         )
         .await?;
-        set_preference(
+        preference::set(
             tx,
             "hooks.plan_review.max_rounds",
             &clamp_rounds(config.max_rounds).to_string(),
@@ -480,7 +480,7 @@ mod tests {
     use crate::db::sea::sea_test_db;
 
     async fn set_preference(db: &Db, key: &str, value: &str) {
-        db.write(async |tx| crate::db::sea::ops::preference::set_preference(tx, key, value, 1).await)
+        db.write(async |tx| crate::db::sea::ops::preference::set(tx, key, value, 1).await)
             .await
             .unwrap();
     }

@@ -144,7 +144,7 @@ pub async fn resolve(
         // fixed-schema tools present whenever this assistant has a confirmed
         // roster, even if an older preset predates the feature.
         if let Some(assistant_id) = assistant.as_ref().map(|value| value.id.as_str()) {
-            let has_stickers = match crate::db::sea::ops::emoji_pack::list_assigned_pack_ids(db, assistant_id).await {
+            let has_stickers = match crate::db::sea::ops::emoji_pack::list_assigned_ids(db, assistant_id).await {
                 Ok(packs) => crate::db::sea::ops::emoji::list_confirmed_for_packs(db, &packs)
                     .await
                     .is_ok_and(|stickers| !stickers.is_empty()),
@@ -330,7 +330,7 @@ async fn enabled_tools(
         return Ok(None);
     };
     if let Some(preset_id) = assistant.tool_preset_id.as_ref() {
-        let preset = crate::db::sea::ops::tool_preset::get_preset(db, preset_id)
+        let preset = crate::db::sea::ops::tool_preset::get(db, preset_id)
             .await
             .map_err(|error| {
                 format!(

@@ -135,7 +135,7 @@ impl SubAgentCatalog {
 /// tools is a single completion, which is a different feature.
 /// In one snapshot, so a provider and the models filed under it agree.
 pub async fn catalog(db: &impl crate::db::sea::cap::Snapshot) -> Result<SubAgentCatalog, String> {
-    let providers = crate::db::sea::ops::provider::list_providers(db)
+    let providers = crate::db::sea::ops::provider::list(db)
         .await
         .map_err(|error| error.to_string())?;
     let mut models: Vec<AgentModel> = Vec::new();

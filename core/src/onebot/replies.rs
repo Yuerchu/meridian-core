@@ -276,7 +276,7 @@ fn parse_bank(raw: Option<String>) -> Result<ReplyBank, String> {
 }
 
 pub async fn load_in(db: &impl Read) -> Result<ReplyBank, String> {
-    let raw = sea_ops::preference::get_preference(db, PREF_KEY)
+    let raw = sea_ops::preference::get(db, PREF_KEY)
         .await
         .map_err(|error| format!("failed to read preference {PREF_KEY}: {error}"))?;
     parse_bank(raw)
@@ -301,7 +301,7 @@ pub async fn load_for_send(db: &Db) -> ReplyBank {
 pub async fn save_in(tx: &WriteTx, bank: &ReplyBank) -> Result<(), String> {
     bank.validate()?;
     let json = serde_json::to_string(bank).map_err(|error| format!("could not serialize {PREF_KEY}: {error}"))?;
-    sea_ops::preference::set_preference(tx, PREF_KEY, &json, now_ms())
+    sea_ops::preference::set(tx, PREF_KEY, &json, now_ms())
         .await
         .map_err(|error| error.to_string())
 }
@@ -411,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_json_fails_load_and_send_falls_back_to_seeds() {
         let db = sea_test_db().await;
-        db.write(async |tx| sea_ops::preference::set_preference(tx, PREF_KEY, "{not json", 1).await)
+        db.write(async |tx| sea_ops::preference::set(tx, PREF_KEY, "{not json", 1).await)
             .await
             .unwrap();
         let error = load(&db).await.unwrap_err();

@@ -90,7 +90,7 @@ impl Settings {
     /// `autoreview.*`, read straight from preferences, in one snapshot.
     pub async fn read_in(db: &impl Snapshot) -> Result<Self, String> {
         let read = async |key: &str| {
-            sea_ops::preference::get_preference(db, key)
+            sea_ops::preference::get(db, key)
                 .await
                 .map_err(|error| format!("failed to read preference {key}: {error}"))
         };
@@ -247,7 +247,7 @@ struct Active {
 /// cautious end. An unreadable list is a damaged first-party contract and must
 /// stop the turn rather than silently changing who may authorise it.
 async fn admin_roster(db: &impl DbRead) -> Result<Vec<i64>, String> {
-    let stored = sea_ops::preference::get_preference(db, "onebot.admin_users")
+    let stored = sea_ops::preference::get(db, "onebot.admin_users")
         .await
         .map_err(|error| format!("failed to read preference onebot.admin_users: {error}"))?;
     match stored {
@@ -372,12 +372,12 @@ impl Active {
             .services
             .db
             .read(async |tx| {
-                let Some(conversation) = sea_ops::conversation::get_conversation(tx, id).await? else {
+                let Some(conversation) = sea_ops::conversation::get(tx, id).await? else {
                     return Ok(Err(format!(
                         "failed to load conversation {id} for auto review: no such conversation"
                     )));
                 };
-                let messages = sea_ops::message::list_messages(tx, id).await?;
+                let messages = sea_ops::message::list(tx, id).await?;
                 Ok::<_, DbErr>(Ok(sea_ops::message::active_context(
                     &messages,
                     conversation.head_message_id.as_deref(),
@@ -859,7 +859,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn set_preference(db: &Db, key: &str, value: &str) {
-        db.write(async |tx| sea_ops::preference::set_preference(tx, key, value, 1).await)
+        db.write(async |tx| sea_ops::preference::set(tx, key, value, 1).await)
             .await
             .unwrap();
     }

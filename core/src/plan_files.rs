@@ -473,7 +473,7 @@ mod tests {
 
     async fn pending_plan(db: &Db, conversation_id: &str, content: &str) -> plan_review::PlanRevisionAppendResult {
         db.write(async |tx| {
-            crate::db::sea::ops::conversation::create_conversation(tx, conversation_id, None, None, None, 1).await?;
+            crate::db::sea::ops::conversation::create(tx, conversation_id, None, None, None, 1).await?;
             let document = plan_review::create_or_resume_document(tx, conversation_id, 2).await?;
             plan_review::append_assistant_revision(
                 tx,

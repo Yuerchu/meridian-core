@@ -269,7 +269,7 @@ impl CommandSettings {
     /// something, and it is the stored data that is wrong.
     pub async fn read_in(db: &impl crate::db::sea::cap::Snapshot) -> Result<Self, String> {
         let read = async |key: &str| {
-            crate::db::sea::ops::preference::get_preference(db, key)
+            crate::db::sea::ops::preference::get(db, key)
                 .await
                 .map_err(|error| format!("could not read the `{key}` preference: {error}"))
         };
@@ -1607,7 +1607,7 @@ mod tests {
         use crate::db::sea::cap::Db;
 
         async fn set(db: &Db, key: &str, value: &str) {
-            db.write(async |tx| crate::db::sea::ops::preference::set_preference(tx, key, value, 1).await)
+            db.write(async |tx| crate::db::sea::ops::preference::set(tx, key, value, 1).await)
                 .await
                 .unwrap();
         }

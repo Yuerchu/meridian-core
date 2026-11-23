@@ -589,15 +589,7 @@ mod tests {
         services
             .db
             .write(async |tx| {
-                crate::db::sea::ops::conversation::create_conversation(
-                    tx,
-                    "conversation-1",
-                    Some("plan"),
-                    None,
-                    None,
-                    1,
-                )
-                .await?;
+                crate::db::sea::ops::conversation::create(tx, "conversation-1", Some("plan"), None, None, 1).await?;
                 crate::db::sea::ops::turn::begin(tx, "turn-1", "conversation-1", TurnOrigin::ClaudeCode, None, 2).await
             })
             .await
@@ -649,7 +641,7 @@ mod tests {
         services
             .db
             .write(async |tx| {
-                crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("plan"), None, None, 1).await?;
+                crate::db::sea::ops::conversation::create(tx, "c1", Some("plan"), None, None, 1).await?;
                 crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::ClaudeCode, None, 2).await?;
                 crate::db::sea::ops::turn::begin(tx, "t2", "c1", TurnOrigin::ClaudeCode, None, 3).await
             })

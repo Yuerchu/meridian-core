@@ -96,7 +96,7 @@ pub(crate) async fn begin_assistant(
         model_id: Some(model.to_owned()),
         ..turn_row(&message_id, conversation_id, turn_id, "assistant", "")
     };
-    db.write(async |tx| message_ops::append_message(tx, row, parent).await)
+    db.write(async |tx| message_ops::append(tx, row, parent).await)
         .await
         .map_err(|e| e.to_string())?;
     Ok(message_id)
@@ -119,7 +119,7 @@ pub(crate) async fn complete_assistant(
     timing: StreamTiming,
 ) -> Result<(), String> {
     db.write(async |tx| {
-        message_ops::update_assistant_message(
+        message_ops::update_assistant(
             tx,
             message_id,
             content,
@@ -131,7 +131,7 @@ pub(crate) async fn complete_assistant(
             timing,
         )
         .await?;
-        match message_ops::get_message(tx, message_id).await {
+        match message_ops::get(tx, message_id).await {
             Ok(Some(row)) => {
                 if let Err(e) = tx.nested(async |tx| audit::record(tx, &row).await).await {
                     tracing::error!(
@@ -180,10 +180,7 @@ pub(crate) async fn append_tool_result(
         tool_outcome: Some(outcome.to_owned()),
         ..turn_row(&message_id, conversation_id, turn_id, "tool", content)
     };
-    match db
-        .write(async |tx| message_ops::append_message(tx, row, parent).await)
-        .await
-    {
+    match db.write(async |tx| message_ops::append(tx, row, parent).await).await {
         Ok(_) => Some(message_id),
         Err(e) => {
             tracing::error!("failed to persist tool result: {e}");
@@ -297,7 +294,7 @@ async fn write_steering_as(
         created_at,
         ..turn_row(&message_id, conversation_id, turn_id, role.as_str(), content)
     };
-    db.write(async |tx| message_ops::append_message(tx, row, parent).await)
+    db.write(async |tx| message_ops::append(tx, row, parent).await)
         .await
         .map_err(|e| e.to_string())?;
     Ok(message_id)
@@ -345,11 +342,11 @@ mod tests {
     }
 
     async fn rows(db: &Db) -> Vec<message::Model> {
-        message_ops::list_messages(db, "c1").await.unwrap()
+        message_ops::list(db, "c1").await.unwrap()
     }
 
     async fn head(db: &Db) -> Option<String> {
-        crate::db::sea::ops::conversation::get_conversation(db, "c1")
+        crate::db::sea::ops::conversation::get(db, "c1")
             .await
             .unwrap()
             .unwrap()

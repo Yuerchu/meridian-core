@@ -25,13 +25,13 @@ fn parse_saf_roots(value: Option<&str>) -> Result<Vec<SafRootEntry>, String> {
 pub async fn build_file_access(db: &Db) -> Result<tools::FileAccess, String> {
     #[cfg(target_os = "android")]
     {
-        let manage_pref = crate::db::sea::ops::preference::get_preference(db, "android.manage_storage_enabled")
+        let manage_pref = crate::db::sea::ops::preference::get(db, "android.manage_storage_enabled")
             .await
             .map_err(|error| error.to_string())?;
-        let saf_pref = crate::db::sea::ops::preference::get_preference(db, "android.saf_roots")
+        let saf_pref = crate::db::sea::ops::preference::get(db, "android.saf_roots")
             .await
             .map_err(|error| error.to_string())?;
-        let manage_enabled = crate::db::sea::ops::preference::parse_bool_preference(
+        let manage_enabled = crate::db::sea::ops::preference::parse_bool(
             "android.manage_storage_enabled",
             manage_pref.as_deref(),
             false,

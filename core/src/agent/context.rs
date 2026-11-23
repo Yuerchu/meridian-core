@@ -566,7 +566,7 @@ pub async fn freeze_sticker_parts(db: &crate::db::sea::cap::Db, content: &str) -
         else {
             continue;
         };
-        let sticker = crate::db::sea::ops::emoji::get_emoji(db, sticker_id)
+        let sticker = crate::db::sea::ops::emoji::get(db, sticker_id)
             .await
             .map_err(|e| format!("could not read sticker `{sticker_id}`: {e}"))?
             .ok_or_else(|| format!("sticker `{sticker_id}` does not exist"))?;
@@ -658,7 +658,7 @@ async fn unlabelled_sticker_parts(
     };
     // `message_stickers` holds the row with `RESTRICT`, so a sticker a message
     // showed is still there.
-    let sticker = crate::db::sea::ops::emoji::get_emoji(db, sticker_id)
+    let sticker = crate::db::sea::ops::emoji::get(db, sticker_id)
         .await
         .map_err(|e| format!("could not read sticker `{sticker_id}`: {e}"))?
         .ok_or_else(|| format!("sticker `{sticker_id}` does not exist"))?;

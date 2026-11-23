@@ -113,7 +113,7 @@ mod tests {
         db.write(async |tx| upsert(tx, "c1", Some("sess-1"), "/a", 1).await)
             .await
             .unwrap();
-        db.write(async |tx| crate::db::sea::ops::conversation::delete_conversation(tx, "c1").await)
+        db.write(async |tx| crate::db::sea::ops::conversation::delete(tx, "c1").await)
             .await
             .unwrap();
         assert_eq!(get(&db, "c1").await.unwrap(), None);

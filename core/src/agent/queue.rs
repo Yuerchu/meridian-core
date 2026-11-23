@@ -100,7 +100,7 @@ async fn is_hosted(services: &Services, conversation_id: &str) -> bool {
     // short way, a busy pool or a transient query error read exactly like an
     // ordinary conversation — and the recovery from a transient error is a
     // Claude Code queue answered by the user's own provider.
-    match crate::db::sea::ops::conversation::get_conversation(&services.db, conversation_id).await {
+    match crate::db::sea::ops::conversation::get(&services.db, conversation_id).await {
         Ok(Some(conversation)) => conversation.agent_kind.as_deref() == Some(crate::acp::AGENT_KIND),
         // Nothing was learned, and the two answers are not symmetrical:
         // `hosted::pump` with no session does nothing and the queue waits,
@@ -496,7 +496,7 @@ mod tests {
             services
                 .db
                 .write(async |tx| {
-                    crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
+                    crate::db::sea::ops::conversation::create(tx, "c1", None, None, None, 1).await?;
                     let document = review_ops::create_or_resume_document(tx, "c1", 2).await?;
                     let appended = review_ops::append_assistant_revision(
                         tx,
@@ -607,9 +607,7 @@ mod tests {
         let services = crate::services::bare_services(dir.path()).await;
         services
             .db
-            .write(async |tx| {
-                crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await
-            })
+            .write(async |tx| crate::db::sea::ops::conversation::create(tx, "c1", None, None, None, 1).await)
             .await
             .unwrap();
         services

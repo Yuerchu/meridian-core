@@ -2158,7 +2158,7 @@ async fn barrier_conversations(
         if active_reviews.is_empty() {
             continue;
         }
-        let conversation = conversation::get_conversation(db, &conversation_id)
+        let conversation = conversation::get(db, &conversation_id)
             .await?
             .ok_or_else(|| DbErr::RecordNotFound(format!("conversation `{conversation_id}`")))?;
         let mut missing_runtime = false;
@@ -2479,7 +2479,7 @@ mod store_tests {
     }
 
     async fn seed_conversation(db: &Db, id: &str) {
-        db.write(async |tx| conversation::create_conversation(tx, id, None, None, None, 1).await)
+        db.write(async |tx| conversation::create(tx, id, None, None, None, 1).await)
             .await
             .unwrap();
     }
@@ -2639,7 +2639,7 @@ mod store_tests {
             Some(first.revision.id.as_str())
         );
         assert_eq!(
-            conversation::get_conversation(&db, "c1").await.unwrap().unwrap().mode,
+            conversation::get(&db, "c1").await.unwrap().unwrap().mode,
             None,
             "approval and leaving plan mode are one transaction"
         );

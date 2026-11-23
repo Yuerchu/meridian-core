@@ -23,20 +23,20 @@ pub async fn list_by_pack(db: &impl Read, pack_id: &str) -> Result<Vec<emoji::Mo
         .await
 }
 
-pub async fn get_emoji(db: &impl Read, id: &str) -> Result<Option<emoji::Model>, DbErr> {
+pub async fn get(db: &impl Read, id: &str) -> Result<Option<emoji::Model>, DbErr> {
     emoji::Entity::find_by_id(id).one(db.conn()?).await
 }
 
 fn not_found(id: &str) -> DbErr {
-    DbErr::RecordNotFound(format!("sticker `{id}`"))
+    DbErr::RecordNotFound(format!("emoji `{id}`"))
 }
 
 async fn existing(tx: &WriteTx, id: &str) -> Result<emoji::Model, DbErr> {
-    get_emoji(tx, id).await?.ok_or_else(|| not_found(id))
+    get(tx, id).await?.ok_or_else(|| not_found(id))
 }
 
 /// Inserts the row the caller built and reads it back.
-pub async fn create_emoji(tx: &WriteTx, model: emoji::Model) -> Result<emoji::Model, DbErr> {
+pub async fn create(tx: &WriteTx, model: emoji::Model) -> Result<emoji::Model, DbErr> {
     let id = model.id.clone();
     emoji::Entity::insert(model.into_active_model())
         .exec_without_returning(tx.conn()?)
@@ -57,19 +57,19 @@ async fn set(tx: &WriteTx, id: &str, columns: Vec<(emoji::Column, Expr)>) -> Res
     existing(tx, id).await
 }
 
-pub async fn rename_emoji(tx: &WriteTx, id: &str, new_name: &str) -> Result<emoji::Model, DbErr> {
+pub async fn rename(tx: &WriteTx, id: &str, new_name: &str) -> Result<emoji::Model, DbErr> {
     set(tx, id, vec![(emoji::Column::Name, Expr::value(new_name))]).await
 }
 
 /// How many rows went: 0 for a sticker already gone. A sticker some message
 /// still shows is refused by `message_stickers`' `ON DELETE RESTRICT`, as an
 /// error.
-pub async fn delete_emoji(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
     Ok(emoji::Entity::delete_by_id(id).exec(tx.conn()?).await?.rows_affected)
 }
 
 /// Name or tags containing `query`, at most 50.
-pub async fn search_emojis(db: &impl Read, query: &str) -> Result<Vec<emoji::Model>, DbErr> {
+pub async fn search(db: &impl Read, query: &str) -> Result<Vec<emoji::Model>, DbErr> {
     emoji::Entity::find()
         .filter(
             Condition::any()
@@ -210,7 +210,7 @@ pub async fn attach_captured_media(
 
 /// Record which stickers a message shows, in order, from its parts. Content
 /// that is not a parts array has none; a link already there is left alone.
-pub async fn link_stickers_in_content(tx: &WriteTx, message_id: &str, content: &str) -> Result<(), DbErr> {
+pub async fn link_emojis_in_content(tx: &WriteTx, message_id: &str, content: &str) -> Result<(), DbErr> {
     let Ok(parts) = serde_json::from_str::<Vec<serde_json::Value>>(content) else {
         return Ok(());
     };
@@ -277,7 +277,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn insert(db: &Db, model: emoji::Model) -> emoji::Model {
-        db.write(async |tx| create_emoji(tx, model).await).await.unwrap()
+        db.write(async |tx| create(tx, model).await).await.unwrap()
     }
 
     async fn with_pack() -> Db {
@@ -333,7 +333,7 @@ pub(crate) mod tests {
         assert!(list_candidates(&db, "p").await.unwrap().is_empty());
         assert_eq!(list_confirmed_for_packs(&db, &["p".into()]).await.unwrap().len(), 1);
 
-        let missing = db.write(async |tx| rename_emoji(tx, "nope", "x").await).await;
+        let missing = db.write(async |tx| rename(tx, "nope", "x").await).await;
         assert!(matches!(missing, Err(DbErr::RecordNotFound(_))), "{missing:?}");
     }
 
@@ -382,8 +382,8 @@ pub(crate) mod tests {
             .map(|s| s.id)
             .collect();
         assert_eq!(sendable, ["gif"]);
-        assert_eq!(search_emojis(&db, "lot").await.unwrap().len(), 1);
-        assert_eq!(search_emojis(&db, "happ").await.unwrap().len(), 2, "tags match too");
+        assert_eq!(search(&db, "lot").await.unwrap().len(), 1);
+        assert_eq!(search(&db, "happ").await.unwrap().len(), 2, "tags match too");
     }
 
     /// A payload that is not a JSON object fails the read rather than arriving
@@ -401,12 +401,12 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        assert!(db.write(async |tx| delete_emoji(tx, "s1").await).await.is_err());
+        assert!(db.write(async |tx| delete(tx, "s1").await).await.is_err());
 
         execute_for_tests(&db, "UPDATE emojis SET native_payload = '[1]'")
             .await
             .unwrap();
-        assert!(get_emoji(&db, "s1").await.is_err());
+        assert!(get(&db, "s1").await.is_err());
     }
 
     /// A message's sticker parts become links in the order they appear;
@@ -427,11 +427,11 @@ pub(crate) mod tests {
         .unwrap();
         let content = r#"[{"type":"sticker","sticker_id":"s2"},{"type":"text","text":"and"},{"type":"sticker","sticker_id":"s1"}]"#;
         for _ in 0..2 {
-            db.write(async |tx| link_stickers_in_content(tx, "m1", content).await)
+            db.write(async |tx| link_emojis_in_content(tx, "m1", content).await)
                 .await
                 .unwrap();
         }
-        db.write(async |tx| link_stickers_in_content(tx, "m2", "plain words").await)
+        db.write(async |tx| link_emojis_in_content(tx, "m2", "plain words").await)
             .await
             .unwrap();
 

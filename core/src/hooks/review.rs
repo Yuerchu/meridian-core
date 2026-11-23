@@ -257,11 +257,11 @@ async fn effective_assistant(
 
     let sea = &state.services.db;
     let base = match state.config.assistant_id.as_deref() {
-        Some(id) => sea_ops::assistant::get_assistant(sea, id)
+        Some(id) => sea_ops::assistant::get(sea, id)
             .await
             .map_err(|e| e.to_string())
             .and_then(|found| found.ok_or_else(|| format!("assistant `{id}` not found"))),
-        None => sea_ops::assistant::get_default_assistant(sea)
+        None => sea_ops::assistant::get_default(sea)
             .await
             .map_err(|e| e.to_string())
             .and_then(|found| found.ok_or_else(|| "there is no assistant to base the review on".to_string())),
@@ -365,7 +365,7 @@ async fn open_or_reuse(db: &Db, job: &ReviewJob) -> (String, bool) {
         // review's conversation would inherit an intention it was meant to
         // judge without.
         let wanted = job.kind.agent_kind();
-        let ours = sea_ops::conversation::get_conversation(db, &claimed)
+        let ours = sea_ops::conversation::get(db, &claimed)
             .await
             .ok()
             .flatten()
@@ -428,7 +428,7 @@ async fn write_round(
         // No project for this path just means null, as before. Inventing one
         // would put a row in a list the user curates.
         let head = if is_new {
-            let project_id = sea_ops::project::find_project_by_path(tx, cwd).await?.map(|p| p.id);
+            let project_id = sea_ops::project::find_by_path(tx, cwd).await?.map(|p| p.id);
             sea_ops::conversation::insert(
                 tx,
                 conversation::Model {
@@ -449,7 +449,7 @@ async fn write_round(
             .await?;
             None
         } else {
-            sea_ops::conversation::get_conversation(tx, conversation_id)
+            sea_ops::conversation::get(tx, conversation_id)
                 .await?
                 .and_then(|c| c.head_message_id)
         };
@@ -458,7 +458,7 @@ async fn write_round(
             turn_id: Some(turn_id.to_string()),
             ..sea_ops::message::new_row(&message_id, conversation_id, "user", &prompt, now)
         };
-        sea_ops::message::append_message(tx, row, head.as_deref()).await?;
+        sea_ops::message::append(tx, row, head.as_deref()).await?;
         sea_ops::turn::begin(tx, turn_id, conversation_id, origin, None, now).await?;
         Ok::<_, DbErr>(())
     })
@@ -648,10 +648,10 @@ async fn load_history(state: &SharedState, conversation_id: &str) -> sea_ops::me
         .services
         .db
         .read(async |tx| {
-            let Some(conversation) = sea_ops::conversation::get_conversation(tx, conversation_id).await? else {
+            let Some(conversation) = sea_ops::conversation::get(tx, conversation_id).await? else {
                 return Ok(None);
             };
-            let messages = sea_ops::message::list_messages(tx, conversation_id).await?;
+            let messages = sea_ops::message::list(tx, conversation_id).await?;
             Ok::<_, DbErr>(Some(sea_ops::message::active_context(
                 &messages,
                 conversation.head_message_id.as_deref(),
@@ -749,7 +749,7 @@ mod tests {
     async fn a_later_round_continues_the_earlier_one() {
         let db = crate::db::sea::sea_test_db().await;
         let reviewer = sea_ops::assistant::tests::assistant_row("a1", 0);
-        db.write(async |tx| sea_ops::assistant::create_assistant(tx, reviewer.clone()).await)
+        db.write(async |tx| sea_ops::assistant::create(tx, reviewer.clone()).await)
             .await
             .unwrap();
         let first = job(Kind::Plan, 1, vec![]);
@@ -761,13 +761,10 @@ mod tests {
             .await
             .unwrap();
 
-        let second = sea_ops::message::get_message(&db, &two).await.unwrap().unwrap();
+        let second = sea_ops::message::get(&db, &two).await.unwrap().unwrap();
         assert_eq!(second.parent_id.as_deref(), Some(one.as_str()));
-        let conversation = sea_ops::conversation::get_conversation(&db, "rev")
-            .await
-            .unwrap()
-            .unwrap();
-        let history = sea_ops::message::list_messages(&db, "rev").await.unwrap();
+        let conversation = sea_ops::conversation::get(&db, "rev").await.unwrap().unwrap();
+        let history = sea_ops::message::list(&db, "rev").await.unwrap();
         let path = sea_ops::message::active_context(&history, conversation.head_message_id.as_deref()).path;
         assert_eq!(
             path.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),

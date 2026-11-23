@@ -351,7 +351,7 @@ pub async fn sync_index(db: &Db, root: &Path) -> Result<Vec<skill::Model>, Strin
         );
         // pool-read-before-write: this branch reads the index and returns; it
         // never reaches the write below.
-        return skill_ops::list_skills(db).await.map_err(|e| e.to_string());
+        return skill_ops::list(db).await.map_err(|e| e.to_string());
     }
 
     let now = now_ms();
@@ -365,7 +365,7 @@ pub async fn sync_index(db: &Db, root: &Path) -> Result<Vec<skill::Model>, Strin
             // Display fields default to the LLM-facing ones on first sight; the
             // user can rename them afterwards without a rescan clobbering the
             // change.
-            let existing = skill_ops::get_skill(tx, &meta.dir_name).await?;
+            let existing = skill_ops::get(tx, &meta.dir_name).await?;
             let row = skill::Model {
                 dir_name: meta.dir_name.clone(),
                 llm_name: meta.llm_name.clone(),
@@ -382,7 +382,7 @@ pub async fn sync_index(db: &Db, root: &Path) -> Result<Vec<skill::Model>, Strin
                 created_at: now,
                 updated_at: now,
             };
-            skill_ops::upsert_skill(tx, row).await?;
+            skill_ops::upsert(tx, row).await?;
         }
 
         let present: Vec<String> = found.iter().map(|m| m.dir_name.clone()).collect();
@@ -394,7 +394,7 @@ pub async fn sync_index(db: &Db, root: &Path) -> Result<Vec<skill::Model>, Strin
                 "dropped skills that are no longer on disk"
             );
         }
-        skill_ops::list_skills(tx).await
+        skill_ops::list(tx).await
     })
     .await
     .map_err(|e| e.to_string())
@@ -427,11 +427,11 @@ pub async fn seed_builtin_bindings(db: &Db) {
         // what that limit is for.
         let seeded = db
             .write(async |tx| {
-                if preference_ops::get_preference(tx, &key).await?.is_some() {
+                if preference_ops::get(tx, &key).await?.is_some() {
                     return Ok(());
                 }
                 skill_binding_ops::bind(tx, SkillLayer::Global, None, dir_name).await?;
-                preference_ops::set_preference(tx, &key, "1", now_ms()).await
+                preference_ops::set(tx, &key, "1", now_ms()).await
             })
             .await;
         if let Err(error) = seeded {
@@ -720,7 +720,7 @@ mod tests {
         let db = sea_test_db().await;
         sync_index(&db, dir.path()).await.unwrap();
         db.write(async |tx| {
-            skill_ops::update_skill(
+            skill_ops::update(
                 tx,
                 "s",
                 SkillChangeset {

@@ -390,9 +390,9 @@ pub async fn sync_once(db: &Db, catalog: &ModelsDevCatalog, force: bool) -> Resu
     // pool-read-before-write: the switch is read before a network fetch, and
     // the fetch must not run inside `BEGIN IMMEDIATE`. A switch flipped while
     // the document is in flight is picked up by the next pass, not this one.
-    let enabled = ops::preference::parse_bool_preference(
+    let enabled = ops::preference::parse_bool(
         SYNC_ENABLED_KEY,
-        ops::preference::get_preference(db, SYNC_ENABLED_KEY)
+        ops::preference::get(db, SYNC_ENABLED_KEY)
             .await
             .map_err(|error| error.to_string())?
             .as_deref(),
@@ -416,7 +416,7 @@ pub async fn sync_once(db: &Db, catalog: &ModelsDevCatalog, force: bool) -> Resu
 
     let report = apply(db, &snapshot).await?;
     let now = now_ms();
-    db.write(async |tx| ops::preference::set_preference(tx, SYNC_AT_KEY, &now.to_string(), now).await)
+    db.write(async |tx| ops::preference::set(tx, SYNC_AT_KEY, &now.to_string(), now).await)
         .await
         .map_err(|error| error.to_string())?;
     Ok(report)

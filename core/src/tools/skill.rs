@@ -146,7 +146,7 @@ mod tests {
     use super::*;
     use crate::db::entity::skill::{self as skill_entity, SkillSource};
     use crate::db::sea::cap::Db;
-    use crate::db::sea::ops::skill::upsert_skill;
+    use crate::db::sea::ops::skill as skill_ops;
     use crate::db::sea::ops::skill_binding::{SkillLayer, bind};
     use crate::db::sea::sea_test_db;
     use crate::db::types::SqlBool;
@@ -181,7 +181,7 @@ mod tests {
 
     async fn index(db: &Db, dir: &str, name: &str) {
         let model = row(dir, name);
-        db.write(async |tx| upsert_skill(tx, model).await).await.unwrap();
+        db.write(async |tx| skill_ops::upsert(tx, model).await).await.unwrap();
     }
 
     async fn index_and_bind(db: &Db, dir: &str, name: &str) {
