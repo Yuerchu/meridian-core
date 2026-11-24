@@ -2733,12 +2733,12 @@ impl AcpSession {
                     note.push_str("## User notes / feedback\n");
                     note.push_str(fb);
                 }
-                if !note.is_empty() && self.steering {
-                    if let Ok(params) =
+                if !note.is_empty()
+                    && self.steering
+                    && let Ok(params) =
                         serde_json::to_value(protocol::SteerParams::text(self.acp_session_id.clone(), &note))
-                    {
-                        let _ = self.peer.request(protocol::STEER_METHOD, params).await;
-                    }
+                {
+                    let _ = self.peer.request(protocol::STEER_METHOD, params).await;
                 }
                 let used_accept_edits_option = self
                     .shared
@@ -2754,19 +2754,18 @@ impl AcpSession {
                     "The user requested changes to your plan. Stay in plan mode, revise the plan to address the feedback below, and call ExitPlanMode again when ready.\n\n{feedback}"
                 );
                 let mut needs_follow_up = true;
-                if self.steering {
-                    if let Ok(params) =
+                if self.steering
+                    && let Ok(params) =
                         serde_json::to_value(protocol::SteerParams::text(self.acp_session_id.clone(), &prompt))
-                    {
-                        match self.peer.request(protocol::STEER_METHOD, params).await {
-                            Ok(value) => match serde_json::from_value::<protocol::SteerResult>(value) {
-                                Ok(result) if result.outcome() == protocol::SteerOutcome::PromptRequired => {
-                                    needs_follow_up = true;
-                                }
-                                Ok(_) | Err(_) => needs_follow_up = false,
-                            },
-                            Err(_) => needs_follow_up = true,
-                        }
+                {
+                    match self.peer.request(protocol::STEER_METHOD, params).await {
+                        Ok(value) => match serde_json::from_value::<protocol::SteerResult>(value) {
+                            Ok(result) if result.outcome() == protocol::SteerOutcome::PromptRequired => {
+                                needs_follow_up = true;
+                            }
+                            Ok(_) | Err(_) => needs_follow_up = false,
+                        },
+                        Err(_) => needs_follow_up = true,
                     }
                 }
                 self.shared
