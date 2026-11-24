@@ -405,6 +405,15 @@ fn row_usage(usage: Option<&crate::provider::TokenUsage>) -> MessageUsage {
     }
 }
 
+/// The user approved a plan and chose to clear context before coding. The
+/// planning turn finishes cleanly as `Done` and the desktop runner opens a
+/// fresh implementation turn with only the approved plan in context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearContextPlan {
+    pub accept_edits: bool,
+    pub prompt: String,
+}
+
 /// What a turn left behind, whatever became of it.
 #[derive(Default)]
 pub struct TurnProgress {
@@ -464,9 +473,8 @@ pub struct TurnProgress {
     /// row opens a branch and pushes whatever came after it off the path, which
     /// the reader sees as an answer disappearing.
     pub final_cursor: Option<String>,
-    /// A durable plan review was committed. The exit tool intentionally has no
-    /// result row yet; a later explicit decision continues that pending call.
-    pub waiting_review: Option<String>,
+    /// Set when the user approved `exit_plan` with `clear_context = true`.
+    pub clear_context_plan: Option<ClearContextPlan>,
 }
 
 /// A turn's reply, plus what the caller needs to close it out.
@@ -543,7 +551,7 @@ async fn run(
         keep_recent,
         context_limit,
         warm,
-        approval_rule,
+        mut approval_rule,
         withheld,
         files_root,
         user_media,
@@ -1490,33 +1498,45 @@ async fn run(
                         "error",
                     )
                 } else {
+                    let target = mode
+                        .exit_to
+                        .and_then(|id| crate::agent::modes::resolve(Some(id)).ok())
+                        .expect("mode with exit_tool names a valid exit_to mode");
                     let request = transitions::SubmitPlanRequest {
                         turn_id: turn_id.clone(),
                         assistant_message_id: assistant_msg_id.clone(),
                         provider_call_id: tc.id.clone(),
                     };
-                    match in_phase(
-                        pool,
-                        &turn_id,
-                        TurnPhase::RunningTool,
-                        Some(&tc.name),
-                        transitions::submit(transition_ports, &tc.arguments, request),
+                    match transitions::exit(
+                        transition_ports,
+                        emit,
+                        &conversation_id,
+                        target,
+                        &tc.arguments,
+                        request,
+                        &cancel,
                     )
                     .await
                     {
-                        Ok(event) => {
-                            // Durable state first. An event is only an
-                            // invalidation hint and a failing sink must not
-                            // turn a committed WaitingReview boundary into a
-                            // failed turn that can never be decided.
-                            progress.waiting_review = Some(event.review_id.clone());
-                            if let Some(emitter) = emit
-                                && let Err(error) = emitter.emit_plan_review_requested(event.clone())
+                        Ok(transitions::ExitEffect::Switched { effect, accept_edits }) => {
+                            if let ApprovalRule::ByReach {
+                                accept_edits: ref mut ae,
+                            } = approval_rule
                             {
-                                tracing::warn!(%error, review_id = %event.review_id, "could not publish durable plan-review request");
+                                *ae = accept_edits;
                             }
-                            break;
+                            effect.apply(&mut mode, &mut chat_messages, &mut tool_defs, &mut offered)
                         }
+                        Ok(transitions::ExitEffect::ClearContext {
+                            result,
+                            accept_edits,
+                            prompt,
+                        }) => {
+                            progress.clear_context_plan = Some(ClearContextPlan { accept_edits, prompt });
+                            (result, "success")
+                        }
+                        Ok(transitions::ExitEffect::Said { result, outcome }) => (result, outcome),
+                        Ok(transitions::ExitEffect::Cancelled { result }) => (result, "denied"),
                         Err(error) => (format!("Error: {error}"), "error"),
                     }
                 }
@@ -1713,12 +1733,12 @@ async fn run(
                 user_media.clone(),
             )?);
 
-            if turn_aborted {
+            if turn_aborted || progress.clear_context_plan.is_some() {
                 break;
             }
         }
 
-        if cancel.is_cancelled() || turn_aborted || progress.waiting_review.is_some() {
+        if cancel.is_cancelled() || turn_aborted || progress.clear_context_plan.is_some() {
             break;
         }
 
@@ -2370,19 +2390,11 @@ mod tests {
 
         async fn submit_plan(
             &self,
-            request: transitions::SubmitPlanRequest,
-        ) -> Result<crate::events::PlanReviewEvent, String> {
+            _request: transitions::SubmitPlanRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<transitions::PlanReviewSubmitOutcome, String> {
             self.submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(crate::events::PlanReviewEvent {
-                review_id: "review-that-must-not-exist".into(),
-                conversation_id: "c1".into(),
-                document_id: "document-1".into(),
-                revision_id: "revision-1".into(),
-                turn_id: request.turn_id,
-                status: "pending".into(),
-                lock_version: 0,
-                delivery_state: None,
-            })
+            Ok(transitions::PlanReviewSubmitOutcome::Cancelled)
         }
     }
 
@@ -3139,7 +3151,7 @@ mod tests {
             0,
             "exit_plan must not create a review after any same-batch update failure"
         );
-        assert!(outcome.progress.waiting_review.is_none());
+        assert!(outcome.progress.clear_context_plan.is_none());
         let tool_rows = rows(&pool)
             .await
             .into_iter()

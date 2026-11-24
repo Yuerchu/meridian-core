@@ -100,47 +100,6 @@ pub async fn set_phase(
     update_running(tx, id, row).await
 }
 
-/// Release a turn at the durable human-review boundary. `ended_at` stays NULL
-/// because the tool call has not received its decision yet.
-pub async fn wait_for_review(tx: &WriteTx, id: &str, now: EpochMs) -> Result<u64, DbErr> {
-    let row = turn::ActiveModel {
-        status: Set(TurnStatus::WaitingReview),
-        phase: Set(Some(TurnPhase::AwaitingApproval)),
-        phase_tool: Set(Some(crate::agent::modes::EXIT_PLAN_TOOL.to_owned())),
-        updated_at: Set(now),
-        ..Default::default()
-    };
-    update_running(tx, id, row).await
-}
-
-/// Settle a durable review boundary after its transcript tool result has been
-/// committed, in the same write.
-pub async fn finish_waiting_review(
-    tx: &WriteTx,
-    id: &str,
-    status: TurnStatus,
-    error: Option<&str>,
-    now: EpochMs,
-) -> Result<u64, DbErr> {
-    assert!(
-        matches!(status, TurnStatus::Done | TurnStatus::Cancelled | TurnStatus::Failed),
-        "a waiting review may only move to a terminal status"
-    );
-    Ok(turn::Entity::update_many()
-        .set(turn::ActiveModel {
-            status: Set(status),
-            error: Set(error.map(str::to_owned)),
-            ended_at: Set(Some(now)),
-            updated_at: Set(now),
-            ..Default::default()
-        })
-        .filter(turn::Column::Id.eq(id))
-        .filter(turn::Column::Status.eq(TurnStatus::WaitingReview))
-        .exec(tx.conn()?)
-        .await?
-        .rows_affected)
-}
-
 /// Close a turn out. Only the paths that actually reach an ending call this;
 /// everything else is left for `reconcile_interrupted`.
 pub async fn finish(
@@ -323,8 +282,11 @@ pub async fn get(db: &impl Read, turn_id: &str) -> Result<Option<turn::Model>, D
 /// holds everything queued behind it, and a crash is the purest such turn.
 pub async fn reconcile_interrupted(tx: &WriteTx, now: EpochMs) -> Result<u64, DbErr> {
     // Read before the update: after it nothing tells these conversations apart.
+    // Legacy `waiting_review` rows from earlier versions are reconciled alongside
+    // `running` turns so upgrading an existing database never leaves a stuck turn.
+    let stranded_statuses = [TurnStatus::Running, TurnStatus::WaitingReview];
     let stranded: Vec<String> = turn::Entity::find()
-        .filter(turn::Column::Status.eq(TurnStatus::Running))
+        .filter(turn::Column::Status.is_in(stranded_statuses))
         .select_only()
         .column(turn::Column::ConversationId)
         .distinct()
@@ -335,7 +297,7 @@ pub async fn reconcile_interrupted(tx: &WriteTx, now: EpochMs) -> Result<u64, Db
         .col_expr(turn::Column::Status, Expr::value(TurnStatus::Interrupted))
         .col_expr(turn::Column::EndedAt, Expr::value(now))
         .col_expr(turn::Column::UpdatedAt, Expr::value(now))
-        .filter(turn::Column::Status.eq(TurnStatus::Running))
+        .filter(turn::Column::Status.is_in(stranded_statuses))
         .exec(tx.conn()?)
         .await?
         .rows_affected;
@@ -722,56 +684,18 @@ mod tests {
         assert_eq!((t.status, t.ended_at, t.error), (TurnStatus::Done, Some(1500), None));
     }
 
-    /// A durable review boundary parks the turn, and only a terminal status
-    /// releases it.
+    /// Legacy `waiting_review` rows left behind by an older build are
+    /// reconciled as interrupted at startup alongside `running` turns.
     #[tokio::test]
-    async fn a_turn_waiting_for_review_is_settled_once() {
+    async fn legacy_waiting_review_turns_reconcile_as_interrupted() {
         let db = with_conversations(&["c1"]).await;
         start(&db, "t1", "c1", TurnOrigin::Desktop, 1000).await.unwrap();
-        assert_eq!(
-            db.write(async |tx| wait_for_review(tx, "t1", 1100).await)
-                .await
-                .unwrap(),
-            1
-        );
-        let waiting = turn_row(&db, "t1").await;
-        assert_eq!(
-            (
-                waiting.status,
-                waiting.phase,
-                waiting.phase_tool.as_deref(),
-                waiting.ended_at
-            ),
-            (
-                TurnStatus::WaitingReview,
-                Some(TurnPhase::AwaitingApproval),
-                Some(crate::agent::modes::EXIT_PLAN_TOOL),
-                None
-            )
-        );
-        assert_eq!(
-            reconcile(&db, 1150).await,
-            0,
-            "a durable boundary is not an interruption"
-        );
-        assert_eq!(
-            finish_as(&db, "t1", TurnStatus::Done, None, 1200).await,
-            0,
-            "finish needs a running turn"
-        );
-
-        let settle = |now| {
-            let db = db.clone();
-            async move {
-                db.write(async |tx| finish_waiting_review(tx, "t1", TurnStatus::Done, None, now).await)
-                    .await
-                    .unwrap()
-            }
-        };
-        assert_eq!(settle(1300).await, 1);
-        assert_eq!(settle(1400).await, 0);
+        execute_for_tests(&db, "UPDATE turns SET status = 'waiting_review' WHERE id = 't1'")
+            .await
+            .unwrap();
+        assert_eq!(reconcile(&db, 1150).await, 1);
         let t = turn_row(&db, "t1").await;
-        assert_eq!((t.status, t.ended_at), (TurnStatus::Done, Some(1300)));
+        assert_eq!((t.status, t.ended_at), (TurnStatus::Interrupted, Some(1150)));
     }
 
     /// Two turns in one millisecond are told apart by insertion order, not by

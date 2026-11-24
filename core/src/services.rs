@@ -22,7 +22,7 @@ use crate::events::EventBus;
 use crate::mcp;
 use crate::secrets::SecretsManager;
 use crate::sleep_inhibitor::AppSleepInhibitor;
-use crate::state::{AppSubAgentInboxes, ApprovalWaiters, VoiceState};
+use crate::state::{AppSubAgentInboxes, ApprovalWaiters, PlanReviewWaiters, VoiceState};
 use crate::tools;
 use crate::turn::TurnCoordinator;
 
@@ -58,6 +58,7 @@ pub struct ServicesInner {
     /// would hand out a conversation a desktop turn was still writing.
     pub turns: Arc<TurnCoordinator>,
     pub approvals: ApprovalWaiters,
+    pub plan_reviews: PlanReviewWaiters,
     pub sub_agent_inboxes: AppSubAgentInboxes,
     pub compact_breakers: Mutex<HashMap<String, Arc<CompactCircuitBreaker>>>,
     pub voice: VoiceState,
@@ -205,6 +206,7 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         mcp: mcp::McpRegistry::new(),
         turns: Arc::new(TurnCoordinator::new()),
         approvals: ApprovalWaiters::new(),
+        plan_reviews: PlanReviewWaiters::new(),
         sub_agent_inboxes: AppSubAgentInboxes::default(),
         compact_breakers: Mutex::new(HashMap::new()),
         voice: VoiceState::new(),

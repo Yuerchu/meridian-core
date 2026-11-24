@@ -123,6 +123,79 @@ impl ApprovalWaiters {
     }
 }
 
+/// What the user decided on a live `exit_plan` review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanReviewResolution {
+    Approved {
+        accept_edits: bool,
+        clear_context: bool,
+        /// Final approved plan markdown (either the assistant's submitted
+        /// revision or the user's edited version if they modified it before
+        /// approving).
+        plan_markdown: String,
+        edited_by_user: bool,
+        /// Optional formatted notes (inline comments, global note, or edit
+        /// summary) carried directly into the approval tool result.
+        feedback: Option<String>,
+    },
+    ChangesRequested {
+        /// Formatted revision feedback (suggested diff, inline comments, and
+        /// global note) returned to the planning turn.
+        feedback: String,
+    },
+}
+
+/// A live native `exit_plan` call parked waiting for the user's decision.
+pub struct PendingPlanReview {
+    pub review_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub sender: oneshot::Sender<PlanReviewResolution>,
+}
+
+/// Keyed by `review_id`. Parallels [`ApprovalWaiters`]: every critical section
+/// is a map lookup/removal with nothing awaited inside so cancellation and
+/// `Drop` can clean up synchronously.
+pub struct PlanReviewWaiters(std::sync::Mutex<HashMap<String, PendingPlanReview>>);
+
+impl PlanReviewWaiters {
+    pub(crate) fn new() -> Self {
+        PlanReviewWaiters(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingPlanReview>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn insert(&self, review_id: String, pending: PendingPlanReview) {
+        self.lock().insert(review_id, pending);
+    }
+
+    /// Atomically claim a live waiter so only one caller can resolve or cancel it.
+    pub fn claim(&self, review_id: &str) -> Option<PendingPlanReview> {
+        self.lock().remove(review_id)
+    }
+
+    pub fn has(&self, review_id: &str) -> bool {
+        self.lock().contains_key(review_id)
+    }
+
+    /// Drop any live plan review waiters belonging to `turn_id` and return
+    /// their `review_id`s.
+    pub fn cancel_turn(&self, turn_id: &str) -> Vec<String> {
+        let mut map = self.lock();
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, entry)| entry.turn_id == turn_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            map.remove(id);
+        }
+        ids
+    }
+}
+
 /// Voice input state. The engine slot has its own lock so that a slow model
 /// load (~3.6s) naturally deduplicates: the prewarm task holds the lock while
 /// loading and a concurrent transcribe call just waits on it, then hits the

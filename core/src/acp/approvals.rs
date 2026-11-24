@@ -107,18 +107,16 @@ pub async fn ask(
         )
         .await?;
         let wait = plan_review::install_permission_wait(&turn.plan_reviews, &submitted, &turn.turn_id, choices)?;
-        // The row is already durable. Missing this invalidation event costs a
-        // live refresh, not the review, so do not turn it into a JSON-RPC error
-        // that leaves Claude Code guessing whether its submission landed.
         if let Err(error) = services.events.emit_plan_review_requested(&submitted.event) {
             tracing::warn!(%error, review_id = %submitted.event.review_id, "could not announce ACP plan review");
         }
-        return Ok(plan_review::await_permission_decision(
-            &turn.plan_reviews,
-            &submitted,
+        let db = services.db.clone();
+        return Ok(engine::in_phase(
+            &db,
             &turn.turn_id,
-            &turn.cancel,
-            wait,
+            TurnPhase::AwaitingApproval,
+            Some("ExitPlanMode"),
+            plan_review::await_permission_decision(services, &turn.plan_reviews, &submitted, &turn.cancel, wait),
         )
         .await);
     }

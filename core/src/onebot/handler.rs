@@ -1913,14 +1913,6 @@ async fn dispatch_compact(
     };
 
     let secrets = &state.services.secrets;
-    match crate::agent::queue::has_plan_review_barrier(&state.services, &conversation_id).await {
-        Ok(false) => {}
-        Ok(true) => return build_reply(event, "这个对话正在等待计划审阅，请先在电脑端完成审阅。", reply_to),
-        Err(error) => {
-            tracing::warn!(%error, %conversation_id, "could not verify the plan-review barrier before OneBot compaction");
-            return build_reply(event, "无法确认计划审阅状态，暂未压缩对话。", reply_to);
-        }
-    }
     let (assistant, keep_recent) = match conversation_and_assistant(state, &conversation_id, None).await {
         Ok((_, assistant)) => {
             let keep_recent = assistant

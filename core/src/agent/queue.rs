@@ -29,7 +29,6 @@
 use crate::db::entity::queued_prompt;
 use crate::db::models::queue::Delivery;
 use crate::db::models::turn::TurnStatus;
-use crate::db::sea::DbErr;
 use crate::db::sea::ops::queue as queue_ops;
 use crate::services::Services;
 use crate::util::now_ms;
@@ -44,19 +43,6 @@ pub use native::{Announcing, Interjections};
 /// which is the ordinary case: this runs after every turn of every hosted
 /// conversation, and most of them have an empty queue.
 pub async fn pump(services: &Services, conversation_id: &str) {
-    // A durable plan review is a conversation barrier, not merely a missing
-    // in-memory lease.  The planning worker deliberately releases its lease at
-    // `exit_plan`; without this row check the next queued prompt could start in
-    // the gap and bypass the decision.  Read failures are fail-closed for the
-    // same reason.
-    match has_plan_review_barrier(services, conversation_id).await {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            tracing::warn!(%error, conversation_id, "could not verify the plan-review barrier; leaving the queue alone");
-            return;
-        }
-    }
     // **Which runner is a property of the conversation, not of what happens to
     // be running.** Asking the registry answers "is an adapter alive right
     // now", and the two questions come apart exactly when it matters: after a
@@ -74,21 +60,6 @@ pub async fn pump(services: &Services, conversation_id: &str) {
         return hosted::pump(services, conversation_id).await;
     }
     native::pump(services, conversation_id).await;
-}
-
-/// Read the durable plan-review/continuation barrier off the database.
-///
-/// Public because writes outside the queue (manual compaction in both native
-/// shells) take the same mutation lease and must make the same check before
-/// changing the transcript. Keeping one async bridge avoids one caller
-/// accidentally checking only for a pending review and forgetting the
-/// unacknowledged delivery states.
-pub async fn has_plan_review_barrier(services: &Services, conversation_id: &str) -> Result<bool, String> {
-    services
-        .db
-        .read(async |tx| crate::db::sea::ops::plan_review::has_conversation_barrier(tx, conversation_id).await)
-        .await
-        .map_err(|error: DbErr| error.to_string())
 }
 
 /// Whether this conversation belongs to a hosted agent, from the row rather
@@ -138,11 +109,6 @@ pub fn pump_later(services: &Services, conversation_id: &str) {
 pub async fn after_turn(services: &Services, conversation_id: &str, status: Option<TurnStatus>) {
     match status {
         Some(TurnStatus::Done) => pump_later(services, conversation_id),
-        // exit_plan is a durable pause, not a failed premise. The review row
-        // blocks delivery until its continuation is acknowledged; marking the
-        // prompt queue held here would survive that acknowledgement and require
-        // an unrelated manual queue release.
-        Some(TurnStatus::WaitingReview) => {}
         _ => hold(services, conversation_id).await,
     }
 }
@@ -483,144 +449,6 @@ mod tests {
             0,
             "and ahead of the queue"
         );
-    }
-
-    #[tokio::test]
-    async fn a_plan_review_blocks_then_acknowledgement_starts_the_queued_follow_up() {
-        let dir = tempfile::tempdir().unwrap();
-        let services = crate::services::bare_services(dir.path()).await;
-        let starter = std::sync::Arc::new(CountingStarter::default());
-        services.turn_starter.set(starter.clone()).ok().unwrap();
-        {
-            use crate::db::sea::ops::plan_review as review_ops;
-            services
-                .db
-                .write(async |tx| {
-                    crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
-                    let document = review_ops::create_or_resume_document(tx, "c1", 2).await?;
-                    let appended = review_ops::append_assistant_revision(
-                        tx,
-                        &review_ops::PlanRevisionAppend {
-                            document_id: &document.id,
-                            expected_generation: 0,
-                            expected_head_sha256: None,
-                            content_markdown: "# Plan\n",
-                            patch: "*** Add File: plan.md",
-                            source_message_id: None,
-                            source_call_id: None,
-                            responding_to_suggestion_revision_id: None,
-                            now: 3,
-                        },
-                    )
-                    .await?;
-                    review_ops::mark_materialization_applied(tx, &appended.materialization.id, 4).await?;
-                    crate::db::sea::ops::turn::begin(tx, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 5).await?;
-                    review_ops::submit_native_head_for_review(
-                        tx,
-                        &review_ops::PlanReviewSubmit {
-                            document_id: &document.id,
-                            expected_generation: 1,
-                            expected_head_sha256: &appended.revision.content_sha256,
-                            turn_id: Some("t1"),
-                            assistant_message_id: None,
-                            provider_call_id: None,
-                            provider_kind: crate::db::models::plan_review::PlanReviewProviderKind::Native,
-                            now: 6,
-                        },
-                        &crate::db::models::plan_review::NativePlanReviewRuntimeConfig::fixture(),
-                    )
-                    .await
-                })
-                .await
-                .unwrap();
-        }
-        services
-            .db
-            .write(async |tx| queue_ops::enqueue(tx, "q1", "c1", "bypass the review", Delivery::FollowUp, 7).await)
-            .await
-            .unwrap();
-
-        assert!(
-            has_plan_review_barrier(&services, "c1").await.unwrap(),
-            "desktop and OneBot compaction share this durable guard after taking their mutation lease"
-        );
-        pump(&services, "c1").await;
-
-        assert_eq!(starter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let queued = queue_ops::list(&services.db, "c1").await.unwrap();
-        assert_eq!(queued[0].settled_at, None, "the prompt remains durable and undelivered");
-        assert_eq!(queued[0].state(), crate::db::models::queue::QueueState::Queued);
-
-        after_recorded_turn(&services, "c1", "t1").await.unwrap();
-        let queued = queue_ops::list(&services.db, "c1").await.unwrap();
-        assert_eq!(
-            queued[0].state(),
-            crate::db::models::queue::QueueState::Queued,
-            "WaitingReview is a pause and must not hold the follow-up queue"
-        );
-
-        {
-            use crate::db::sea::ops::plan_review as review_ops;
-            services
-                .db
-                .write(async |tx| {
-                    let review = review_ops::get_pending_review_for_conversation(tx, "c1")
-                        .await?
-                        .expect("the review is pending");
-                    let bundle = review_ops::get_review_bundle(tx, &review.id).await?;
-                    let decided = review_ops::decide_review(
-                        tx,
-                        &review_ops::PlanReviewDecision {
-                            review_id: &review.id,
-                            decision_id: "approve-1",
-                            expected_lock_version: review.lock_version,
-                            expected_draft_generation: bundle.draft.generation,
-                            expected_draft_sha256: &bundle.draft.draft_sha256,
-                            action: review_ops::PlanReviewDecisionAction::Approve,
-                            decision_summary: None,
-                            delivery_target: Some(crate::db::models::plan_review::PlanDeliveryTarget::Native),
-                            target_session_id: None,
-                            target_turn_id: Some("continuation-1"),
-                            now: 8,
-                        },
-                    )
-                    .await?;
-                    let delivery = decided.delivery.expect("an approval delivers");
-                    review_ops::mark_delivery_dispatched(tx, &delivery.id, "attempt-1", 9).await?;
-                    review_ops::mark_delivery_acknowledged(tx, &delivery.id, "attempt-1", 10).await
-                })
-                .await
-                .unwrap();
-        }
-
-        pump(&services, "c1").await;
-        assert_eq!(
-            starter.0.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "an acknowledged plan continuation releases the durable barrier and starts the follow-up"
-        );
-    }
-
-    #[tokio::test]
-    async fn waiting_review_never_marks_an_ordinary_queued_prompt_held() {
-        let dir = tempfile::tempdir().unwrap();
-        let services = crate::services::bare_services(dir.path()).await;
-        services
-            .db
-            .write(async |tx| {
-                crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await
-            })
-            .await
-            .unwrap();
-        services
-            .db
-            .write(async |tx| queue_ops::enqueue(tx, "q1", "c1", "after review", Delivery::FollowUp, 2).await)
-            .await
-            .unwrap();
-
-        after_turn(&services, "c1", Some(TurnStatus::WaitingReview)).await;
-        let queued = queue_ops::list(&services.db, "c1").await.unwrap();
-        assert_eq!(queued[0].state(), crate::db::models::queue::QueueState::Queued);
     }
 
     fn doubtful(content: &str) -> queued_prompt::Model {

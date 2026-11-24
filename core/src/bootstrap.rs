@@ -27,7 +27,7 @@ use crate::provider::registry::{ApiFormat, CredentialKind, ProviderType, Transpo
 use crate::secrets::{SecretName, SecretScope, SecretsManager};
 use crate::services::{Paths, Services, ServicesInner};
 use crate::sleep_inhibitor::AppSleepInhibitor;
-use crate::state::{AppSubAgentInboxes, ApprovalWaiters, VoiceState};
+use crate::state::{AppSubAgentInboxes, ApprovalWaiters, PlanReviewWaiters, VoiceState};
 use crate::util::now_ms;
 use crate::{agent, db, mcp, tools, turn};
 
@@ -283,6 +283,7 @@ pub async fn bootstrap_with_secrets(
         mcp: mcp::McpRegistry::new(),
         turns: Arc::new(turn::TurnCoordinator::new()),
         approvals: ApprovalWaiters::new(),
+        plan_reviews: PlanReviewWaiters::new(),
         sub_agent_inboxes: AppSubAgentInboxes::default(),
         compact_breakers: Mutex::new(HashMap::new()),
         voice: VoiceState::new(),
@@ -480,12 +481,12 @@ pub(crate) async fn startup_recovery(sea: &db::sea::cap::Db, plan_files: &crate:
         Err(error) => tracing::error!(error = %error, "could not backfill legacy plan artifacts"),
     }
     match sea
-        .write(async |tx| plan_ops::reconcile_dispatched_deliveries(tx, now).await)
+        .write(async |tx| plan_ops::orphan_pending_reviews(tx, now).await)
         .await
     {
         Ok(0) => {}
-        Ok(n) => tracing::warn!(deliveries = n, "reconciled plan review deliveries after restart"),
-        Err(error) => tracing::error!(error = %error, "could not reconcile plan review deliveries"),
+        Ok(n) => tracing::info!(reviews = n, "orphaned pending plan reviews from the previous session"),
+        Err(error) => tracing::error!(error = %error, "could not orphan pending plan reviews"),
     }
     // Background commands run only inside the process that started them, so a
     // native task still `running` here was being watched by a process that is
@@ -597,72 +598,9 @@ pub async fn reconnect_mcp(services: Services) {
     futures::future::join_all(attempts).await;
 }
 
-/// Resume queues whose native plan continuation durably finished before the
-/// previous process could acknowledge it. Ordinary queues still never pump at
-/// startup; these rows carry an explicit, persisted user decision and a Done
-/// continuation turn, so leaving them behind would let a later direct prompt
-/// overtake the already queued follow-up.
-pub async fn resume_completed_plan_review_queues(services: Services) {
-    let resumes = services
-        .db
-        .read(async |tx| crate::db::sea::ops::plan_review::list_startup_queue_resumes(tx).await)
-        .await;
-    let resumes = match resumes {
-        Ok(resumes) => resumes,
-        Err(error) => {
-            tracing::warn!(%error, "could not read plan-review queue resumes at startup");
-            return;
-        }
-    };
-
-    for (delivery_id, conversation_id) in resumes {
-        let before = next_pending_queue_id(&services, &conversation_id).await;
-        crate::agent::queue::pump(&services, &conversation_id).await;
-        let after = next_pending_queue_id(&services, &conversation_id).await;
-        let progressed = match (before, after) {
-            (Ok(before), Ok(after)) => queue_resume_progressed(before.as_deref(), after.as_deref()),
-            (Err(error), _) | (_, Err(error)) => {
-                tracing::warn!(%error, conversation_id, "could not verify plan-review queue resume progress");
-                false
-            }
-        };
-        if !progressed {
-            // Keep the durable marker. A missing starter, a busy lease or a
-            // failed turn start all leave the same queue head untouched; the
-            // next startup must be allowed to try this explicit user-authored
-            // continuation again.
-            tracing::warn!(conversation_id, "plan-review queue resume made no durable progress");
-            continue;
-        }
-        let cleared = services
-            .db
-            .write(async |tx| {
-                crate::db::sea::ops::plan_review::finish_startup_queue_resume(tx, &delivery_id, now_ms()).await
-            })
-            .await;
-        if !matches!(cleared, Ok(true)) {
-            tracing::warn!(
-                conversation_id,
-                "could not clear a completed plan-review queue resume marker"
-            );
-        }
-    }
-}
-
-async fn next_pending_queue_id(services: &Services, conversation_id: &str) -> Result<Option<String>, String> {
-    crate::db::sea::ops::queue::next_pending(&services.db, conversation_id)
-        .await
-        .map(|row| row.map(|row| row.id))
-        .map_err(|error| error.to_string())
-}
-
-fn queue_resume_progressed(before: Option<&str>, after: Option<&str>) -> bool {
-    before.is_none() || before != after
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_tool_preset_names, queue_resume_progressed};
+    use super::parse_tool_preset_names;
 
     #[test]
     fn tool_preset_names_require_an_array_of_strings() {
@@ -785,13 +723,5 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn startup_queue_resume_marker_is_kept_until_the_head_advances() {
-        assert!(!queue_resume_progressed(Some("queue-1"), Some("queue-1")));
-        assert!(queue_resume_progressed(Some("queue-1"), Some("queue-2")));
-        assert!(queue_resume_progressed(Some("queue-1"), None));
-        assert!(queue_resume_progressed(None, None));
     }
 }
