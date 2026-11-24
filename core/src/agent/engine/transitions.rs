@@ -363,7 +363,7 @@ mod tests {
     }
 
     async fn stored_mode(pool: &crate::db::sea::cap::Db) -> Option<String> {
-        crate::db::sea::ops::conversation::get_conversation(pool, "c1")
+        crate::db::sea::ops::conversation::get(pool, "c1")
             .await
             .unwrap()
             .unwrap()

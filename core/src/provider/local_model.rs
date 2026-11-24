@@ -141,7 +141,7 @@ pub async fn for_provider(
     provider_id: &str,
     refresh: bool,
 ) -> Result<LocalModelSnapshot, String> {
-    let provider = crate::db::sea::ops::provider::get_provider(db, provider_id)
+    let provider = crate::db::sea::ops::provider::get(db, provider_id)
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("provider {provider_id} not found"))?;

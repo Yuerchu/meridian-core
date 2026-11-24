@@ -1209,7 +1209,7 @@ pub async fn plan_injection_async(
 mod tests {
     use super::*;
     use crate::db::entity::memory::{MemoryType, Origin};
-    use crate::db::sea::ops::memory::upsert_memory;
+    use crate::db::sea::ops::memory as memory_ops;
     use crate::db::sea::{execute_for_tests, sea_test_db};
 
     async fn project(conn: &Db, id: &str) {
@@ -1251,7 +1251,7 @@ mod tests {
             created_at: 1,
             updated_at,
         };
-        conn.write(async |tx| upsert_memory(tx, row).await).await.unwrap();
+        conn.write(async |tx| memory_ops::upsert(tx, row).await).await.unwrap();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1446,7 +1446,7 @@ mod tests {
 
             round(conn, &req, &mut history, 1_000).await;
             conn.write(async |tx| {
-                crate::db::sea::ops::memory::soft_delete_memories(
+                crate::db::sea::ops::memory::soft_delete(
                     tx,
                     &["old".into()],
                     crate::db::entity::memory::DeletedBy::Admin,
@@ -1482,7 +1482,7 @@ mod tests {
 
             round(conn, &req, &mut history, 1_000).await;
             conn.write(async |tx| {
-                crate::db::sea::ops::memory::soft_delete_memories(
+                crate::db::sea::ops::memory::soft_delete(
                     tx,
                     &["old".into()],
                     crate::db::entity::memory::DeletedBy::Admin,
@@ -1493,7 +1493,7 @@ mod tests {
             .await
             .unwrap();
             round(conn, &req, &mut history, 2_000).await;
-            conn.write(async |tx| crate::db::sea::ops::memory::restore_memories(tx, &["old".into()], 2_500).await)
+            conn.write(async |tx| crate::db::sea::ops::memory::restore(tx, &["old".into()], 2_500).await)
                 .await
                 .unwrap();
 

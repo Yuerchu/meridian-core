@@ -284,7 +284,7 @@ impl Default for AcpConfig {
 impl AcpConfig {
     pub async fn load(db: &Db) -> Result<Self, String> {
         let get = async |key: &str| -> Result<Option<String>, String> {
-            crate::db::sea::ops::preference::get_preference(db, key)
+            crate::db::sea::ops::preference::get(db, key)
                 .await
                 .map_err(|error| format!("failed to read preference {key}: {error}"))
         };
@@ -306,13 +306,13 @@ impl AcpConfig {
     /// Both keys in one transaction, so a failure part-way leaves the previous
     /// command and arguments together rather than a new command with old ones.
     pub async fn save(&self, db: &Db) -> Result<(), String> {
-        use crate::db::sea::ops::preference::set_preference;
+        use crate::db::sea::ops::preference;
 
         let now = crate::util::now_ms();
         let args = serde_json::to_string(&self.args).map_err(|e| e.to_string())?;
         db.write(async |tx| {
-            set_preference(tx, "acp.command", &self.command, now).await?;
-            set_preference(tx, "acp.args", &args, now).await?;
+            preference::set(tx, "acp.command", &self.command, now).await?;
+            preference::set(tx, "acp.args", &args, now).await?;
             Ok::<(), sea_orm::DbErr>(())
         })
         .await
@@ -404,7 +404,7 @@ pub async fn open_session_as(
     // adapter starts, which takes seconds and holds no lock; the row written
     // after it files the conversation under what was decided here.
     let project_id = match project {
-        ProjectChoice::ByPath => crate::db::sea::ops::project::find_project_by_path(&services.db, cwd)
+        ProjectChoice::ByPath => crate::db::sea::ops::project::find_by_path(&services.db, cwd)
             .await
             .map_err(|e| e.to_string())?
             .map(|p| p.id),
@@ -474,7 +474,7 @@ pub async fn reopen_session(
                     "this conversation has no recorded working directory; start a new session".to_string(),
                 ));
             };
-            let has_messages = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+            let has_messages = crate::db::sea::ops::conversation::get(tx, conversation_id)
                 .await
                 .ok()
                 .flatten()
@@ -527,7 +527,7 @@ async fn write_conversation_row(
         .write(async |tx| {
             // An assistant that cannot be read leaves the row with none, as
             // before.
-            let assistant_id = crate::db::sea::ops::assistant::get_default_assistant(tx)
+            let assistant_id = crate::db::sea::ops::assistant::get_default(tx)
                 .await
                 .ok()
                 .flatten()
@@ -703,7 +703,7 @@ mod tests {
             .await
             .unwrap();
 
-        let said = crate::db::sea::ops::conversation::get_conversation(&services.db, "said")
+        let said = crate::db::sea::ops::conversation::get(&services.db, "said")
             .await
             .unwrap()
             .unwrap();
@@ -718,7 +718,7 @@ mod tests {
             .cwd;
         assert_eq!(cwd, "/r.worktrees/a1b2c3d4", "the session works where it was opened");
 
-        let derived = crate::db::sea::ops::conversation::get_conversation(&services.db, "derived")
+        let derived = crate::db::sea::ops::conversation::get(&services.db, "derived")
             .await
             .unwrap()
             .unwrap();
@@ -764,7 +764,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_stored_acp_arguments_are_not_defaulted() {
         let db = crate::db::sea::sea_test_db().await;
-        db.write(async |tx| crate::db::sea::ops::preference::set_preference(tx, "acp.args", "npx -y adapter", 1).await)
+        db.write(async |tx| crate::db::sea::ops::preference::set(tx, "acp.args", "npx -y adapter", 1).await)
             .await
             .unwrap();
 

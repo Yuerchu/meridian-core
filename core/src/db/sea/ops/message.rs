@@ -2,7 +2,7 @@
 //!
 //! Messages are a tree read as one path: each row has a `parent_id`, and the
 //! conversation's `head_message_id` names the leaf the active path ends at.
-//! Write only through [`append_message`] (or [`append_context`] for injected
+//! Write only through [`append`] (or [`append_context`] for injected
 //! background), which links the row and moves the head in the caller's write;
 //! delete only whole subtrees ([`delete_subtree`]). The tree helpers below are
 //! pure and shared with the Diesel module, which re-exports them; the Diesel
@@ -110,7 +110,7 @@ async fn link(tx: &WriteTx, new: message::Model, parent: Option<&str>) -> Result
         .filter(conversation::Column::Id.eq(&conversation_id))
         .exec(tx.conn()?)
         .await?;
-    get_message(tx, &id)
+    get(tx, &id)
         .await?
         .ok_or_else(|| DbErr::RecordNotFound(format!("message `{id}`")))
 }
@@ -123,7 +123,7 @@ async fn link(tx: &WriteTx, new: message::Model, parent: Option<&str>) -> Result
 ///
 /// A user row also gets its audit copy, in a savepoint: a database that
 /// cannot take the copy is logged, never allowed to take the message with it.
-pub async fn append_message(tx: &WriteTx, new: message::Model, parent: Option<&str>) -> Result<message::Model, DbErr> {
+pub async fn append(tx: &WriteTx, new: message::Model, parent: Option<&str>) -> Result<message::Model, DbErr> {
     let row = link(tx, new, parent).await?;
     audit_copy(tx, &row).await;
     Ok(row)
@@ -176,7 +176,7 @@ pub async fn find_by_turn_and_source(
 }
 
 /// A conversation's rows in insertion order (`sort_order`), every branch.
-pub async fn list_messages(db: &impl Read, conversation_id: &str) -> Result<Vec<message::Model>, DbErr> {
+pub async fn list(db: &impl Read, conversation_id: &str) -> Result<Vec<message::Model>, DbErr> {
     message::Entity::find()
         .filter(message::Column::ConversationId.eq(conversation_id))
         .order_by_asc(message::Column::SortOrder)
@@ -185,19 +185,19 @@ pub async fn list_messages(db: &impl Read, conversation_id: &str) -> Result<Vec<
 }
 
 /// One row by id; `None` for an id with no row.
-pub async fn get_message(db: &impl Read, id: &str) -> Result<Option<message::Model>, DbErr> {
+pub async fn get(db: &impl Read, id: &str) -> Result<Option<message::Model>, DbErr> {
     message::Entity::find_by_id(id).one(db.conn()?).await
 }
 
 /// Insert a row as given, without linking it or moving the head: for the
 /// writers that build a tree by hand (import) or a summary that is not on
 /// the path.
-pub async fn insert_message(tx: &WriteTx, new: message::Model) -> Result<message::Model, DbErr> {
+pub async fn insert(tx: &WriteTx, new: message::Model) -> Result<message::Model, DbErr> {
     let id = new.id.clone();
     message::Entity::insert(new.into_active_model())
         .exec_without_returning(tx.conn()?)
         .await?;
-    get_message(tx, &id)
+    get(tx, &id)
         .await?
         .ok_or_else(|| DbErr::RecordNotFound(format!("message `{id}`")))
 }
@@ -205,7 +205,7 @@ pub async fn insert_message(tx: &WriteTx, new: message::Model) -> Result<message
 /// Fill in an assistant row once the model has finished with it.
 /// `RecordNotFound` when there is no such row.
 #[allow(clippy::too_many_arguments)]
-pub async fn update_assistant_message(
+pub async fn update_assistant(
     tx: &WriteTx,
     id: &str,
     content: &str,
@@ -446,7 +446,7 @@ pub async fn delete_subtree(tx: &WriteTx, conversation_id: &str, message_id: &st
             .await?;
     }
 
-    let history = list_messages(tx, conversation_id).await?;
+    let history = list(tx, conversation_id).await?;
     let new_head = parent
         .filter(|p| history.iter().any(|m| &m.id == p))
         .map(|p| deepest_descendant(&history, &p))
@@ -488,7 +488,7 @@ pub async fn retract_failed_head(tx: &WriteTx, conversation_id: &str) -> Result<
     let Some(head_id) = conv.head_message_id else {
         return Ok(None);
     };
-    let Some(head) = get_message(tx, &head_id).await? else {
+    let Some(head) = get(tx, &head_id).await? else {
         return Ok(None);
     };
     let blank = |s: &Option<String>| s.as_deref().is_none_or(str::is_empty);
@@ -536,7 +536,7 @@ pub async fn retract_failed_head(tx: &WriteTx, conversation_id: &str) -> Result<
 /// last written. `RecordNotFound` for a message that is not on this
 /// conversation's tree.
 pub async fn switch_branch(tx: &WriteTx, conversation_id: &str, message_id: &str) -> Result<Option<String>, DbErr> {
-    let history = list_messages(tx, conversation_id).await?;
+    let history = list(tx, conversation_id).await?;
     if !history
         .iter()
         .any(|m| m.id == message_id && !m.is_compact_summary.get())
@@ -789,13 +789,11 @@ mod tests {
     }
 
     async fn append(db: &Db, new: message::Model, parent: Option<&str>) -> message::Model {
-        db.write(async |tx| append_message(tx, new, parent).await)
-            .await
-            .unwrap()
+        db.write(async |tx| super::append(tx, new, parent).await).await.unwrap()
     }
 
     async fn stored(db: &Db, id: &str) -> message::Model {
-        get_message(db, id).await.unwrap().unwrap()
+        get(db, id).await.unwrap().unwrap()
     }
 
     async fn head(db: &Db, conversation: &str) -> Option<String> {
@@ -808,7 +806,7 @@ mod tests {
     }
 
     async fn ids(db: &Db, conversation: &str) -> Vec<String> {
-        list_messages(db, conversation)
+        list(db, conversation)
             .await
             .unwrap()
             .into_iter()
@@ -823,7 +821,7 @@ mod tests {
                 parent_id: parent.map(str::to_owned),
                 ..row(id, "c1", "user")
             };
-            db.write(async |tx| insert_message(tx, new).await).await.unwrap();
+            db.write(async |tx| insert(tx, new).await).await.unwrap();
         }
     }
 
@@ -1038,9 +1036,9 @@ mod tests {
             parent_id: Some(a.id.clone()),
             ..row("b", "c1", "user")
         };
-        let refused = db.write(async |tx| append_message(tx, stray, None).await).await;
+        let refused = db.write(async |tx| super::append(tx, stray, None).await).await;
         assert!(matches!(refused, Err(DbErr::Custom(_))), "{refused:?}");
-        assert!(get_message(&db, "b").await.unwrap().is_none());
+        assert!(get(&db, "b").await.unwrap().is_none());
         assert_eq!(head(&db, "c1").await.as_deref(), Some("a"));
 
         let agreeing = message::Model {
@@ -1112,7 +1110,7 @@ mod tests {
             server_tool_calls: Some(3),
         };
         db.write(async |tx| {
-            update_assistant_message(
+            update_assistant(
                 tx,
                 "m1",
                 "done",
@@ -1154,7 +1152,7 @@ mod tests {
         assert_eq!((m.ttft_ms, m.generation_ms), (Some(90), Some(1100)));
         let missing = db
             .write(async |tx| {
-                update_assistant_message(tx, "nope", "", None, None, None, &usage, None, StreamTiming::default()).await
+                update_assistant(tx, "nope", "", None, None, None, &usage, None, StreamTiming::default()).await
             })
             .await;
         assert!(matches!(missing, Err(DbErr::RecordNotFound(_))));
@@ -1342,7 +1340,7 @@ mod tests {
             parent_id: None,
             ..row("q2", "c2", "user")
         };
-        db.write(async |tx| insert_message(tx, other).await).await.unwrap();
+        db.write(async |tx| insert(tx, other).await).await.unwrap();
         execute_for_tests(&db, "UPDATE conversations SET head_message_id = 'a1x' WHERE id = 'c1'")
             .await
             .unwrap();
@@ -1387,7 +1385,7 @@ mod tests {
             let mut parent: Option<String> = None;
             for i in 0..2000 {
                 let id = format!("m{i}");
-                insert_message(
+                insert(
                     tx,
                     message::Model {
                         parent_id: parent.clone(),
@@ -1418,7 +1416,7 @@ mod tests {
                 compact_anchor_id: Some(anchor.into()),
                 ..row(id, "c1", "user")
             };
-            db.write(async |tx| insert_message(tx, summary).await).await.unwrap();
+            db.write(async |tx| insert(tx, summary).await).await.unwrap();
         }
         db.write(async |tx| delete_summaries_anchored_in(tx, "c1", &["q".into(), "a1".into()]).await)
             .await
@@ -1446,8 +1444,8 @@ mod tests {
         execute_for_tests(&db, "UPDATE messages SET is_compact_summary = 2 WHERE id = 'm1'")
             .await
             .unwrap();
-        assert!(list_messages(&db, "c1").await.is_err());
-        assert!(get_message(&db, "m1").await.is_err());
+        assert!(list(&db, "c1").await.is_err());
+        assert!(get(&db, "m1").await.is_err());
     }
 
     fn path_ids(ctx: &ActiveContext) -> Vec<&str> {
@@ -1461,7 +1459,7 @@ mod tests {
         append(&db, row("a1", "c1", "assistant"), Some(&q.id)).await;
         append(&db, row("a2", "c1", "assistant"), Some(&q.id)).await;
 
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
         // a1 is not the newest row, so only the stored head can name it.
         assert_eq!(resolve_head(Some("a1"), &history).as_deref(), Some("a1"));
     }
@@ -1474,7 +1472,7 @@ mod tests {
         let a = append(&db, row("a", "c1", "user"), None).await;
         append(&db, row("b", "c1", "assistant"), Some(&a.id)).await;
 
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
         assert_eq!(resolve_head(None, &history).as_deref(), Some("b"));
         assert_eq!(resolve_head(Some("gone"), &history).as_deref(), Some("b"));
 
@@ -1493,9 +1491,9 @@ mod tests {
         let mut summary = row("s", "c1", "user");
         summary.is_compact_summary = SqlBool::TRUE;
         summary.sort_order = -1;
-        db.write(async |tx| insert_message(tx, summary).await).await.unwrap();
+        db.write(async |tx| insert(tx, summary).await).await.unwrap();
 
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
         assert_eq!(resolve_head(Some("s"), &history).as_deref(), Some("b"));
         assert_eq!(resolve_head(None, &history).as_deref(), Some("b"));
     }
@@ -1520,7 +1518,7 @@ mod tests {
             ],
         )
         .await;
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
 
         assert_eq!(path_ids(&active_context(&history, Some("a1x"))), ["q", "a1", "a1x"]);
         assert_eq!(path_ids(&active_context(&history, Some("a2x"))), ["q", "a2", "a2x"]);
@@ -1542,7 +1540,7 @@ mod tests {
         execute_for_tests(&db, "UPDATE messages SET parent_id = 'b' WHERE id = 'a'")
             .await
             .unwrap();
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
 
         let ctx = active_context(&history, Some("b"));
         assert!(ctx.path.len() <= 2, "a cycle must terminate, got {:?}", path_ids(&ctx));
@@ -1557,8 +1555,8 @@ mod tests {
         s.is_compact_summary = SqlBool::TRUE;
         s.sort_order = -1;
         s.compact_anchor_id = Some("m2".into());
-        db.write(async |tx| insert_message(tx, s).await).await.unwrap();
-        let history = list_messages(&db, "c1").await.unwrap();
+        db.write(async |tx| insert(tx, s).await).await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
 
         let ctx = active_context(&history, Some("m3"));
         assert_eq!(ctx.anchor_index, Some(1));
@@ -1581,8 +1579,8 @@ mod tests {
         s.is_compact_summary = SqlBool::TRUE;
         s.sort_order = -1;
         s.compact_anchor_id = Some("a1".into());
-        db.write(async |tx| insert_message(tx, s).await).await.unwrap();
-        let history = list_messages(&db, "c1").await.unwrap();
+        db.write(async |tx| insert(tx, s).await).await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
 
         let ctx = active_context(&history, Some("a2"));
         assert!(ctx.summary.is_none());
@@ -1600,9 +1598,9 @@ mod tests {
             s.is_compact_summary = SqlBool::TRUE;
             s.sort_order = -1;
             s.compact_anchor_id = Some(anchor.into());
-            db.write(async |tx| insert_message(tx, s).await).await.unwrap();
+            db.write(async |tx| insert(tx, s).await).await.unwrap();
         }
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
 
         let ctx = active_context(&history, Some("m3"));
         assert_eq!(ctx.summary.as_ref().map(|m| m.id.as_str()), Some("s2"));
@@ -1617,7 +1615,7 @@ mod tests {
     async fn parentless_rows_are_not_stitched_together() {
         let db = with_conversations(&["c1"]).await;
         tree(&db, &[("m1", None), ("m2", None), ("m3", Some("m2"))]).await;
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
 
         assert_eq!(path_ids(&active_context(&history, Some("m3"))), ["m2", "m3"]);
     }
@@ -1637,7 +1635,7 @@ mod tests {
             parent = Some(written.id);
         }
 
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
         let by_sort_order: Vec<&str> = history.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(path_ids(&active_context(&history, None)), by_sort_order);
     }
@@ -1646,7 +1644,7 @@ mod tests {
     async fn a_conversation_that_never_branched_has_no_branch_points() {
         let db = with_conversations(&["c1"]).await;
         tree(&db, &[("q", None), ("a", Some("q"))]).await;
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
         let ctx = active_context(&history, None);
 
         assert!(branch_points(&history, &ctx.path).is_empty());
@@ -1660,7 +1658,7 @@ mod tests {
             &[("q", None), ("a1", Some("q")), ("a2", Some("q")), ("a3", Some("q"))],
         )
         .await;
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
         let ctx = active_context(&history, Some("a2"));
 
         let points = branch_points(&history, &ctx.path);
@@ -1677,7 +1675,7 @@ mod tests {
     async fn sibling_roots_are_a_branch_point() {
         let db = with_conversations(&["c1"]).await;
         tree(&db, &[("q1", None), ("q2", None)]).await;
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
         let ctx = active_context(&history, Some("q2"));
 
         let points = branch_points(&history, &ctx.path);
@@ -1691,7 +1689,7 @@ mod tests {
     async fn a_forked_history_is_never_flattened() {
         let db = with_conversations(&["c1"]).await;
         tree(&db, &[("q", None), ("a1", Some("q")), ("a2", Some("q"))]).await;
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
 
         assert_eq!(path_ids(&active_context(&history, Some("a2"))), ["q", "a2"]);
     }
@@ -1719,7 +1717,7 @@ mod tests {
         append(&db, ctx, None).await;
         append(&db, row("q2", "c1", "user"), Some("mem")).await;
 
-        let history = list_messages(&db, "c1").await.unwrap();
+        let history = list(&db, "c1").await.unwrap();
         let path = active_context(&history, Some("q2")).path;
         let points = branch_points(&history, &path);
 

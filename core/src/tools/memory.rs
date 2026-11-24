@@ -121,7 +121,7 @@ impl Tool for SaveMemoryTool {
         // the wording runs in the same write, so it describes what the write did.
         let existed = db
             .write(async |tx| {
-                let existed = mem_ops::get_memory_by_key(tx, scope, &scope_id, &key).await?.is_some();
+                let existed = mem_ops::get_by_key(tx, scope, &scope_id, &key).await?.is_some();
                 Ok::<_, crate::db::sea::DbErr>(mem_ops::remember(tx, row).await?.map(|_| existed))
             })
             .await
@@ -184,7 +184,7 @@ impl Tool for RecallMemoryTool {
             .ok_or("Missing required parameter: key")?
             .to_string();
 
-        match mem_ops::get_memory_by_key(db, scope, &scope_id, &key)
+        match mem_ops::get_by_key(db, scope, &scope_id, &key)
             .await
             .map_err(|e| e.to_string())?
         {
@@ -307,10 +307,10 @@ impl Tool for DeleteMemoryTool {
         // recoverable from the trash. The lookup and the delete are one write.
         let deleted = db
             .write(async |tx| {
-                let Some(existing) = mem_ops::get_memory_by_key(tx, scope, &scope_id, &key).await? else {
+                let Some(existing) = mem_ops::get_by_key(tx, scope, &scope_id, &key).await? else {
                     return Ok(false);
                 };
-                mem_ops::soft_delete_memories(tx, &[existing.id], DeletedBy::Admin, crate::util::now_ms())
+                mem_ops::soft_delete(tx, &[existing.id], DeletedBy::Admin, crate::util::now_ms())
                     .await
                     .map(|n| n > 0)
             })

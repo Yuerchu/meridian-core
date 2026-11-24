@@ -53,7 +53,7 @@ pub fn get_provider_api_key(secrets: &SecretsManager, provider_id: &str) -> Opti
 /// The keys come off the secret store on the blocking pool; a read that fails
 /// leaves its key out, as before.
 pub async fn build_tool_secrets(secrets: &Arc<SecretsManager>, db: &Db) -> std::collections::HashMap<String, String> {
-    let search_provider = preference::get_preference(db, "search_provider").await.ok().flatten();
+    let search_provider = preference::get(db, "search_provider").await.ok().flatten();
     let secrets = secrets.clone();
     let mut map = tokio::task::spawn_blocking(move || {
         let mut map = std::collections::HashMap::new();
@@ -125,7 +125,7 @@ pub async fn resolve_provider_config(
     assistant: Option<&assistant::Model>,
 ) -> Result<ResolvedProvider, String> {
     if let Some(provider_id) = assistant.and_then(|a| a.provider_id.as_deref()) {
-        let provider = provider_ops::get_provider(db, provider_id)
+        let provider = provider_ops::get(db, provider_id)
             .await
             .map_err(|e| format!("Provider not found: {e}"))?
             .ok_or_else(|| format!("Provider not found: {provider_id}"))?;
@@ -140,7 +140,7 @@ pub async fn resolve_provider_config(
     // A damaged row or unreadable credential is reported as itself rather than
     // being relabelled "no provider configured" or silently moving to a
     // different endpoint.
-    let providers = provider_ops::list_providers(db)
+    let providers = provider_ops::list(db)
         .await
         .map_err(|error| format!("could not read configured providers: {error}"))?;
     let p = providers
@@ -225,7 +225,7 @@ async fn codex_client_version(db: &Db, wanted: bool) -> Option<String> {
     if !wanted {
         return None;
     }
-    preference::get_preference(db, provider::codex_identity::CODEX_CLIENT_VERSION_PREF)
+    preference::get(db, provider::codex_identity::CODEX_CLIENT_VERSION_PREF)
         .await
         .unwrap_or_else(|error| {
             tracing::warn!(error = %error, "could not read the Codex client version override");
@@ -238,7 +238,7 @@ async fn google_compat_thinking_mode(db: &Db, wanted: bool) -> provider::openai_
     if !wanted {
         return GoogleCompatThinkingMode::Auto;
     }
-    let raw = preference::get_preference(db, GOOGLE_COMPAT_THINKING_MODE_PREF)
+    let raw = preference::get(db, GOOGLE_COMPAT_THINKING_MODE_PREF)
         .await
         .unwrap_or_else(|error| {
             tracing::warn!(error = %error, "could not read the Google compat thinking mode preference");
@@ -257,7 +257,7 @@ async fn google_include_thoughts_when_off(db: &Db, wanted: bool) -> bool {
     if !wanted {
         return false;
     }
-    let raw = preference::get_preference(
+    let raw = preference::get(
         db,
         provider::google_generate_content::GOOGLE_INCLUDE_THOUGHTS_WHEN_OFF_PREF,
     )
@@ -266,7 +266,7 @@ async fn google_include_thoughts_when_off(db: &Db, wanted: bool) -> bool {
         tracing::warn!(error = %error, "could not read the Google include_thoughts_when_off preference");
         None
     });
-    preference::parse_bool_preference(
+    preference::parse_bool(
         provider::google_generate_content::GOOGLE_INCLUDE_THOUGHTS_WHEN_OFF_PREF,
         raw.as_deref(),
         false,
@@ -375,7 +375,7 @@ async fn resolve_named(
     provider_id: &str,
     model: String,
 ) -> Result<ResolvedProvider, String> {
-    let provider = provider_ops::get_provider(db, provider_id)
+    let provider = provider_ops::get(db, provider_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("provider {provider_id} not found"))?;
@@ -671,7 +671,7 @@ mod tests {
 
     async fn seed(db: &Db, provider: provider_entity::Model, config: Option<FlatModelConfig<'_>>) {
         db.write(async |tx| {
-            provider_ops::create_provider(tx, provider).await?;
+            provider_ops::create(tx, provider).await?;
             if let Some(config) = config {
                 seed_flat(tx, &config).await?;
             }
@@ -1237,7 +1237,7 @@ mod tests {
         );
 
         db.write(async |tx| {
-            crate::db::sea::ops::preference::set_preference(
+            crate::db::sea::ops::preference::set(
                 tx,
                 crate::agent::auxiliary::AUXILIARY_MODEL_PREFERENCE,
                 "p1:deepseek-v4-flash",
@@ -1265,7 +1265,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let secrets = mock_secrets(dir.path());
         db.write(async |tx| {
-            crate::db::sea::ops::preference::set_preference(
+            crate::db::sea::ops::preference::set(
                 tx,
                 crate::agent::auxiliary::AUXILIARY_MODEL_PREFERENCE,
                 "gone:some-model",

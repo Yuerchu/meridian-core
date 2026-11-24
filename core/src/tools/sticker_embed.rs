@@ -131,7 +131,7 @@ async fn try_pick_with_images<'a, T: RosterItem>(
     db: &Db,
     image_of: impl Fn(&T, bool) -> Option<Vec<u8>>,
 ) -> Result<&'a T, String> {
-    let path = pref_ops::get_preference(db, EMBEDDER_PREFERENCE)
+    let path = pref_ops::get(db, EMBEDDER_PREFERENCE)
         .await
         .map_err(|e| e.to_string())?;
     let Some(path) = path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) else {

@@ -63,7 +63,7 @@ fn from_env(var: &str) -> Result<String, &'static str> {
 /// one empty directory cannot both find it empty and both take it.
 async fn claim_data_dir(sea: &Db) -> Result<(), &'static str> {
     sea.write(async |tx| {
-        let claimed = preference_ops::get_preference(tx, OWNERSHIP_KEY).await?;
+        let claimed = preference_ops::get(tx, OWNERSHIP_KEY).await?;
         if claimed.is_some() {
             return Ok(Ok(()));
         }
@@ -71,13 +71,13 @@ async fn claim_data_dir(sea: &Db) -> Result<(), &'static str> {
         // in it to lose. `providers` is the right thing to count: it is what
         // this daemon manages, it exists in every install, and a desktop
         // install that has ever been configured has at least one.
-        let providers = provider_ops::list_providers(tx).await?.len();
+        let providers = provider_ops::list(tx).await?.len();
         if providers > 0 {
             return Ok(Err(
                 "data directory is not marked as the daemon's; choose a separate --data-dir",
             ));
         }
-        preference_ops::set_preference(tx, OWNERSHIP_KEY, "true", now_ms()).await?;
+        preference_ops::set(tx, OWNERSHIP_KEY, "true", now_ms()).await?;
         Ok::<_, DbErr>(Ok(()))
     })
     .await
@@ -155,8 +155,8 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
         let enabled = SqlBool::from(provider.enabled);
         // The existence check and the write are one transaction, so a second
         // apply racing this one cannot both see "absent" and both insert.
-        sea.write(async |tx| match provider_ops::get_provider(tx, &provider.id).await? {
-            Some(_) => provider_ops::update_provider(
+        sea.write(async |tx| match provider_ops::get(tx, &provider.id).await? {
+            Some(_) => provider_ops::update(
                 tx,
                 &provider.id,
                 ProviderChangeset {
@@ -176,7 +176,7 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
             )
             .await
             .map(|_| ()),
-            None => provider_ops::create_provider(
+            None => provider_ops::create(
                 tx,
                 provider_entity::Model {
                     id: provider.id.clone(),
@@ -220,11 +220,11 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
     let disabled = sea
         .write(async |tx| {
             let mut disabled = Vec::new();
-            for row in provider_ops::list_providers(tx).await? {
+            for row in provider_ops::list(tx).await? {
                 if named.contains(&row.id.as_str()) || !row.is_enabled.get() {
                     continue;
                 }
-                provider_ops::update_provider(
+                provider_ops::update(
                     tx,
                     &row.id,
                     ProviderChangeset {
@@ -344,7 +344,7 @@ mod tests {
     use meridian_core::db::sea::sea_test_db;
 
     async fn provider_count(sea: &Db) -> usize {
-        provider_ops::list_providers(sea).await.unwrap().len()
+        provider_ops::list(sea).await.unwrap().len()
     }
 
     fn secrets(dir: &std::path::Path) -> SecretsManager {
@@ -465,7 +465,7 @@ mod tests {
             .unwrap()
         };
         let vendor_of = async |sea: &Db| {
-            let row = provider_ops::get_provider(sea, "p1").await.unwrap().unwrap();
+            let row = provider_ops::get(sea, "p1").await.unwrap().unwrap();
             balance_vendor(ProviderIdentity::new(
                 row.catalog_id.as_deref(),
                 row.provider_type.as_str(),
@@ -544,7 +544,7 @@ mod tests {
     async fn a_populated_unclaimed_data_directory_is_refused() {
         let sea = sea_test_db().await;
         sea.write(async |tx| {
-            provider_ops::create_provider(
+            provider_ops::create(
                 tx,
                 provider_entity::Model {
                     id: "desktop-one".into(),
@@ -578,10 +578,7 @@ mod tests {
         let fresh = sea_test_db().await;
         claim_data_dir(&fresh).await.unwrap();
         assert_eq!(
-            preference_ops::get_preference(&fresh, OWNERSHIP_KEY)
-                .await
-                .unwrap()
-                .as_deref(),
+            preference_ops::get(&fresh, OWNERSHIP_KEY).await.unwrap().as_deref(),
             Some("true")
         );
         claim_data_dir(&fresh).await.unwrap();

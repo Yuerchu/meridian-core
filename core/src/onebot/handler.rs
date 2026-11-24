@@ -1455,7 +1455,7 @@ async fn dispatch_memory(
                 Err(e) => build_reply(event, &e, reply_to),
                 Ok(ids) => {
                     let n = db
-                        .write(async |tx| mem_ops::soft_delete_memories(tx, &ids, DeletedBy::SelfRemoved, now).await)
+                        .write(async |tx| mem_ops::soft_delete(tx, &ids, DeletedBy::SelfRemoved, now).await)
                         .await
                         .unwrap_or(0);
                     build_reply(
@@ -1504,7 +1504,7 @@ async fn dispatch_memory(
                         })
                         .map(|m| m.id)
                         .collect();
-                    mem_ops::restore_memories(tx, &ids, crate::util::now_ms()).await
+                    mem_ops::restore(tx, &ids, crate::util::now_ms()).await
                 })
                 .await
                 .unwrap_or(0);
@@ -1604,9 +1604,7 @@ async fn dispatch_memory(
                     Err(e) => build_reply(event, &e, reply_to),
                     Ok(ids) => {
                         let n = db
-                            .write(async |tx| {
-                                mem_ops::soft_delete_memories(tx, &ids, DeletedBy::SelfRemoved, now).await
-                            })
+                            .write(async |tx| mem_ops::soft_delete(tx, &ids, DeletedBy::SelfRemoved, now).await)
                             .await
                             .unwrap_or(0);
                         build_reply(event, &format!("已删除 {n} 条群记忆。"), reply_to)
@@ -2121,15 +2119,12 @@ async fn conversation_and_assistant_in(
     ),
     String,
 > {
-    let conv = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+    let conv = crate::db::sea::ops::conversation::get(tx, conversation_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("conversation {conversation_id} not found"))?;
     let assistant = match preferred.or(conv.assistant_id.as_deref()) {
-        Some(aid) => crate::db::sea::ops::assistant::get_assistant(tx, aid)
-            .await
-            .ok()
-            .flatten(),
+        Some(aid) => crate::db::sea::ops::assistant::get(tx, aid).await.ok().flatten(),
         None => None,
     };
     Ok((conv, assistant))
@@ -2165,7 +2160,7 @@ async fn status_of(state: &SharedState, conversation_id: &str) -> Result<(String
             // switched away from would not describe the conversation /status is
             // reporting on. A failed read is reported as a failure, not as an
             // empty conversation.
-            let history = crate::db::sea::ops::message::list_messages(tx, conversation_id).await?;
+            let history = crate::db::sea::ops::message::list(tx, conversation_id).await?;
             let msg_count = crate::db::sea::ops::message::active_context(&history, conv.head_message_id.as_deref())
                 .path
                 .iter()

@@ -12,7 +12,7 @@ use crate::db::sea::cap::sealed::Access;
 use crate::db::sea::cap::{Read, WriteTx};
 use crate::db::types::SqlBool;
 
-pub async fn list_tools(db: &impl Read) -> Result<Vec<custom_tool::Model>, DbErr> {
+pub async fn list(db: &impl Read) -> Result<Vec<custom_tool::Model>, DbErr> {
     custom_tool::Entity::find()
         .order_by_asc(custom_tool::Column::SortOrder)
         .order_by_asc(custom_tool::Column::Id)
@@ -20,7 +20,7 @@ pub async fn list_tools(db: &impl Read) -> Result<Vec<custom_tool::Model>, DbErr
         .await
 }
 
-pub async fn list_enabled_tools(db: &impl Read) -> Result<Vec<custom_tool::Model>, DbErr> {
+pub async fn list_enabled(db: &impl Read) -> Result<Vec<custom_tool::Model>, DbErr> {
     custom_tool::Entity::find()
         .filter(custom_tool::Column::IsEnabled.eq(SqlBool::TRUE))
         .order_by_asc(custom_tool::Column::SortOrder)
@@ -37,7 +37,7 @@ async fn get_tool(db: &impl Read, id: &str) -> Result<custom_tool::Model, DbErr>
 }
 
 /// Inserts the row the caller built and reads it back.
-pub async fn create_tool(tx: &WriteTx, model: custom_tool::Model) -> Result<custom_tool::Model, DbErr> {
+pub async fn create(tx: &WriteTx, model: custom_tool::Model) -> Result<custom_tool::Model, DbErr> {
     validate_execution(model.execution.as_ref(), model.is_enabled, model.timeout_ms)?;
     let id = model.id.clone();
     custom_tool::Entity::insert(model.into_active_model())
@@ -47,7 +47,7 @@ pub async fn create_tool(tx: &WriteTx, model: custom_tool::Model) -> Result<cust
 }
 
 /// `RecordNotFound` when there is no such row, before anything is written.
-pub async fn update_tool(tx: &WriteTx, id: &str, changeset: CustomToolChangeset) -> Result<custom_tool::Model, DbErr> {
+pub async fn update(tx: &WriteTx, id: &str, changeset: CustomToolChangeset) -> Result<custom_tool::Model, DbErr> {
     let existing = get_tool(tx, id).await?;
     validate_execution(
         changeset.execution.as_ref().unwrap_or(&existing.execution).as_ref(),
@@ -78,7 +78,7 @@ fn validate_execution(
 }
 
 /// How many rows went: 0 for an id that was already gone.
-pub async fn delete_tool(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
     Ok(custom_tool::Entity::delete_by_id(id)
         .exec(tx.conn()?)
         .await?
@@ -90,7 +90,7 @@ mod tests {
     use super::*;
     use crate::db::entity::tool_category;
     use crate::db::sea::cap::Db;
-    use crate::db::sea::ops::tool_category::create_category;
+    use crate::db::sea::ops::tool_category as tool_category_ops;
     use crate::db::sea::{execute_for_tests, sea_test_db};
     use crate::db::types::Json;
     use crate::tools::Permission;
@@ -119,7 +119,7 @@ mod tests {
     }
 
     async fn insert(db: &Db, model: custom_tool::Model) -> custom_tool::Model {
-        db.write(async |tx| create_tool(tx, model).await).await.unwrap()
+        db.write(async |tx| create(tx, model).await).await.unwrap()
     }
 
     #[tokio::test]
@@ -130,7 +130,7 @@ mod tests {
         insert(&db, legacy).await;
         let changed = db
             .write(async |tx| {
-                update_tool(
+                update(
                     tx,
                     "legacy",
                     CustomToolChangeset {
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(changed.command, "printf '%s'");
         assert!(!changed.is_enabled.get());
         assert!(
-            db.write(async |tx| update_tool(
+            db.write(async |tx| update(
                 tx,
                 "legacy",
                 CustomToolChangeset {
@@ -160,7 +160,7 @@ mod tests {
         );
         let converted = db
             .write(async |tx| {
-                update_tool(
+                update(
                     tx,
                     "legacy",
                     CustomToolChangeset {
@@ -175,7 +175,7 @@ mod tests {
             .unwrap();
         assert!(converted.is_enabled.get());
         assert!(
-            db.write(async |tx| update_tool(
+            db.write(async |tx| update(
                 tx,
                 "legacy",
                 CustomToolChangeset {
@@ -187,7 +187,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(list_enabled_tools(&db).await.unwrap()[0].execution.is_some());
+        assert!(list_enabled(&db).await.unwrap()[0].execution.is_some());
     }
 
     #[tokio::test]
@@ -198,14 +198,9 @@ mod tests {
         insert(&db, tool("a", 2, false, None)).await;
         insert(&db, tool("c", 0, true, None)).await;
 
-        let all: Vec<_> = list_tools(&db).await.unwrap().into_iter().map(|t| t.id).collect();
+        let all: Vec<_> = list(&db).await.unwrap().into_iter().map(|t| t.id).collect();
         assert_eq!(all, ["c", "b", "a"]);
-        let enabled: Vec<_> = list_enabled_tools(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
+        let enabled: Vec<_> = list_enabled(&db).await.unwrap().into_iter().map(|t| t.id).collect();
         assert_eq!(enabled, ["c", "b"]);
     }
 
@@ -215,7 +210,7 @@ mod tests {
         insert(&db, tool("t", 0, true, None)).await;
         let updated = db
             .write(async |tx| {
-                update_tool(
+                update(
                     tx,
                     "t",
                     CustomToolChangeset {
@@ -239,7 +234,7 @@ mod tests {
     async fn deleting_a_category_uncategorises_its_tools() {
         let db = sea_test_db().await;
         db.write(async |tx| {
-            create_category(
+            tool_category_ops::create(
                 tx,
                 tool_category::Model {
                     id: "cat".into(),
@@ -256,7 +251,7 @@ mod tests {
         .unwrap();
         insert(&db, tool("t", 0, true, Some("cat"))).await;
         execute_for_tests(&db, "DELETE FROM tool_categories").await.unwrap();
-        assert_eq!(list_tools(&db).await.unwrap()[0].category_id, None);
+        assert_eq!(list(&db).await.unwrap()[0].category_id, None);
     }
 
     #[tokio::test]
@@ -267,7 +262,7 @@ mod tests {
             execute_for_tests(&db, &format!("UPDATE custom_tools SET {column} = {value}"))
                 .await
                 .unwrap();
-            assert!(list_enabled_tools(&db).await.is_err(), "{column} = {value} decoded");
+            assert!(list_enabled(&db).await.is_err(), "{column} = {value} decoded");
         }
     }
 }

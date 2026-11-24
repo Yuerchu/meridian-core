@@ -1177,7 +1177,7 @@ fn validate_scope_list(key: &str, values: &[String], groups_only: bool) -> Resul
 
 pub async fn load_config(db: &Db) -> Result<OneBotConfig, String> {
     let get = async |key: &str| -> Result<Option<String>, String> {
-        crate::db::sea::ops::preference::get_preference(db, key)
+        crate::db::sea::ops::preference::get(db, key)
             .await
             .map_err(|error| format!("failed to read preference {key}: {error}"))
     };
@@ -1257,7 +1257,7 @@ pub async fn save_settings(db: &Db, config: &OneBotConfig, replies: &ReplyBank) 
 }
 
 async fn save_config_in(tx: &WriteTx, config: &OneBotConfig) -> Result<(), crate::db::sea::DbErr> {
-    use crate::db::sea::ops::preference::set_preference;
+    use crate::db::sea::ops::preference;
 
     let now = now_ms();
     let admin_users = serde_json::to_string(&config.admin_users)
@@ -1269,17 +1269,17 @@ async fn save_config_in(tx: &WriteTx, config: &OneBotConfig) -> Result<(), crate
         crate::db::sea::DbErr::Custom(format!("could not serialize onebot.voice_send_groups: {error}"))
     })?;
 
-    set_preference(tx, "onebot.enabled", if config.enabled { "true" } else { "false" }, now).await?;
-    set_preference(tx, "onebot.host", &config.host, now).await?;
-    set_preference(tx, "onebot.port", &config.port.to_string(), now).await?;
-    set_preference(
+    preference::set(tx, "onebot.enabled", if config.enabled { "true" } else { "false" }, now).await?;
+    preference::set(tx, "onebot.host", &config.host, now).await?;
+    preference::set(tx, "onebot.port", &config.port.to_string(), now).await?;
+    preference::set(
         tx,
         "onebot.access_token",
         config.access_token.as_deref().unwrap_or(""),
         now,
     )
     .await?;
-    set_preference(
+    preference::set(
         tx,
         "onebot.assistant_id",
         config.assistant_id.as_deref().unwrap_or(""),
@@ -1288,20 +1288,20 @@ async fn save_config_in(tx: &WriteTx, config: &OneBotConfig) -> Result<(), crate
     .await?;
     let private_media_origins = serde_json::to_string(&config.private_media_origins)
         .map_err(|e| crate::db::sea::DbErr::Custom(e.to_string()))?;
-    set_preference(tx, "onebot.private_media_origins", &private_media_origins, now).await?;
-    set_preference(tx, "onebot.admin_users", &admin_users, now).await?;
-    set_preference(tx, "onebot.ack_emoji_id", &config.ack_emoji_id, now).await?;
-    set_preference(tx, "onebot.voice_capture_sessions", &voice_capture_sessions, now).await?;
-    set_preference(
+    preference::set(tx, "onebot.private_media_origins", &private_media_origins, now).await?;
+    preference::set(tx, "onebot.admin_users", &admin_users, now).await?;
+    preference::set(tx, "onebot.ack_emoji_id", &config.ack_emoji_id, now).await?;
+    preference::set(tx, "onebot.voice_capture_sessions", &voice_capture_sessions, now).await?;
+    preference::set(
         tx,
         "onebot.voice_send_enabled",
         if config.voice_send_enabled { "true" } else { "false" },
         now,
     )
     .await?;
-    set_preference(tx, "onebot.voice_send_groups", &voice_send_groups, now).await?;
-    set_preference(tx, "onebot.voice_tts_model", &config.voice_tts_model, now).await?;
-    set_preference(tx, "onebot.voice_tts_reference_id", &config.voice_tts_reference_id, now).await?;
+    preference::set(tx, "onebot.voice_send_groups", &voice_send_groups, now).await?;
+    preference::set(tx, "onebot.voice_tts_model", &config.voice_tts_model, now).await?;
+    preference::set(tx, "onebot.voice_tts_reference_id", &config.voice_tts_reference_id, now).await?;
     Ok(())
 }
 
@@ -1917,11 +1917,9 @@ mod tests {
     #[tokio::test]
     async fn stored_onebot_config_rejects_malformed_values() {
         let db = crate::db::sea::sea_test_db().await;
-        db.write(async |tx| {
-            crate::db::sea::ops::preference::set_preference(tx, "onebot.admin_users", "not json", 1).await
-        })
-        .await
-        .unwrap();
+        db.write(async |tx| crate::db::sea::ops::preference::set(tx, "onebot.admin_users", "not json", 1).await)
+            .await
+            .unwrap();
 
         let error = load_config(&db)
             .await
@@ -2702,11 +2700,9 @@ mod tests {
             r#"[{"origin":"http://local.test","ip":"127.0.0.1","wildcard":true}]"#,
             r#"[{"origin":"http://local.test/path","ip":"127.0.0.1"}]"#,
         ] {
-            db.write(async |tx| {
-                crate::db::sea::ops::preference::set_preference(tx, "onebot.private_media_origins", raw, 1).await
-            })
-            .await
-            .unwrap();
+            db.write(async |tx| crate::db::sea::ops::preference::set(tx, "onebot.private_media_origins", raw, 1).await)
+                .await
+                .unwrap();
             assert!(load_config(&db).await.is_err(), "{raw}");
         }
     }

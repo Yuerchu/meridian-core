@@ -178,7 +178,7 @@ mod tests {
     async fn seeded() -> Db {
         let db = crate::db::sea::sea_test_db().await;
         db.write(async |tx| {
-            crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("t"), None, None, 1).await?;
+            crate::db::sea::ops::conversation::create(tx, "c1", Some("t"), None, None, 1).await?;
             crate::db::sea::ops::turn::begin(tx, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).await
         })
         .await
@@ -293,14 +293,14 @@ mod tests {
 
         let db = crate::db::sea::sea_test_db().await;
         db.write(async |tx| {
-            conversation_ops::create_conversation(tx, "c1", Some("t"), None, None, 1).await?;
+            conversation_ops::create(tx, "c1", Some("t"), None, None, 1).await?;
             crate::db::sea::ops::turn::begin(tx, "t1", "c1", crate::turn::TurnOrigin::Desktop, None, 1000).await
         })
         .await
         .unwrap();
         async fn live(db: &Db) -> Vec<message_entity::Model> {
-            let conv = conversation_ops::get_conversation(db, "c1").await.unwrap().unwrap();
-            let history = message_ops::list_messages(db, "c1").await.unwrap();
+            let conv = conversation_ops::get(db, "c1").await.unwrap().unwrap();
+            let history = message_ops::list(db, "c1").await.unwrap();
             message_ops::active_context(&history, conv.head_message_id.as_deref())
                 .live()
                 .to_vec()
@@ -310,7 +310,7 @@ mod tests {
                 turn_id: Some("t1".into()),
                 ..message_ops::new_row(id, "c1", "user", "go on", now)
             };
-            db.write(async |tx| message_ops::append_message(tx, row, parent).await)
+            db.write(async |tx| message_ops::append(tx, row, parent).await)
                 .await
                 .unwrap();
         }

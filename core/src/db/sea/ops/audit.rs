@@ -152,7 +152,7 @@ async fn billing_mode_for(
     let Some(provider_id) = provider_id else {
         return Ok(BillingMode::Metered);
     };
-    match provider::get_provider(tx, provider_id).await? {
+    match provider::get(tx, provider_id).await? {
         Some(provider) => BillingMode::for_transport(provider.transport_profile.as_str())
             .map_err(|error| DbErr::Type(error.to_string())),
         None => Ok(BillingMode::Metered),
@@ -505,7 +505,7 @@ mod tests {
     /// Append the reply and record it, as the turn loop does once it is final.
     async fn record_reply(db: &Db, row: message::Model) {
         db.write(async |tx| {
-            let row = db_message::append_message(tx, row, None).await?;
+            let row = db_message::append(tx, row, None).await?;
             record(tx, &row).await
         })
         .await
@@ -719,7 +719,7 @@ mod tests {
             ..reply("u1", None, None)
         };
         db.write(async |tx| {
-            let row = db_message::append_message(tx, user, None).await?;
+            let row = db_message::append(tx, user, None).await?;
             record(tx, &row).await
         })
         .await

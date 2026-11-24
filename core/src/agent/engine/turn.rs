@@ -2401,7 +2401,7 @@ mod tests {
     }
 
     async fn rows(pool: &Db) -> Vec<crate::db::entity::message::Model> {
-        crate::db::sea::ops::message::list_messages(pool, "c1").await.unwrap()
+        crate::db::sea::ops::message::list(pool, "c1").await.unwrap()
     }
 
     fn def(name: &str) -> ToolDefinition {

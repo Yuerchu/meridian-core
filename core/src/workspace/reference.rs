@@ -26,7 +26,7 @@ pub const MAX_CONTEXT_TOKENS: usize = 25_000;
 pub const MAX_MODEL_SHELL_CONTEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceReferenceRequest {
     pub path: String,
     #[serde(deserialize_with = "crate::events::deserialize_required_nullable")]
@@ -1378,15 +1378,15 @@ mod tests {
     }
 
     #[test]
-    fn workspace_reference_request_requires_camel_case_nullable_range_keys() {
+    fn workspace_reference_request_requires_snake_case_nullable_range_keys() {
         let complete = serde_json::json!({
             "path": "src/main.rs",
-            "lineStart": null,
-            "lineEnd": null
+            "line_start": null,
+            "line_end": null
         });
         assert!(serde_json::from_value::<WorkspaceReferenceRequest>(complete.clone()).is_ok());
 
-        for key in ["lineStart", "lineEnd"] {
+        for key in ["line_start", "line_end"] {
             let mut missing = complete.clone();
             missing.as_object_mut().unwrap().remove(key);
             assert!(
@@ -1398,11 +1398,11 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkspaceReferenceRequest>(serde_json::json!({
                 "path": "src/main.rs",
-                "line_start": null,
-                "line_end": null
+                "lineStart": null,
+                "lineEnd": null
             }))
             .is_err(),
-            "obsolete snake_case wire fields must be rejected"
+            "obsolete camelCase wire fields must be rejected"
         );
     }
 

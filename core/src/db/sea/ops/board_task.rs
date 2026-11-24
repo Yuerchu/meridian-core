@@ -390,7 +390,7 @@ mod tests {
         db.write(async |tx| set_started(tx, "a", &start("c1")).await)
             .await
             .unwrap();
-        db.write(async |tx| crate::db::sea::ops::conversation::delete_conversation(tx, "c1").await)
+        db.write(async |tx| crate::db::sea::ops::conversation::delete(tx, "c1").await)
             .await
             .unwrap();
         let card = get(&db, "a").await.unwrap().unwrap();

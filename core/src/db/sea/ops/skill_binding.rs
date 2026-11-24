@@ -184,13 +184,13 @@ pub async fn resolve_available(
 mod tests {
     use super::*;
     use crate::db::sea::cap::Db;
-    use crate::db::sea::ops::skill::{update_skill, upsert_skill};
+    use crate::db::sea::ops::skill as skill_ops;
     use crate::db::sea::{execute_for_tests, sea_test_db};
 
     async fn index(db: &Db, dir: &str) {
         let mut model = crate::db::sea::ops::skill::tests::make_skill(dir, dir);
         model.display_name = dir.into();
-        db.write(async |tx| upsert_skill(tx, model).await).await.unwrap();
+        db.write(async |tx| skill_ops::upsert(tx, model).await).await.unwrap();
     }
 
     async fn anchors(db: &Db) {
@@ -262,7 +262,7 @@ mod tests {
         set(&db, SkillLayer::Assistant, Some("a1"), "a", true).await;
         set(&db, SkillLayer::Global, None, "off", true).await;
         db.write(async |tx| {
-            update_skill(
+            skill_ops::update(
                 tx,
                 "off",
                 crate::db::entity::skill::SkillChangeset {
@@ -285,7 +285,7 @@ mod tests {
         let db = sea_test_db().await;
         index(&db, "s").await;
         set(&db, SkillLayer::Global, None, "s", true).await;
-        db.write(async |tx| crate::db::sea::ops::skill::delete_skill(tx, "s").await)
+        db.write(async |tx| crate::db::sea::ops::skill::delete(tx, "s").await)
             .await
             .unwrap();
         assert!(list_layer(&db, SkillLayer::Global, None).await.unwrap().is_empty());

@@ -74,7 +74,7 @@ async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
     one(conn, sql, vec![], "n").await
 }
 
-/// `None` when the key has no row, as `ops::preference::get_preference` answers.
+/// `None` when the key has no row, as `ops::preference::get` answers.
 async fn preference(conn: &DatabaseConnection, key: &str) -> Option<String> {
     conn.query_one_raw(raw("SELECT value FROM preferences WHERE key = ?", vec![key.into()]))
         .await
@@ -109,10 +109,7 @@ async fn a_conversation_starts_out_asking_about_every_edit() {
     )
     .await
     .unwrap();
-    let c = super::ops::conversation::get_conversation(&db, "c1")
-        .await
-        .unwrap()
-        .unwrap();
+    let c = super::ops::conversation::get(&db, "c1").await.unwrap().unwrap();
     assert!(
         !c.accept_edits.get(),
         "a conversation that predates the column must keep asking"
@@ -508,7 +505,7 @@ async fn conversations_that_predate_delegation_stay_in_the_lists() {
 
     run_migrations_from(&conn, "00000000000027").await;
 
-    // The sidebar's query, `ops::conversation::list_conversations(conn, false)`.
+    // The sidebar's query, `ops::conversation::list(conn, false)`.
     let listed = rows(
         &conn,
         "SELECT id, parent_conversation_id, agent_model_id FROM conversations

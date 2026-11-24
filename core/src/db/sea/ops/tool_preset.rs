@@ -11,7 +11,7 @@ use crate::db::entity::tool_preset::ToolPresetChangeset;
 use crate::db::sea::cap::sealed::Access;
 use crate::db::sea::cap::{Read, WriteTx};
 
-pub async fn list_presets(db: &impl Read) -> Result<Vec<tool_preset::Model>, DbErr> {
+pub async fn list(db: &impl Read) -> Result<Vec<tool_preset::Model>, DbErr> {
     tool_preset::Entity::find()
         .order_by_asc(tool_preset::Column::SortOrder)
         .order_by_asc(tool_preset::Column::Id)
@@ -19,7 +19,7 @@ pub async fn list_presets(db: &impl Read) -> Result<Vec<tool_preset::Model>, DbE
         .await
 }
 
-pub async fn get_preset(db: &impl Read, id: &str) -> Result<Option<tool_preset::Model>, DbErr> {
+pub async fn get(db: &impl Read, id: &str) -> Result<Option<tool_preset::Model>, DbErr> {
     tool_preset::Entity::find_by_id(id).one(db.conn()?).await
 }
 
@@ -28,28 +28,24 @@ fn not_found(id: &str) -> DbErr {
 }
 
 /// Inserts the row the caller built and reads it back.
-pub async fn create_preset(tx: &WriteTx, model: tool_preset::Model) -> Result<tool_preset::Model, DbErr> {
+pub async fn create(tx: &WriteTx, model: tool_preset::Model) -> Result<tool_preset::Model, DbErr> {
     let id = model.id.clone();
     tool_preset::Entity::insert(model.into_active_model())
         .exec_without_returning(tx.conn()?)
         .await?;
-    get_preset(tx, &id).await?.ok_or_else(|| not_found(&id))
+    get(tx, &id).await?.ok_or_else(|| not_found(&id))
 }
 
 /// `RecordNotFound` when there is no such row, before anything is written.
-pub async fn update_preset(
-    tx: &WriteTx,
-    id: &str,
-    changeset: ToolPresetChangeset,
-) -> Result<tool_preset::Model, DbErr> {
-    let existing = get_preset(tx, id).await?.ok_or_else(|| not_found(id))?;
+pub async fn update(tx: &WriteTx, id: &str, changeset: ToolPresetChangeset) -> Result<tool_preset::Model, DbErr> {
+    let existing = get(tx, id).await?.ok_or_else(|| not_found(id))?;
     let mut row = changeset.into_active_model();
     row.id = Unchanged(existing.id);
     row.update(tx.conn()?).await
 }
 
 /// How many rows went: 0 for an id that was already gone.
-pub async fn delete_preset(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
     Ok(tool_preset::Entity::delete_by_id(id)
         .exec(tx.conn()?)
         .await?
@@ -78,7 +74,7 @@ mod tests {
     }
 
     async fn insert(db: &Db, model: tool_preset::Model) -> tool_preset::Model {
-        db.write(async |tx| create_preset(tx, model).await).await.unwrap()
+        db.write(async |tx| create(tx, model).await).await.unwrap()
     }
 
     #[tokio::test]
@@ -87,9 +83,9 @@ mod tests {
         let written = preset("b", 1);
         assert_eq!(insert(&db, written.clone()).await, written);
         insert(&db, preset("a", 0)).await;
-        let ids: Vec<_> = list_presets(&db).await.unwrap().into_iter().map(|p| p.id).collect();
+        let ids: Vec<_> = list(&db).await.unwrap().into_iter().map(|p| p.id).collect();
         assert_eq!(ids, ["a", "b"]);
-        assert_eq!(get_preset(&db, "missing").await.unwrap(), None);
+        assert_eq!(get(&db, "missing").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -98,7 +94,7 @@ mod tests {
         insert(&db, preset("p", 0)).await;
         let updated = db
             .write(async |tx| {
-                update_preset(
+                update(
                     tx,
                     "p",
                     ToolPresetChangeset {
@@ -115,9 +111,9 @@ mod tests {
         assert_eq!(*updated.tool_names, ["glob"]);
         assert_eq!(updated.name, "p");
 
-        assert_eq!(db.write(async |tx| delete_preset(tx, "p").await).await.unwrap(), 1);
+        assert_eq!(db.write(async |tx| delete(tx, "p").await).await.unwrap(), 1);
         let missing = db
-            .write(async |tx| update_preset(tx, "p", ToolPresetChangeset::default()).await)
+            .write(async |tx| update(tx, "p", ToolPresetChangeset::default()).await)
             .await;
         assert!(matches!(missing, Err(DbErr::RecordNotFound(_))), "{missing:?}");
     }
@@ -130,7 +126,7 @@ mod tests {
         execute_for_tests(&db, "UPDATE tool_presets SET tool_names = 'read_file'")
             .await
             .unwrap();
-        assert!(get_preset(&db, "p").await.is_err());
-        assert!(list_presets(&db).await.is_err());
+        assert!(get(&db, "p").await.is_err());
+        assert!(list(&db).await.is_err());
     }
 }

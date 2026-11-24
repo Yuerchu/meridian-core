@@ -46,7 +46,7 @@ pub async fn ids_by_project(db: &impl Read, project_id: &str) -> Result<Vec<Stri
 
 /// `None` for an id with no row. The Diesel version answers `NotFound`
 /// instead, which its callers match on; here the absence is in the type.
-pub async fn get_conversation(db: &impl Read, id: &str) -> Result<Option<conversation::Model>, DbErr> {
+pub async fn get(db: &impl Read, id: &str) -> Result<Option<conversation::Model>, DbErr> {
     conversation::Entity::find_by_id(id).one(db.conn()?).await
 }
 
@@ -152,12 +152,12 @@ pub async fn insert(tx: &WriteTx, new: conversation::Model) -> Result<conversati
     conversation::Entity::insert(new.into_active_model())
         .exec_without_returning(tx.conn()?)
         .await?;
-    get_conversation(tx, &id)
+    get(tx, &id)
         .await?
         .ok_or_else(|| DbErr::RecordNotFound(format!("conversation `{id}`")))
 }
 
-pub async fn create_conversation(
+pub async fn create(
     tx: &WriteTx,
     id: &str,
     title: Option<&str>,
@@ -180,7 +180,7 @@ pub async fn create_conversation(
 /// The user's own conversations — archived or not — pinned first, then
 /// newest. Sub-agent transcripts are left out: being spawned is not a
 /// decision anyone can reverse, unlike archiving.
-pub async fn list_conversations(db: &impl Read, archived: bool) -> Result<Vec<conversation::Model>, DbErr> {
+pub async fn list(db: &impl Read, archived: bool) -> Result<Vec<conversation::Model>, DbErr> {
     conversation::Entity::find()
         .filter(conversation::Column::IsArchived.eq(SqlBool::from(archived)))
         .filter(conversation::Column::ParentConversationId.is_null())
@@ -190,7 +190,7 @@ pub async fn list_conversations(db: &impl Read, archived: bool) -> Result<Vec<co
         .await
 }
 
-pub async fn list_conversations_by_project(
+pub async fn list_by_project(
     db: &impl Read,
     project_id: &str,
     archived: bool,
@@ -224,62 +224,22 @@ pub async fn update_mode(tx: &WriteTx, id: &str, mode: Option<&str>, now: EpochM
     update_columns(tx, id, row).await
 }
 
-pub async fn archive_conversation(tx: &WriteTx, id: &str, now: EpochMs) -> Result<u64, DbErr> {
+pub async fn set_pinned(tx: &WriteTx, id: &str, pinned: bool, now: EpochMs) -> Result<u64, DbErr> {
     let row = conversation::ActiveModel {
-        is_archived: Set(SqlBool::TRUE),
+        is_pinned: Set(SqlBool::from(pinned)),
         updated_at: Set(now),
         ..Default::default()
     };
     update_columns(tx, id, row).await
 }
 
-/// Flip one flag and hand back the row as it is after the flip. The read and
-/// the write share the caller's `BEGIN IMMEDIATE`, so two presses at once
-/// are each applied rather than one read seeing the other's stale value.
-async fn toggle(
-    tx: &WriteTx,
-    id: &str,
-    now: EpochMs,
-    flag: impl Fn(&conversation::Model) -> SqlBool,
-    set: impl Fn(SqlBool) -> conversation::ActiveModel,
-) -> Result<conversation::Model, DbErr> {
-    let current = get_conversation(tx, id)
-        .await?
-        .ok_or_else(|| DbErr::RecordNotFound(format!("conversation `{id}`")))?;
-    let mut row = set(SqlBool::from(!flag(&current).get()));
-    row.updated_at = Set(now);
-    update_columns(tx, id, row).await?;
-    get_conversation(tx, id)
-        .await?
-        .ok_or_else(|| DbErr::RecordNotFound(format!("conversation `{id}`")))
-}
-
-pub async fn toggle_pin(tx: &WriteTx, id: &str, now: EpochMs) -> Result<conversation::Model, DbErr> {
-    toggle(
-        tx,
-        id,
-        now,
-        |c| c.is_pinned,
-        |pinned| conversation::ActiveModel {
-            is_pinned: Set(pinned),
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-pub async fn toggle_archive(tx: &WriteTx, id: &str, now: EpochMs) -> Result<conversation::Model, DbErr> {
-    toggle(
-        tx,
-        id,
-        now,
-        |c| c.is_archived,
-        |archived| conversation::ActiveModel {
-            is_archived: Set(archived),
-            ..Default::default()
-        },
-    )
-    .await
+pub async fn set_archived(tx: &WriteTx, id: &str, archived: bool, now: EpochMs) -> Result<u64, DbErr> {
+    let row = conversation::ActiveModel {
+        is_archived: Set(SqlBool::from(archived)),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    update_columns(tx, id, row).await
 }
 
 /// The conversations spawned by this one, oldest first, so two readings
@@ -320,7 +280,7 @@ pub async fn descendants(db: &impl Snapshot, id: &str) -> Result<Vec<String>, Db
 /// Delete a conversation and every delegated run under it, in the caller's
 /// write: half a tree is worse than either outcome. Everything inside each
 /// one is reached by the foreign keys those rows do have.
-pub async fn delete_conversation(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
     let mut doomed = descendants(tx, id).await?;
     doomed.push(id.to_string());
     Ok(conversation::Entity::delete_many()
@@ -596,12 +556,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let row = get_conversation(&db, "c1").await.unwrap().unwrap();
+        let row = get(&db, "c1").await.unwrap().unwrap();
         assert_eq!(
             (row.title.as_deref(), row.is_pinned.get(), row.updated_at),
             (Some("Hi"), true, 6)
         );
-        assert_eq!(get_conversation(&db, "c2").await.unwrap(), None);
+        assert_eq!(get(&db, "c2").await.unwrap(), None);
         assert_eq!(all_ids(&db).await.unwrap(), ["c1"]);
     }
 
@@ -620,7 +580,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before = get_conversation(&db, "c1").await.unwrap().unwrap();
+        let before = get(&db, "c1").await.unwrap().unwrap();
 
         db.write(async |tx| {
             update_assistant(tx, "c1", None, 2).await?;
@@ -630,7 +590,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let after = get_conversation(&db, "c1").await.unwrap().unwrap();
+        let after = get(&db, "c1").await.unwrap().unwrap();
         assert_eq!(
             after,
             conversation::Model {
@@ -841,14 +801,9 @@ mod tests {
             .unwrap();
         }
 
-        let listed: Vec<_> = list_conversations(&db, false)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|c| c.id)
-            .collect();
+        let listed: Vec<_> = list(&db, false).await.unwrap().into_iter().map(|c| c.id).collect();
         assert_eq!(listed, ["parent"]);
-        let by_project: Vec<_> = list_conversations_by_project(&db, "p1", false)
+        let by_project: Vec<_> = list_by_project(&db, "p1", false)
             .await
             .unwrap()
             .into_iter()
@@ -911,58 +866,40 @@ mod tests {
             ["child", "grandchild"],
             "the cycle back to root is not followed"
         );
-        assert_eq!(
-            db.write(async |tx| delete_conversation(tx, "root").await)
-                .await
-                .unwrap(),
-            3
-        );
+        assert_eq!(db.write(async |tx| delete(tx, "root").await).await.unwrap(), 3);
         assert_eq!(all_ids(&db).await.unwrap(), ["bystander"]);
     }
 
-    /// Two writers toggling one row each land their toggle: the read and the
-    /// write share one `BEGIN IMMEDIATE`, so neither reads the other's stale
-    /// value. An even number of presses per writer lands back where it began.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_toggles_are_each_applied() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::sea::file_test_db(dir.path()).await;
+    /// Idempotent flag setters write their target state directly and are safe
+    /// under repeated or concurrent writes.
+    #[tokio::test]
+    async fn flag_setters_are_idempotent() {
+        let db = sea_test_db().await;
         conversations(&db, vec![new_row("c1", 1)]).await;
-        const ROUNDS: i64 = 200;
-        let workers: Vec<_> = (0..4)
-            .map(|_| {
-                let db = db.clone();
-                tokio::spawn(async move {
-                    // A writer starved past busy_timeout under a loaded test
-                    // run answers "database is locked". A refused toggle changed
-                    // nothing and is simply asked again: availability is not
-                    // what this test is about, losing a press is.
-                    async fn until_applied(db: &Db, pin: bool, now: EpochMs) {
-                        loop {
-                            let outcome = if pin {
-                                db.write(async |tx| toggle_pin(tx, "c1", now).await).await
-                            } else {
-                                db.write(async |tx| toggle_archive(tx, "c1", now).await).await
-                            };
-                            match outcome {
-                                Ok(_) => return,
-                                Err(e) if e.to_string().contains("database is locked") => {}
-                                Err(e) => panic!("{e}"),
-                            }
-                        }
-                    }
-                    for i in 0..ROUNDS {
-                        until_applied(&db, false, i).await;
-                        until_applied(&db, true, i).await;
-                    }
-                })
-            })
-            .collect();
-        for worker in workers {
-            worker.await.unwrap();
-        }
-        let conv = get_conversation(&db, "c1").await.unwrap().unwrap();
-        assert_eq!((conv.is_archived.get(), conv.is_pinned.get()), (false, false));
+        db.write(async |tx| {
+            set_pinned(tx, "c1", true, 2).await?;
+            set_pinned(tx, "c1", true, 3).await?;
+            set_archived(tx, "c1", true, 4).await
+        })
+        .await
+        .unwrap();
+        let conv = get(&db, "c1").await.unwrap().unwrap();
+        assert_eq!(
+            (conv.is_pinned.get(), conv.is_archived.get(), conv.updated_at),
+            (true, true, 4)
+        );
+
+        db.write(async |tx| {
+            set_pinned(tx, "c1", false, 5).await?;
+            set_archived(tx, "c1", false, 6).await
+        })
+        .await
+        .unwrap();
+        let conv = get(&db, "c1").await.unwrap().unwrap();
+        assert_eq!(
+            (conv.is_pinned.get(), conv.is_archived.get(), conv.updated_at),
+            (false, false, 6)
+        );
     }
 
     /// Title, mode and archive each write their column and the clock.
@@ -973,17 +910,17 @@ mod tests {
         db.write(async |tx| {
             update_title(tx, "c1", "Named", 2).await?;
             update_mode(tx, "c1", Some("plan"), 3).await?;
-            archive_conversation(tx, "c1", 4).await
+            set_archived(tx, "c1", true, 4).await
         })
         .await
         .unwrap();
-        let c = get_conversation(&db, "c1").await.unwrap().unwrap();
+        let c = get(&db, "c1").await.unwrap().unwrap();
         assert_eq!(
             (c.title.as_deref(), c.mode.as_deref(), c.is_archived.get(), c.updated_at),
             (Some("Named"), Some("plan"), true, 4)
         );
-        assert!(list_conversations(&db, false).await.unwrap().is_empty());
-        assert_eq!(list_conversations(&db, true).await.unwrap().len(), 1);
+        assert!(list(&db, false).await.unwrap().is_empty());
+        assert_eq!(list(&db, true).await.unwrap().len(), 1);
     }
 
     /// A new conversation inherits the assistant's reasoning preferences and
@@ -992,7 +929,7 @@ mod tests {
     async fn a_new_conversation_is_ordinary_and_inherits_its_reasoning_prefs() {
         let db = sea_test_db().await;
         let conv = db
-            .write(async |tx| create_conversation(tx, "c1", Some("t"), None, None, 1).await)
+            .write(async |tx| create(tx, "c1", Some("t"), None, None, 1).await)
             .await
             .unwrap();
         assert_eq!(conv.thinking_level, None, "defaults to inheriting the assistant");
@@ -1034,7 +971,7 @@ mod tests {
             ..crate::db::sea::ops::assistant::tests::assistant_row("a1", 0)
         };
 
-        let parent = get_conversation(&db, "parent").await.unwrap().unwrap();
+        let parent = get(&db, "parent").await.unwrap().unwrap();
         let unchanged = parent.pin_model(Some(big.clone())).unwrap();
         assert_eq!(unchanged.model_id.as_deref(), Some("mythos"));
         assert_eq!(
@@ -1042,7 +979,7 @@ mod tests {
             "an ordinary conversation keeps its own"
         );
 
-        let child = get_conversation(&db, "child").await.unwrap().unwrap();
+        let child = get(&db, "child").await.unwrap().unwrap();
         let pinned = child.pin_model(Some(big)).unwrap();
         assert_eq!(pinned.provider_id.as_deref(), Some("deepseek"));
         assert_eq!(pinned.model_id.as_deref(), Some("deepseek-chat"));
@@ -1062,7 +999,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(get_conversation(&db, "c1").await.is_err());
-        assert!(list_conversations(&db, false).await.is_err());
+        assert!(get(&db, "c1").await.is_err());
+        assert!(list(&db, false).await.is_err());
     }
 }

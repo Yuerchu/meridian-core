@@ -37,13 +37,13 @@ pub const INSTALLATION_ID_PREF: &str = "codex.installation_id";
 pub async fn installation_id(db: &Db) -> Option<String> {
     let id = db
         .write(async |tx| {
-            if let Some(existing) = preference::get_preference(tx, INSTALLATION_ID_PREF).await?
+            if let Some(existing) = preference::get(tx, INSTALLATION_ID_PREF).await?
                 && !existing.trim().is_empty()
             {
                 return Ok::<_, DbErr>(existing);
             }
             let minted = uuid::Uuid::new_v4().to_string();
-            preference::set_preference(tx, INSTALLATION_ID_PREF, &minted, now_ms()).await?;
+            preference::set(tx, INSTALLATION_ID_PREF, &minted, now_ms()).await?;
             Ok(minted)
         })
         .await;
@@ -72,10 +72,7 @@ mod tests {
 
         // And it is a stored preference rather than anything derived, so
         // clearing the data clears it.
-        assert_eq!(
-            preference::get_preference(&db, INSTALLATION_ID_PREF).await.unwrap(),
-            Some(first)
-        );
+        assert_eq!(preference::get(&db, INSTALLATION_ID_PREF).await.unwrap(), Some(first));
     }
 
     /// Concurrent first requests agree on one id: the read and the mint are
@@ -92,7 +89,7 @@ mod tests {
         let ids: std::collections::HashSet<_> = ids.into_iter().map(|id| id.unwrap().unwrap()).collect();
         assert_eq!(ids.len(), 1, "{ids:?}");
         assert_eq!(
-            preference::get_preference(&db, INSTALLATION_ID_PREF).await.unwrap(),
+            preference::get(&db, INSTALLATION_ID_PREF).await.unwrap(),
             ids.into_iter().next()
         );
     }

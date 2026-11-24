@@ -98,7 +98,7 @@ impl RetireCause {
 /// human-scale event, while a cached copy would mean the setting takes effect
 /// at some point nobody can name.
 pub async fn ttl(services: &Services) -> Result<Option<Duration>, String> {
-    let stored = crate::db::sea::ops::preference::get_preference(&services.db, TTL_PREFERENCE)
+    let stored = crate::db::sea::ops::preference::get(&services.db, TTL_PREFERENCE)
         .await
         .map_err(|error| format!("failed to read preference {TTL_PREFERENCE}: {error}"))?;
     let minutes = match stored {
@@ -278,7 +278,7 @@ mod tests {
     async fn set_ttl(services: &Services, raw: &str) {
         services
             .db
-            .write(async |tx| crate::db::sea::ops::preference::set_preference(tx, TTL_PREFERENCE, raw, 1).await)
+            .write(async |tx| crate::db::sea::ops::preference::set(tx, TTL_PREFERENCE, raw, 1).await)
             .await
             .unwrap();
     }

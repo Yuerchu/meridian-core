@@ -56,6 +56,33 @@ pub(crate) fn apply_configured(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    const FORBIDDEN_AMBIENT_KEYS: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "SSL_CERT_FILE",
+        "MERIDIAN_ENV_TEST_SECRET",
+    ];
+
+    fn parse_env_output(stdout: &str) -> HashMap<String, String> {
+        stdout
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_env_output_preserves_equals_in_values() {
+        let parsed = parse_env_output("HOME=fixture-home\nTOKEN=abc=def==\n");
+        assert_eq!(parsed.get("HOME").map(String::as_str), Some("fixture-home"));
+        assert_eq!(parsed.get("TOKEN").map(String::as_str), Some("abc=def=="));
+    }
 
     #[test]
     fn reserved_configuration_is_rejected_before_any_entries_are_applied() {
@@ -103,10 +130,15 @@ mod tests {
                 format!("child_env::tests::{test}"),
             ]
         };
-        let run = |cmd: &mut Command| {
+        let run_test_child = |cmd: &mut Command| {
             let output = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
         };
         if std::env::var(DRIVER).as_deref() != Ok("parent") {
             // A private parent process gives the launch sites a known ambient environment
@@ -129,16 +161,73 @@ mod tests {
             ] {
                 parent.env(key, "ambient-fixture");
             }
-            run(&mut parent);
+            // Keep any cargo-supplied LD_LIBRARY_PATH so `parent` itself can still load
+            // dynamically linked test dependencies (e.g. sherpa-onnx on Linux); otherwise
+            // inject a fixture value so we always verify it is stripped from children.
+            if std::env::var_os("LD_LIBRARY_PATH").is_none() {
+                parent.env("LD_LIBRARY_PATH", "ambient-fixture");
+            }
+            run_test_child(&mut parent);
             return;
         }
-        let acp = crate::acp::process::launch_command(program, &args("acp_child_environment"));
-        run(&mut acp.into_std());
-        let env = [("OPENAI_API_KEY".into(), "authorized-fixture".into())].into();
-        let mcp = crate::mcp::stdio::launch_command(program, &args("mcp_child_environment"), &env, None).unwrap();
-        run(&mut mcp.into_std());
+
+        #[cfg(windows)]
+        {
+            let acp = crate::acp::process::launch_command(program, &args("acp_child_environment"));
+            run_test_child(&mut acp.into_std());
+            let env = [("OPENAI_API_KEY".into(), "authorized-fixture".into())].into();
+            let mcp = crate::mcp::stdio::launch_command(program, &args("mcp_child_environment"), &env, None).unwrap();
+            run_test_child(&mut mcp.into_std());
+        }
+
+        // On Unix, re-executing the test binary after `env_clear()` fails inside `ld.so`
+        // because `clear_and_allow_platform` intentionally strips `LD_LIBRARY_PATH`, which
+        // the test binary needs for dynamically linked `sherpa-onnx`. Running the system
+        // `env` binary tests the exact cleared child environment without weakening the guard.
+        #[cfg(not(windows))]
+        {
+            let capture_env = |cmd: &mut Command| {
+                let output = cmd.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    output.status
+                );
+                parse_env_output(&stdout)
+            };
+
+            let acp_vars = capture_env(&mut crate::acp::process::launch_command("env", &[]).into_std());
+            assert!(!acp_vars.contains_key("OPENAI_API_KEY"));
+            assert_eq!(acp_vars.get("MERIDIAN_ACP_HOSTED").map(String::as_str), Some("1"));
+            assert_platform_env_map(&acp_vars);
+
+            let configured = [("OPENAI_API_KEY".into(), "authorized-fixture".into())].into();
+            let mcp_vars = capture_env(
+                &mut crate::mcp::stdio::launch_command("env", &[], &configured, None)
+                    .unwrap()
+                    .into_std(),
+            );
+            assert_eq!(
+                mcp_vars.get("OPENAI_API_KEY").map(String::as_str),
+                Some("authorized-fixture")
+            );
+            assert!(!mcp_vars.contains_key("MERIDIAN_ACP_HOSTED"));
+            assert_platform_env_map(&mcp_vars);
+        }
     }
 
+    #[cfg(all(not(windows), not(target_os = "android")))]
+    fn assert_platform_env_map(vars: &HashMap<String, String>) {
+        for key in FORBIDDEN_AMBIENT_KEYS {
+            assert!(!vars.contains_key(*key), "ambient {key} leaked");
+        }
+        assert_eq!(vars.get("HOME").map(String::as_str), Some("fixture-home"));
+        assert!(vars.contains_key("PATH"));
+    }
+
+    #[cfg(windows)]
     #[test]
     #[ignore = "invoked as an ACP child by child_env_boundary"]
     fn acp_child_environment() {
@@ -147,6 +236,7 @@ mod tests {
         assert_platform_environment();
     }
 
+    #[cfg(windows)]
     #[test]
     #[ignore = "invoked as an MCP child by child_env_boundary"]
     fn mcp_child_environment() {
@@ -155,21 +245,13 @@ mod tests {
         assert_platform_environment();
     }
 
+    #[cfg(windows)]
     fn assert_platform_environment() {
-        for key in [
-            "ANTHROPIC_API_KEY",
-            "NODE_OPTIONS",
-            "PYTHONPATH",
-            "LD_PRELOAD",
-            "DYLD_INSERT_LIBRARIES",
-            "SSL_CERT_FILE",
-            "MERIDIAN_ENV_TEST_SECRET",
-        ] {
+        for key in FORBIDDEN_AMBIENT_KEYS {
             assert!(std::env::var_os(key).is_none(), "ambient {key} leaked");
         }
         assert_eq!(std::env::var("HOME").as_deref(), Ok("fixture-home"));
         assert!(std::env::var_os("PATH").is_some());
-        #[cfg(windows)]
         assert!(std::env::var_os("SystemRoot").is_some());
     }
 }

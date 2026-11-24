@@ -231,7 +231,7 @@ impl Tool for ListStickersTool {
             .to_lowercase();
         let stickers = db
             .read(async |tx| {
-                let pack_ids = pack_ops::list_assigned_pack_ids(tx, assistant_id).await?;
+                let pack_ids = pack_ops::list_assigned_ids(tx, assistant_id).await?;
                 emoji_ops::list_confirmed_for_packs(tx, &pack_ids).await
             })
             .await
@@ -330,7 +330,7 @@ impl Tool for SendStickerTool {
         let (db, assistant_id) = context_parts(context)?;
         let stickers = db
             .read(async |tx| {
-                let pack_ids = pack_ops::list_assigned_pack_ids(tx, assistant_id).await?;
+                let pack_ids = pack_ops::list_assigned_ids(tx, assistant_id).await?;
                 emoji_ops::list_confirmed_for_packs(tx, &pack_ids).await
             })
             .await
