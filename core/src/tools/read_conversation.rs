@@ -73,9 +73,7 @@ async fn granted_targets(
     db: &impl crate::db::sea::cap::Snapshot,
     current: &str,
 ) -> Result<std::collections::HashSet<String>, String> {
-    let history = sea_ops::message::list_messages(db, current)
-        .await
-        .map_err(|e| e.to_string())?;
+    let history = sea_ops::message::list(db, current).await.map_err(|e| e.to_string())?;
     let message_ids: Vec<String> = history.iter().map(|m| m.id.clone()).collect();
     let items = sea_ops::message_context_item::list_for_messages(db, &message_ids)
         .await
@@ -172,11 +170,10 @@ impl Tool for ReadConversationTool {
                         request.conversation_id
                     )));
                 }
-                let Some(conversation) = sea_ops::conversation::get_conversation(tx, &request.conversation_id).await?
-                else {
+                let Some(conversation) = sea_ops::conversation::get(tx, &request.conversation_id).await? else {
                     return Ok(Err("the referenced conversation no longer exists".to_string()));
                 };
-                let history = sea_ops::message::list_messages(tx, &request.conversation_id).await?;
+                let history = sea_ops::message::list(tx, &request.conversation_id).await?;
                 Ok(Ok((conversation, history)))
             })
             .await
@@ -240,12 +237,12 @@ mod tests {
     async fn seeded() -> Db {
         let db = crate::db::sea::sea_test_db().await;
         db.write(async |tx| {
-            sea_ops::conversation::create_conversation(tx, "c-here", Some("here"), None, None, 1).await?;
-            sea_ops::conversation::create_conversation(tx, "c-there", Some("那边的线程"), None, None, 1).await?;
+            sea_ops::conversation::create(tx, "c-here", Some("here"), None, None, 1).await?;
+            sea_ops::conversation::create(tx, "c-there", Some("那边的线程"), None, None, 1).await?;
             let here = sea_ops::message::new_row("m-user", "c-here", "user", "看看我拖进来的线程", 2);
-            sea_ops::message::append_message(tx, here, None).await?;
+            sea_ops::message::append(tx, here, None).await?;
             let there = sea_ops::message::new_row("m-t1", "c-there", "user", "那边说过的话", 2);
-            sea_ops::message::append_message(tx, there, None).await?;
+            sea_ops::message::append(tx, there, None).await?;
             sea_ops::message_context_item::insert_many(
                 tx,
                 vec![crate::db::entity::message_context_item::Model {
@@ -334,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn a_deleted_target_reads_as_gone_not_as_a_crash() {
         let db = seeded().await;
-        db.write(async |tx| sea_ops::conversation::delete_conversation(tx, "c-there").await)
+        db.write(async |tx| sea_ops::conversation::delete(tx, "c-there").await)
             .await
             .unwrap();
         let refused = ReadConversationTool::new()

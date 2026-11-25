@@ -153,10 +153,10 @@ impl Tool for AddRedactionRuleTool {
         // The checks and the insert share one write lock, so two concurrent
         // adds cannot both pass the name check or the per-scope count.
         db.write(async |tx| {
-            if let Err(refused) = rule_ops::validate_new_rule(tx, scope, &row.scope_id, &spec).await {
+            if let Err(refused) = rule_ops::validate_new(tx, scope, &row.scope_id, &spec).await {
                 return Ok(Err(refused));
             }
-            rule_ops::create_rule(tx, row).await.map(Ok)
+            rule_ops::create(tx, row).await.map(Ok)
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -311,7 +311,7 @@ impl Tool for RemoveRedactionRuleTool {
         let db = context.db.as_ref().ok_or("no database available")?;
         let refused = db
             .write(async |tx| {
-                let Some(row) = rule_ops::get_rule_by_name(tx, scope, &scope_id, name).await? else {
+                let Some(row) = rule_ops::get_by_name(tx, scope, &scope_id, name).await? else {
                     return Ok(Some(format!(
                         "no rule named `{name}` found in {} scope",
                         scope.as_str()
@@ -322,7 +322,7 @@ impl Tool for RemoveRedactionRuleTool {
                         "`{name}` was created by the user; ask them to change it in Settings"
                     )));
                 }
-                rule_ops::delete_rule(tx, &row.id).await?;
+                rule_ops::delete(tx, &row.id).await?;
                 Ok::<_, sea_orm::DbErr>(None)
             })
             .await
@@ -423,7 +423,7 @@ mod tests {
                 created_at: 1,
                 updated_at: 1,
             };
-            db.write(async |tx| rule_ops::create_rule(tx, row).await).await.unwrap();
+            db.write(async |tx| rule_ops::create(tx, row).await).await.unwrap();
         }
         let engine = Arc::new(RedactionEngine::disabled());
         let add = AddRedactionRuleTool::new(engine);

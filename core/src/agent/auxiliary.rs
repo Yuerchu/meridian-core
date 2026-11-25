@@ -62,7 +62,7 @@ pub async fn configured(
     kind: CodexRequestKind,
 ) -> Result<Option<AuxiliaryModel>, String> {
     let raw = db
-        .read(async |tx| sea_ops::preference::get_preference(tx, AUXILIARY_MODEL_PREFERENCE).await)
+        .read(async |tx| sea_ops::preference::get(tx, AUXILIARY_MODEL_PREFERENCE).await)
         .await
         .map_err(|error| format!("failed to read preference {AUXILIARY_MODEL_PREFERENCE}: {error}"))?;
     let Some((provider_id, model_id)) = parse_selection(raw)? else {

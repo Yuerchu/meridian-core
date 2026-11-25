@@ -426,7 +426,7 @@ pub async fn attach(services: &Services, conversation_id: &str, session_id: &str
 /// are the point of the operation — writing the id is one line. A refusal is
 /// the inner `Err`, a sentence for the user; it writes nothing.
 async fn repoint(tx: &WriteTx, conversation_id: &str, session_id: &str, cwd: &str) -> Result<(), String> {
-    let row = sea_ops::conversation::get_conversation(tx, conversation_id)
+    let row = sea_ops::conversation::get(tx, conversation_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no such conversation".to_string())?;
@@ -852,13 +852,9 @@ impl Clock {
 /// person said.)
 async fn write(tx: &WriteTx, w: &Written) -> Result<Counts, DbErr> {
     let now = now_ms();
-    let project_id = sea_ops::project::find_project_by_path(tx, &w.cwd).await?.map(|p| p.id);
+    let project_id = sea_ops::project::find_by_path(tx, &w.cwd).await?.map(|p| p.id);
     // An assistant that cannot be read leaves the row with none, as before.
-    let assistant_id = sea_ops::assistant::get_default_assistant(tx)
-        .await
-        .ok()
-        .flatten()
-        .map(|a| a.id);
+    let assistant_id = sea_ops::assistant::get_default(tx).await.ok().flatten().map(|a| a.id);
 
     sea_ops::conversation::insert(
         tx,
@@ -989,7 +985,7 @@ async fn row(
     fields: message_entity::Model,
 ) -> Result<String, DbErr> {
     let id = uuid::Uuid::new_v4().to_string();
-    sea_ops::message::append_message(
+    sea_ops::message::append(
         tx,
         message_entity::Model {
             id: id.clone(),
@@ -1376,10 +1372,7 @@ mod tests {
         assert_eq!(counts.turns, 2);
         assert_eq!(counts.messages, 6);
 
-        let conversation = sea_ops::conversation::get_conversation(&db, "imported-1")
-            .await
-            .unwrap()
-            .unwrap();
+        let conversation = sea_ops::conversation::get(&db, "imported-1").await.unwrap().unwrap();
         assert_eq!(conversation.title.as_deref(), Some("Fix the queue"));
         assert_eq!(conversation.agent_kind.as_deref(), Some(super::super::AGENT_KIND));
         // Not exactly `last_active`: `trg_messages_count_insert` drags it to
@@ -1392,7 +1385,7 @@ mod tests {
             conversation.updated_at,
         );
 
-        let history = sea_ops::message::list_messages(&db, "imported-1").await.unwrap();
+        let history = sea_ops::message::list(&db, "imported-1").await.unwrap();
         let path = sea_ops::message::active_context(&history, conversation.head_message_id.as_deref());
         let shape: Vec<(&str, &str)> = path
             .path
@@ -1481,7 +1474,7 @@ mod tests {
         };
         write_on(&db, &written).await;
 
-        let rows = sea_ops::message::list_messages(&db, "imported-3").await.unwrap();
+        let rows = sea_ops::message::list(&db, "imported-3").await.unwrap();
         let assistant = rows.iter().find(|m| m.role == "assistant").unwrap();
         let stored: std::collections::BTreeMap<String, Vec<ToolCallDiff>> =
             serde_json::from_str(assistant.tool_diffs.as_deref().expect("the diff is on the row")).unwrap();
@@ -1552,7 +1545,7 @@ mod tests {
         assert_eq!(turn_scoped.severity, AcpNoticeSeverity::Error);
         assert_eq!(turn_scoped.title, "Rate limit reached.");
         let turn_id = turn_scoped.turn_id.as_deref().expect("filed on the turn that was open");
-        let first_turn_question = sea_ops::message::list_messages(&db, "imported-2")
+        let first_turn_question = sea_ops::message::list(&db, "imported-2")
             .await
             .unwrap()
             .into_iter()

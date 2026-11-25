@@ -337,16 +337,13 @@ pub(super) async fn oneshot_completion(
     let sea = &state.services.db;
     let assistant = sea
         .read(async |tx| {
-            let Some(conv) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? else {
+            let Some(conv) = crate::db::sea::ops::conversation::get(tx, conversation_id).await? else {
                 return Ok(Err(format!("conversation {conversation_id} not found")));
             };
             // An assistant that cannot be read leaves the pass on the default
             // provider, as before.
             let assistant = match conv.assistant_id {
-                Some(id) => crate::db::sea::ops::assistant::get_assistant(tx, &id)
-                    .await
-                    .ok()
-                    .flatten(),
+                Some(id) => crate::db::sea::ops::assistant::get(tx, &id).await.ok().flatten(),
                 None => None,
             };
             Ok::<_, crate::db::sea::DbErr>(Ok(assistant))
@@ -418,7 +415,7 @@ pub(super) async fn oneshot_completion(
             .services
             .db
             .write(async |tx| {
-                let head = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+                let head = crate::db::sea::ops::conversation::get(tx, conversation_id)
                     .await?
                     .and_then(|c| c.head_message_id);
                 let Some(message_id) = head else {
@@ -555,14 +552,11 @@ async fn headless_chat_inner(
     // is no longer an error on that path, only on the one that acts on it.
     let _sleep_guard = match services {
         Some(s) => {
-            let stored = crate::db::sea::ops::preference::get_preference(&s.db, "sleep_inhibitor.enabled")
+            let stored = crate::db::sea::ops::preference::get(&s.db, "sleep_inhibitor.enabled")
                 .await
                 .map_err(|error| error.to_string())?;
-            let enabled = crate::db::sea::ops::preference::parse_bool_preference(
-                "sleep_inhibitor.enabled",
-                stored.as_deref(),
-                true,
-            )?;
+            let enabled =
+                crate::db::sea::ops::preference::parse_bool("sleep_inhibitor.enabled", stored.as_deref(), true)?;
             enabled.then(|| s.sleep.begin_turn())
         }
         None => None,
@@ -571,17 +565,14 @@ async fn headless_chat_inner(
     // Load assistant + the conversation's active path, in one snapshot.
     let (assistant, ctx) = sea
         .read(async |tx| {
-            let Some(conv) = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? else {
+            let Some(conv) = crate::db::sea::ops::conversation::get(tx, conversation_id).await? else {
                 return Ok(Err(format!("conversation {conversation_id} not found")));
             };
             let assistant = match assistant_id.or(conv.assistant_id.as_deref()) {
-                Some(aid) => crate::db::sea::ops::assistant::get_assistant(tx, aid)
-                    .await
-                    .ok()
-                    .flatten(),
+                Some(aid) => crate::db::sea::ops::assistant::get(tx, aid).await.ok().flatten(),
                 None => None,
             };
-            let history = crate::db::sea::ops::message::list_messages(tx, conversation_id).await?;
+            let history = crate::db::sea::ops::message::list(tx, conversation_id).await?;
             // Resolved once and carried for the turn; see the desktop loop for
             // why the head is not re-read per row.
             let ctx = crate::db::sea::ops::message::active_context(&history, conv.head_message_id.as_deref());
@@ -945,8 +936,8 @@ async fn headless_chat_inner(
                     turn_id: Some(turn_id.to_string()),
                     ..crate::db::sea::ops::message::new_row(&row.id, conversation_id, "user", &row.text, row.created_at)
                 };
-                crate::db::sea::ops::message::append_message(tx, model, parent.as_deref()).await?;
-                crate::db::sea::ops::emoji::link_stickers_in_content(tx, &row.id, &row.text).await?;
+                crate::db::sea::ops::message::append(tx, model, parent.as_deref()).await?;
+                crate::db::sea::ops::emoji::link_emojis_in_content(tx, &row.id, &row.text).await?;
                 // Queued messages chain to each other, not all to the same parent.
                 parent = Some(row.id.clone());
             }

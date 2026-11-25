@@ -16,7 +16,7 @@ use crate::redaction::rule::RuleSpec;
 
 /// The enabled rules, global ones first, each scope in the order its rules
 /// were added.
-pub async fn list_enabled_rules(db: &impl Read) -> Result<Vec<redaction_rule::Model>, DbErr> {
+pub async fn list_enabled(db: &impl Read) -> Result<Vec<redaction_rule::Model>, DbErr> {
     redaction_rule::Entity::find()
         .filter(redaction_rule::Column::IsEnabled.eq(SqlBool::TRUE))
         .order_by_asc(redaction_rule::Column::ScopeType)
@@ -27,7 +27,7 @@ pub async fn list_enabled_rules(db: &impl Read) -> Result<Vec<redaction_rule::Mo
         .await
 }
 
-pub async fn get_rule_by_name(
+pub async fn get_by_name(
     db: &impl Read,
     scope_type: RuleScope,
     scope_id: &str,
@@ -45,19 +45,14 @@ pub async fn get_rule_by_name(
 /// name, not a name the scope already has (enabled or not), and under the
 /// per-scope limit. Takes the write transaction the insert will run in, so the
 /// answer still holds when the row goes in.
-pub async fn validate_new_rule(
-    tx: &WriteTx,
-    scope_type: RuleScope,
-    scope_id: &str,
-    spec: &RuleSpec,
-) -> Result<(), String> {
+pub async fn validate_new(tx: &WriteTx, scope_type: RuleScope, scope_id: &str, spec: &RuleSpec) -> Result<(), String> {
     use crate::redaction::builtin::BUILTIN_RULES;
 
     if BUILTIN_RULES.iter().any(|b| b.name == spec.name) {
         return Err(format!("`{}` is a built-in rule and cannot be overridden", spec.name));
     }
 
-    if let Some(existing) = get_rule_by_name(tx, scope_type, scope_id, &spec.name)
+    if let Some(existing) = get_by_name(tx, scope_type, scope_id, &spec.name)
         .await
         .map_err(|e| e.to_string())?
     {
@@ -89,7 +84,7 @@ pub async fn validate_new_rule(
 }
 
 /// Inserts the row the caller built.
-pub async fn create_rule(tx: &WriteTx, model: redaction_rule::Model) -> Result<(), DbErr> {
+pub async fn create(tx: &WriteTx, model: redaction_rule::Model) -> Result<(), DbErr> {
     redaction_rule::Entity::insert(model.into_active_model())
         .exec_without_returning(tx.conn()?)
         .await?;
@@ -97,7 +92,7 @@ pub async fn create_rule(tx: &WriteTx, model: redaction_rule::Model) -> Result<(
 }
 
 /// How many rows went: 0 for an id that was already gone.
-pub async fn delete_rule(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
     Ok(redaction_rule::Entity::delete_by_id(id)
         .exec(tx.conn()?)
         .await?
@@ -145,12 +140,12 @@ mod tests {
     }
 
     async fn insert(db: &Db, model: redaction_rule::Model) {
-        db.write(async |tx| create_rule(tx, model).await).await.unwrap();
+        db.write(async |tx| create(tx, model).await).await.unwrap();
     }
 
     async fn validate(db: &Db, scope: RuleScope, scope_id: &str, name: &str) -> Result<(), String> {
         let spec = spec(name);
-        db.write(async |tx| Ok::<_, DbErr>(validate_new_rule(tx, scope, scope_id, &spec).await))
+        db.write(async |tx| Ok::<_, DbErr>(validate_new(tx, scope, scope_id, &spec).await))
             .await
             .unwrap()
     }
@@ -165,22 +160,13 @@ mod tests {
         off.is_enabled = SqlBool::FALSE;
         insert(&db, off).await;
 
-        let ids: Vec<_> = list_enabled_rules(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
+        let ids: Vec<_> = list_enabled(&db).await.unwrap().into_iter().map(|r| r.id).collect();
         assert_eq!(ids, ["g1", "g2", "p1"]);
-        let found = get_rule_by_name(&db, RuleScope::Global, GLOBAL_SCOPE_ID, "a")
-            .await
-            .unwrap();
+        let found = get_by_name(&db, RuleScope::Global, GLOBAL_SCOPE_ID, "a").await.unwrap();
         assert_eq!(found, Some(rule("g1", RuleScope::Global, GLOBAL_SCOPE_ID, "a", 2)));
-        assert_eq!(db.write(async |tx| delete_rule(tx, "g1").await).await.unwrap(), 1);
+        assert_eq!(db.write(async |tx| delete(tx, "g1").await).await.unwrap(), 1);
         assert_eq!(
-            get_rule_by_name(&db, RuleScope::Global, GLOBAL_SCOPE_ID, "a")
-                .await
-                .unwrap(),
+            get_by_name(&db, RuleScope::Global, GLOBAL_SCOPE_ID, "a").await.unwrap(),
             None
         );
     }
@@ -239,6 +225,6 @@ mod tests {
         execute_for_tests(&db, r#"UPDATE redaction_rules SET examples = '[{"text": "x"}]'"#)
             .await
             .unwrap();
-        assert!(list_enabled_rules(&db).await.is_err());
+        assert!(list_enabled(&db).await.is_err());
     }
 }

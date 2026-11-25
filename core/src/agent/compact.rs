@@ -268,10 +268,10 @@ pub async fn do_compact(
     // names and their items are read at the same instant.
     let (ctx, context_items, sender_names) = db
         .read(async |tx| {
-            let Some(conv) = sea_ops::conversation::get_conversation(tx, conversation_id).await? else {
+            let Some(conv) = sea_ops::conversation::get(tx, conversation_id).await? else {
                 return Ok(Err(format!("conversation {conversation_id} not found")));
             };
-            let history = sea_ops::message::list_messages(tx, conversation_id).await?;
+            let history = sea_ops::message::list(tx, conversation_id).await?;
             let ctx = sea_ops::message::active_context(&history, conv.head_message_id.as_deref());
             let path_ids = ctx.path.iter().map(|message| message.id.clone()).collect::<Vec<_>>();
             let context_items = sea_ops::message_context_item::list_for_messages(tx, &path_ids).await?;
@@ -397,7 +397,7 @@ pub async fn do_compact(
         row.sort_order = -1;
         row.is_compact_summary = SqlBool::TRUE;
         row.compact_anchor_id = Some(anchor_id.clone());
-        sea_ops::message::insert_message(tx, row).await?;
+        sea_ops::message::insert(tx, row).await?;
 
         // Best effort, like every other audit write: a summary that was
         // produced and not accounted for is a gap in the ledger, and refusing
@@ -1498,21 +1498,15 @@ mod tests {
             Arc::new(crate::keyring::test_support::MockKeyringStore::new()),
         ));
         db.write(async |tx| {
-            sea_ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
+            sea_ops::conversation::create(tx, "c1", None, None, None, 1).await?;
             let mut parent: Option<String> = None;
             for index in 0..6 {
                 let role = if index % 2 == 0 { "user" } else { "assistant" };
                 let row = sea_ops::message::new_row(&format!("m{index}"), "c1", role, "words", 1);
-                let written = sea_ops::message::append_message(tx, row, parent.as_deref()).await?;
+                let written = sea_ops::message::append(tx, row, parent.as_deref()).await?;
                 parent = Some(written.id);
             }
-            sea_ops::preference::set_preference(
-                tx,
-                crate::agent::auxiliary::AUXILIARY_MODEL_PREFERENCE,
-                "gone:cheap",
-                1,
-            )
-            .await
+            sea_ops::preference::set(tx, crate::agent::auxiliary::AUXILIARY_MODEL_PREFERENCE, "gone:cheap", 1).await
         })
         .await
         .unwrap();

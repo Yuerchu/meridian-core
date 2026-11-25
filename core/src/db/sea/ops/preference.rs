@@ -13,7 +13,7 @@ use crate::db::types::EpochMs;
 
 /// `None` when the key has no row, which every caller treats as "the shipped
 /// default", as distinct from a row holding an empty string.
-pub async fn get_preference(db: &impl Read, key: &str) -> Result<Option<String>, DbErr> {
+pub async fn get(db: &impl Read, key: &str) -> Result<Option<String>, DbErr> {
     Ok(preference::Entity::find_by_id(key)
         .one(db.conn()?)
         .await?
@@ -23,7 +23,7 @@ pub async fn get_preference(db: &impl Read, key: &str) -> Result<Option<String>,
 /// Writes or overwrites the row. An upsert rather than Diesel's `REPLACE`,
 /// which deletes and re-inserts: the same result here, where nothing
 /// references the row, and the form every backend has.
-pub async fn set_preference(tx: &WriteTx, key: &str, value: &str, now: EpochMs) -> Result<(), DbErr> {
+pub async fn set(tx: &WriteTx, key: &str, value: &str, now: EpochMs) -> Result<(), DbErr> {
     let row = preference::ActiveModel {
         key: Set(key.to_owned()),
         value: Set(value.to_owned()),
@@ -41,12 +41,12 @@ pub async fn set_preference(tx: &WriteTx, key: &str, value: &str, now: EpochMs) 
 }
 
 /// Removes the row; a key with no row is not an error, as with Diesel.
-pub async fn delete_preference(tx: &WriteTx, key: &str) -> Result<(), DbErr> {
+pub async fn delete(tx: &WriteTx, key: &str) -> Result<(), DbErr> {
     preference::Entity::delete_by_id(key).exec(tx.conn()?).await?;
     Ok(())
 }
 
-pub fn parse_bool_preference(key: &str, value: Option<&str>, default: bool) -> Result<bool, String> {
+pub fn parse_bool(key: &str, value: Option<&str>, default: bool) -> Result<bool, String> {
     match value {
         None => Ok(default),
         Some("true") => Ok(true),
@@ -61,12 +61,12 @@ mod tests {
 
     #[test]
     fn bool_preferences_are_closed_but_keep_the_missing_default() {
-        assert!(parse_bool_preference("feature.enabled", None, true).unwrap());
-        assert!(!parse_bool_preference("feature.enabled", None, false).unwrap());
-        assert!(parse_bool_preference("feature.enabled", Some("true"), false).unwrap());
-        assert!(!parse_bool_preference("feature.enabled", Some("false"), true).unwrap());
-        assert!(parse_bool_preference("feature.enabled", Some("1"), true).is_err());
-        assert!(parse_bool_preference("feature.enabled", Some("TRUE"), true).is_err());
+        assert!(parse_bool("feature.enabled", None, true).unwrap());
+        assert!(!parse_bool("feature.enabled", None, false).unwrap());
+        assert!(parse_bool("feature.enabled", Some("true"), false).unwrap());
+        assert!(!parse_bool("feature.enabled", Some("false"), true).unwrap());
+        assert!(parse_bool("feature.enabled", Some("1"), true).is_err());
+        assert!(parse_bool("feature.enabled", Some("TRUE"), true).is_err());
     }
 
     use super::*;
@@ -75,23 +75,17 @@ mod tests {
     #[tokio::test]
     async fn a_missing_key_reads_as_none_and_deleting_it_is_not_an_error() {
         let db = sea_test_db().await;
-        assert_eq!(get_preference(&db, "never.set").await.unwrap(), None);
-        db.write(async |tx| delete_preference(tx, "never.set").await)
-            .await
-            .unwrap();
+        assert_eq!(get(&db, "never.set").await.unwrap(), None);
+        db.write(async |tx| delete(tx, "never.set").await).await.unwrap();
     }
 
     #[tokio::test]
     async fn a_second_set_overwrites_the_value_and_the_time() {
         let db = sea_test_db().await;
-        db.write(async |tx| set_preference(tx, "theme", "dark", 10).await)
-            .await
-            .unwrap();
-        db.write(async |tx| set_preference(tx, "theme", "light", 20).await)
-            .await
-            .unwrap();
+        db.write(async |tx| set(tx, "theme", "dark", 10).await).await.unwrap();
+        db.write(async |tx| set(tx, "theme", "light", 20).await).await.unwrap();
 
-        assert_eq!(get_preference(&db, "theme").await.unwrap().as_deref(), Some("light"));
+        assert_eq!(get(&db, "theme").await.unwrap().as_deref(), Some("light"));
         let row = preference::Entity::find_by_id("theme")
             .one(db.conn().unwrap())
             .await
@@ -108,17 +102,14 @@ mod tests {
     #[tokio::test]
     async fn an_empty_string_is_a_value_and_delete_makes_it_absent() {
         let db = sea_test_db().await;
-        db.write(async |tx| set_preference(tx, "onebot.access_token", "", 1).await)
+        db.write(async |tx| set(tx, "onebot.access_token", "", 1).await)
             .await
             .unwrap();
-        assert_eq!(
-            get_preference(&db, "onebot.access_token").await.unwrap().as_deref(),
-            Some("")
-        );
-        db.write(async |tx| delete_preference(tx, "onebot.access_token").await)
+        assert_eq!(get(&db, "onebot.access_token").await.unwrap().as_deref(), Some(""));
+        db.write(async |tx| delete(tx, "onebot.access_token").await)
             .await
             .unwrap();
-        assert_eq!(get_preference(&db, "onebot.access_token").await.unwrap(), None);
+        assert_eq!(get(&db, "onebot.access_token").await.unwrap(), None);
     }
 
     /// The reads and the write of one key happen inside one `WriteTx`, as a
@@ -128,8 +119,8 @@ mod tests {
         let db = sea_test_db().await;
         let seen = db
             .write(async |tx| {
-                set_preference(tx, "k", "v", 1).await?;
-                get_preference(tx, "k").await
+                set(tx, "k", "v", 1).await?;
+                get(tx, "k").await
             })
             .await
             .unwrap();

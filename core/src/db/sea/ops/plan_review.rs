@@ -1811,7 +1811,7 @@ mod store_tests {
     }
 
     async fn seed_conversation(db: &Db, id: &str) {
-        db.write(async |tx| conversation::create_conversation(tx, id, None, None, None, 1).await)
+        db.write(async |tx| conversation::create(tx, id, None, None, None, 1).await)
             .await
             .unwrap();
     }
@@ -2001,7 +2001,7 @@ mod store_tests {
         assert!(fb.contains("Add error handling here"));
         assert!(fb.contains("- Step 1 (with tests)"));
 
-        let conv = conversation::get_conversation(&db, "c1").await.unwrap().unwrap();
+        let conv = conversation::get(&db, "c1").await.unwrap().unwrap();
         assert_eq!(conv.mode, None);
         assert!(conv.accept_edits.get());
 

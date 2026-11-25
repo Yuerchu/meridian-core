@@ -101,11 +101,11 @@ pub async fn bootstrap_with_secrets(
     // Create default assistant on first run
     let seeded = sea
         .write(async |tx| {
-            if db::sea::ops::assistant::get_default_assistant(tx).await?.is_some() {
+            if db::sea::ops::assistant::get_default(tx).await?.is_some() {
                 return Ok(());
             }
             let now = now_ms();
-            db::sea::ops::assistant::create_assistant(
+            db::sea::ops::assistant::create(
                 tx,
                 assistant_entity::Model {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -198,18 +198,18 @@ pub async fn bootstrap_with_secrets(
                     // The row and the default assistant pointed at it, together.
                     let written = sea
                         .write(async |tx| {
-                            if !db::sea::ops::provider::list_providers(tx).await?.is_empty() {
+                            if !db::sea::ops::provider::list(tx).await?.is_empty() {
                                 return Ok(None);
                             }
-                            let provider = db::sea::ops::provider::create_provider(tx, row).await?;
-                            if let Some(default_assistant) = db::sea::ops::assistant::get_default_assistant(tx).await? {
+                            let provider = db::sea::ops::provider::create(tx, row).await?;
+                            if let Some(default_assistant) = db::sea::ops::assistant::get_default(tx).await? {
                                 let changeset = AssistantChangeset {
                                     provider_id: Some(Some(provider.id.clone())),
                                     model_id: model.clone().map(Some),
                                     updated_at: Some(now),
                                     ..Default::default()
                                 };
-                                db::sea::ops::assistant::update_assistant(tx, &default_assistant.id, changeset).await?;
+                                db::sea::ops::assistant::update(tx, &default_assistant.id, changeset).await?;
                             }
                             Ok::<_, DbErr>(Some(provider))
                         })
@@ -234,7 +234,7 @@ pub async fn bootstrap_with_secrets(
 
     // Load custom tools from DB into tool registry
     let registry = tools::ToolRegistry::new(skills_root.clone(), data_dir.join("logs"), redaction.clone());
-    match db::sea::ops::custom_tool::list_enabled_tools(&sea).await {
+    match db::sea::ops::custom_tool::list_enabled(&sea).await {
         Ok(custom_tools) => registry.set_custom_tools(
             custom_tools
                 .iter()
@@ -336,7 +336,7 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
     let unreadable = |error: sea_orm::DbErr| format!("could not read the tool presets: {error}");
 
     // pool-read-before-write: startup, nothing else writes yet (see the top of this function).
-    if ops::tool_category::count_categories(sea).await.unwrap_or(0) == 0 {
+    if ops::tool_category::count(sea).await.unwrap_or(0) == 0 {
         let now = now_ms();
         let cats = [
             ("cat_interaction", "Interaction", "User interaction tools", 0),
@@ -353,9 +353,7 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
                 sort_order: order,
                 created_at: now,
             };
-            let _ = sea
-                .write(async |tx| ops::tool_category::create_category(tx, row).await)
-                .await;
+            let _ = sea.write(async |tx| ops::tool_category::create(tx, row).await).await;
         }
     }
 
@@ -387,11 +385,7 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
     // pick up newly added built-in presets.
     for (id, name, desc, tools_json, order) in presets {
         // pool-read-before-write: startup, nothing else writes yet (see the top of this function).
-        if ops::tool_preset::get_preset(sea, id)
-            .await
-            .map_err(unreadable)?
-            .is_some()
-        {
+        if ops::tool_preset::get(sea, id).await.map_err(unreadable)?.is_some() {
             continue;
         }
         let row = tool_preset::Model {
@@ -405,15 +399,13 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
             created_at: now,
             updated_at: now,
         };
-        let _ = sea
-            .write(async |tx| ops::tool_preset::create_preset(tx, row).await)
-            .await;
+        let _ = sea.write(async |tx| ops::tool_preset::create(tx, row).await).await;
     }
     // Repair presets from earlier seeds: "glob_files" never existed
     // (real tool name is "glob"), the built-in Research preset
     // gained web_search, and Coding gained update_todos.
     // pool-read-before-write: startup, nothing else writes yet (see the top of this function).
-    for p in ops::tool_preset::list_presets(sea).await.map_err(unreadable)? {
+    for p in ops::tool_preset::list(sea).await.map_err(unreadable)? {
         let builtin = p.is_builtin.get();
         let mut names = p.tool_names.into_inner();
         let mut changed = false;
@@ -448,7 +440,7 @@ async fn seed_tool_catalog(sea: &db::sea::cap::Db) -> Result<(), String> {
                 ..Default::default()
             };
             let _ = sea
-                .write(async |tx| ops::tool_preset::update_preset(tx, &p.id, changeset).await)
+                .write(async |tx| ops::tool_preset::update(tx, &p.id, changeset).await)
                 .await;
         }
     }
@@ -505,7 +497,7 @@ pub(crate) async fn startup_recovery(sea: &db::sea::cap::Db, plan_files: &crate:
     // others done, and the next startup retries it.
     use db::sea::ops::memory as mem_ops;
     let orphans = sea
-        .write(async |tx| mem_ops::purge_orphan_project_memories(tx).await)
+        .write(async |tx| mem_ops::purge_orphan_projects(tx).await)
         .await
         .unwrap_or(0);
     let proposals = sea
@@ -565,7 +557,7 @@ pub(crate) async fn startup_recovery(sea: &db::sea::cap::Db, plan_files: &crate:
 /// idempotence is what stops this and a hand-clicked Connect from starting two
 /// processes for one server.
 pub async fn reconnect_mcp(services: Services) {
-    let servers = match db::sea::ops::mcp_server::list_enabled_mcp_servers(&services.db).await {
+    let servers = match db::sea::ops::mcp_server::list_enabled(&services.db).await {
         Ok(servers) => servers,
         // A row that does not decode fails the whole list, and with it every
         // auto-connect; said here, since nobody is looking at the settings
@@ -699,11 +691,9 @@ mod tests {
         };
 
         let services = start().await;
-        let providers = crate::db::sea::ops::provider::list_providers(&services.db)
-            .await
-            .unwrap();
+        let providers = crate::db::sea::ops::provider::list(&services.db).await.unwrap();
         assert_eq!(providers.len(), 1);
-        let assistant = crate::db::sea::ops::assistant::get_default_assistant(&services.db)
+        let assistant = crate::db::sea::ops::assistant::get_default(&services.db)
             .await
             .unwrap()
             .unwrap();
@@ -716,12 +706,6 @@ mod tests {
         drop(services);
 
         let again = start().await;
-        assert_eq!(
-            crate::db::sea::ops::provider::list_providers(&again.db)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(crate::db::sea::ops::provider::list(&again.db).await.unwrap().len(), 1);
     }
 }

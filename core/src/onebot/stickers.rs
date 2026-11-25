@@ -59,7 +59,7 @@ async fn ensure_pack(state: &SharedState, account_id: &str) -> Result<String, St
                 return Ok(pack.id);
             }
             let now = crate::util::now_ms();
-            let pack = pack_ops::create_pack(
+            let pack = pack_ops::create(
                 tx,
                 emoji_pack::Model {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -76,7 +76,7 @@ async fn ensure_pack(state: &SharedState, account_id: &str) -> Result<String, St
             )
             .await?;
             if let Some(assistant_id) = assistant_id.as_deref() {
-                pack_ops::assign_pack(tx, assistant_id, &pack.id, now).await?;
+                pack_ops::assign(tx, assistant_id, &pack.id, now).await?;
             }
             Ok(pack.id)
         })
@@ -119,7 +119,7 @@ async fn record_new(state: &SharedState, row: emoji::Model, hint: Option<&str>, 
             } else {
                 row.name = base_name;
             }
-            emoji_ops::create_emoji(tx, row).await.map(|created| created.id)
+            emoji_ops::create(tx, row).await.map(|created| created.id)
         })
         .await
         .map_err(|e: sea_orm::DbErr| tracing::warn!(error = %e, "could not record a captured sticker"))
@@ -277,7 +277,7 @@ async fn evict_candidates(state: &SharedState, pack_id: &str, data_dir: &std::pa
         }
         // A referenced sticker fails here, with the key, and is kept.
         if sea
-            .write(async |tx| emoji_ops::delete_emoji(tx, &sticker.id).await)
+            .write(async |tx| emoji_ops::delete(tx, &sticker.id).await)
             .await
             .is_ok_and(|deleted| deleted > 0)
         {

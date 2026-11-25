@@ -13,7 +13,7 @@ use crate::db::sea::cap::{Read, WriteTx};
 use crate::db::sea::ops::memory;
 
 /// Most recently touched first.
-pub async fn list_projects(db: &impl Read) -> Result<Vec<project::Model>, DbErr> {
+pub async fn list(db: &impl Read) -> Result<Vec<project::Model>, DbErr> {
     project::Entity::find()
         .order_by_desc(project::Column::UpdatedAt)
         .all(db.conn()?)
@@ -22,7 +22,7 @@ pub async fn list_projects(db: &impl Read) -> Result<Vec<project::Model>, DbErr>
 
 /// `None` for an id with no row. The Diesel version answers `NotFound`
 /// instead; here the absence is in the type.
-pub async fn get_project(db: &impl Read, id: &str) -> Result<Option<project::Model>, DbErr> {
+pub async fn get(db: &impl Read, id: &str) -> Result<Option<project::Model>, DbErr> {
     project::Entity::find_by_id(id).one(db.conn()?).await
 }
 
@@ -31,17 +31,17 @@ fn not_found(id: &str) -> DbErr {
 }
 
 /// Inserts the row the caller built and reads it back.
-pub async fn create_project(tx: &WriteTx, model: project::Model) -> Result<project::Model, DbErr> {
+pub async fn create(tx: &WriteTx, model: project::Model) -> Result<project::Model, DbErr> {
     let id = model.id.clone();
     project::Entity::insert(model.into_active_model())
         .exec_without_returning(tx.conn()?)
         .await?;
-    get_project(tx, &id).await?.ok_or_else(|| not_found(&id))
+    get(tx, &id).await?.ok_or_else(|| not_found(&id))
 }
 
 /// `RecordNotFound` when there is no such row, before anything is written.
-pub async fn update_project(tx: &WriteTx, id: &str, changeset: ProjectChangeset) -> Result<project::Model, DbErr> {
-    let existing = get_project(tx, id).await?.ok_or_else(|| not_found(id))?;
+pub async fn update(tx: &WriteTx, id: &str, changeset: ProjectChangeset) -> Result<project::Model, DbErr> {
+    let existing = get(tx, id).await?.ok_or_else(|| not_found(id))?;
     let mut row = changeset.into_active_model();
     row.id = Unchanged(existing.id);
     row.update(tx.conn()?).await
@@ -52,7 +52,7 @@ pub async fn update_project(tx: &WriteTx, id: &str, changeset: ProjectChangeset)
 /// key, so nothing would cascade on its own. Conversations in it keep their
 /// rows with no project. How many projects went: 0 for an id already gone.
 /// The project a OneBot session lives in, by where its messages come from.
-pub async fn find_project_by_source(
+pub async fn find_by_source(
     db: &impl Read,
     source_type: project::ProjectSource,
     source_id: &str,
@@ -67,7 +67,7 @@ pub async fn find_project_by_source(
 /// The project whose directory this is, however the two sides spelled it
 /// (`normalize_path`). Most recently touched first, so of
 /// two spellings of one directory the live project wins.
-pub async fn find_project_by_path(db: &impl Read, path: &str) -> Result<Option<project::Model>, DbErr> {
+pub async fn find_by_path(db: &impl Read, path: &str) -> Result<Option<project::Model>, DbErr> {
     let wanted = normalize_path(path);
     if wanted.is_empty() {
         return Ok(None);
@@ -103,8 +103,8 @@ pub(crate) fn normalize_path(path: &str) -> String {
     }
 }
 
-pub async fn delete_project(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
-    memory::delete_project_memories(tx, id).await?;
+pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+    memory::delete_for_project(tx, id).await?;
     Ok(project::Entity::delete_by_id(id).exec(tx.conn()?).await?.rows_affected)
 }
 
@@ -133,7 +133,7 @@ mod tests {
             path: path.map(str::to_owned),
             ..project_row(id, 1)
         };
-        db.write(async |tx| create_project(tx, row).await).await.unwrap();
+        db.write(async |tx| create(tx, row).await).await.unwrap();
     }
 
     /// The two sides are typed by different programs, so they agree on the
@@ -162,7 +162,7 @@ mod tests {
         with_path(&db, "p1", Some(stored)).await;
 
         for asked in asked {
-            let found = find_project_by_path(&db, asked).await.unwrap();
+            let found = find_by_path(&db, asked).await.unwrap();
             assert_eq!(found.map(|p| p.id), Some("p1".into()), "asked `{asked}`");
         }
     }
@@ -175,9 +175,9 @@ mod tests {
         with_path(&db, "p1", Some("C:/Code/repo")).await;
         with_path(&db, "p2", None).await;
 
-        assert!(find_project_by_path(&db, "C:/Code/other").await.unwrap().is_none());
-        assert!(find_project_by_path(&db, "C:/Code").await.unwrap().is_none());
-        assert!(find_project_by_path(&db, "").await.unwrap().is_none());
+        assert!(find_by_path(&db, "C:/Code/other").await.unwrap().is_none());
+        assert!(find_by_path(&db, "C:/Code").await.unwrap().is_none());
+        assert!(find_by_path(&db, "").await.unwrap().is_none());
     }
 
     /// Project comparison still trims: a picker or another program's cwd
@@ -195,14 +195,9 @@ mod tests {
         let db = sea_test_db().await;
         for (id, at) in [("old", 1), ("new", 5)] {
             let row = project_row(id, at);
-            assert_eq!(
-                db.write(async |tx| create_project(tx, row.clone()).await)
-                    .await
-                    .unwrap(),
-                row
-            );
+            assert_eq!(db.write(async |tx| create(tx, row.clone()).await).await.unwrap(), row);
         }
-        let ids: Vec<_> = list_projects(&db).await.unwrap().into_iter().map(|p| p.id).collect();
+        let ids: Vec<_> = list(&db).await.unwrap().into_iter().map(|p| p.id).collect();
         assert_eq!(ids, ["new", "old"]);
 
         let updated = db
@@ -213,7 +208,7 @@ mod tests {
                     updated_at: Some(9),
                     ..Default::default()
                 };
-                update_project(tx, "old", changes).await
+                update(tx, "old", changes).await
             })
             .await
             .unwrap();
@@ -227,7 +222,7 @@ mod tests {
             }
         );
         let missing = db
-            .write(async |tx| update_project(tx, "nope", ProjectChangeset::default()).await)
+            .write(async |tx| update(tx, "nope", ProjectChangeset::default()).await)
             .await;
         assert!(matches!(missing, Err(DbErr::RecordNotFound(_))));
     }
@@ -238,9 +233,7 @@ mod tests {
     async fn deleting_a_project_deletes_its_memories() {
         let db = sea_test_db().await;
         for id in ["gone", "kept"] {
-            db.write(async |tx| create_project(tx, project_row(id, 1)).await)
-                .await
-                .unwrap();
+            db.write(async |tx| create(tx, project_row(id, 1)).await).await.unwrap();
         }
         execute_for_tests(
             &db,
@@ -252,11 +245,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(db.write(async |tx| delete_project(tx, "gone").await).await.unwrap(), 1);
-        assert_eq!(get_project(&db, "gone").await.unwrap(), None);
+        assert_eq!(db.write(async |tx| delete(tx, "gone").await).await.unwrap(), 1);
+        assert_eq!(get(&db, "gone").await.unwrap(), None);
         let left: Vec<_> = memory::list_all(&db).await.unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(left.len(), 2);
         assert!(!left.contains(&"m1".to_string()), "{left:?}");
-        assert_eq!(db.write(async |tx| delete_project(tx, "gone").await).await.unwrap(), 0);
+        assert_eq!(db.write(async |tx| delete(tx, "gone").await).await.unwrap(), 0);
     }
 }

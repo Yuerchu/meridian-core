@@ -765,7 +765,7 @@ mod tests {
     async fn a_turn_the_loop_guard_stopped_is_not_recorded_as_done() {
         let db = crate::db::sea::sea_test_db().await;
         db.write(async |tx| {
-            crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await?;
+            crate::db::sea::ops::conversation::create(tx, "c1", None, None, None, 1).await?;
             begin(tx, "t1", "c1", TurnOrigin::Desktop, None, 1000).await?;
             finish(
                 tx,

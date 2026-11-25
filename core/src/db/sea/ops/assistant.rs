@@ -11,20 +11,20 @@ use crate::db::entity::assistant::AssistantChangeset;
 use crate::db::sea::cap::sealed::Access;
 use crate::db::sea::cap::{Read, WriteTx};
 
-pub async fn list_assistants(db: &impl Read) -> Result<Vec<assistant::Model>, DbErr> {
+pub async fn list(db: &impl Read) -> Result<Vec<assistant::Model>, DbErr> {
     assistant::Entity::find()
         .order_by_asc(assistant::Column::SortOrder)
         .all(db.conn()?)
         .await
 }
 
-pub async fn get_assistant(db: &impl Read, id: &str) -> Result<Option<assistant::Model>, DbErr> {
+pub async fn get(db: &impl Read, id: &str) -> Result<Option<assistant::Model>, DbErr> {
     assistant::Entity::find_by_id(id).one(db.conn()?).await
 }
 
 /// The assistant marked default, if any. More than one is not prevented by
 /// the schema; the first the table yields wins, as it always has.
-pub async fn get_default_assistant(db: &impl Read) -> Result<Option<assistant::Model>, DbErr> {
+pub async fn get_default(db: &impl Read) -> Result<Option<assistant::Model>, DbErr> {
     assistant::Entity::find()
         .filter(assistant::Column::IsDefault.eq(crate::db::types::SqlBool::TRUE))
         .one(db.conn()?)
@@ -36,21 +36,17 @@ fn not_found(id: &str) -> DbErr {
 }
 
 /// Inserts the row the caller built and reads it back.
-pub async fn create_assistant(tx: &WriteTx, model: assistant::Model) -> Result<assistant::Model, DbErr> {
+pub async fn create(tx: &WriteTx, model: assistant::Model) -> Result<assistant::Model, DbErr> {
     let id = model.id.clone();
     assistant::Entity::insert(model.into_active_model())
         .exec_without_returning(tx.conn()?)
         .await?;
-    get_assistant(tx, &id).await?.ok_or_else(|| not_found(&id))
+    get(tx, &id).await?.ok_or_else(|| not_found(&id))
 }
 
 /// `RecordNotFound` when there is no such row, before anything is written.
-pub async fn update_assistant(
-    tx: &WriteTx,
-    id: &str,
-    changeset: AssistantChangeset,
-) -> Result<assistant::Model, DbErr> {
-    let existing = get_assistant(tx, id).await?.ok_or_else(|| not_found(id))?;
+pub async fn update(tx: &WriteTx, id: &str, changeset: AssistantChangeset) -> Result<assistant::Model, DbErr> {
+    let existing = get(tx, id).await?.ok_or_else(|| not_found(id))?;
     let mut row = changeset.into_active_model();
     row.id = Unchanged(existing.id);
     row.update(tx.conn()?).await
@@ -59,7 +55,7 @@ pub async fn update_assistant(
 /// How many rows went: 0 for an id that was already gone. Conversations and
 /// projects that named it are set to no assistant; its skill and sticker-pack
 /// bindings go with it.
-pub async fn delete_assistant(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
     Ok(assistant::Entity::delete_by_id(id)
         .exec(tx.conn()?)
         .await?
@@ -101,19 +97,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_default_assistant_is_the_one_marked_default() {
         let db = sea_test_db().await;
-        assert!(get_default_assistant(&db).await.unwrap().is_none());
+        assert!(get_default(&db).await.unwrap().is_none());
         let mut marked = assistant_row("b", 1);
         marked.is_default = SqlBool::TRUE;
         db.write(async |tx| {
-            create_assistant(tx, assistant_row("a", 0)).await?;
-            create_assistant(tx, marked).await
+            create(tx, assistant_row("a", 0)).await?;
+            create(tx, marked).await
         })
         .await
         .unwrap();
-        assert_eq!(
-            get_default_assistant(&db).await.unwrap().map(|a| a.id).as_deref(),
-            Some("b")
-        );
+        assert_eq!(get_default(&db).await.unwrap().map(|a| a.id).as_deref(), Some("b"));
     }
 
     #[tokio::test]
@@ -121,20 +114,18 @@ pub(crate) mod tests {
         let db = sea_test_db().await;
         let written = assistant_row("b", 1);
         assert_eq!(
-            db.write(async |tx| create_assistant(tx, written.clone()).await)
-                .await
-                .unwrap(),
+            db.write(async |tx| create(tx, written.clone()).await).await.unwrap(),
             written
         );
-        db.write(async |tx| create_assistant(tx, assistant_row("a", 0)).await)
+        db.write(async |tx| create(tx, assistant_row("a", 0)).await)
             .await
             .unwrap();
-        let ids: Vec<_> = list_assistants(&db).await.unwrap().into_iter().map(|a| a.id).collect();
+        let ids: Vec<_> = list(&db).await.unwrap().into_iter().map(|a| a.id).collect();
         assert_eq!(ids, ["a", "b"]);
 
         let updated = db
             .write(async |tx| {
-                update_assistant(
+                update(
                     tx,
                     "b",
                     AssistantChangeset {
@@ -161,10 +152,10 @@ pub(crate) mod tests {
         assert_eq!(updated.system_prompt, "be brief", "a field left out is not written");
 
         let missing = db
-            .write(async |tx| update_assistant(tx, "nope", AssistantChangeset::default()).await)
+            .write(async |tx| update(tx, "nope", AssistantChangeset::default()).await)
             .await;
         assert!(matches!(missing, Err(DbErr::RecordNotFound(_))));
-        assert_eq!(db.write(async |tx| delete_assistant(tx, "b").await).await.unwrap(), 1);
-        assert_eq!(get_assistant(&db, "b").await.unwrap(), None);
+        assert_eq!(db.write(async |tx| delete(tx, "b").await).await.unwrap(), 1);
+        assert_eq!(get(&db, "b").await.unwrap(), None);
     }
 }

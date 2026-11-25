@@ -153,7 +153,7 @@ pub const STORAGE_KEY_PREF: &str = "onebot.voice_storage_key";
 pub async fn storage_key(db: &Db) -> Result<Vec<u8>, String> {
     let existing = db
         .write(async |tx| {
-            if let Some(existing) = crate::db::sea::ops::preference::get_preference(tx, STORAGE_KEY_PREF)
+            if let Some(existing) = crate::db::sea::ops::preference::get(tx, STORAGE_KEY_PREF)
                 .await?
                 .filter(|v| !v.trim().is_empty())
             {
@@ -162,8 +162,7 @@ pub async fn storage_key(db: &Db) -> Result<Vec<u8>, String> {
             // uuid 的随机性来自 getrandom,这里要的就是"没人能猜到"。两个 v4
             // 拼起来是 256 位。
             let fresh = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-            crate::db::sea::ops::preference::set_preference(tx, STORAGE_KEY_PREF, &fresh, crate::util::now_ms())
-                .await?;
+            crate::db::sea::ops::preference::set(tx, STORAGE_KEY_PREF, &fresh, crate::util::now_ms()).await?;
             Ok::<_, sea_orm::DbErr>(fresh)
         })
         .await

@@ -201,11 +201,11 @@ async fn freeze_in(
         if !seen.insert(id.as_str()) {
             continue;
         }
-        let conversation = sea_ops::conversation::get_conversation(db, id)
+        let conversation = sea_ops::conversation::get(db, id)
             .await
             .map_err(|error| format!("reading {id}: {error}"))?
             .ok_or_else(|| format!("referenced conversation {id} does not exist"))?;
-        let history = sea_ops::message::list_messages(db, id)
+        let history = sea_ops::message::list(db, id)
             .await
             .map_err(|error| format!("reading {id}: {error}"))?;
         let context = sea_ops::message::active_context(&history, conversation.head_message_id.as_deref());
@@ -329,10 +329,10 @@ mod tests {
     async fn seeded() -> Db {
         let db = crate::db::sea::sea_test_db().await;
         db.write(async |tx| {
-            sea_ops::conversation::create_conversation(tx, "c-cur", Some("当前"), None, None, 1).await?;
-            sea_ops::conversation::create_conversation(tx, "c-ref", Some("被引线程"), None, None, 1).await?;
+            sea_ops::conversation::create(tx, "c-cur", Some("当前"), None, None, 1).await?;
+            sea_ops::conversation::create(tx, "c-ref", Some("被引线程"), None, None, 1).await?;
             let row = sea_ops::message::new_row("m-1", "c-ref", "user", "被引线程里说过的话", 2);
-            sea_ops::message::append_message(tx, row, None).await
+            sea_ops::message::append(tx, row, None).await
         })
         .await
         .unwrap();

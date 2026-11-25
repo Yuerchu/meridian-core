@@ -444,7 +444,7 @@ mod tests {
             ..ComposerDraftContent::default()
         };
         write(&db, &slot("c1"), &content, 1, 100).await.unwrap();
-        db.write(async |tx| emoji::delete_emoji(tx, "e1").await).await.unwrap();
+        db.write(async |tx| emoji::delete(tx, "e1").await).await.unwrap();
 
         let row = get(&db, &slot("c1")).await.unwrap().unwrap();
         assert_eq!((row.sticker_id, row.body.as_str()), (None, "look"));

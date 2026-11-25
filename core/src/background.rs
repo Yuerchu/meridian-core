@@ -616,7 +616,7 @@ pub async fn claim(db: &Db, conversation_id: &str, turn_id: &str) -> Result<Vec<
                 continue;
             }
             let text = notice(&task);
-            let head = crate::db::sea::ops::conversation::get_conversation(tx, conversation_id)
+            let head = crate::db::sea::ops::conversation::get(tx, conversation_id)
                 .await?
                 .and_then(|c| c.head_message_id);
             let message_id = uuid::Uuid::new_v4().to_string();
@@ -873,7 +873,7 @@ mod tests {
             notices[0].text
         );
 
-        let stored = crate::db::sea::ops::message::get_message(&services.db, &notices[0].message_id)
+        let stored = crate::db::sea::ops::message::get(&services.db, &notices[0].message_id)
             .await
             .unwrap()
             .expect("the notice row exists");

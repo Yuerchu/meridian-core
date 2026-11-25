@@ -214,16 +214,13 @@ async fn resolve_supports_images(
         .read(async |tx| {
             let effective_aid = match state.config.assistant_id.clone() {
                 Some(aid) => Some(aid),
-                None => match crate::db::sea::ops::conversation::get_conversation(tx, conversation_id).await? {
+                None => match crate::db::sea::ops::conversation::get(tx, conversation_id).await? {
                     Some(conv) => conv.assistant_id,
                     None => return Ok(None),
                 },
             };
             let assistant = match effective_aid {
-                Some(aid) => crate::db::sea::ops::assistant::get_assistant(tx, &aid)
-                    .await
-                    .ok()
-                    .flatten(),
+                Some(aid) => crate::db::sea::ops::assistant::get(tx, &aid).await.ok().flatten(),
                 None => None,
             };
             Ok::<_, crate::db::sea::DbErr>(Some(assistant))

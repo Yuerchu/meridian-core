@@ -15,7 +15,7 @@ use crate::db::sea::cap::sealed::Access;
 use crate::db::sea::cap::{Read, WriteTx};
 use crate::db::types::EpochMs;
 
-pub async fn list_packs(db: &impl Read) -> Result<Vec<emoji_pack::Model>, DbErr> {
+pub async fn list(db: &impl Read) -> Result<Vec<emoji_pack::Model>, DbErr> {
     emoji_pack::Entity::find()
         .order_by_asc(emoji_pack::Column::SortOrder)
         .order_by_asc(emoji_pack::Column::Id)
@@ -23,24 +23,24 @@ pub async fn list_packs(db: &impl Read) -> Result<Vec<emoji_pack::Model>, DbErr>
         .await
 }
 
-pub async fn get_pack(db: &impl Read, id: &str) -> Result<Option<emoji_pack::Model>, DbErr> {
+pub async fn get(db: &impl Read, id: &str) -> Result<Option<emoji_pack::Model>, DbErr> {
     emoji_pack::Entity::find_by_id(id).one(db.conn()?).await
 }
 
 /// Inserts the row the caller built and reads it back.
-pub async fn create_pack(tx: &WriteTx, model: emoji_pack::Model) -> Result<emoji_pack::Model, DbErr> {
+pub async fn create(tx: &WriteTx, model: emoji_pack::Model) -> Result<emoji_pack::Model, DbErr> {
     let id = model.id.clone();
     emoji_pack::Entity::insert(model.into_active_model())
         .exec_without_returning(tx.conn()?)
         .await?;
-    get_pack(tx, &id)
+    get(tx, &id)
         .await?
         .ok_or_else(|| DbErr::RecordNotFound(format!("emoji pack `{id}`")))
 }
 
 /// How many rows went: 0 for a pack that was already gone. Its stickers and
 /// assignments go with it by cascade.
-pub async fn delete_pack(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+pub async fn delete(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
     Ok(emoji_pack::Entity::delete_by_id(id)
         .exec(tx.conn()?)
         .await?
@@ -48,7 +48,7 @@ pub async fn delete_pack(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
 }
 
 /// The packs assigned to an assistant, in display order.
-pub async fn list_packs_for_assistant(db: &impl Read, assistant_id: &str) -> Result<Vec<emoji_pack::Model>, DbErr> {
+pub async fn list_for_assistant(db: &impl Read, assistant_id: &str) -> Result<Vec<emoji_pack::Model>, DbErr> {
     emoji_pack::Entity::find()
         .join(JoinType::InnerJoin, emoji_pack::Relation::AssistantEmojiPack.def())
         .filter(assistant_emoji_pack::Column::AssistantId.eq(assistant_id))
@@ -59,7 +59,7 @@ pub async fn list_packs_for_assistant(db: &impl Read, assistant_id: &str) -> Res
 }
 
 /// Assign a pack to an assistant; assigning it twice is not an error.
-pub async fn assign_pack(tx: &WriteTx, assistant_id: &str, pack_id: &str, now: EpochMs) -> Result<(), DbErr> {
+pub async fn assign(tx: &WriteTx, assistant_id: &str, pack_id: &str, now: EpochMs) -> Result<(), DbErr> {
     assistant_emoji_pack::Entity::insert(assistant_emoji_pack::ActiveModel {
         assistant_id: Set(assistant_id.to_owned()),
         pack_id: Set(pack_id.to_owned()),
@@ -79,14 +79,14 @@ pub async fn assign_pack(tx: &WriteTx, assistant_id: &str, pack_id: &str, now: E
 }
 
 /// Remove an assignment; removing one that is not there is not an error.
-pub async fn unassign_pack(tx: &WriteTx, assistant_id: &str, pack_id: &str) -> Result<(), DbErr> {
+pub async fn unassign(tx: &WriteTx, assistant_id: &str, pack_id: &str) -> Result<(), DbErr> {
     assistant_emoji_pack::Entity::delete_by_id((assistant_id.to_owned(), pack_id.to_owned()))
         .exec(tx.conn()?)
         .await?;
     Ok(())
 }
 
-pub async fn list_assigned_pack_ids(db: &impl Read, assistant_id: &str) -> Result<Vec<String>, DbErr> {
+pub async fn list_assigned_ids(db: &impl Read, assistant_id: &str) -> Result<Vec<String>, DbErr> {
     assistant_emoji_pack::Entity::find()
         .select_only()
         .column(assistant_emoji_pack::Column::PackId)
@@ -129,7 +129,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn insert(db: &Db, model: emoji_pack::Model) -> emoji_pack::Model {
-        db.write(async |tx| create_pack(tx, model).await).await.unwrap()
+        db.write(async |tx| create(tx, model).await).await.unwrap()
     }
 
     #[tokio::test]
@@ -144,22 +144,22 @@ pub(crate) mod tests {
         let written = pack("b", EmojiPackKind::Manual, None, 1);
         assert_eq!(insert(&db, written.clone()).await, written);
         insert(&db, pack("a", EmojiPackKind::Manual, None, 0)).await;
-        let ids: Vec<_> = list_packs(&db).await.unwrap().into_iter().map(|p| p.id).collect();
+        let ids: Vec<_> = list(&db).await.unwrap().into_iter().map(|p| p.id).collect();
         assert_eq!(ids, ["a", "b"]);
 
         for _ in 0..2 {
-            db.write(async |tx| assign_pack(tx, "a1", "b", 5).await).await.unwrap();
+            db.write(async |tx| assign(tx, "a1", "b", 5).await).await.unwrap();
         }
-        assert_eq!(list_assigned_pack_ids(&db, "a1").await.unwrap(), ["b"]);
-        let assigned: Vec<_> = list_packs_for_assistant(&db, "a1")
+        assert_eq!(list_assigned_ids(&db, "a1").await.unwrap(), ["b"]);
+        let assigned: Vec<_> = list_for_assistant(&db, "a1")
             .await
             .unwrap()
             .into_iter()
             .map(|p| p.id)
             .collect();
         assert_eq!(assigned, ["b"]);
-        db.write(async |tx| unassign_pack(tx, "a1", "b").await).await.unwrap();
-        assert!(list_assigned_pack_ids(&db, "a1").await.unwrap().is_empty());
+        db.write(async |tx| unassign(tx, "a1", "b").await).await.unwrap();
+        assert!(list_assigned_ids(&db, "a1").await.unwrap().is_empty());
     }
 
     /// One pool per account: the lookup finds it by kind and account, and the
@@ -175,9 +175,9 @@ pub(crate) mod tests {
         );
         assert_eq!(get_by_source_account(&db, "43").await.unwrap(), None);
         let second = db
-            .write(async |tx| create_pack(tx, pack("again", EmojiPackKind::Onebot, Some("42"), 0)).await)
+            .write(async |tx| create(tx, pack("again", EmojiPackKind::Onebot, Some("42"), 0)).await)
             .await;
         assert!(second.is_err());
-        assert_eq!(db.write(async |tx| delete_pack(tx, "pool").await).await.unwrap(), 1);
+        assert_eq!(db.write(async |tx| delete(tx, "pool").await).await.unwrap(), 1);
     }
 }

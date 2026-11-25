@@ -2151,17 +2151,15 @@ mod tests {
     #[tokio::test]
     async fn a_deleted_conversation_keeps_its_row_and_loses_its_name() {
         let db = sea_test_db().await;
-        db.write(async |tx| {
-            crate::db::sea::ops::conversation::create_conversation(tx, "c1", Some("Named"), None, None, 1).await
-        })
-        .await
-        .unwrap();
+        db.write(async |tx| crate::db::sea::ops::conversation::create(tx, "c1", Some("Named"), None, None, 1).await)
+            .await
+            .unwrap();
         reply(&db, "a", "m", 1_000, (100, 0, 0, 0), Some(("10", "0")), "desktop").await;
 
         let named = r!(db, report(UsageDimension::Conversation, &UsageFilter::default())).unwrap();
         assert_eq!(named[0].label.as_deref(), Some("Named"));
 
-        db.write(async |tx| crate::db::sea::ops::conversation::delete_conversation(tx, "c1").await)
+        db.write(async |tx| crate::db::sea::ops::conversation::delete(tx, "c1").await)
             .await
             .unwrap();
 
@@ -2174,11 +2172,9 @@ mod tests {
     #[tokio::test]
     async fn an_untitled_conversation_stays_distinct_from_a_deleted_one() {
         let db = sea_test_db().await;
-        db.write(async |tx| {
-            crate::db::sea::ops::conversation::create_conversation(tx, "c1", None, None, None, 1).await
-        })
-        .await
-        .unwrap();
+        db.write(async |tx| crate::db::sea::ops::conversation::create(tx, "c1", None, None, None, 1).await)
+            .await
+            .unwrap();
         reply(&db, "a", "m", 1_000, (100, 0, 0, 0), Some(("10", "0")), "desktop").await;
 
         let existing = r!(db, report(UsageDimension::Conversation, &UsageFilter::default())).unwrap();
@@ -2188,7 +2184,7 @@ mod tests {
             "empty title still means the row exists"
         );
 
-        db.write(async |tx| crate::db::sea::ops::conversation::delete_conversation(tx, "c1").await)
+        db.write(async |tx| crate::db::sea::ops::conversation::delete(tx, "c1").await)
             .await
             .unwrap();
         let deleted = r!(db, report(UsageDimension::Conversation, &UsageFilter::default())).unwrap();

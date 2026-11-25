@@ -656,7 +656,7 @@ mod tests {
         // Fill the bot-wide scope to its ceiling so the next write is refused.
         db.write(async |tx| {
             for i in 0..MAX_ONEBOT_GLOBAL_MEMORIES {
-                mem_ops::upsert_memory(
+                mem_ops::upsert(
                     tx,
                     memory::Model {
                         id: format!("g{i}"),
@@ -692,7 +692,7 @@ mod tests {
         let p = mem_ops::get_proposal(&db, id).await.unwrap().unwrap();
         assert_eq!(p.status, ProposalStatus::Pending);
 
-        db.write(async |tx| mem_ops::soft_delete_memories(tx, &["g0".to_string()], DeletedBy::Admin, 2500).await)
+        db.write(async |tx| mem_ops::soft_delete(tx, &["g0".to_string()], DeletedBy::Admin, 2500).await)
             .await
             .unwrap();
         assert_eq!(approve_proposal(&db, id, 99, 3000).await.unwrap().as_deref(), Some("k"));

@@ -118,7 +118,7 @@ impl SessionManager {
         if let Some(cached) = self.cache.get(&cache_key).cloned() {
             // pool-read-before-write: a hit returns here; a miss goes on to the
             // write, which finds the project and conversation again itself.
-            if sea_ops::conversation::get_conversation(&self.db, &cached.conversation_id)
+            if sea_ops::conversation::get(&self.db, &cached.conversation_id)
                 .await
                 .is_ok_and(|found| found.is_some())
             {
@@ -132,18 +132,17 @@ impl SessionManager {
         let (project, conversation_id) = self
             .db
             .write(async |tx| {
-                let project = match sea_ops::project::find_project_by_source(tx, source_type, &source_id).await? {
+                let project = match sea_ops::project::find_by_source(tx, source_type, &source_id).await? {
                     Some(p) => p,
                     None => create_project(tx, &cache_key, title, source_type, &source_id, assistant_id).await?,
                 };
                 // The latest active (non-archived) conversation under this project.
-                let conversations =
-                    sea_ops::conversation::list_conversations_by_project(tx, &project.id, false).await?;
+                let conversations = sea_ops::conversation::list_by_project(tx, &project.id, false).await?;
                 let conversation_id = match conversations.first() {
                     Some(conv) => conv.id.clone(),
                     None => {
                         let conv_id = uuid::Uuid::new_v4().to_string();
-                        sea_ops::conversation::create_conversation(
+                        sea_ops::conversation::create(
                             tx,
                             &conv_id,
                             Some(title),
@@ -210,27 +209,19 @@ impl SessionManager {
         let project = self
             .db
             .write(async |tx| {
-                let Some(project) = sea_ops::project::find_project_by_source(tx, source_type, &source_id).await? else {
+                let Some(project) = sea_ops::project::find_by_source(tx, source_type, &source_id).await? else {
                     return Ok(Err("No project found for this session".to_string()));
                 };
                 let now = now_ms();
                 // Best effort, as before: a conversation already gone is not a
                 // reason to leave the session without a new one.
                 if let Err(e) = tx
-                    .nested(async |tx| sea_ops::conversation::archive_conversation(tx, current, now).await)
+                    .nested(async |tx| sea_ops::conversation::set_archived(tx, current, true, now).await)
                     .await
                 {
                     tracing::warn!(error = %e, "could not archive the session's conversation");
                 }
-                sea_ops::conversation::create_conversation(
-                    tx,
-                    &conv_id,
-                    Some(title),
-                    assistant_id,
-                    Some(&project.id),
-                    now,
-                )
-                .await?;
+                sea_ops::conversation::create(tx, &conv_id, Some(title), assistant_id, Some(&project.id), now).await?;
                 Ok::<_, DbErr>(Ok(project))
             })
             .await
@@ -258,9 +249,9 @@ async fn create_project(
     source_id: &str,
     assistant_id: Option<&str>,
 ) -> Result<project::Model, DbErr> {
-    let legacy_conv_id = sea_ops::preference::get_preference(tx, cache_key).await.ok().flatten();
+    let legacy_conv_id = sea_ops::preference::get(tx, cache_key).await.ok().flatten();
     let now = now_ms();
-    let project = sea_ops::project::create_project(
+    let project = sea_ops::project::create(
         tx,
         project::Model {
             id: uuid::Uuid::new_v4().to_string(),
@@ -281,7 +272,7 @@ async fn create_project(
         if let Err(e) = tx
             .nested(async |tx| {
                 sea_ops::conversation::update_project(tx, &conv_id, Some(project.id.clone()), now_ms()).await?;
-                sea_ops::preference::delete_preference(tx, cache_key).await
+                sea_ops::preference::delete(tx, cache_key).await
             })
             .await
         {
@@ -313,8 +304,7 @@ mod tests {
         // Somebody's own conversation, in the same project, from the desktop.
         let theirs = "desktop-conv";
         db.write(async |tx| {
-            sea_ops::conversation::create_conversation(tx, theirs, Some("mine"), None, Some(&project_id), now_ms())
-                .await
+            sea_ops::conversation::create(tx, theirs, Some("mine"), None, Some(&project_id), now_ms()).await
         })
         .await
         .unwrap();
@@ -325,7 +315,7 @@ mod tests {
             .expect("reset");
 
         let archived = async |id: &str| {
-            sea_ops::conversation::get_conversation(&db, id)
+            sea_ops::conversation::get(&db, id)
                 .await
                 .unwrap()
                 .unwrap()
@@ -346,8 +336,8 @@ mod tests {
         let db = crate::db::sea::sea_test_db().await;
         let key = SessionKey::private(7);
         db.write(async |tx| {
-            sea_ops::conversation::create_conversation(tx, "legacy", Some("old"), None, None, 1).await?;
-            sea_ops::preference::set_preference(tx, &key.pref_key(), "legacy", 1).await
+            sea_ops::conversation::create(tx, "legacy", Some("old"), None, None, 1).await?;
+            sea_ops::preference::set(tx, &key.pref_key(), "legacy", 1).await
         })
         .await
         .unwrap();
@@ -355,15 +345,9 @@ mod tests {
         let mut sessions = SessionManager::new(db.clone());
         let (project_id, conversation_id) = sessions.get_or_create(&key, "[QQ] 7", None).await.unwrap();
         assert_eq!(conversation_id, "legacy", "the old transcript continues");
-        let moved = sea_ops::conversation::get_conversation(&db, "legacy")
-            .await
-            .unwrap()
-            .unwrap();
+        let moved = sea_ops::conversation::get(&db, "legacy").await.unwrap().unwrap();
         assert_eq!(moved.project_id.as_deref(), Some(project_id.as_str()));
-        assert_eq!(
-            sea_ops::preference::get_preference(&db, &key.pref_key()).await.unwrap(),
-            None
-        );
+        assert_eq!(sea_ops::preference::get(&db, &key.pref_key()).await.unwrap(), None);
 
         let again = SessionManager::new(db.clone())
             .get_or_create(&key, "[QQ] 7", None)

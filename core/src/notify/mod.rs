@@ -170,7 +170,7 @@ fn parse_optional_decimal(key: &str, raw: Option<String>) -> Result<Option<Decim
 
 pub async fn load_config(db: &Db) -> Result<NotifyConfig, String> {
     let get = async |key: &str| -> Result<Option<String>, String> {
-        crate::db::sea::ops::preference::get_preference(db, key)
+        crate::db::sea::ops::preference::get(db, key)
             .await
             .map_err(|error| format!("failed to read preference {key}: {error}"))
     };
@@ -254,56 +254,56 @@ pub fn validate(config: &NotifyConfig) -> Result<(), String> {
 /// One transaction for the whole block, so a failure part-way leaves the
 /// previous configuration rather than half of each.
 pub async fn save_config(db: &Db, config: &NotifyConfig) -> Result<(), String> {
-    use crate::db::sea::ops::preference::{delete_preference, set_preference};
+    use crate::db::sea::ops::preference;
 
     validate(config)?;
     let now = now_ms();
     db.write(async |tx| {
-        set_preference(tx, "notify.enabled", if config.enabled { "true" } else { "false" }, now).await?;
+        preference::set(tx, "notify.enabled", if config.enabled { "true" } else { "false" }, now).await?;
         match config.balance_threshold.as_ref() {
-            Some(value) => set_preference(tx, "notify.balance.threshold", &value.to_string(), now).await?,
+            Some(value) => preference::set(tx, "notify.balance.threshold", &value.to_string(), now).await?,
             // Deleted rather than stored empty: absent is the "off" state, and an
             // empty string is refused by the parser on the way back in.
-            None => delete_preference(tx, "notify.balance.threshold").await?,
+            None => preference::delete(tx, "notify.balance.threshold").await?,
         }
-        set_preference(
+        preference::set(
             tx,
             "notify.balance.interval_minutes",
             &config.balance_interval_minutes.to_string(),
             now,
         )
         .await?;
-        set_preference(
+        preference::set(
             tx,
             "notify.usage.enabled",
             if config.usage_enabled { "true" } else { "false" },
             now,
         )
         .await?;
-        set_preference(
+        preference::set(
             tx,
             "notify.usage.check_interval_minutes",
             &config.usage_check_interval_minutes.to_string(),
             now,
         )
         .await?;
-        set_preference(
+        preference::set(
             tx,
             "notify.usage.window_hours",
             &config.usage_window_hours.to_string(),
             now,
         )
         .await?;
-        set_preference(
+        preference::set(
             tx,
             "notify.usage.baseline_days",
             &config.usage_baseline_days.to_string(),
             now,
         )
         .await?;
-        set_preference(tx, "notify.usage.multiplier", &config.usage_multiplier.to_string(), now).await?;
-        set_preference(tx, "notify.usage.min_cost", &config.usage_min_cost.to_string(), now).await?;
-        set_preference(
+        preference::set(tx, "notify.usage.multiplier", &config.usage_multiplier.to_string(), now).await?;
+        preference::set(tx, "notify.usage.min_cost", &config.usage_min_cost.to_string(), now).await?;
+        preference::set(
             tx,
             "notify.usage.cooldown_minutes",
             &config.usage_cooldown_minutes.to_string(),
@@ -723,7 +723,7 @@ mod tests {
     use crate::db::sea::sea_test_db;
 
     async fn set(db: &Db, key: &str, value: &str) {
-        db.write(async |tx| crate::db::sea::ops::preference::set_preference(tx, key, value, 1).await)
+        db.write(async |tx| crate::db::sea::ops::preference::set(tx, key, value, 1).await)
             .await
             .unwrap();
     }
@@ -796,7 +796,7 @@ mod tests {
         save_config(&db, &config).await.unwrap();
         assert_eq!(load_config(&db).await.unwrap().balance_threshold, None);
         assert_eq!(
-            crate::db::sea::ops::preference::get_preference(&db, "notify.balance.threshold")
+            crate::db::sea::ops::preference::get(&db, "notify.balance.threshold")
                 .await
                 .unwrap(),
             None,
@@ -862,7 +862,7 @@ mod tests {
         };
         assert!(save_config(&db, &config).await.is_err());
         assert_eq!(
-            crate::db::sea::ops::preference::get_preference(&db, "notify.usage.baseline_days")
+            crate::db::sea::ops::preference::get(&db, "notify.usage.baseline_days")
                 .await
                 .unwrap(),
             None,

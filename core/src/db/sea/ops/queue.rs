@@ -261,7 +261,7 @@ pub async fn take_next(
         let Some(item) = next_deliverable(tx, conversation_id, delivery).await? else {
             return Ok(None);
         };
-        let row = crate::db::sea::ops::message::append_message(tx, message, parent).await?;
+        let row = crate::db::sea::ops::message::append(tx, message, parent).await?;
         queued_prompt::Entity::update_many()
             .set(queued_prompt::ActiveModel {
                 dispatched_at: Set(Some(now)),
@@ -991,7 +991,7 @@ mod tests {
     }
 
     async fn messages(db: &Db) -> Vec<String> {
-        crate::db::sea::ops::message::list_messages(db, "c1")
+        crate::db::sea::ops::message::list(db, "c1")
             .await
             .unwrap()
             .into_iter()
@@ -1026,7 +1026,7 @@ mod tests {
         let db = with_conversations(&["c1"]).await;
         add(&db, "c1", "first", Delivery::FollowUp).await;
         db.write(async |tx| {
-            crate::db::sea::ops::message::append_message(tx, user_row("dup", "c1", "in the way", "t0"), None).await
+            crate::db::sea::ops::message::append(tx, user_row("dup", "c1", "in the way", "t0"), None).await
         })
         .await
         .unwrap();
@@ -1072,21 +1072,16 @@ mod tests {
         // q2 is not the front: the claim is refused and the row goes with it.
         let refused = db
             .write(async |tx| {
-                crate::db::sea::ops::message::append_message(tx, row("m2"), None).await?;
+                crate::db::sea::ops::message::append(tx, row("m2"), None).await?;
                 spend(tx, "c1", "q2", "t1", "m2", 3).await
             })
             .await;
         assert!(refused.is_err());
-        assert!(
-            crate::db::sea::ops::message::list_messages(&db, "c1")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(crate::db::sea::ops::message::list(&db, "c1").await.unwrap().is_empty());
         assert_eq!(get(&db, "q2").await.unwrap().unwrap().state(), QueueState::Queued);
 
         db.write(async |tx| {
-            crate::db::sea::ops::message::append_message(tx, row("m1"), None).await?;
+            crate::db::sea::ops::message::append(tx, row("m1"), None).await?;
             spend(tx, "c1", "q1", "t1", "m1", 4).await
         })
         .await

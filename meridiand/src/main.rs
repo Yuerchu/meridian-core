@@ -239,7 +239,7 @@ fn webhook_status_line(row: &meridian_core::db::entity::notification_webhook::Mo
 async fn print_provider_status(sea: &meridian_core::db::sea::cap::Db) -> Result<(), String> {
     use meridian_core::provider::balance::{ProviderIdentity, balance_vendor};
 
-    let providers = meridian_core::db::sea::ops::provider::list_providers(sea)
+    let providers = meridian_core::db::sea::ops::provider::list(sea)
         .await
         .map_err(|error| error.to_string())?;
     if providers.is_empty() {

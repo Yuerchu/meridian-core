@@ -147,7 +147,7 @@ impl RedactionEngine {
     /// scope and category — cannot be wrong here: they decode at the read, and
     /// the schema's `CHECK` would not have stored a bad one.
     pub async fn reload(&self, db: &impl Read) -> Result<(), String> {
-        let mode_raw = preference_ops::get_preference(db, MODE_PREFERENCE)
+        let mode_raw = preference_ops::get(db, MODE_PREFERENCE)
             .await
             .map_err(|e| e.to_string())?;
         let mode = RedactionMode::parse(mode_raw.as_deref())?;
@@ -157,7 +157,7 @@ impl RedactionEngine {
         let mut by_project: HashMap<String, Vec<CompiledRule>> = HashMap::new();
 
         if mode.is_enabled() {
-            let rows = rule_ops::list_enabled_rules(db).await.map_err(|e| e.to_string())?;
+            let rows = rule_ops::list_enabled(db).await.map_err(|e| e.to_string())?;
             for row in rows {
                 let regex = match compile(&row.pattern) {
                     Ok(r) => r,
@@ -965,7 +965,7 @@ mod tests {
             rule("pj_token", RuleScope::Project, "p1", r"pj_[0-9]{4}"),
             rule("stale", RuleScope::Global, GLOBAL_SCOPE_ID, r"ok_[0-9]{4}"),
         ] {
-            db.write(async |tx| rule_ops::create_rule(tx, row).await).await.unwrap();
+            db.write(async |tx| rule_ops::create(tx, row).await).await.unwrap();
         }
         // Written past the validation the tool does, the way a regex-engine
         // change would leave it.
@@ -982,7 +982,7 @@ mod tests {
         let in_project = engine.redact(text, Some("p1")).text.into_owned();
         assert!(in_project.contains("[REDACTED:pj_token]"), "{in_project}");
 
-        db.write(async |tx| preference_ops::set_preference(tx, MODE_PREFERENCE, "off", 2).await)
+        db.write(async |tx| preference_ops::set(tx, MODE_PREFERENCE, "off", 2).await)
             .await
             .unwrap();
         engine.reload(&db).await.unwrap();

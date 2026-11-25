@@ -109,12 +109,7 @@ impl CodexTurnMetadata {
         thread_source: CodexThreadSource,
     ) -> Option<Self> {
         let installation_id = crate::agent::codex_install::installation_id(db).await?;
-        let read = async |key: &str| {
-            crate::db::sea::ops::preference::get_preference(db, key)
-                .await
-                .ok()
-                .flatten()
-        };
+        let read = async |key: &str| crate::db::sea::ops::preference::get(db, key).await.ok().flatten();
         let sandbox = read("sandbox.enabled").await;
         // The same conjunction `AutoReviewed::wrap` uses: the switch alone
         // leaves an inert wrapper, so a turn with no model named is not
@@ -226,7 +221,7 @@ mod tests {
         let set = async |pairs: &[(&str, &str)]| {
             db.write(async |tx| {
                 for (key, value) in pairs {
-                    crate::db::sea::ops::preference::set_preference(tx, key, value, 1).await?;
+                    crate::db::sea::ops::preference::set(tx, key, value, 1).await?;
                 }
                 Ok::<_, crate::db::sea::DbErr>(())
             })

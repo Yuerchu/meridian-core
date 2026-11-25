@@ -235,7 +235,7 @@ pub fn validate_level(level: &str) -> Result<LogLevel, String> {
 /// Read the exact saved spelling. Absence means the documented default; a row
 /// that exists but is invalid is a broken contract and is returned as an error.
 pub async fn load_saved_level(db: &crate::db::sea::cap::Db) -> Result<LogLevel, String> {
-    let saved = crate::db::sea::ops::preference::get_preference(db, LEVEL_PREFERENCE_KEY)
+    let saved = crate::db::sea::ops::preference::get(db, LEVEL_PREFERENCE_KEY)
         .await
         .map_err(|error| format!("failed to read preference {LEVEL_PREFERENCE_KEY}: {error}"))?;
     match saved {
@@ -330,11 +330,9 @@ mod tests {
         assert_eq!(load_saved_level(&db).await.unwrap(), default_level());
 
         for raw in ["WARN", " info ", "trace", "future"] {
-            db.write(async |tx| {
-                crate::db::sea::ops::preference::set_preference(tx, LEVEL_PREFERENCE_KEY, raw, 1).await
-            })
-            .await
-            .unwrap();
+            db.write(async |tx| crate::db::sea::ops::preference::set(tx, LEVEL_PREFERENCE_KEY, raw, 1).await)
+                .await
+                .unwrap();
             let error = load_saved_level(&db)
                 .await
                 .expect_err("invalid stored log level must fail");
