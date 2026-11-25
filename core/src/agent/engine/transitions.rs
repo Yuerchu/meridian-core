@@ -21,6 +21,8 @@
 
 use std::collections::HashSet;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::agent::modes::ModeSpec;
 use crate::agent::turn_config::TurnConfig;
 
@@ -50,12 +52,32 @@ pub trait Transitions: Send + Sync {
         Err("this runner has no durable plan document".into())
     }
 
-    /// Seal the current head as a review and move the recorded turn to
-    /// `waiting_review`. This does not wait for a person and does not return a
-    /// tool result; a later explicit continuation settles that pending call.
-    async fn submit_plan(&self, _request: SubmitPlanRequest) -> Result<crate::events::PlanReviewEvent, String> {
+    /// Seal the current head as a review, announce it, and wait synchronously
+    /// inside the live turn until the user approves, requests changes, or the
+    /// turn is cancelled.
+    async fn submit_plan(
+        &self,
+        _request: SubmitPlanRequest,
+        _cancel: &CancellationToken,
+    ) -> Result<PlanReviewSubmitOutcome, String> {
         Err("this runner has no durable plan review surface".into())
     }
+}
+
+/// Outcome of a synchronous `exit_plan` review wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanReviewSubmitOutcome {
+    Approved {
+        accept_edits: bool,
+        clear_context: bool,
+        plan_markdown: String,
+        edited_by_user: bool,
+        feedback: Option<String>,
+    },
+    ChangesRequested {
+        feedback: String,
+    },
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -300,16 +322,107 @@ pub(crate) async fn enter(
     })
 }
 
-/// Submit the already-saved head. Unlike the former approval waiter this is a
-/// bounded durable write: it returns as soon as the review and the turn's
-/// `waiting_review` state have committed.
-pub(crate) async fn submit(
+/// What a synchronous `exit_plan` call produced for the turn loop.
+pub(crate) enum ExitEffect {
+    /// Approved without clearing context: switch mode, update `accept_edits`,
+    /// and continue the same turn.
+    Switched {
+        effect: TransitionEffect,
+        accept_edits: bool,
+    },
+    /// Approved with `clear_context`: record the tool result and end this
+    /// planning turn cleanly so the caller can start a fresh implementation
+    /// turn with only the approved plan in context.
+    ClearContext {
+        result: String,
+        accept_edits: bool,
+        prompt: String,
+    },
+    /// Rejected / changes requested / rebuild failed: stay in the current mode.
+    Said { result: String, outcome: &'static str },
+    /// Turn was cancelled before the user decided.
+    Cancelled { result: String },
+}
+
+/// Submit the already-saved `plan.md` head and wait synchronously for the
+/// user's decision, mirroring Claude Code's `ExitPlanMode` approval flow.
+pub(crate) async fn exit(
     transitions: &dyn Transitions,
+    emit: Option<&dyn Emit>,
+    conversation_id: &str,
+    target: &'static ModeSpec,
     arguments: &str,
     request: SubmitPlanRequest,
-) -> Result<crate::events::PlanReviewEvent, String> {
+    cancel: &CancellationToken,
+) -> Result<ExitEffect, String> {
     parse_empty_plan_arguments("exit_plan", arguments)?;
-    transitions.submit_plan(request).await
+    match transitions.submit_plan(request, cancel).await? {
+        PlanReviewSubmitOutcome::Approved {
+            accept_edits,
+            clear_context: true,
+            plan_markdown,
+            edited_by_user: _,
+            feedback,
+        } => {
+            announce(emit, conversation_id);
+            let mut prompt = format!("Implement the following plan:\n\n{}", plan_markdown.trim());
+            if let Some(fb) = feedback.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                prompt.push_str("\n\n## User notes / feedback\n");
+                prompt.push_str(fb);
+            }
+            Ok(ExitEffect::ClearContext {
+                result: "User approved the plan and chose to clear context before implementation. Ending planning turn to start a fresh implementation turn.".into(),
+                accept_edits,
+                prompt,
+            })
+        }
+        PlanReviewSubmitOutcome::Approved {
+            accept_edits,
+            clear_context: false,
+            plan_markdown,
+            edited_by_user,
+            feedback,
+        } => match transitions.rebuild(target).await? {
+            Ok(next) => {
+                announce(emit, conversation_id);
+                let mut text = String::from("User has approved your plan. You can now start coding.");
+                if edited_by_user {
+                    text.push_str(
+                        "\n\nThe user edited the plan before approving, and `plan.md` has been updated to match. Follow this approved plan:\n\n",
+                    );
+                    text.push_str(plan_markdown.trim());
+                }
+                if let Some(fb) = feedback.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    text.push_str("\n\n## User notes / feedback\n");
+                    text.push_str(fb);
+                }
+                if accept_edits {
+                    text.push_str("\n\nAuto-accept edits is enabled for workspace file changes.");
+                }
+                Ok(ExitEffect::Switched {
+                    effect: TransitionEffect::switched(text, target, next),
+                    accept_edits,
+                })
+            }
+            Err(e) => Ok(ExitEffect::Said {
+                result: format!(
+                    "The user approved the plan, but switching back to work mode failed: {e}. \
+                     Tell the user before attempting to make edits."
+                ),
+                outcome: "error",
+            }),
+        },
+        PlanReviewSubmitOutcome::ChangesRequested { feedback } => Ok(ExitEffect::Said {
+            result: format!(
+                "The user requested changes to your plan. Stay in plan mode, revise `plan.md` with `update_plan` \
+                 to address the feedback below, and call `exit_plan` again when ready.\n\n{feedback}"
+            ),
+            outcome: "denied",
+        }),
+        PlanReviewSubmitOutcome::Cancelled => Ok(ExitEffect::Cancelled {
+            result: "Plan review was cancelled before a decision was made.".into(),
+        }),
+    }
 }
 
 /// The outer `Result` is kept for the shape the caller already matches on:
@@ -427,17 +540,18 @@ mod tests {
             }
         }
 
-        async fn submit_plan(&self, request: SubmitPlanRequest) -> Result<crate::events::PlanReviewEvent, String> {
-            self.submitted.lock().unwrap().push(request.clone());
-            Ok(crate::events::PlanReviewEvent {
-                review_id: "review-1".into(),
-                conversation_id: "c1".into(),
-                document_id: "document-1".into(),
-                revision_id: "revision-1".into(),
-                turn_id: request.turn_id,
-                status: "pending".into(),
-                lock_version: 0,
-                delivery_state: None,
+        async fn submit_plan(
+            &self,
+            request: SubmitPlanRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<PlanReviewSubmitOutcome, String> {
+            self.submitted.lock().unwrap().push(request);
+            Ok(PlanReviewSubmitOutcome::Approved {
+                accept_edits: false,
+                clear_context: false,
+                plan_markdown: "# Plan\n".into(),
+                edited_by_user: false,
+                feedback: None,
             })
         }
     }
@@ -635,21 +749,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_plan_accepts_only_an_empty_object_and_submits_without_rebuilding() {
+    async fn exit_plan_accepts_only_an_empty_object_and_rebuilds_on_approval() {
         let transitions = FakeRebuild::giving("work", &["write_file"]);
+        let cancel = CancellationToken::new();
         let request = SubmitPlanRequest {
             turn_id: "turn-1".into(),
             assistant_message_id: "message-1".into(),
             provider_call_id: "call-1".into(),
         };
-        let event = submit(&transitions, "{}", request).await.unwrap();
+        let effect = exit(&transitions, None, "c1", work_mode(), "{}", request, &cancel)
+            .await
+            .unwrap();
 
-        assert_eq!(event.review_id, "review-1");
-        assert_eq!(event.status, "pending");
-        assert!(
-            transitions.asked.lock().unwrap().is_empty(),
-            "review is not an approval waiter"
-        );
+        assert!(matches!(
+            effect,
+            ExitEffect::Switched {
+                accept_edits: false,
+                ..
+            }
+        ));
+        assert_eq!(*transitions.asked.lock().unwrap(), vec!["work"]);
         {
             let submitted = transitions.submitted.lock().unwrap();
             assert_eq!(submitted.len(), 1);
@@ -662,7 +781,10 @@ mod tests {
                 assistant_message_id: "message-2".into(),
                 provider_call_id: "call-2".into(),
             };
-            let error = submit(&transitions, arguments, request).await.unwrap_err();
+            let error = match exit(&transitions, None, "c1", work_mode(), arguments, request, &cancel).await {
+                Ok(_) => panic!("expected invalid arguments error for {arguments}"),
+                Err(error) => error,
+            };
             assert!(error.contains("invalid exit_plan arguments"), "{arguments}: {error}");
         }
         assert_eq!(transitions.submitted.lock().unwrap().len(), 1);

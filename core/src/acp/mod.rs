@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::db::sea::cap::Db;
 
-pub use plan_review::{AcpPlanReviewDelivery, AcpPlanReviewDeliveryOutcome};
+pub use plan_review::AcpPlanReviewResolution;
 pub use session::AcpSession;
 
 /// The sessions running right now.

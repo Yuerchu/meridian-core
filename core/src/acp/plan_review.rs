@@ -1,15 +1,16 @@
-//! Durable human review for ACP's `ExitPlanMode` permission boundary.
+//! Synchronous human review for ACP's `ExitPlanMode` permission boundary.
 //!
 //! Claude Code exposes plan submission as a `session/request_permission`
-//! request.  The request contains the complete plan snapshot, not a patch, and
-//! the adapter remains parked until the client chooses one of its option ids.
-//! This module turns that transient request into the same revision/review rows
-//! the native runtime uses, then keeps only the live protocol continuation in
-//! memory.  Losing the process therefore loses a waiter, never the review.
+//! request whose `rawInput.plan` carries the full plan snapshot. This module
+//! imports that snapshot into the durable `plan_documents` / `plan_revisions` /
+//! `plan_review_sessions` tables (so Meridian's `PlanReviewPage` editor,
+//! inline comments, and revision diff work identically for Native and ACP) and
+//! parks synchronously on the live permission request until the user decides or
+//! cancels the turn — matching Claude Code's native `ExitPlanMode` lifecycle.
 
 use std::sync::Mutex;
 
-use tokio::sync::{oneshot, watch};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::entity::plan_review_session::{PlanReviewProviderKind, PlanReviewState};
@@ -35,7 +36,7 @@ pub(super) struct ExitPlanSubmission {
 ///
 /// A malformed `ExitPlanMode` is an error rather than an ordinary permission:
 /// routing it to the generic approval card would approve a plan that was never
-/// durably captured.
+/// captured.
 pub(super) fn exit_plan_submission(params: &RequestPermissionParams) -> Result<Option<ExitPlanSubmission>, String> {
     if mapping::tool_name_of(&params.tool_call) != EXIT_PLAN_MODE {
         return Ok(None);
@@ -61,41 +62,48 @@ pub(super) fn exit_plan_submission(params: &RequestPermissionParams) -> Result<O
     }))
 }
 
-/// The two reversible choices Meridian's review page can make.
+/// The permission option ids Meridian can answer `ExitPlanMode` with.
 ///
-/// A lasting option is deliberately never substituted.  The review page says
-/// approve/reject this submission, so returning `allow_always` would grant a
-/// permission the user was never shown.
+/// - `allow_default`: approves the plan in manual-confirmation (`default`) mode.
+/// - `allow_accept_edits`: optional `acceptEdits` approval option when offered
+///   by the adapter (never `bypassPermissions`).
+/// - `reject`: stays in plan mode so the user's requested changes can be applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ReviewChoices {
-    pub allow: String,
+    pub allow_default: String,
+    pub allow_accept_edits: Option<String>,
     pub reject: String,
 }
 
 impl ReviewChoices {
     pub fn pick(options: &[PermissionOption]) -> Option<Self> {
-        let once = |allow: bool| {
-            options
-                .iter()
-                .find(|option| option.is_once() && if allow { option.is_allow() } else { option.is_reject() })
-        };
+        let allow_default = options
+            .iter()
+            .find(|o| o.is_allow() && o.option_id == "default")
+            .or_else(|| options.iter().find(|o| o.is_once() && o.is_allow()))?;
+        let allow_accept_edits = options
+            .iter()
+            .find(|o| o.is_allow() && matches!(o.option_id.as_str(), "acceptEdits" | "accept_edits"))
+            .map(|o| o.option_id.clone());
+        let reject = options
+            .iter()
+            .find(|o| o.is_reject() && o.option_id == "plan")
+            .or_else(|| options.iter().find(|o| o.is_once() && o.is_reject()))?;
         Some(Self {
-            allow: once(true)?.option_id.clone(),
-            reject: once(false)?.option_id.clone(),
+            allow_default: allow_default.option_id.clone(),
+            allow_accept_edits,
+            reject: reject.option_id.clone(),
         })
     }
 }
 
-/// The durable review row plus the protocol ids needed to resume its live
-/// permission request.
+/// The review event produced when an ACP `ExitPlanMode` snapshot is submitted.
 #[derive(Debug, Clone)]
 pub(super) struct SubmittedReview {
     pub event: PlanReviewEvent,
-    pub session_id: String,
-    pub call_id: String,
 }
 
-/// Import one full ACP snapshot as a revision and submit it for review.
+/// Import one full ACP snapshot as a revision and open a pending review row.
 pub(super) async fn submit(
     services: &Services,
     conversation_id: &str,
@@ -114,8 +122,6 @@ pub(super) async fn submit(
         Ok(())
     };
 
-    // The snapshot as the document's head: one write, so the pending check,
-    // the head it compares against and the append describe one moment.
     let (document_id, revision) = db
         .write(async |tx| {
             not_twice(tx).await?;
@@ -164,8 +170,6 @@ pub(super) async fn submit(
         .await
         .map_err(|error| error.to_string())?;
 
-    // plan.md on disk before the review is of it; the store acknowledges
-    // each write on its own.
     let materialized = services
         .plan_files
         .reconcile_document(db, &document_id, now_ms())
@@ -201,149 +205,64 @@ pub(super) async fn submit(
                 turn_id: turn_id.to_string(),
                 status: bundle.review.state.as_str().to_string(),
                 lock_version: bundle.review.lock_version,
-                delivery_state: None,
             })
         })
         .await
         .map_err(|error| error.to_string())?;
 
-    Ok(SubmittedReview {
-        event,
-        session_id: submission.session_id,
-        call_id: submission.call_id,
-    })
+    Ok(SubmittedReview { event })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewDecisionAction {
-    Approve,
-    RequestChanges,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeliveryBoundary {
-    Acknowledged,
-    InDoubt(String),
-}
-
-/// Everything the command layer has already committed for one ACP delivery.
-/// Owned strings keep the async boundary independent of Tauri request DTOs.
+/// Decision sent from `decide_plan_review` into a live ACP session.
 #[derive(Debug, Clone)]
-pub struct AcpPlanReviewDelivery {
-    pub delivery_id: String,
-    pub review_id: String,
-    pub provider_call_id: String,
-    pub target_session_id: Option<String>,
-    pub submitting_turn_id: String,
-    pub payload_json: String,
-}
-
-/// Certainty at the ACP process boundary. The command layer maps these to the
-/// durable delivery states with the attempt token it owns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AcpPlanReviewDeliveryOutcome {
-    Acknowledged,
-    /// Nothing crossed an ambiguous process boundary; an explicit continuation
-    /// can safely try again.
-    Held(String),
-    /// The adapter may have consumed the response/message. Never retry this
-    /// automatically.
-    InDoubt(String),
+pub enum AcpPlanReviewResolution {
+    Approve {
+        review_id: String,
+        accept_edits: bool,
+        clear_context: bool,
+        plan_markdown: String,
+        edited_by_user: bool,
+        feedback: Option<String>,
+    },
+    RequestChanges {
+        review_id: String,
+        feedback: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DeliveryAction {
-    Approve,
+pub(super) enum AcpPlanReply {
+    Approve { accept_edits: bool },
     RequestChanges,
+    CancelForClearContext,
 }
 
-pub(super) fn delivery_action(payload_json: &str) -> Result<DeliveryAction, String> {
-    let payload: serde_json::Value = serde_json::from_str(payload_json)
-        .map_err(|error| format!("stored ACP plan delivery payload is invalid JSON: {error}"))?;
-    let object = payload
-        .as_object()
-        .ok_or("stored ACP plan delivery payload must be an object")?;
-    match object.get("action").and_then(serde_json::Value::as_str) {
-        Some("approve") => Ok(DeliveryAction::Approve),
-        Some(other) => Err(format!("unknown ACP plan delivery action '{other}'")),
-        None if object.contains_key("suggestionRevisionId") && object.contains_key("baseRevisionId") => {
-            Ok(DeliveryAction::RequestChanges)
-        }
-        None => Err("stored ACP plan delivery payload has no decision shape".into()),
-    }
-}
-
-pub(super) fn delivery_prompt(payload_json: &str, action: DeliveryAction) -> String {
-    let heading = match action {
-        DeliveryAction::Approve => "The user approved the submitted plan.",
-        DeliveryAction::RequestChanges => {
-            "The user requested changes to the submitted plan. Apply the suggested diff and address every annotation before submitting it again."
-        }
-    };
-    let rendered = serde_json::from_str::<serde_json::Value>(payload_json)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .unwrap_or_else(|| payload_json.to_string());
-    format!("{heading}\n\n<plan_review_delivery>\n{rendered}\n</plan_review_delivery>")
-}
-
-struct Decision {
-    option_id: String,
-    completion: oneshot::Sender<DeliveryBoundary>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PermissionReply {
+    Selected(String),
+    Cancelled,
 }
 
 struct PendingReview {
     review_id: String,
     turn_id: String,
-    session_id: String,
-    call_id: String,
     choices: ReviewChoices,
-    decision: oneshot::Sender<Decision>,
+    decision: oneshot::Sender<PermissionReply>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PendingIdentity {
-    pub review_id: String,
-    pub turn_id: String,
-    pub session_id: String,
-    pub call_id: String,
-}
-
-struct ArmedBoundary {
-    turn_id: String,
-    completion: oneshot::Sender<DeliveryBoundary>,
-}
-
-/// In-memory continuation for a durable review.  Only ACP option senders live
-/// here; the plan, comments, edits and delivery state stay in SQLite.
+/// In-memory waiter for one live ACP `ExitPlanMode` permission request.
+#[derive(Default)]
 pub(super) struct ReviewControl {
     pending: Mutex<Option<PendingReview>>,
-    boundary: Mutex<Option<ArmedBoundary>>,
-    pause: watch::Sender<Option<String>>,
-}
-
-impl Default for ReviewControl {
-    fn default() -> Self {
-        let (pause, _) = watch::channel(None);
-        Self {
-            pending: Mutex::new(None),
-            boundary: Mutex::new(None),
-            pause,
-        }
-    }
 }
 
 impl ReviewControl {
-    pub fn subscribe(&self) -> watch::Receiver<Option<String>> {
-        self.pause.subscribe()
-    }
-
     fn install(
         &self,
         review: &SubmittedReview,
         turn_id: &str,
         choices: ReviewChoices,
-    ) -> Result<oneshot::Receiver<Decision>, String> {
+    ) -> Result<oneshot::Receiver<PermissionReply>, String> {
         let (decision, receive) = oneshot::channel();
         let mut pending = self.pending.lock().map_err(|_| "ACP plan review lock was poisoned")?;
         if pending.is_some() {
@@ -352,110 +271,75 @@ impl ReviewControl {
         *pending = Some(PendingReview {
             review_id: review.event.review_id.clone(),
             turn_id: turn_id.to_string(),
-            session_id: review.session_id.clone(),
-            call_id: review.call_id.clone(),
             choices,
             decision,
         });
-        let _ = self.pause.send(Some(turn_id.to_string()));
         Ok(receive)
     }
 
-    pub fn identity(&self, review_id: &str) -> Option<PendingIdentity> {
-        let pending = self.pending.lock().ok()?;
-        let pending = pending.as_ref().filter(|pending| pending.review_id == review_id)?;
-        Some(PendingIdentity {
-            review_id: pending.review_id.clone(),
-            turn_id: pending.turn_id.clone(),
-            session_id: pending.session_id.clone(),
-            call_id: pending.call_id.clone(),
-        })
+    pub fn has_pending(&self, review_id: &str) -> bool {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|pending| pending.as_ref().map(|p| p.review_id == review_id))
+            .unwrap_or(false)
     }
 
     pub fn is_waiting_turn(&self, turn_id: &str) -> bool {
-        let pending = self
-            .pending
+        self.pending
             .lock()
             .ok()
-            .and_then(|pending| pending.as_ref().map(|pending| pending.turn_id == turn_id))
-            .unwrap_or(false);
-        pending
-            || self
-                .boundary
-                .lock()
-                .ok()
-                .and_then(|boundary| boundary.as_ref().map(|boundary| boundary.turn_id == turn_id))
-                .unwrap_or(false)
+            .and_then(|pending| pending.as_ref().map(|p| p.turn_id == turn_id))
+            .unwrap_or(false)
     }
 
-    pub fn resolve(
-        &self,
-        review_id: &str,
-        action: ReviewDecisionAction,
-    ) -> Result<oneshot::Receiver<DeliveryBoundary>, String> {
+    /// Resolve the live `ExitPlanMode` waiter. Returns `true` when the chosen
+    /// `option_id` already handled `acceptEdits` natively.
+    pub fn resolve(&self, review_id: &str, reply: AcpPlanReply) -> Result<bool, String> {
         let mut pending = self.pending.lock().map_err(|_| "ACP plan review lock was poisoned")?;
         let current = pending
             .as_ref()
-            .ok_or("the ACP plan permission request is no longer live")?;
+            .ok_or("the ACP plan review request is no longer active")?;
         if current.review_id != review_id {
-            return Err("the live ACP plan permission belongs to a different review".into());
+            return Err("the active ACP plan review belongs to a different review".into());
         }
         let pending = pending.take().expect("checked above");
-        let option_id = match action {
-            ReviewDecisionAction::Approve => pending.choices.allow.clone(),
-            ReviewDecisionAction::RequestChanges => pending.choices.reject.clone(),
+        let (wire, used_accept_edits_option) = match reply {
+            AcpPlanReply::Approve { accept_edits: true } => {
+                if let Some(id) = pending.choices.allow_accept_edits {
+                    (PermissionReply::Selected(id), true)
+                } else {
+                    (PermissionReply::Selected(pending.choices.allow_default), false)
+                }
+            }
+            AcpPlanReply::Approve { accept_edits: false } => {
+                (PermissionReply::Selected(pending.choices.allow_default), false)
+            }
+            AcpPlanReply::RequestChanges => (PermissionReply::Selected(pending.choices.reject), false),
+            AcpPlanReply::CancelForClearContext => (PermissionReply::Cancelled, false),
         };
-        let (completion, receive) = oneshot::channel();
         pending
             .decision
-            .send(Decision { option_id, completion })
+            .send(wire)
             .map_err(|_| "the ACP plan permission request ended before it could be answered")?;
-        Ok(receive)
+        Ok(used_accept_edits_option)
     }
 
-    fn arm(&self, turn_id: &str, completion: oneshot::Sender<DeliveryBoundary>) {
-        if let Ok(mut boundary) = self.boundary.lock() {
-            *boundary = Some(ArmedBoundary {
-                turn_id: turn_id.to_string(),
-                completion,
-            });
-        }
-    }
-
-    pub fn take_boundary(&self, turn_id: &str) -> Option<BoundaryCompletion> {
-        let mut boundary = self.boundary.lock().ok()?;
-        if boundary.as_ref().is_some_and(|boundary| boundary.turn_id == turn_id) {
-            let boundary = boundary.take()?;
-            let _ = self.pause.send(None);
-            Some(BoundaryCompletion(boundary.completion))
-        } else {
-            None
-        }
-    }
-
-    pub fn cancel(&self, review_id: &str) {
+    pub fn cancel(&self, review_id: &str) -> bool {
         if let Ok(mut pending) = self.pending.lock()
             && pending.as_ref().is_some_and(|pending| pending.review_id == review_id)
         {
             pending.take();
-            let _ = self.pause.send(None);
+            return true;
         }
+        false
     }
 }
 
-pub(super) struct BoundaryCompletion(oneshot::Sender<DeliveryBoundary>);
+pub(super) struct PermissionWait(oneshot::Receiver<PermissionReply>);
 
-impl BoundaryCompletion {
-    pub fn complete(self, boundary: DeliveryBoundary) {
-        let _ = self.0.send(boundary);
-    }
-}
-
-pub(super) struct PermissionWait(oneshot::Receiver<Decision>);
-
-/// Install the live option sender before announcing the durable review. This
-/// closes the small but real race where a fast click could otherwise dispatch
-/// a decision while the review row existed but its ACP continuation did not.
+/// Install the live permission sender before announcing the review so a fast
+/// user click cannot race ahead of the waiter.
 pub(super) fn install_permission_wait(
     control: &ReviewControl,
     review: &SubmittedReview,
@@ -465,24 +349,52 @@ pub(super) fn install_permission_wait(
     control.install(review, turn_id, choices).map(PermissionWait)
 }
 
-/// Wait for the durable decision and turn it back into ACP's exact option id.
+/// Wait for the decision and turn it into the ACP JSON-RPC permission reply.
+/// If the turn is cancelled before the user decides, marks the review orphaned
+/// and announces the update.
 pub(super) async fn await_permission_decision(
+    services: &Services,
     control: &ReviewControl,
     review: &SubmittedReview,
-    turn_id: &str,
     cancel: &CancellationToken,
     wait: PermissionWait,
 ) -> serde_json::Value {
-    let decision = tokio::select! {
-        decision = wait.0 => decision.ok(),
+    let reply = tokio::select! {
+        reply = wait.0 => reply.ok(),
         _ = cancel.cancelled() => None,
     };
-    let Some(decision) = decision else {
-        control.cancel(&review.event.review_id);
-        return super::protocol::permission_cancelled();
-    };
-    control.arm(turn_id, decision.completion);
-    super::protocol::permission_selected(&decision.option_id)
+    match reply {
+        Some(PermissionReply::Selected(option_id)) => super::protocol::permission_selected(&option_id),
+        Some(PermissionReply::Cancelled) => super::protocol::permission_cancelled(),
+        None => {
+            control.cancel(&review.event.review_id);
+            let orphaned = services
+                .db
+                .write(async |tx| {
+                    ops::orphan_review(
+                        tx,
+                        &review.event.review_id,
+                        "The turn was stopped before this plan was decided",
+                        now_ms(),
+                    )
+                    .await
+                })
+                .await;
+            if let Ok(Some((doc, rev))) = orphaned {
+                let event = PlanReviewEvent {
+                    review_id: rev.id,
+                    conversation_id: doc.conversation_id,
+                    document_id: rev.document_id,
+                    revision_id: rev.submitted_revision_id,
+                    turn_id: rev.turn_id.unwrap_or_default(),
+                    status: rev.state.as_str().to_string(),
+                    lock_version: rev.lock_version,
+                };
+                let _ = services.events.emit_plan_review_updated(&event);
+            }
+            super::protocol::permission_cancelled()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -517,11 +429,6 @@ mod tests {
         }
     }
 
-    /// The shape the adapter actually sends for a top-level `ExitPlanMode`:
-    /// no `_meta` (that is only for sub-agent and MCP calls), the name in
-    /// `name`, and a title written for a person. The fixture above puts the
-    /// name in `_meta`, which is why this path passed its tests while every
-    /// real plan went to the ordinary two-button card.
     #[test]
     fn exit_plan_is_detected_as_the_adapter_actually_sends_it() {
         let params: RequestPermissionParams = serde_json::from_value(serde_json::json!({
@@ -564,26 +471,39 @@ mod tests {
     }
 
     #[test]
-    fn review_choices_are_always_one_shot() {
+    fn review_choices_pick_default_accept_edits_and_reject_without_bypass() {
         let option = |id: &str, kind: &str| PermissionOption {
             option_id: id.into(),
             name: id.into(),
             kind: kind.into(),
         };
         let choices = ReviewChoices::pick(&[
-            option("forever", "allow_always"),
+            option("bypassPermissions", "allow_always"),
+            option("acceptEdits", "allow_always"),
+            option("default", "allow_once"),
+            option("plan", "reject_once"),
+        ])
+        .unwrap();
+        assert_eq!(choices.allow_default, "default");
+        assert_eq!(choices.allow_accept_edits.as_deref(), Some("acceptEdits"));
+        assert_eq!(choices.reject, "plan");
+
+        // Never falls back to bypassPermissions.
+        let basic = ReviewChoices::pick(&[
+            option("bypassPermissions", "allow_always"),
             option("yes", "allow_once"),
-            option("never", "reject_always"),
             option("no", "reject_once"),
         ])
         .unwrap();
-        assert_eq!(choices.allow, "yes");
-        assert_eq!(choices.reject, "no");
+        assert_eq!(basic.allow_default, "yes");
+        assert_eq!(basic.allow_accept_edits, None);
+        assert_eq!(basic.reject, "no");
+
         assert!(ReviewChoices::pick(&[option("forever", "allow_always"), option("never", "reject_always"),]).is_none());
     }
 
     #[tokio::test]
-    async fn an_acp_snapshot_becomes_a_materialized_waiting_review() {
+    async fn an_acp_snapshot_becomes_a_materialized_pending_review_on_a_running_turn() {
         let dir = tempfile::tempdir().unwrap();
         let services = bare_services(dir.path()).await;
         services
@@ -618,73 +538,16 @@ mod tests {
         assert_eq!(bundle.review.provider_call_id.as_deref(), Some("call-1"));
         assert_eq!(bundle.review.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(bundle.submitted_revision.content_markdown, "# Plan\n\n- one\n");
-        let snapshot = services
-            .plan_files
-            .read_document(&services.db, &bundle.document.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(snapshot.content, bundle.submitted_revision.content_markdown);
         let turn = crate::db::sea::ops::turn::get(&services.db, "turn-1")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(turn.status, TurnStatus::WaitingReview);
-    }
-
-    /// A second ExitPlanMode while one review is waiting is refused before it
-    /// writes anything: the conversation has one review at a time.
-    #[tokio::test]
-    async fn a_second_snapshot_waits_for_the_first_review() {
-        let dir = tempfile::tempdir().unwrap();
-        let services = bare_services(dir.path()).await;
-        services
-            .db
-            .write(async |tx| {
-                crate::db::sea::ops::conversation::create(tx, "c1", Some("plan"), None, None, 1).await?;
-                crate::db::sea::ops::turn::begin(tx, "t1", "c1", TurnOrigin::ClaudeCode, None, 2).await?;
-                crate::db::sea::ops::turn::begin(tx, "t2", "c1", TurnOrigin::ClaudeCode, None, 3).await
-            })
-            .await
-            .unwrap();
-        let snapshot = |call: &str, markdown: &str| ExitPlanSubmission {
-            session_id: "session-1".into(),
-            call_id: call.into(),
-            markdown: markdown.into(),
-        };
-        submit(
-            &services,
-            "c1",
-            "t1",
-            "m1",
-            snapshot(
-                "call-1", "# One
-",
-            ),
-        )
-        .await
-        .unwrap();
-        let error = submit(
-            &services,
-            "c1",
-            "t2",
-            "m2",
-            snapshot(
-                "call-2", "# Two
-",
-            ),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.contains("already has a plan awaiting review"), "{error}");
-        let document = ops::get_active_document(&services.db, "c1").await.unwrap().unwrap();
-        assert_eq!(ops::list_revisions(&services.db, &document.id).await.unwrap().len(), 1);
+        assert_eq!(turn.status, TurnStatus::Running);
     }
 
     #[tokio::test]
-    async fn the_live_control_releases_the_lease_signal_and_keeps_exact_option_ids() {
+    async fn live_control_resolves_approve_accept_edits_and_clear_context() {
         let control = ReviewControl::default();
-        let mut pause = control.subscribe();
         let submitted = SubmittedReview {
             event: PlanReviewEvent {
                 review_id: "review-1".into(),
@@ -694,34 +557,24 @@ mod tests {
                 turn_id: "turn-1".into(),
                 status: "pending".into(),
                 lock_version: 0,
-                delivery_state: None,
             },
-            session_id: "session-1".into(),
-            call_id: "call-1".into(),
         };
-        let decision = control
+        let rx = control
             .install(
                 &submitted,
                 "turn-1",
                 ReviewChoices {
-                    allow: "allow-once-id".into(),
-                    reject: "reject-once-id".into(),
+                    allow_default: "default".into(),
+                    allow_accept_edits: Some("acceptEdits".into()),
+                    reject: "plan".into(),
                 },
             )
             .unwrap();
-        pause.changed().await.unwrap();
-        assert_eq!(pause.borrow().as_deref(), Some("turn-1"));
-
-        let completed = control
-            .resolve("review-1", ReviewDecisionAction::RequestChanges)
+        assert!(control.has_pending("review-1"));
+        let used_accept_edits = control
+            .resolve("review-1", AcpPlanReply::Approve { accept_edits: true })
             .unwrap();
-        let decision = decision.await.unwrap();
-        assert_eq!(decision.option_id, "reject-once-id");
-        control.arm("turn-1", decision.completion);
-        control
-            .take_boundary("turn-1")
-            .unwrap()
-            .complete(DeliveryBoundary::Acknowledged);
-        assert_eq!(completed.await.unwrap(), DeliveryBoundary::Acknowledged);
+        assert!(used_accept_edits);
+        assert_eq!(rx.await.unwrap(), PermissionReply::Selected("acceptEdits".into()));
     }
 }

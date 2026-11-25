@@ -98,8 +98,6 @@ pub struct PlanReviewEvent {
     pub turn_id: String,
     pub status: String,
     pub lock_version: i64,
-    #[serde(deserialize_with = "deserialize_required_nullable")]
-    pub delivery_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

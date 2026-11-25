@@ -2660,165 +2660,140 @@ impl AcpSession {
         (!self.shared.plan_reviews.is_waiting_turn(&turn.turn_id)).then(|| turn.turn_id.clone())
     }
 
-    /// Continue a committed durable plan decision across the ACP boundary.
+    /// Whether this session currently holds a live `ExitPlanMode` waiter for `review_id`.
+    pub fn has_pending_plan_review(&self, review_id: &str) -> bool {
+        self.shared.plan_reviews.has_pending(review_id)
+    }
+
+    /// Best-effort switch of the ACP session's `mode` config option (e.g.
+    /// `default` or `acceptEdits`) when the adapter exposes one.
+    pub async fn set_mode_if_available(&self, mode_value: &str) {
+        let mode_option_id = self
+            .shared
+            .config_options()
+            .into_iter()
+            .find(|opt| {
+                (opt.category.as_deref() == Some("mode") || opt.id == "mode")
+                    && opt.options.iter().any(|choice| choice.value == mode_value)
+            })
+            .map(|opt| opt.id);
+        if let Some(config_id) = mode_option_id
+            && let Err(error) = self
+                .set_config_option(&config_id, serde_json::Value::String(mode_value.to_string()))
+                .await
+        {
+            tracing::warn!(%error, mode = mode_value, "could not update ACP session mode");
+        }
+    }
+
+    /// Resolve a live ACP `ExitPlanMode` permission request immediately.
     ///
-    /// A live ExitPlanMode is resumed by answering its exact one-shot option.
-    /// Change feedback is steered into that turn first when the adapter can
-    /// prove it was injected; otherwise the rejection is allowed to close the
-    /// old turn and the same durable envelope is sent as a new prompt. After a
-    /// restart there is no option sender to recover, so the explicit delivery
-    /// likewise becomes a prompt on the resumed session.
-    pub async fn deliver_plan_review(
+    /// Returns without waiting for the implementation turn to finish — the
+    /// adapter continues streaming inside the same `session/prompt` turn.
+    pub async fn resolve_plan_review(
         &self,
         services: &Services,
-        delivery: super::AcpPlanReviewDelivery,
-    ) -> super::AcpPlanReviewDeliveryOutcome {
-        use super::plan_review::{
-            AcpPlanReviewDeliveryOutcome as Outcome, DeliveryAction, DeliveryBoundary, ReviewDecisionAction,
-        };
+        resolution: super::AcpPlanReviewResolution,
+    ) -> Result<(), String> {
+        use super::plan_review::{AcpPlanReply, AcpPlanReviewResolution as Res};
 
-        let action = match super::plan_review::delivery_action(&delivery.payload_json) {
-            Ok(action) => action,
-            Err(error) => return Outcome::Held(error),
-        };
-        let prompt = super::plan_review::delivery_prompt(&delivery.payload_json, action);
-
-        if let Some(identity) = self.shared.plan_reviews.identity(&delivery.review_id) {
-            if identity.call_id != delivery.provider_call_id {
-                return Outcome::Held(format!(
-                    "ACP review call mismatch: live {}, stored {}",
-                    identity.call_id, delivery.provider_call_id
-                ));
+        match resolution {
+            Res::Approve {
+                review_id,
+                accept_edits: _,
+                clear_context: true,
+                ..
+            } => {
+                // Cancel the live ExitPlanMode permission so Claude Code does
+                // not start implementing inside the old context; the caller
+                // immediately opens a fresh ACP session for the approved plan.
+                self.shared
+                    .plan_reviews
+                    .resolve(&review_id, AcpPlanReply::CancelForClearContext)?;
+                Ok(())
             }
-            if let Some(expected) = delivery.target_session_id.as_deref()
-                && expected != identity.session_id
-            {
-                return Outcome::Held(format!(
-                    "ACP review session mismatch: live {}, stored {expected}",
-                    identity.session_id
-                ));
+            Res::Approve {
+                review_id,
+                accept_edits,
+                clear_context: false,
+                plan_markdown,
+                edited_by_user,
+                feedback,
+            } => {
+                let mut note = String::new();
+                if edited_by_user {
+                    note.push_str("The user edited the plan before approving. Follow this updated plan:\n\n");
+                    note.push_str(plan_markdown.trim());
+                }
+                if let Some(fb) = feedback.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    if !note.is_empty() {
+                        note.push_str("\n\n");
+                    }
+                    note.push_str("## User notes / feedback\n");
+                    note.push_str(fb);
+                }
+                if !note.is_empty()
+                    && self.steering
+                    && let Ok(params) =
+                        serde_json::to_value(protocol::SteerParams::text(self.acp_session_id.clone(), &note))
+                {
+                    let _ = self.peer.request(protocol::STEER_METHOD, params).await;
+                }
+                let used_accept_edits_option = self
+                    .shared
+                    .plan_reviews
+                    .resolve(&review_id, AcpPlanReply::Approve { accept_edits })?;
+                if accept_edits && !used_accept_edits_option {
+                    self.set_mode_if_available("acceptEdits").await;
+                }
+                Ok(())
             }
-            if identity.turn_id != delivery.submitting_turn_id {
-                return Outcome::Held(format!(
-                    "ACP review turn mismatch: live {}, stored {}",
-                    identity.turn_id, delivery.submitting_turn_id
-                ));
-            }
-
-            let mut needs_prompt = false;
-            // Once steering reports any success other than `promptRequired`,
-            // the feedback may already be inside the adapter. If resolving the
-            // parked ExitPlanMode option then fails, replaying this delivery is
-            // unsafe: surface an in-doubt boundary instead of a retryable hold.
-            let mut feedback_consumed = false;
-            if action == DeliveryAction::RequestChanges {
-                if self.steering {
-                    let params =
-                        match serde_json::to_value(protocol::SteerParams::text(self.acp_session_id.clone(), &prompt)) {
-                            Ok(params) => params,
-                            Err(error) => return Outcome::Held(error.to_string()),
-                        };
+            Res::RequestChanges { review_id, feedback } => {
+                let prompt = format!(
+                    "The user requested changes to your plan. Stay in plan mode, revise the plan to address the feedback below, and call ExitPlanMode again when ready.\n\n{feedback}"
+                );
+                let mut needs_follow_up = true;
+                if self.steering
+                    && let Ok(params) =
+                        serde_json::to_value(protocol::SteerParams::text(self.acp_session_id.clone(), &prompt))
+                {
                     match self.peer.request(protocol::STEER_METHOD, params).await {
                         Ok(value) => match serde_json::from_value::<protocol::SteerResult>(value) {
                             Ok(result) if result.outcome() == protocol::SteerOutcome::PromptRequired => {
-                                // Definitively not consumed; safe to carry it
-                                // as a normal prompt after rejection closes the
-                                // ExitPlanMode turn.
-                                needs_prompt = true;
+                                needs_follow_up = true;
                             }
-                            // Injected, startedNewTurn and an unknown future
-                            // success all mean the adapter says it consumed the
-                            // message. An unreadable success reply is treated
-                            // the same way: replaying would be the dangerous
-                            // choice.
-                            Ok(_) | Err(_) => feedback_consumed = true,
+                            Ok(_) | Err(_) => needs_follow_up = false,
                         },
-                        Err(PeerError::Rpc(_)) => {
-                            // The adapter answered no, so nothing was consumed.
-                            needs_prompt = true;
-                        }
-                        Err(PeerError::Dead(error)) => return Outcome::InDoubt(error),
+                        Err(_) => needs_follow_up = true,
                     }
-                } else {
-                    needs_prompt = true;
                 }
-            }
-
-            let action = match action {
-                DeliveryAction::Approve => ReviewDecisionAction::Approve,
-                DeliveryAction::RequestChanges => ReviewDecisionAction::RequestChanges,
-            };
-            let boundary = match self.shared.plan_reviews.resolve(&delivery.review_id, action) {
-                Ok(boundary) => boundary,
-                Err(error) if feedback_consumed => return Outcome::InDoubt(error),
-                Err(error) => return Outcome::Held(error),
-            };
-            match boundary.await {
-                Ok(DeliveryBoundary::Acknowledged) => {}
-                Ok(DeliveryBoundary::InDoubt(error)) => return Outcome::InDoubt(error),
-                Err(_) => {
-                    return Outcome::InDoubt("ACP review response ended without a prompt acknowledgement".into());
+                self.shared
+                    .plan_reviews
+                    .resolve(&review_id, AcpPlanReply::RequestChanges)?;
+                if needs_follow_up {
+                    // Enqueue as an immediate follow-up so it runs as soon as
+                    // the rejected ExitPlanMode turn settles and drops its lease.
+                    let services = services.clone();
+                    let conversation_id = self.conversation_id.clone();
+                    let queue_id = uuid::Uuid::new_v4().to_string();
+                    let _ = services
+                        .db
+                        .write(async |tx| {
+                            crate::db::sea::ops::queue::enqueue(
+                                tx,
+                                &queue_id,
+                                &conversation_id,
+                                &prompt,
+                                crate::db::models::queue::Delivery::FollowUp,
+                                now_ms(),
+                            )
+                            .await
+                        })
+                        .await;
                 }
-            }
-
-            if !needs_prompt {
-                return Outcome::Acknowledged;
-            }
-            return match self
-                .prompt_with(
-                    services,
-                    &prompt,
-                    None,
-                    None,
-                    Vec::new(),
-                    true,
-                    CancellationToken::new(),
-                )
-                .await
-            {
-                Ok(()) => Outcome::Acknowledged,
-                Err(error) if !self.is_alive() => Outcome::InDoubt(error),
-                Err(error) => Outcome::Held(error),
-            };
-        }
-
-        // There is no recoverable JSON-RPC response sender after restart. An
-        // explicit user continuation instead delivers the immutable envelope
-        // to the resumed ACP session as a normal prompt. Never do this from a
-        // startup pump: callers reach it only from decide/continue commands.
-        if self.shared.turn.lock().is_ok_and(|turn| turn.is_some()) {
-            return Outcome::Held("the ACP session is busy with another turn".into());
-        }
-        let outcome = match self
-            .prompt_with(
-                services,
-                &prompt,
-                None,
-                None,
-                Vec::new(),
-                true,
-                CancellationToken::new(),
-            )
-            .await
-        {
-            Ok(()) => Outcome::Acknowledged,
-            Err(error) if !self.is_alive() => Outcome::InDoubt(error),
-            Err(error) => Outcome::Held(error),
-        };
-        if matches!(outcome, Outcome::Acknowledged) {
-            let turn_id = delivery.submitting_turn_id;
-            let written = services
-                .db
-                .write(async |tx| {
-                    crate::db::sea::ops::turn::finish_waiting_review(tx, &turn_id, TurnStatus::Done, None, now_ms())
-                        .await
-                })
-                .await;
-            if let Err(error) = written {
-                tracing::warn!(%error, "could not settle resumed ACP review turn");
+                Ok(())
             }
         }
-        outcome
     }
 
     /// Put a message into the turn that is already running.
@@ -2947,16 +2922,8 @@ impl AcpSession {
     /// would not exist until the adapter had been reached, and everything
     /// arriving in the gap would be measured against nothing.
     pub async fn prompt(&self, services: &Services, text: &str, turn_id: Option<String>) -> Result<(), String> {
-        self.prompt_with(
-            services,
-            text,
-            turn_id,
-            None,
-            Vec::new(),
-            false,
-            CancellationToken::new(),
-        )
-        .await
+        self.prompt_with(services, text, turn_id, None, Vec::new(), CancellationToken::new())
+            .await
     }
 
     /// The same turn with user-selected workspace snapshots. `text` remains
@@ -2975,8 +2942,7 @@ impl AcpSession {
         context: Vec<crate::workspace::reference::PreparedContextItem>,
         stop: CancellationToken,
     ) -> Result<(), String> {
-        self.prompt_with(services, text, turn_id, None, context, false, stop)
-            .await
+        self.prompt_with(services, text, turn_id, None, context, stop).await
     }
 
     /// Whether a message's attachments can go to this agent as they are.
@@ -3051,7 +3017,6 @@ impl AcpSession {
             None,
             Some(&item.id),
             context,
-            false,
             CancellationToken::new(),
         )
         .await
@@ -3064,21 +3029,15 @@ impl AcpSession {
         turn_id: Option<String>,
         queued: Option<&str>,
         context: Vec<crate::workspace::reference::PreparedContextItem>,
-        bypass_plan_review_barrier: bool,
         cancel: CancellationToken,
     ) -> Result<(), String> {
-        // Usually the coordinator lease is the whole concurrency guard. A
-        // waiting_review turn has intentionally released that lease while its
-        // ACP request is still alive, so the session-local state is the second
-        // half: no new prompt may overwrite the parked turn before its durable
-        // decision has crossed the adapter boundary.
         if let Ok(turn) = self.shared.turn.lock()
             && let Some(turn) = turn.as_ref()
         {
             return Err(if turn.unprompted.is_some() {
                 "Claude Code is still working on its own. Wait for it to finish, or stop it first.".into()
             } else {
-                "Claude Code is still finishing the previous plan review decision.".into()
+                "Claude Code is busy with another turn.".into()
             });
         }
         let turn_id = match turn_id {
@@ -3090,7 +3049,7 @@ impl AcpSession {
         // The peer's drop counter never resets, so what this turn lost is the
         // difference across it rather than the total.
         let dropped_before = self.peer.dropped_notifications();
-        let mut lease = Some(
+        let lease = Some(
             Arc::clone(&services.turns)
                 .try_acquire_turn_with(
                     &self.conversation_id,
@@ -3100,18 +3059,6 @@ impl AcpSession {
                 )
                 .map_err(|busy| busy.to_string())?,
         );
-        if !bypass_plan_review_barrier
-            && crate::agent::queue::has_plan_review_barrier(services, &self.conversation_id).await?
-        {
-            return Err(
-                "This conversation is waiting for plan review or its continuation. Finish it before sending another ACP prompt."
-                    .into(),
-            );
-        }
-        // Subscribed before the prompt is sent. ExitPlanMode can arrive as the
-        // adapter's first act, and the pause notification must not be lost in
-        // the gap between durable submission and entering the select loop.
-        let mut review_pause = self.shared.plan_reviews.subscribe();
 
         // Before the row, so that a refusal leaves nothing behind: no message
         // for an attachment the agent was never sent, no turn to unwind. The
@@ -3264,17 +3211,6 @@ impl AcpSession {
                         "session/cancel",
                         serde_json::json!({ "sessionId": self.acp_session_id }),
                     ).await;
-                }
-                changed = review_pause.changed(), if lease.is_some() => {
-                    if changed.is_ok()
-                        && review_pause.borrow().as_deref() == Some(turn_id.as_str())
-                    {
-                        // SQLite is already at waiting_review. Releasing this
-                        // lease is what makes the boundary survive as durable
-                        // state rather than as a runner that merely happens to
-                        // be blocked on a person.
-                        drop(lease.take());
-                    }
                 }
             }
         };
@@ -3464,11 +3400,6 @@ impl AcpSession {
             self.retire_approvals(services, turn_id);
             return Err("the ACP turn lost its state".into());
         };
-        // Present only after a durable review decision was handed back to the
-        // adapter. A process dying while the review is still pending has no
-        // boundary here, so the waiting_review row is deliberately left
-        // untouched for restart recovery.
-        let review_boundary = self.shared.plan_reviews.take_boundary(turn_id);
 
         // Before anything else, and on every path out of a turn. A question can
         // still be on screen when the turn ends — the adapter died with one
@@ -3548,22 +3479,7 @@ impl AcpSession {
         let unwritten = self.shared.unwritten_rows.swap(0, std::sync::atomic::Ordering::Relaxed);
         let (status, reason, error) = incomplete_unless_whole(status, reason, error, lost, unwritten);
 
-        if review_boundary.is_some() {
-            let written = services
-                .db
-                .write(async |tx| {
-                    crate::db::sea::ops::turn::finish_waiting_review(tx, turn_id, status, error.as_deref(), now_ms())
-                        .await
-                })
-                .await;
-            match written {
-                Ok(1) => {}
-                Ok(_) => tracing::warn!(turn_id, "ACP review decision found no waiting turn to settle"),
-                Err(error) => tracing::warn!(%error, turn_id, "could not settle ACP waiting review turn"),
-            }
-        } else {
-            crate::agent::turn_record::finish(&services.db, turn_id, status, error.as_deref()).await;
-        }
+        crate::agent::turn_record::finish(&services.db, turn_id, status, error.as_deref()).await;
 
         self.shared.emit(ChatStreamEvent::Stop {
             reason,
@@ -3589,16 +3505,6 @@ impl AcpSession {
         match status {
             TurnStatus::Done => crate::agent::queue::pump_later(services, &self.conversation_id),
             _ => crate::agent::queue::hold(services, &self.conversation_id).await,
-        }
-
-        if let Some(boundary) = review_boundary {
-            boundary.complete(match &outcome {
-                // An answer to session/prompt is the first protocol evidence
-                // that the adapter consumed our permission response. Its stop
-                // reason may still describe a failed turn; delivery happened.
-                Ok(_) => super::plan_review::DeliveryBoundary::Acknowledged,
-                Err(error) => super::plan_review::DeliveryBoundary::InDoubt(error.to_string()),
-            });
         }
 
         // A failure the adapter reported as a typed record is already in the

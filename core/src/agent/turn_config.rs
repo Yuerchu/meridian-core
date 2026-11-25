@@ -753,7 +753,7 @@ mod tests {
             )
             .await?;
             plan_ops::mark_materialization_applied(tx, &appended.materialization.id, 14).await?;
-            let review = plan_ops::submit_native_head_for_review(
+            let review = plan_ops::submit_head_for_review(
                 tx,
                 &plan_ops::PlanReviewSubmit {
                     document_id: &document.id,
@@ -765,7 +765,6 @@ mod tests {
                     provider_kind: crate::db::models::plan_review::PlanReviewProviderKind::Native,
                     now: 15,
                 },
-                &crate::db::models::plan_review::NativePlanReviewRuntimeConfig::fixture(),
             )
             .await?;
             plan_ops::decide_review(
@@ -777,10 +776,8 @@ mod tests {
                     expected_draft_generation: 0,
                     expected_draft_sha256: &review.draft.draft_sha256,
                     action: plan_ops::PlanReviewDecisionAction::Approve,
+                    accept_edits: None,
                     decision_summary: None,
-                    delivery_target: None,
-                    target_session_id: None,
-                    target_turn_id: None,
                     now: 16,
                 },
             )

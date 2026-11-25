@@ -398,13 +398,6 @@ pub async fn attach(services: &Services, conversation_id: &str, session_id: &str
         )
         .map_err(|busy| busy.to_string())?;
 
-    if crate::agent::queue::has_plan_review_barrier(services, conversation_id).await? {
-        return Err(
-            "This conversation is waiting for plan review or its continuation. Finish it before attaching another ACP session."
-                .into(),
-        );
-    }
-
     // One transaction, because the checks are read-then-write: two clients
     // pointing two conversations at one session would both pass the ownership
     // read and the loser would get the raw
