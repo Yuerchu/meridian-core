@@ -1727,6 +1727,10 @@ async fn handle_connection(ws: axum::extract::ws::WebSocket, conn_id: u64, state
 
     // Set up a channel for outbound messages (used by approval requests etc.)
     let (sink_tx, mut sink_rx) = mpsc::channel::<String>(64);
+    // Wake the split write half to flush tungstenite's auto-queued Pong frames
+    // even while the connection is otherwise idle (clients like SnowLuma send
+    // 30s Ping keepalives and drop half-open links after 2 missed Pongs).
+    let (flush_tx, mut flush_rx) = mpsc::channel::<()>(4);
     {
         let mut sinks = state.ws_sinks.lock().await;
         sinks.insert(conn_id, sink_tx);
@@ -1734,9 +1738,20 @@ async fn handle_connection(ws: axum::extract::ws::WebSocket, conn_id: u64, state
 
     // Spawn outbound writer
     let mut write_handle = tokio::spawn(async move {
-        while let Some(msg) = sink_rx.recv().await {
-            if write.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                Some(()) = flush_rx.recv() => {
+                    if write.flush().await.is_err() {
+                        break;
+                    }
+                }
+                msg = sink_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if write.send(Message::Text(msg.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -1761,7 +1776,11 @@ async fn handle_connection(ws: axum::extract::ws::WebSocket, conn_id: u64, state
         let Some(msg) = next else { break };
         let text = match msg {
             Ok(Message::Text(t)) => t.to_string(),
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+            Ok(Message::Ping(_)) => {
+                let _ = flush_tx.try_send(());
+                continue;
+            }
+            Ok(Message::Pong(_)) => continue,
             Ok(Message::Close(_)) | Err(_) => break,
             _ => continue,
         };
