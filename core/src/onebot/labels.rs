@@ -28,6 +28,8 @@ const LABELS: &[(&str, &str)] = &[
     ("delete_memory", "删除记忆"),
     ("ask_user", "提问"),
     ("web_search", "网络搜索"),
+    ("generate_image", "生成图片"),
+    ("generate_video", "生成视频"),
     ("google_search", "Google 搜索"),
     ("url_context", "网页获取"),
     ("update_todos", "任务清单"),
