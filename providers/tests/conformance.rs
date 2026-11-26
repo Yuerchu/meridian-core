@@ -47,9 +47,9 @@ fn all_shipped_protocol_and_capability_providers_pass_conformance() {
         "https://aiplatform.googleapis.com/v1beta1/locations/global",
         "k",
     ));
-    assert_chat_provider_conformance(&DeepSeekChatProvider::new("https://api.deepseek.com", "k"));
-    assert_chat_provider_conformance(&XaiOpenAIChatProvider::new("https://api.x.ai/v1", "k"));
-    assert_chat_provider_conformance(&GoogleOpenAIChatProvider::new(
+    assert_chat_provider_conformance(&DeepSeekChatProvider::build("https://api.deepseek.com", "k"));
+    assert_chat_provider_conformance(&XaiOpenAIChatProvider::build("https://api.x.ai/v1", "k"));
+    assert_chat_provider_conformance(&GoogleOpenAIChatProvider::build(
         "https://generativelanguage.googleapis.com/v1beta/openai",
         "k",
         GoogleCompatThinkingMode::Auto,

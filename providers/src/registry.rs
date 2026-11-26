@@ -390,7 +390,7 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
         }
         ProviderType::Deepseek => match api_format {
             ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key, codex_shape.clone())),
-            ApiFormat::ChatCompletions => Box::new(DeepSeekChatProvider::new(base_url, api_key)),
+            ApiFormat::ChatCompletions => Box::new(DeepSeekChatProvider::build(base_url, api_key)),
             other => {
                 return Err(format!(
                     "API format `{other:?}` is not supported by provider type `deepseek`"
@@ -399,7 +399,7 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
         },
         ProviderType::Xai => match api_format {
             ApiFormat::Responses => Box::new(OpenAIResponsesProvider::new(base_url, api_key, codex_shape.clone())),
-            ApiFormat::ChatCompletions => Box::new(XaiOpenAIChatProvider::new(base_url, api_key)),
+            ApiFormat::ChatCompletions => Box::new(XaiOpenAIChatProvider::build(base_url, api_key)),
             other => {
                 return Err(format!(
                     "API format `{other:?}` is not supported by provider type `xai`"
@@ -418,7 +418,7 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
                 }
                 super::Credential::ChatGpt(_) | super::Credential::None => unreachable!(),
             },
-            ApiFormat::ChatCompletions => Box::new(GoogleOpenAIChatProvider::new(
+            ApiFormat::ChatCompletions => Box::new(GoogleOpenAIChatProvider::build(
                 base_url,
                 api_key,
                 google_compat_thinking_mode,

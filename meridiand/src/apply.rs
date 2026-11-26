@@ -198,6 +198,8 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
                     // to follow.
                     codex_request_shape: SqlBool::FALSE,
                     local_backend: None,
+                    capability_domain: meridian_core::provider::CapabilityDomain::Chat,
+                    config_json: None,
                 },
             )
             .await
@@ -562,6 +564,8 @@ mod tests {
                     icon: None,
                     codex_request_shape: SqlBool::FALSE,
                     local_backend: None,
+                    capability_domain: meridian_core::provider::CapabilityDomain::Chat,
+                    config_json: None,
                 },
             )
             .await

@@ -45,7 +45,7 @@ impl OpenAIChatExtension for XaiOpenAIChatExtension {
 pub struct XaiOpenAIChatProvider;
 
 impl XaiOpenAIChatProvider {
-    pub fn new(base_url: &str, api_key: &str) -> OpenAIChatProvider {
+    pub fn build(base_url: &str, api_key: &str) -> OpenAIChatProvider {
         OpenAIChatProvider::with_extension(base_url, api_key, Arc::new(XaiOpenAIChatExtension))
     }
 }
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn the_cache_key_becomes_the_routing_header() {
-        let provider = XaiOpenAIChatProvider::new("https://api.x.ai/v1", "key");
+        let provider = XaiOpenAIChatProvider::build("https://api.x.ai/v1", "key");
         let req = provider
             .build_request(&[ChatMessage::user("hello")], None, &params(), true)
             .unwrap();
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn no_cache_key_means_no_header_rather_than_an_empty_one() {
-        let provider = XaiOpenAIChatProvider::new("https://api.x.ai/v1", "key");
+        let provider = XaiOpenAIChatProvider::build("https://api.x.ai/v1", "key");
         let mut p = params();
         p.cache_key = None;
         let req = provider

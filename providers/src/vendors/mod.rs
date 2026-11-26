@@ -86,7 +86,7 @@ mod tests {
         assert!(find_manifest("fish_audio").is_some());
         assert!(manifests_for_domain(CapabilityDomain::Chat).len() >= 9);
         assert!(manifests_for_domain(CapabilityDomain::WebSearch).len() >= 3);
-        assert!(manifests_for_domain(CapabilityDomain::Tts).len() >= 1);
+        assert!(!manifests_for_domain(CapabilityDomain::Tts).is_empty());
     }
 
     #[test]

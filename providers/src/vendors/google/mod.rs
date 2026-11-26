@@ -281,7 +281,7 @@ impl OpenAIChatExtension for GoogleOpenAIChatExtension {
 pub struct GoogleOpenAIChatProvider;
 
 impl GoogleOpenAIChatProvider {
-    pub fn new(base_url: &str, api_key: &str, thinking_mode: GoogleCompatThinkingMode) -> OpenAIChatProvider {
+    pub fn build(base_url: &str, api_key: &str, thinking_mode: GoogleCompatThinkingMode) -> OpenAIChatProvider {
         OpenAIChatProvider::with_extension(base_url, api_key, Arc::new(GoogleOpenAIChatExtension { thinking_mode }))
     }
 }
@@ -455,7 +455,7 @@ mod tests {
             ..Default::default()
         };
 
-        let official = GoogleOpenAIChatProvider::new(
+        let official = GoogleOpenAIChatProvider::build(
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "key",
             GoogleCompatThinkingMode::Auto,
@@ -473,7 +473,7 @@ mod tests {
             serde_json::json!({ "include_thoughts": true, "thinking_level": "high" })
         );
 
-        let relay = GoogleOpenAIChatProvider::new("https://relay.example/v1", "key", GoogleCompatThinkingMode::Auto);
+        let relay = GoogleOpenAIChatProvider::build("https://relay.example/v1", "key", GoogleCompatThinkingMode::Auto);
         let req = relay
             .build_request(&[ChatMessage::user("hello")], None, &params, true)
             .unwrap();
@@ -484,7 +484,7 @@ mod tests {
         assert!(body.get("google").is_none());
         assert_eq!(body["reasoning_effort"], "high");
 
-        let forced_google = GoogleOpenAIChatProvider::new(
+        let forced_google = GoogleOpenAIChatProvider::build(
             "https://relay.example/v1",
             "key",
             GoogleCompatThinkingMode::GoogleThinkingConfig,
@@ -500,7 +500,7 @@ mod tests {
             serde_json::json!({ "include_thoughts": true, "thinking_level": "high" })
         );
 
-        let forced_effort = GoogleOpenAIChatProvider::new(
+        let forced_effort = GoogleOpenAIChatProvider::build(
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "key",
             GoogleCompatThinkingMode::ReasoningEffort,
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn google_compat_honours_sampling_and_non_thinking_params() {
-        let provider = GoogleOpenAIChatProvider::new(
+        let provider = GoogleOpenAIChatProvider::build(
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "key",
             GoogleCompatThinkingMode::Auto,

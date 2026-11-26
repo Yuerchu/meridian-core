@@ -106,7 +106,7 @@ fn serialize_deepseek_message(m: &ChatMessage, carry: &mut ToolImageCarryMixin) 
 pub struct DeepSeekChatProvider;
 
 impl DeepSeekChatProvider {
-    pub fn new(base_url: &str, api_key: &str) -> OpenAIChatProvider {
+    pub fn build(base_url: &str, api_key: &str) -> OpenAIChatProvider {
         OpenAIChatProvider::with_extension(base_url, api_key, Arc::new(DeepSeekChatExtension))
     }
 }
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn deepseek_omits_sampling_params_and_sends_disabled_thinking_when_off() {
-        let provider = DeepSeekChatProvider::new("https://api.deepseek.com", "key");
+        let provider = DeepSeekChatProvider::build("https://api.deepseek.com", "key");
         assert_eq!(provider.adapter_name(), "DeepSeekChatProvider");
         let params = ChatParams {
             model: "deepseek-reasoner".into(),
