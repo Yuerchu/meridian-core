@@ -243,8 +243,10 @@ pub async fn bootstrap_with_secrets(
         events.clone(),
         &data_dir,
     ));
+    let sticker_embed = tools::sticker_embed::StickerEmbedIndex::new(sea.clone(), data_dir.clone());
     let registry = tools::ToolRegistry::new(skills_root.clone(), data_dir.join("logs"), redaction.clone());
     registry.attach_media_runner(media_runner.clone());
+    registry.attach_sticker_embed(sticker_embed.clone());
     match db::sea::ops::custom_tool::list_enabled(&sea).await {
         Ok(custom_tools) => registry.set_custom_tools(
             custom_tools
@@ -320,6 +322,7 @@ pub async fn bootstrap_with_secrets(
         turn_starter: std::sync::OnceLock::new(),
         journal_shared: crate::journal::capture::JournalShared::new(),
         media_runner,
+        sticker_embed,
         redaction,
         redaction_mappings: crate::redaction::RedactionMappings::new(),
     });

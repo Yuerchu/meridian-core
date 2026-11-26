@@ -123,6 +123,7 @@ pub struct ServicesInner {
     /// snapshotting secrets until restart.
     pub journal_shared: Arc<crate::journal::capture::JournalShared>,
     pub media_runner: Arc<crate::media::MediaRunner>,
+    pub sticker_embed: Arc<crate::tools::sticker_embed::StickerEmbedIndex>,
     pub redaction: Arc<crate::redaction::RedactionEngine>,
     pub redaction_mappings: crate::redaction::RedactionMappings,
     /// How to start an ordinary turn, once the shell has said.
@@ -204,12 +205,14 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         events.clone(),
         dir,
     ));
+    let sticker_embed = crate::tools::sticker_embed::StickerEmbedIndex::new(sea.clone(), dir.to_path_buf());
     let tools = Arc::new(tools::ToolRegistry::new(
         dir.join("skills"),
         dir.join("logs"),
         Arc::new(crate::redaction::RedactionEngine::disabled()),
     ));
     tools.attach_media_runner(media_runner.clone());
+    tools.attach_sticker_embed(sticker_embed.clone());
     Services::new(ServicesInner {
         db: sea,
         secrets,
@@ -241,6 +244,7 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         turn_starter: std::sync::OnceLock::new(),
         journal_shared: crate::journal::capture::JournalShared::new(),
         media_runner,
+        sticker_embed,
         redaction: Arc::new(crate::redaction::RedactionEngine::disabled()),
         redaction_mappings: crate::redaction::RedactionMappings::new(),
     })

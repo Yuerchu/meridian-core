@@ -97,6 +97,34 @@ pub async fn list_confirmed_for_packs(db: &impl Read, pack_ids: &[String]) -> Re
         .await
 }
 
+/// Every sendable sticker across all packs, for background embedding indexing.
+pub async fn list_all_confirmed(db: &impl Read) -> Result<Vec<emoji::Model>, DbErr> {
+    emoji::Entity::find()
+        .filter(emoji::Column::SemanticStatus.eq(EmojiSemanticStatus::Confirmed))
+        .filter(emoji::Column::FileFormat.ne("lottie"))
+        .order_by_asc(emoji::Column::PackId)
+        .order_by_asc(emoji::Column::SortOrder)
+        .order_by_asc(emoji::Column::Id)
+        .all(db.conn()?)
+        .await
+}
+
+/// Sendable stickers matching `ids`, for incremental embedding indexing.
+pub async fn list_confirmed_by_ids(db: &impl Read, ids: &[String]) -> Result<Vec<emoji::Model>, DbErr> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    emoji::Entity::find()
+        .filter(emoji::Column::Id.is_in(ids.iter().map(String::as_str)))
+        .filter(emoji::Column::SemanticStatus.eq(EmojiSemanticStatus::Confirmed))
+        .filter(emoji::Column::FileFormat.ne("lottie"))
+        .order_by_asc(emoji::Column::PackId)
+        .order_by_asc(emoji::Column::SortOrder)
+        .order_by_asc(emoji::Column::Id)
+        .all(db.conn()?)
+        .await
+}
+
 /// A pack's stickers that still lack a confirmed meaning, most recently and
 /// most often seen first.
 pub async fn list_candidates(db: &impl Read, pack_id: &str) -> Result<Vec<emoji::Model>, DbErr> {
