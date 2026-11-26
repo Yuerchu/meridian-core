@@ -43,8 +43,9 @@ pub fn decode_vector(bytes: &[u8], dims: i32) -> Result<Vec<f32>, String> {
         ));
     }
     let mut values = Vec::with_capacity(dims);
-    for chunk in bytes.chunks_exact(4) {
-        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    let (chunks, _) = bytes.as_chunks::<4>();
+    for &chunk in chunks {
+        let value = f32::from_le_bytes(chunk);
         if !value.is_finite() {
             return Err("stored embedding vector contains non-finite float".into());
         }
