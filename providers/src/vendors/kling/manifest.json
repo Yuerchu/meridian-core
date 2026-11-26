@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "id": "kling",
+  "provider_type": null,
+  "name": "Kling AI",
+  "icon": "kling",
+  "sort_order": 410,
+  "domains": ["video_gen"],
+  "balance": false,
+  "websites": {
+    "official": "https://klingai.com",
+    "api_key": "https://app.klingai.com/cn/dev/api-key",
+    "docs": "https://klingai.com/document-api",
+    "models": null
+  },
+  "auth": [],
+  "config_fields": [
+    {
+      "key": "SERVICE_KLING_KEY",
+      "label": "Kling API Key",
+      "kind": "secret",
+      "required": true,
+      "secret": true,
+      "default_value": null,
+      "placeholder": null,
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    },
+    {
+      "key": "SERVICE_KLING_BASE_URL",
+      "label": "Kling Base URL",
+      "kind": "text",
+      "required": false,
+      "secret": false,
+      "default_value": "https://api-beijing.klingai.com",
+      "placeholder": "https://api-beijing.klingai.com",
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    }
+  ],
+  "models_dev": null,
+  "models": [
+    {
+      "family": "kling-video",
+      "ids": ["kling-3.0", "kling-3.0-turbo", "kling-3.0-omni", "kling-4.0", "kling-4.0-flash"]
+    }
+  ]
+}

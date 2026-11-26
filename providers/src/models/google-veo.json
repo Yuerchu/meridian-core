@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "family": "google-veo",
+  "origin_vendor": "google",
+  "canonical_protocols": ["google_veo"],
+  "models": [
+    { "prefix": "veo-3.1" },
+    { "prefix": "veo-3.0" },
+    { "prefix": "veo-2.0" }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "family": "vidu-video",
+  "origin_vendor": "vidu",
+  "canonical_protocols": ["vidu_video"],
+  "models": [
+    { "prefix": "viduq3" },
+    { "prefix": "viduq2" }
+  ]
+}

@@ -19,6 +19,7 @@ pub mod emoji;
 pub mod emoji_pack;
 pub mod journal;
 pub mod mcp_server;
+pub mod media_generation;
 pub mod memory;
 pub mod message;
 pub mod message_context_item;

@@ -27,6 +27,7 @@ pub mod journal_blob;
 pub mod journal_file;
 pub mod journal_version;
 pub mod mcp_server;
+pub mod media_generation;
 pub mod memory;
 pub mod memory_proposal;
 pub mod memory_subject;
@@ -131,6 +132,7 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<journal_file::Entity>(),
         shape_of::<journal_version::Entity>(),
         shape_of::<mcp_server::Entity>(),
+        shape_of::<media_generation::Entity>(),
         shape_of::<memory::Entity>(),
         shape_of::<memory_proposal::Entity>(),
         shape_of::<memory_subject::Entity>(),

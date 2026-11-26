@@ -35,6 +35,7 @@ pub mod keyring;
 pub mod listen_guard;
 pub mod logging;
 pub mod mcp;
+pub mod media;
 /// Watching the account balance and this install's own spending, and telling
 /// somebody over a webhook. Not desktop-only: it is an HTTP client, not a
 /// server.

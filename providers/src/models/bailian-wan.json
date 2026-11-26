@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "family": "bailian-wan",
+  "origin_vendor": "bailian",
+  "canonical_protocols": ["bailian_wan_video"],
+  "models": [
+    { "prefix": "wan3.0" },
+    { "prefix": "wan2.6" }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "family": "minimax-video",
+  "origin_vendor": "minimax",
+  "canonical_protocols": ["minimax_video"],
+  "models": [
+    { "prefix": "minimax-hailuo" }
+  ]
+}

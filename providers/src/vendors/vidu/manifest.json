@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "id": "vidu",
+  "provider_type": null,
+  "name": "Vidu",
+  "icon": "vidu",
+  "sort_order": 430,
+  "domains": ["video_gen"],
+  "balance": false,
+  "websites": {
+    "official": "https://platform.vidu.com",
+    "api_key": "https://platform.vidu.com/api-keys",
+    "docs": "https://docs.platform.vidu.com",
+    "models": null
+  },
+  "auth": [],
+  "config_fields": [
+    {
+      "key": "SERVICE_VIDU_KEY",
+      "label": "Vidu API Key",
+      "kind": "secret",
+      "required": true,
+      "secret": true,
+      "default_value": null,
+      "placeholder": null,
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    },
+    {
+      "key": "SERVICE_VIDU_BASE_URL",
+      "label": "Vidu Base URL",
+      "kind": "text",
+      "required": false,
+      "secret": false,
+      "default_value": "https://api.vidu.cn",
+      "placeholder": "https://api.vidu.cn",
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    }
+  ],
+  "models_dev": null,
+  "models": [
+    {
+      "family": "vidu-video",
+      "ids": ["viduq3-pro", "viduq3-pro-fast", "viduq3-turbo", "viduq3"]
+    }
+  ]
+}

@@ -5,7 +5,7 @@
   "name": "OpenAI",
   "icon": "openai",
   "sort_order": 10,
-  "domains": ["chat"],
+  "domains": ["chat", "image_gen"],
   "balance": false,
   "websites": {
     "official": "https://openai.com",

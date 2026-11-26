@@ -122,6 +122,7 @@ pub struct ServicesInner {
     /// cannot see an external `.gitignore` rewrite and would keep
     /// snapshotting secrets until restart.
     pub journal_shared: Arc<crate::journal::capture::JournalShared>,
+    pub media_runner: Arc<crate::media::MediaRunner>,
     pub redaction: Arc<crate::redaction::RedactionEngine>,
     pub redaction_mappings: crate::redaction::RedactionMappings,
     /// How to start an ordinary turn, once the shell has said.
@@ -195,14 +196,24 @@ impl std::ops::Deref for Services {
 #[cfg(test)]
 pub async fn bare_services(dir: &std::path::Path) -> Services {
     let sea = crate::db::sea::file_test_db(dir).await;
+    let secrets = Arc::new(crate::secrets::SecretsManager::new(dir.to_path_buf()));
+    let events = EventBus::new();
+    let media_runner = Arc::new(crate::media::MediaRunner::new(
+        sea.clone(),
+        secrets.clone(),
+        events.clone(),
+        dir,
+    ));
+    let tools = Arc::new(tools::ToolRegistry::new(
+        dir.join("skills"),
+        dir.join("logs"),
+        Arc::new(crate::redaction::RedactionEngine::disabled()),
+    ));
+    tools.attach_media_runner(media_runner.clone());
     Services::new(ServicesInner {
         db: sea,
-        secrets: Arc::new(crate::secrets::SecretsManager::new(dir.to_path_buf())),
-        tools: Arc::new(tools::ToolRegistry::new(
-            dir.join("skills"),
-            dir.join("logs"),
-            Arc::new(crate::redaction::RedactionEngine::disabled()),
-        )),
+        secrets,
+        tools,
         mcp: mcp::McpRegistry::new(),
         turns: Arc::new(TurnCoordinator::new()),
         approvals: ApprovalWaiters::new(),
@@ -213,7 +224,7 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         corpus: Arc::new(crate::voice_corpus::CorpusCoordinator::new(dir)),
         voice_limiter: Arc::new(crate::tts::limiter::VoiceLimiter::default()),
         sleep: AppSleepInhibitor::new(),
-        events: EventBus::new(),
+        events,
         alert_sinks: crate::notify::AlertSinks::new(),
         models_dev: Arc::new(crate::provider::models_dev::ModelsDevCatalog::new()),
         paths: Paths {
@@ -229,6 +240,7 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         containers: crate::container::DockerConnector::new(Default::default()),
         turn_starter: std::sync::OnceLock::new(),
         journal_shared: crate::journal::capture::JournalShared::new(),
+        media_runner,
         redaction: Arc::new(crate::redaction::RedactionEngine::disabled()),
         redaction_mappings: crate::redaction::RedactionMappings::new(),
     })

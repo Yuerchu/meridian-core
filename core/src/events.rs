@@ -32,6 +32,7 @@ pub const VOICE_MODEL_DOWNLOAD_CHANNEL: &str = "voice-model-download";
 pub const VOICE_MODEL_DOWNLOAD_DONE_CHANNEL: &str = "voice-model-download-done";
 pub const PLAN_REVIEW_REQUESTED_CHANNEL: &str = "plan-review-requested";
 pub const PLAN_REVIEW_UPDATED_CHANNEL: &str = "plan-review-updated";
+pub const MEDIA_GENERATION_UPDATED_CHANNEL: &str = "media-generation-updated";
 
 /// A conversation row changed and every client must re-read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +99,21 @@ pub struct PlanReviewEvent {
     pub turn_id: String,
     pub status: String,
     pub lock_version: i64,
+}
+
+/// A media generation job changed status or progress. The frontend re-reads
+/// durable state from `get_media_generation` / `list_media_generations` on
+/// terminal states so a missed event can never leave the UI stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaGenerationUpdatedEvent {
+    pub generation_id: String,
+    pub capability_domain: String,
+    pub status: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub progress_pct: Option<i32>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,6 +868,10 @@ impl EventBus {
 
     pub fn emit_plan_review_updated(&self, event: &PlanReviewEvent) -> Result<(), String> {
         self.emit_typed(PLAN_REVIEW_UPDATED_CHANNEL, event)
+    }
+
+    pub fn emit_media_generation_updated(&self, event: &MediaGenerationUpdatedEvent) -> Result<(), String> {
+        self.emit_typed(MEDIA_GENERATION_UPDATED_CHANNEL, event)
     }
 
     fn lock(&self) -> std::sync::RwLockWriteGuard<'_, Vec<SinkEntry>> {

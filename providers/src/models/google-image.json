@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "family": "google-image",
+  "origin_vendor": "google",
+  "canonical_protocols": ["google_image_gen"],
+  "models": [
+    { "prefix": "gemini-3.1-flash-image" },
+    { "prefix": "gemini-3-pro-image" },
+    { "prefix": "gemini-2.5-flash-image" }
+  ]
+}

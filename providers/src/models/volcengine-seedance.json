@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "family": "volcengine-seedance",
+  "origin_vendor": "volcengine",
+  "canonical_protocols": ["volcengine_seedance"],
+  "models": [
+    { "prefix": "doubao-seedance-2-0" },
+    { "prefix": "doubao-seedance-1-5" },
+    { "prefix": "doubao-seedance-1-0" }
+  ]
+}

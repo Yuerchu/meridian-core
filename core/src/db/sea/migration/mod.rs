@@ -25,6 +25,7 @@ pub mod m0009_readable_mime_overrides;
 pub mod m0010_stream_timing;
 pub mod m0011_custom_tool_execution;
 pub mod m0012_many_to_many_models;
+pub mod m0013_media_generations;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -51,6 +52,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0010StreamTiming),
             Box::new(M0011CustomToolExecution),
             Box::new(M0012ManyToManyModels),
+            Box::new(M0013MediaGenerations),
         ]
     }
 }
@@ -109,6 +111,7 @@ pub fn sqlite_statements() -> Vec<String> {
     all.extend(m0010_stream_timing::sqlite_statements());
     all.extend(m0011_custom_tool_execution::sqlite_statements());
     all.extend(m0012_many_to_many_models::sqlite_statements());
+    all.extend(m0013_media_generations::sqlite_statements());
     all
 }
 
@@ -367,6 +370,32 @@ impl MigrationTrait for M0012ManyToManyModels {
             return Err(DbErr::Migration("m0012_many_to_many_models requires SQLite".into()));
         }
         for statement in m0012_many_to_many_models::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0013MediaGenerations;
+
+impl MigrationName for M0013MediaGenerations {
+    fn name(&self) -> &str {
+        "m0013_media_generations"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0013MediaGenerations {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration("m0013_media_generations requires SQLite".into()));
+        }
+        for statement in m0013_media_generations::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;
         }
         Ok(())

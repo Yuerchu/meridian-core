@@ -12,6 +12,7 @@ pub mod delete_file;
 pub mod edit_file;
 pub mod glob_files;
 pub mod list_directory;
+pub mod media_gen;
 pub mod memory;
 pub mod move_file;
 pub mod plan;
@@ -638,6 +639,7 @@ pub enum MediaOut {
 pub struct ToolRegistry {
     builtin: Vec<Arc<dyn Tool>>,
     custom: std::sync::RwLock<Vec<Arc<dyn Tool>>>,
+    media_runner: media_gen::SharedMediaRunner,
 }
 
 impl ToolRegistry {
@@ -656,6 +658,7 @@ impl ToolRegistry {
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| skills_root.clone());
+        let media_runner: media_gen::SharedMediaRunner = Arc::new(std::sync::OnceLock::new());
         #[allow(unused_mut)]
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ask_user::AskUserTool),
@@ -696,6 +699,8 @@ impl ToolRegistry {
             // reason. See the module header for why QQ never reaches it.
             Arc::new(read_conversation::ReadConversationTool::new()),
             Arc::new(web_search::WebSearchTool::new()),
+            Arc::new(media_gen::GenerateImageTool::new(media_runner.clone())),
+            Arc::new(media_gen::GenerateVideoTool::new(media_runner.clone())),
             Arc::new(redaction::AddRedactionRuleTool::new(redaction_engine.clone())),
             Arc::new(redaction::ListRedactionRulesTool::new(redaction_engine.clone())),
             Arc::new(redaction::RemoveRedactionRuleTool::new(redaction_engine)),
@@ -711,7 +716,14 @@ impl ToolRegistry {
         Self {
             builtin: tools,
             custom: std::sync::RwLock::new(Vec::new()),
+            media_runner,
         }
+    }
+
+    /// Bind the shared [`crate::media::MediaRunner`] so built-in
+    /// `generate_image` and `generate_video` tools can execute media jobs.
+    pub fn attach_media_runner(&self, runner: Arc<crate::media::MediaRunner>) {
+        let _ = self.media_runner.set(runner);
     }
 
     /// Replace the set of user-defined tools. Called at startup and after every

@@ -409,3 +409,11 @@ CREATE INDEX idx_model_configs_profile_priority ON model_configs (profile_id, pr
 
 CREATE INDEX idx_audit_messages_logical_model ON audit_messages (logical_model_id);
 
+CREATE TABLE "media_generations" ( "id" text NOT NULL PRIMARY KEY, "capability_domain" text NOT NULL, "logical_model_id" text, "deployment_id" text, "provider_id" text, "remote_model_id" text, "protocol_id" text, "prompt" text NOT NULL, "params_json" text NOT NULL, "status" text NOT NULL, "progress_pct" integer, "upstream_job_id" text, "result_files_json" text, "error_message" text, "conversation_id" text, "source" text NOT NULL, "created_at" integer NOT NULL, "updated_at" integer NOT NULL, "completed_at" integer, FOREIGN KEY ("logical_model_id") REFERENCES "model_profiles" ("id") ON DELETE SET NULL, FOREIGN KEY ("deployment_id") REFERENCES "model_configs" ("id") ON DELETE SET NULL, FOREIGN KEY ("provider_id") REFERENCES "providers" ("id") ON DELETE SET NULL, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE SET NULL, CHECK (capability_domain IN ('image_gen', 'video_gen')), CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')), CHECK (source IN ('studio', 'agent_tool')) );
+
+CREATE INDEX "idx_media_generations_created_at" ON "media_generations" ("created_at" DESC);
+
+CREATE INDEX "idx_media_generations_domain_created" ON "media_generations" ("capability_domain" ASC, "created_at" DESC);
+
+CREATE INDEX "idx_media_generations_conversation" ON "media_generations" ("conversation_id" ASC);
+

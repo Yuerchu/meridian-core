@@ -5,6 +5,7 @@ pub mod balance;
 pub mod capabilities;
 pub mod catalog;
 pub mod local_model;
+pub mod media_registry;
 pub mod mixins;
 pub mod models;
 pub mod protocols;

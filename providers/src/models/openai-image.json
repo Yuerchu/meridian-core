@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "family": "openai-image",
+  "origin_vendor": "openai",
+  "canonical_protocols": ["openai_images"],
+  "models": [
+    { "prefix": "gpt-image-1.5" },
+    { "prefix": "gpt-image-1-mini" },
+    { "prefix": "gpt-image-1" },
+    { "prefix": "dall-e-3" }
+  ]
+}

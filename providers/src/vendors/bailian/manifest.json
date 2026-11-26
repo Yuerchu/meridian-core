@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "id": "bailian",
+  "provider_type": null,
+  "name": "Alibaba Bailian (Wan)",
+  "icon": "bailian",
+  "sort_order": 440,
+  "domains": ["video_gen"],
+  "balance": false,
+  "websites": {
+    "official": "https://bailian.console.aliyun.com",
+    "api_key": "https://bailian.console.aliyun.com/?apiKey=1",
+    "docs": "https://help.aliyun.com/zh/model-studio",
+    "models": null
+  },
+  "auth": [],
+  "config_fields": [
+    {
+      "key": "SERVICE_BAILIAN_KEY",
+      "label": "Bailian API Key",
+      "kind": "secret",
+      "required": true,
+      "secret": true,
+      "default_value": null,
+      "placeholder": "sk-...",
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    },
+    {
+      "key": "SERVICE_BAILIAN_BASE_URL",
+      "label": "Workspace API v1 Base URL",
+      "kind": "text",
+      "required": false,
+      "secret": false,
+      "default_value": "https://dashscope.aliyuncs.com/api/v1",
+      "placeholder": "https://{workspace}.cn-beijing.maas.aliyuncs.com/api/v1",
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    }
+  ],
+  "models_dev": null,
+  "models": [
+    {
+      "family": "bailian-wan",
+      "ids": ["wan2.6-t2v", "wan2.6-i2v", "wan3.0-t2v"]
+    }
+  ]
+}
