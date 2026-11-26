@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "moonshot",
+  "provider_type": "openai",
+  "name": "Moonshot (Kimi)",
+  "icon": "moonshot",
+  "sort_order": 40,
+  "domains": ["chat"],
+  "balance": true,
+  "websites": {
+    "official": "https://www.moonshot.cn",
+    "api_key": "https://platform.moonshot.cn/console/api-keys",
+    "docs": "https://platform.moonshot.cn/docs",
+    "models": "https://platform.moonshot.cn/docs/pricing"
+  },
+  "auth": [
+    {
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["chat_completions"],
+      "default_base_url": {
+        "chat_completions": "https://api.moonshot.cn/v1"
+      }
+    }
+  ],
+  "config_fields": [],
+  "models_dev": {
+    "default": ["moonshotai", "moonshotai-cn"],
+    "cn": ["moonshotai-cn", "moonshotai"]
+  },
+  "models": []
+}

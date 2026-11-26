@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "family": "deepseek",
+  "origin_vendor": "deepseek",
+  "canonical_protocols": [
+    "openai_chat",
+    "openai_responses"
+  ],
+  "models": [
+    {
+      "prefix": "deepseek-v4-pro",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 128000,
+      "max_output_tokens": 16000,
+      "thinking_style": "toggle_off",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium"
+    },
+    {
+      "prefix": "deepseek-v4-flash",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 128000,
+      "max_output_tokens": 16000,
+      "thinking_style": "toggle_off",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium"
+    },
+    {
+      "prefix": "deepseek-reasoner",
+      "_comment": "Deprecated 2026-07-24.",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 64000,
+      "max_output_tokens": 16000,
+      "thinking_style": "toggle_off"
+    },
+    {
+      "prefix": "deepseek-chat",
+      "supports_thinking": false,
+      "max_context_tokens": 64000,
+      "max_output_tokens": 16000,
+      "thinking_style": "none"
+    }
+  ]
+}

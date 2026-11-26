@@ -204,6 +204,7 @@ macro_rules! usage_by {
 const USAGE_BY_TOTAL: ReadOnly = usage_by!("''");
 const USAGE_BY_PROVIDER: ReadOnly = usage_by!("COALESCE(provider_name, provider_id, '')");
 const USAGE_BY_MODEL: ReadOnly = usage_by!("COALESCE(model_id, '')");
+const USAGE_BY_LOGICAL_MODEL: ReadOnly = usage_by!("COALESCE(logical_model_id, model_id, '')");
 const USAGE_BY_BOT: ReadOnly = usage_by!("COALESCE(CAST(self_id AS TEXT), '')");
 const USAGE_BY_SOURCE: ReadOnly = usage_by!("COALESCE(source_type || ':' || source_id, '')");
 const USAGE_BY_CONVERSATION: ReadOnly = usage_by!("conversation_id");
@@ -288,6 +289,7 @@ pub fn usage_grouping(dimension: crate::db::sea::ops::usage::UsageDimension) -> 
         UsageDimension::Total => USAGE_BY_TOTAL,
         UsageDimension::Provider => USAGE_BY_PROVIDER,
         UsageDimension::Model => USAGE_BY_MODEL,
+        UsageDimension::LogicalModel => USAGE_BY_LOGICAL_MODEL,
         UsageDimension::Bot => USAGE_BY_BOT,
         UsageDimension::Source => USAGE_BY_SOURCE,
         UsageDimension::Conversation => USAGE_BY_CONVERSATION,
@@ -309,10 +311,11 @@ mod tests {
     use super::*;
     use crate::db::sea::ops::usage::UsageDimension;
 
-    const DIMENSIONS: [UsageDimension; 9] = [
+    const DIMENSIONS: [UsageDimension; 10] = [
         UsageDimension::Total,
         UsageDimension::Provider,
         UsageDimension::Model,
+        UsageDimension::LogicalModel,
         UsageDimension::Bot,
         UsageDimension::Source,
         UsageDimension::Conversation,

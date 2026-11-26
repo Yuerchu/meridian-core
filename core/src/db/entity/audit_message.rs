@@ -44,6 +44,8 @@ pub struct Model {
     pub server_tool_price: Option<Decimal>,
     pub billing_mode: BillingMode,
     pub response_model_id: Option<String>,
+    pub logical_model_id: Option<String>,
+    pub deployment_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

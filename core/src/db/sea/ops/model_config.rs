@@ -129,6 +129,10 @@ pub async fn upsert(tx: &WriteTx, new: model_config::Model) -> Result<model_conf
         server_tool_price: Set(new.server_tool_price),
         created_at: Unchanged(existing.created_at),
         updated_at: Set(new.updated_at),
+        protocol_override: Set(new.protocol_override),
+        is_enabled: Set(new.is_enabled),
+        priority: Set(new.priority),
+        capability_overrides: Set(new.capability_overrides),
     }
     .update(tx.conn()?)
     .await?;
@@ -137,6 +141,109 @@ pub async fn upsert(tx: &WriteTx, new: model_config::Model) -> Result<model_conf
         profile_ops::delete_if_unreferenced(tx, &existing.profile_id).await?;
     }
     Ok(row)
+}
+
+/// List all provider deployments serving a given logical model (`profile_id`),
+/// ordered by ascending `priority`.
+pub async fn list_by_profile(db: &impl Read, profile_id: &str) -> Result<Vec<model_config::Model>, DbErr> {
+    model_config::Entity::find()
+        .filter(model_config::Column::ProfileId.eq(profile_id))
+        .order_by_asc(model_config::Column::Priority)
+        .order_by_asc(model_config::Column::Id)
+        .all(db.conn()?)
+        .await
+}
+
+/// Deployment-level partial update for many-to-many routing & overrides.
+#[derive(Debug, Clone)]
+pub struct DeploymentUpdate {
+    pub profile_id: Option<String>,
+    pub protocol_override: Option<Option<String>>,
+    pub is_enabled: Option<crate::db::types::SqlBool>,
+    pub priority: Option<i32>,
+    pub capability_overrides: Option<Option<String>>,
+    pub updated_at: crate::db::types::EpochMs,
+}
+
+/// Update deployment routing/protocol/override fields without deleting the
+/// underlying logical model.
+pub async fn update_deployment(
+    tx: &WriteTx,
+    id: &str,
+    changes: DeploymentUpdate,
+) -> Result<model_config::Model, DbErr> {
+    let existing = get(tx, id)
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound(format!("model deployment `{id}`")))?;
+    let mut active = model_config::ActiveModel {
+        id: Unchanged(existing.id),
+        updated_at: Set(changes.updated_at),
+        ..Default::default()
+    };
+    if let Some(profile_id) = changes.profile_id {
+        active.profile_id = Set(profile_id);
+    }
+    if let Some(protocol_override) = changes.protocol_override {
+        active.protocol_override = Set(protocol_override);
+    }
+    if let Some(is_enabled) = changes.is_enabled {
+        active.is_enabled = Set(is_enabled);
+    }
+    if let Some(priority) = changes.priority {
+        active.priority = Set(priority);
+    }
+    if let Some(capability_overrides) = changes.capability_overrides {
+        active.capability_overrides = Set(capability_overrides);
+    }
+    active.update(tx.conn()?).await
+}
+
+/// Unlink (delete) a single provider deployment WITHOUT auto-deleting its
+/// logical model — logical models persist independently even with 0 channels.
+pub async fn unlink_deployment(tx: &WriteTx, id: &str) -> Result<u64, DbErr> {
+    Ok(model_config::Entity::delete_by_id(id)
+        .exec(tx.conn()?)
+        .await?
+        .rows_affected)
+}
+
+/// Re-point an existing deployment at `target_model_id` (merging a relay's
+/// custom-named model under an existing logical model).
+pub async fn merge_deployment_into_model(
+    tx: &WriteTx,
+    deployment_id: &str,
+    target_model_id: &str,
+    now: crate::db::types::EpochMs,
+) -> Result<model_config::Model, DbErr> {
+    profile_ops::get(tx, target_model_id)
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound(format!("logical model `{target_model_id}`")))?;
+    update_deployment(
+        tx,
+        deployment_id,
+        DeploymentUpdate {
+            profile_id: Some(target_model_id.to_owned()),
+            protocol_override: None,
+            is_enabled: None,
+            priority: None,
+            capability_overrides: None,
+            updated_at: now,
+        },
+    )
+    .await
+}
+
+/// Split an existing deployment out onto its own brand-new logical model in one
+/// transaction.
+pub async fn split_deployment_to_new_model(
+    tx: &WriteTx,
+    deployment_id: &str,
+    new_model: model_profile::Model,
+    now: crate::db::types::EpochMs,
+) -> Result<(model_profile::Model, model_config::Model), DbErr> {
+    let created = profile_ops::insert(tx, new_model).await?;
+    let updated = merge_deployment_into_model(tx, deployment_id, &created.id, now).await?;
+    Ok((created, updated))
 }
 
 /// How many rows went: 0 for an id that was already gone. The profile it
@@ -223,6 +330,12 @@ pub async fn seed_flat(tx: &WriteTx, flat: &FlatModelConfig<'_>) -> Result<model
         capability_overrides: Set(flat.capability_overrides.map(str::to_owned)),
         created_at: Set(flat.created_at),
         updated_at: Set(flat.updated_at),
+        canonical_id: Set(None),
+        capability_domain: Set(crate::provider::CapabilityDomain::Chat),
+        family: Set(None),
+        icon: Set(None),
+        routing_policy: Set(crate::provider::RoutingPolicy::StickyManual),
+        is_archived: Set(crate::db::types::SqlBool::FALSE),
     })
     .on_conflict(
         OnConflict::column(model_profile::Column::Id)
@@ -258,6 +371,10 @@ pub async fn seed_flat(tx: &WriteTx, flat: &FlatModelConfig<'_>) -> Result<model
         server_tool_price: Set(flat.server_tool_price.clone()),
         created_at: Set(flat.created_at),
         updated_at: Set(flat.updated_at),
+        protocol_override: Set(None),
+        is_enabled: Set(crate::db::types::SqlBool::TRUE),
+        priority: Set(0),
+        capability_overrides: Set(None),
     })
     .on_conflict(
         OnConflict::columns([model_config::Column::ProviderId, model_config::Column::ModelId])
@@ -315,6 +432,12 @@ mod tests {
                 capability_overrides: None,
                 created_at: 0,
                 updated_at: 0,
+                canonical_id: None,
+                capability_domain: crate::provider::CapabilityDomain::Chat,
+                family: None,
+                icon: None,
+                routing_policy: crate::provider::RoutingPolicy::StickyManual,
+                is_archived: SqlBool::FALSE,
             };
             db.write(async |tx| profile_ops::insert(tx, profile).await)
                 .await
@@ -339,6 +462,10 @@ mod tests {
             server_tool_price: None,
             created_at: 100,
             updated_at: 100,
+            protocol_override: None,
+            is_enabled: SqlBool::TRUE,
+            priority: 0,
+            capability_overrides: None,
         }
     }
 

@@ -22,6 +22,7 @@ pub mod pricing;
 mod project_instructions;
 mod provider_config;
 pub mod queue;
+pub mod routing;
 pub mod skills;
 mod stream;
 pub mod sub_agents;

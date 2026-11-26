@@ -1,15 +1,25 @@
-// Ported from codex-rs/codex-client (Apache-2.0, OpenAI)
-// NOTICE: This file contains code derived from the OpenAI Codex project.
-// Changes: removed ChatGPT cookie handling, simplified telemetry to plain tracing.
+//! HTTP transport surface re-exported from `meridian-provider-sdk`.
 
-pub(crate) mod bounded;
-mod error;
-mod request;
-mod retry;
-mod sse;
-mod transport;
+pub use meridian_provider_sdk::client::*;
 
-pub use error::TransportError;
-pub use request::{Request, RequestBody, Response};
-pub use retry::backoff;
-pub use transport::{HttpTransport, ReqwestTransport, StreamResponse};
+#[cfg(test)]
+mod retry_integration_tests {
+    use super::*;
+    use http::StatusCode;
+
+    /// Ensure an exhausted transport retry error still formats in a way the
+    /// agent turn loop classifies as retryable.
+    #[test]
+    fn transport_502_display_stays_retryable_by_turn_loop() {
+        let err = TransportError::Http {
+            status: StatusCode::BAD_GATEWAY,
+            url: None,
+            headers: None,
+            body: None,
+        };
+        assert!(
+            crate::agent::is_retryable_stream_error(&err.to_string()),
+            "the status has to survive, or the turn loop stops replaying: {err}"
+        );
+    }
+}

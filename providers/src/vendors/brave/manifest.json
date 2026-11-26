@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "brave",
+  "provider_type": null,
+  "name": "Brave Search",
+  "icon": "brave",
+  "sort_order": 220,
+  "domains": ["web_search"],
+  "balance": false,
+  "websites": {
+    "official": "https://brave.com/search/api/",
+    "api_key": "https://api-dashboard.search.brave.com/app/keys",
+    "docs": "https://api-dashboard.search.brave.com/app/documentation/web-search/get-started",
+    "models": null
+  },
+  "auth": [],
+  "config_fields": [
+    {
+      "key": "SERVICE_BRAVE_SEARCH_KEY",
+      "label": "Brave Search API Key",
+      "kind": "secret",
+      "required": true,
+      "secret": true,
+      "default_value": null,
+      "placeholder": "BSA...",
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    }
+  ],
+  "models_dev": null,
+  "models": []
+}

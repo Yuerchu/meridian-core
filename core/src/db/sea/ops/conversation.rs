@@ -142,6 +142,8 @@ pub fn new_row(id: &str, now: EpochMs) -> conversation::Model {
         agent_kind: None,
         agent_provider_id: None,
         agent_model_id: None,
+        logical_model_id: None,
+        deployment_id: None,
     }
 }
 

@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "id": "deepseek",
+  "provider_type": "deepseek",
+  "name": "DeepSeek",
+  "icon": "deepseek",
+  "sort_order": 30,
+  "domains": ["chat"],
+  "balance": true,
+  "websites": {
+    "official": "https://deepseek.com",
+    "api_key": "https://platform.deepseek.com/api_keys",
+    "docs": "https://api-docs.deepseek.com",
+    "models": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  "auth": [
+    {
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["chat_completions", "responses"],
+      "default_base_url": {
+        "chat_completions": "https://api.deepseek.com",
+        "responses": "https://api.deepseek.com"
+      }
+    }
+  ],
+  "config_fields": [],
+  "models_dev": {
+    "default": ["deepseek"],
+    "cn": []
+  },
+  "models": []
+}

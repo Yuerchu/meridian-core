@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "id": "google",
+  "provider_type": "google",
+  "name": "Google Gemini",
+  "icon": "google",
+  "sort_order": 70,
+  "domains": ["chat"],
+  "balance": false,
+  "websites": {
+    "official": "https://ai.google.dev",
+    "api_key": "https://aistudio.google.com/apikey",
+    "docs": "https://ai.google.dev/gemini-api/docs",
+    "models": "https://ai.google.dev/gemini-api/docs/models"
+  },
+  "auth": [
+    {
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["gemini_generate_content", "gemini_interactions", "chat_completions"],
+      "default_base_url": {
+        "gemini_generate_content": "https://generativelanguage.googleapis.com",
+        "gemini_interactions": "https://aiplatform.googleapis.com/v1beta1/locations/global",
+        "chat_completions": "https://generativelanguage.googleapis.com/v1beta/openai"
+      }
+    },
+    {
+      "id": "vertex_service_account",
+      "credential_kind": "google_vertex_service_account",
+      "transport_profile": "standard",
+      "api_formats": ["gemini_interactions"],
+      "default_base_url": {
+        "gemini_interactions": "https://aiplatform.googleapis.com/v1beta1/locations/global"
+      }
+    }
+  ],
+  "config_fields": [
+    {
+      "key": "google.compat_thinking_mode",
+      "label": "OpenAI-Compat Thinking Mode",
+      "kind": "select",
+      "required": false,
+      "secret": false,
+      "default_value": "auto",
+      "placeholder": null,
+      "options": [
+        { "value": "auto", "label": "Auto (by host)" },
+        { "value": "google_thinking_config", "label": "Google thinking_config" },
+        { "value": "reasoning_effort", "label": "Standard reasoning_effort" }
+      ],
+      "visible_when_protocol": ["chat_completions"],
+      "visible_when_auth": ["api_key"]
+    },
+    {
+      "key": "google.include_thoughts_when_off",
+      "label": "Keep includeThoughts when thinking is off",
+      "kind": "boolean",
+      "required": false,
+      "secret": false,
+      "default_value": "false",
+      "placeholder": null,
+      "options": [],
+      "visible_when_protocol": ["gemini_generate_content"],
+      "visible_when_auth": ["api_key"]
+    }
+  ],
+  "models_dev": {
+    "default": ["google", "google-vertex"],
+    "cn": []
+  },
+  "models": []
+}

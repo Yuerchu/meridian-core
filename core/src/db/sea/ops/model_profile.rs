@@ -22,6 +22,102 @@ pub async fn get(db: &impl Read, id: &str) -> Result<Option<model_profile::Model
     model_profile::Entity::find_by_id(id).one(db.conn()?).await
 }
 
+/// Find an active (non-archived) logical model by its canonical ID (e.g.
+/// `anthropic/claude-sonnet-4-6`) so explicit model discovery opt-in merges
+/// multiple providers under the same logical model by default.
+pub async fn find_by_canonical_id(db: &impl Read, canonical_id: &str) -> Result<Option<model_profile::Model>, DbErr> {
+    model_profile::Entity::find()
+        .filter(model_profile::Column::CanonicalId.eq(canonical_id))
+        .filter(model_profile::Column::IsArchived.eq(crate::db::types::SqlBool::from(false)))
+        .order_by_asc(model_profile::Column::CreatedAt)
+        .one(db.conn()?)
+        .await
+}
+
+/// List every logical model alongside all of its provider deployments (ordered
+/// by deployment priority). Models with zero deployments are included because
+/// logical models are independent first-class entities.
+pub async fn list_with_deployments(
+    db: &impl Snapshot,
+    include_archived: bool,
+) -> Result<Vec<(model_profile::Model, Vec<model_config::Model>)>, DbErr> {
+    let mut query = model_profile::Entity::find().order_by_asc(model_profile::Column::Name);
+    if !include_archived {
+        query = query.filter(model_profile::Column::IsArchived.eq(crate::db::types::SqlBool::from(false)));
+    }
+    let models = query.all(db.conn()?).await?;
+    let deployments = model_config::Entity::find()
+        .order_by_asc(model_config::Column::Priority)
+        .order_by_asc(model_config::Column::Id)
+        .all(db.conn()?)
+        .await?;
+    let mut by_model: HashMap<String, Vec<model_config::Model>> = HashMap::new();
+    for dep in deployments {
+        by_model.entry(dep.profile_id.clone()).or_default().push(dep);
+    }
+    Ok(models
+        .into_iter()
+        .map(|model| {
+            let deps = by_model.remove(&model.id).unwrap_or_default();
+            (model, deps)
+        })
+        .collect())
+}
+
+/// Update first-class logical model metadata (canonical_id, domain, family,
+/// icon, routing_policy, archive flag) without touching pricing/context fields.
+#[derive(Debug, Clone)]
+pub struct LogicalModelMetaChangeset {
+    pub name: Option<String>,
+    pub canonical_id: Option<String>,
+    pub capability_domain: crate::provider::CapabilityDomain,
+    pub family: Option<String>,
+    pub icon: Option<String>,
+    pub routing_policy: crate::provider::RoutingPolicy,
+    pub is_archived: crate::db::types::SqlBool,
+    pub updated_at: crate::db::types::EpochMs,
+}
+
+pub async fn update_meta(
+    tx: &WriteTx,
+    id: &str,
+    meta: LogicalModelMetaChangeset,
+) -> Result<model_profile::Model, DbErr> {
+    use sea_orm::ActiveValue::Set;
+    let existing = get(tx, id).await?.ok_or_else(|| not_found(id))?;
+    let mut row = model_profile::ActiveModel {
+        id: Unchanged(existing.id),
+        canonical_id: Set(meta.canonical_id),
+        capability_domain: Set(meta.capability_domain),
+        family: Set(meta.family),
+        icon: Set(meta.icon),
+        routing_policy: Set(meta.routing_policy),
+        is_archived: Set(meta.is_archived),
+        updated_at: Set(meta.updated_at),
+        ..Default::default()
+    };
+    if let Some(name) = meta.name {
+        row.name = Set(name);
+    }
+    row.update(tx.conn()?).await
+}
+
+/// Explicitly delete a logical model (fails via FK if deployments still point at it,
+/// or removes its deployments first when `cascade_deployments` is true).
+pub async fn delete_logical_model(tx: &WriteTx, id: &str, cascade_deployments: bool) -> Result<bool, DbErr> {
+    if cascade_deployments {
+        model_config::Entity::delete_many()
+            .filter(model_config::Column::ProfileId.eq(id))
+            .exec(tx.conn()?)
+            .await?;
+    }
+    Ok(model_profile::Entity::delete_by_id(id)
+        .exec(tx.conn()?)
+        .await?
+        .rows_affected
+        > 0)
+}
+
 /// Every profile, by name, with the number of provider rows pointing at it —
 /// what the editor needs to say "changing this affects three providers".
 /// Two statements, so it takes a snapshot.
@@ -110,6 +206,12 @@ mod tests {
             capability_overrides: None,
             created_at: 0,
             updated_at: 0,
+            canonical_id: None,
+            capability_domain: crate::provider::CapabilityDomain::Chat,
+            family: None,
+            icon: None,
+            routing_policy: crate::provider::RoutingPolicy::StickyManual,
+            is_archived: crate::db::types::SqlBool::FALSE,
         }
     }
 

@@ -11,8 +11,9 @@
 use sea_orm::ActiveValue::Set;
 use sea_orm::entity::prelude::*;
 
-use crate::db::types::EpochMs;
+use crate::db::types::{EpochMs, SqlBool};
 use crate::decimal::Decimal;
+use crate::provider::{CapabilityDomain, RoutingPolicy};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "model_profiles")]
@@ -32,6 +33,12 @@ pub struct Model {
     pub capability_overrides: Option<String>,
     pub created_at: EpochMs,
     pub updated_at: EpochMs,
+    pub canonical_id: Option<String>,
+    pub capability_domain: CapabilityDomain,
+    pub family: Option<String>,
+    pub icon: Option<String>,
+    pub routing_policy: RoutingPolicy,
+    pub is_archived: SqlBool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

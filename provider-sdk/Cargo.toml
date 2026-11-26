@@ -1,0 +1,48 @@
+[package]
+name = "meridian-provider-sdk"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Framework-free protocol contracts, wire helpers, capability traits, and declarative schemas for Meridian providers."
+repository = "https://github.com/Yuerchu/meridian-core"
+authors = ["于小丘 Yuerchu <admin@yuxiaoqiu.cn>"]
+
+[lib]
+name = "meridian_provider_sdk"
+
+[lints.clippy]
+result_large_err = "allow"
+large_enum_variant = "allow"
+new_without_default = "allow"
+should_implement_trait = "allow"
+
+[features]
+default = []
+# Optional SeaORM TEXT mapping for `Decimal`. Enabled only by `meridian-core`;
+# external provider crates never pull in a database driver.
+sea-orm = ["dep:sea-orm"]
+# Reusable conformance test assertions for external vendor PRs.
+conformance = []
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+bigdecimal = "0.4.10"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+eventsource-stream = "0.2"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+http = "1"
+rand = "0.9"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-webpki-roots"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+strum = { version = "0.27", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "sync", "time"] }
+tracing = "0.1"
+sea-orm = { version = "2.0.4", default-features = false, optional = true }
+
+[dev-dependencies]
+regex = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }

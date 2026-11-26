@@ -613,10 +613,7 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
         // installation id. The turn's own ids are added by the caller, which is
         // the layer that has them.
         codex_turn: match codex_request_shape {
-            true => {
-                provider::codex_metadata::CodexTurnMetadata::for_install(db, codex_request_kind, codex_thread_source)
-                    .await
-            }
+            true => provider::codex_metadata::for_install(db, codex_request_kind, codex_thread_source).await,
             false => None,
         },
         context_limit: Some(context_limit as i32),
@@ -666,6 +663,8 @@ mod tests {
             icon: None,
             codex_request_shape: SqlBool::FALSE,
             local_backend: None,
+            capability_domain: crate::provider::CapabilityDomain::Chat,
+            config_json: None,
         }
     }
 
@@ -738,6 +737,8 @@ mod tests {
             thinking_budget: Some(4096),
             tool_preset_id: None,
             auto_compact_enabled: crate::db::types::SqlBool::TRUE,
+            logical_model_id: None,
+            deployment_id: None,
         }
     }
 

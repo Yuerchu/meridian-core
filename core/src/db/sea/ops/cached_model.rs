@@ -35,12 +35,19 @@ pub async fn replace_models(
     if models.is_empty() {
         return Ok(());
     }
-    cached_model::Entity::insert_many(models.iter().map(|(model_id, model_name)| cached_model::ActiveModel {
-        id: NotSet,
-        provider_id: Set(pid.to_owned()),
-        model_id: Set(model_id.clone()),
-        model_name: Set(model_name.clone()),
-        fetched_at: Set(fetched_at),
+    cached_model::Entity::insert_many(models.iter().map(|(model_id, model_name)| {
+        let canonical = crate::provider::canonical_models::canonicalize_model_id(model_id);
+        let suggested_canonical_id = canonical.as_ref().map(|m| m.canonical_id.clone());
+        let suggested_protocol = canonical.and_then(|m| m.canonical_protocols.into_iter().next());
+        cached_model::ActiveModel {
+            id: NotSet,
+            provider_id: Set(pid.to_owned()),
+            model_id: Set(model_id.clone()),
+            model_name: Set(model_name.clone()),
+            fetched_at: Set(fetched_at),
+            suggested_canonical_id: Set(suggested_canonical_id),
+            suggested_protocol: Set(suggested_protocol),
+        }
     }))
     .exec_without_returning(tx.conn()?)
     .await?;

@@ -93,6 +93,8 @@ pub(crate) mod tests {
             icon: None,
             codex_request_shape: SqlBool::FALSE,
             local_backend: None,
+            capability_domain: crate::provider::CapabilityDomain::Chat,
+            config_json: None,
         }
     }
 

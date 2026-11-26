@@ -1,0 +1,250 @@
+{
+  "version": 1,
+  "family": "anthropic-claude",
+  "origin_vendor": "anthropic",
+  "canonical_protocols": [
+    "anthropic_messages"
+  ],
+  "models": [
+    {
+      "prefix": "claude-opus-5-5",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium",
+      "supports_fast": true
+    },
+    {
+      "prefix": "claude-fable-5-1",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "always_on",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high"
+    },
+    {
+      "prefix": "claude-fable-5",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "always_on",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high"
+    },
+    {
+      "prefix": "claude-opus-4-8",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high",
+      "supports_fast": true
+    },
+    {
+      "prefix": "claude-opus-4-7",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high",
+      "supports_fast": true
+    },
+    {
+      "prefix": "claude-opus-4-6",
+      "supports_thinking": true,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "default_effort": "high"
+    },
+    {
+      "prefix": "claude-opus-4-5",
+      "supports_thinking": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "high"
+    },
+    {
+      "prefix": "claude-sonnet-5",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high"
+    },
+    {
+      "prefix": "claude-sonnet-4-6",
+      "supports_thinking": true,
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "thinking_style": "adaptive",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "default_effort": "high"
+    },
+    {
+      "prefix": "claude-haiku-4-5",
+      "supports_thinking": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget",
+      "supported_efforts": [],
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "claude-opus-4",
+      "supports_thinking": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget"
+    },
+    {
+      "prefix": "claude-sonnet-4",
+      "supports_thinking": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget"
+    },
+    {
+      "prefix": "claude-3-7-sonnet",
+      "supports_thinking": true,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 64000,
+      "thinking_style": "budget"
+    },
+    {
+      "prefix": "claude-3-5-sonnet",
+      "supports_thinking": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 8192,
+      "thinking_style": "none"
+    },
+    {
+      "prefix": "claude-3-5-haiku",
+      "supports_thinking": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 8192,
+      "thinking_style": "none",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "claude-3-opus",
+      "supports_thinking": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 4096,
+      "thinking_style": "none",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "claude-3-sonnet",
+      "supports_thinking": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 4096,
+      "thinking_style": "none",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "claude-3-haiku",
+      "supports_thinking": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 4096,
+      "thinking_style": "none",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    }
+  ]
+}

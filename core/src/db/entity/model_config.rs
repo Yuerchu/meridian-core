@@ -33,6 +33,10 @@ pub struct Model {
     pub server_tool_price: Option<Decimal>,
     pub created_at: EpochMs,
     pub updated_at: EpochMs,
+    pub protocol_override: Option<String>,
+    pub is_enabled: SqlBool,
+    pub priority: i32,
+    pub capability_overrides: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
