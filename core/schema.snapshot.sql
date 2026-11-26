@@ -417,3 +417,7 @@ CREATE INDEX "idx_media_generations_domain_created" ON "media_generations" ("cap
 
 CREATE INDEX "idx_media_generations_conversation" ON "media_generations" ("conversation_id" ASC);
 
+CREATE TABLE "emoji_embeddings" ( "emoji_id" text NOT NULL PRIMARY KEY, "model_fingerprint" text NOT NULL, "source_hash" text NOT NULL, "dims" integer NOT NULL, "vector" blob NOT NULL, "updated_at" integer NOT NULL, FOREIGN KEY ("emoji_id") REFERENCES "emojis" ("id") ON DELETE CASCADE, CHECK (dims > 0) );
+
+CREATE INDEX "idx_emoji_embeddings_model" ON "emoji_embeddings" ("model_fingerprint" ASC);
+

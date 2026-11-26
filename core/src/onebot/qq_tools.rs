@@ -895,15 +895,13 @@ impl QqToolExecutor {
             )
             .await
             .map_err(|e| e.to_string())?;
-        let sticker = crate::tools::sticker_embed::try_pick_emojis(
-            &stickers,
-            sticker_id,
-            query,
-            &self.state.services.db,
-            Some(data_dir.as_path()),
-        )
-        .await?
-        .clone();
+        let sticker = self
+            .state
+            .services
+            .sticker_embed
+            .pick_emojis(&stickers, sticker_id, query)
+            .await?
+            .clone();
 
         let payload = sticker.native_payload();
         let cached_image = || -> Result<MessageSegment, String> {

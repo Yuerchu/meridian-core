@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -40,6 +39,45 @@ impl RosterItem for emoji::Model {
 }
 
 const MISS_NAME_CAP: usize = 20;
+
+/// Return immediately when `sticker_id` is supplied, the query is missing,
+/// the roster is empty, or an exact case-insensitive name match exists.
+///
+/// Exact name always beats vector similarity, so callers can short-circuit
+/// before touching the database or embedding engine.
+pub fn try_fast_pick<'a, T: RosterItem>(
+    roster: &'a [T],
+    sticker_id: Option<&str>,
+    query: Option<&str>,
+) -> Option<Result<&'a T, String>> {
+    let sticker_id = sticker_id.map(str::trim).filter(|s| !s.is_empty());
+    let query = query.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(id) = sticker_id {
+        return Some(
+            roster
+                .iter()
+                .find(|item| item.roster_id() == id)
+                .ok_or_else(|| "That sticker is not in this assistant's confirmed roster".into()),
+        );
+    }
+
+    let Some(query) = query else {
+        return Some(Err("Give send_sticker a query (a name or tag) or a sticker_id".into()));
+    };
+
+    if roster.is_empty() {
+        return Some(Err("No confirmed stickers are available".into()));
+    }
+
+    let q = query.to_lowercase();
+    for item in roster {
+        if match_rank(item, &q) == Some(3) {
+            return Some(Ok(item));
+        }
+    }
+    None
+}
 
 /// Pick one sticker from a confirmed roster.
 ///
@@ -259,16 +297,19 @@ impl Tool for ListStickersTool {
     }
 }
 
+pub type SharedStickerEmbedIndex =
+    std::sync::Arc<std::sync::OnceLock<std::sync::Arc<super::sticker_embed::StickerEmbedIndex>>>;
+
 pub struct SendStickerTool {
     sent_turns: Mutex<HashSet<String>>,
-    data_dir: PathBuf,
+    embed_index: SharedStickerEmbedIndex,
 }
 
 impl SendStickerTool {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(embed_index: SharedStickerEmbedIndex) -> Self {
         Self {
             sent_turns: Mutex::new(HashSet::new()),
-            data_dir,
+            embed_index,
         }
     }
 }
@@ -335,8 +376,10 @@ impl Tool for SendStickerTool {
             })
             .await
             .map_err(|e| e.to_string())?;
-        let sticker =
-            super::sticker_embed::try_pick_emojis(&stickers, sticker_id, query, db, Some(&self.data_dir)).await?;
+        let sticker = match self.embed_index.get() {
+            Some(index) => index.pick_emojis(&stickers, sticker_id, query).await?,
+            None => pick_from_roster(&stickers, sticker_id, query)?,
+        };
 
         let mut sent = self.sent_turns.lock().unwrap_or_else(|e| e.into_inner());
         if sent.contains(&turn_id) {

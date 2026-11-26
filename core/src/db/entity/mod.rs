@@ -22,6 +22,7 @@ pub mod composer_draft;
 pub mod conversation;
 pub mod custom_tool;
 pub mod emoji;
+pub mod emoji_embedding;
 pub mod emoji_pack;
 pub mod journal_blob;
 pub mod journal_file;
@@ -127,6 +128,7 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<conversation::Entity>(),
         shape_of::<custom_tool::Entity>(),
         shape_of::<emoji::Entity>(),
+        shape_of::<emoji_embedding::Entity>(),
         shape_of::<emoji_pack::Entity>(),
         shape_of::<journal_blob::Entity>(),
         shape_of::<journal_file::Entity>(),

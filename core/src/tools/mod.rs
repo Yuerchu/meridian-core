@@ -640,6 +640,7 @@ pub struct ToolRegistry {
     builtin: Vec<Arc<dyn Tool>>,
     custom: std::sync::RwLock<Vec<Arc<dyn Tool>>>,
     media_runner: media_gen::SharedMediaRunner,
+    sticker_embed: sticker::SharedStickerEmbedIndex,
 }
 
 impl ToolRegistry {
@@ -653,12 +654,8 @@ impl ToolRegistry {
         logs_dir: std::path::PathBuf,
         redaction_engine: Arc<crate::redaction::RedactionEngine>,
     ) -> Self {
-        // emoji_packs lives next to skills/ under the app data dir.
-        let data_dir = skills_root
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| skills_root.clone());
         let media_runner: media_gen::SharedMediaRunner = Arc::new(std::sync::OnceLock::new());
+        let sticker_embed: sticker::SharedStickerEmbedIndex = Arc::new(std::sync::OnceLock::new());
         #[allow(unused_mut)]
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ask_user::AskUserTool),
@@ -681,7 +678,7 @@ impl ToolRegistry {
             Arc::new(memory::DeleteMemoryTool),
             Arc::new(todo::UpdateTodosTool),
             Arc::new(sticker::ListStickersTool),
-            Arc::new(sticker::SendStickerTool::new(data_dir)),
+            Arc::new(sticker::SendStickerTool::new(sticker_embed.clone())),
             Arc::new(plan::EnterPlanTool),
             Arc::new(plan::ReadPlanTool),
             Arc::new(plan::UpdatePlanTool),
@@ -717,6 +714,7 @@ impl ToolRegistry {
             builtin: tools,
             custom: std::sync::RwLock::new(Vec::new()),
             media_runner,
+            sticker_embed,
         }
     }
 
@@ -724,6 +722,12 @@ impl ToolRegistry {
     /// `generate_image` and `generate_video` tools can execute media jobs.
     pub fn attach_media_runner(&self, runner: Arc<crate::media::MediaRunner>) {
         let _ = self.media_runner.set(runner);
+    }
+
+    /// Bind the shared [`sticker_embed::StickerEmbedIndex`] so desktop
+    /// `send_sticker` reads precomputed vectors without blocking turns.
+    pub fn attach_sticker_embed(&self, index: Arc<sticker_embed::StickerEmbedIndex>) {
+        let _ = self.sticker_embed.set(index);
     }
 
     /// Replace the set of user-defined tools. Called at startup and after every
