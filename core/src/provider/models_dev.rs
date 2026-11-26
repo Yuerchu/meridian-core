@@ -315,19 +315,10 @@ pub fn normalize_model_id(raw: &str) -> String {
 /// models, so the address picks between the two; the other is a fallback for a
 /// row whose address was typed without the region.
 fn models_dev_provider_ids(catalog_id: &str, base_url: &str) -> Vec<&'static str> {
-    let cn = base_url.to_ascii_lowercase().contains(".cn");
-    match catalog_id {
-        "openai" => vec!["openai"],
-        "anthropic" => vec!["anthropic"],
-        "deepseek" => vec!["deepseek"],
-        "xai" => vec!["xai"],
-        "google" => vec!["google", "google-vertex"],
-        "moonshot" if cn => vec!["moonshotai-cn", "moonshotai"],
-        "moonshot" => vec!["moonshotai", "moonshotai-cn"],
-        "siliconflow" if cn => vec!["siliconflow-cn", "siliconflow"],
-        "siliconflow" => vec!["siliconflow", "siliconflow-cn"],
-        _ => Vec::new(),
-    }
+    meridian_providers::vendors::models_dev_provider_ids(catalog_id, base_url)
+        .iter()
+        .map(String::as_str)
+        .collect()
 }
 
 pub(crate) fn catalog_of(row: &provider::Model) -> Option<String> {
@@ -627,6 +618,12 @@ mod tests {
             capability_overrides: None,
             created_at: 0,
             updated_at: 0,
+            canonical_id: None,
+            capability_domain: crate::provider::CapabilityDomain::Chat,
+            family: None,
+            icon: None,
+            routing_policy: crate::provider::RoutingPolicy::StickyManual,
+            is_archived: crate::db::types::SqlBool::FALSE,
         }
     }
 
@@ -692,6 +689,8 @@ mod tests {
             icon: None,
             codex_request_shape: SqlBool::FALSE,
             local_backend: None,
+            capability_domain: crate::provider::CapabilityDomain::Chat,
+            config_json: None,
         };
         assert_eq!(catalog_of(&row).as_deref(), Some("anthropic"));
     }

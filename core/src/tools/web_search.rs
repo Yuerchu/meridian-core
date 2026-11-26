@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use meridian_provider_sdk::web_search::{SearchSource, WebSearchProvider, WebSearchRequest};
+use meridian_providers::web_search::{TavilyWebSearchProvider, ZhipuWebSearchProvider};
+use serde::Serialize;
 
 use super::{Permission, Tool, ToolContext};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct WebSearchTool {
     client: reqwest::Client,
@@ -22,34 +23,10 @@ impl WebSearchTool {
     }
 }
 
-/// Read a response body with a hard size cap so a misbehaving endpoint can't
-/// buffer unbounded data into memory.
-async fn read_body_capped(resp: reqwest::Response) -> Result<Vec<u8>, String> {
-    crate::util::read_body_capped(resp, MAX_RESPONSE_BYTES, "the search response").await
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SearchSource {
-    title: String,
-    url: String,
-    content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    favicon: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    site_name: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 struct WebSearchOutput {
     llm_text: String,
     sources: Vec<SearchSource>,
-}
-
-fn extract_domain(url: &str) -> Option<String> {
-    url.split("//")
-        .nth(1)
-        .and_then(|s| s.split('/').next())
-        .map(|s| s.strip_prefix("www.").unwrap_or(s).to_string())
 }
 
 #[async_trait]
@@ -112,22 +89,33 @@ impl Tool for WebSearchTool {
             .map(|s| s.as_str())
             .unwrap_or("tavily");
 
-        let sources = match provider {
+        let req = WebSearchRequest {
+            query,
+            max_results,
+            time_range,
+        };
+
+        let response = match provider {
             "zhipu" => {
                 let api_key = context
                     .tool_secrets
                     .get("SERVICE_ZHIPU_SEARCH_KEY")
                     .ok_or("Zhipu Web Search API key not configured. Please set it in Settings > General.")?;
-                search_zhipu(&self.client, api_key, &query, max_results, time_range.as_deref()).await?
+                ZhipuWebSearchProvider::new(self.client.clone(), api_key)
+                    .search(&req)
+                    .await?
             }
             _ => {
                 let api_key = context
                     .tool_secrets
                     .get("SERVICE_TAVILY_KEY")
                     .ok_or("Tavily API key not configured. Please set it in Settings > General.")?;
-                search_tavily(&self.client, api_key, &query, max_results, time_range.as_deref()).await?
+                TavilyWebSearchProvider::new(self.client.clone(), api_key)
+                    .search(&req)
+                    .await?
             }
         };
+        let sources = response.sources;
 
         let mut llm_text = String::new();
         for (i, src) in sources.iter().enumerate() {
@@ -146,154 +134,4 @@ impl Tool for WebSearchTool {
         let output = WebSearchOutput { llm_text, sources };
         serde_json::to_string(&output).map_err(|e| format!("failed to serialize results: {e}"))
     }
-}
-
-// --- Tavily ---
-
-#[derive(Deserialize)]
-struct TavilyResponse {
-    results: Vec<TavilyResult>,
-}
-
-#[derive(Deserialize)]
-struct TavilyResult {
-    title: String,
-    url: String,
-    content: String,
-    #[serde(default)]
-    favicon: Option<String>,
-}
-
-async fn search_tavily(
-    client: &reqwest::Client,
-    api_key: &str,
-    query: &str,
-    max_results: usize,
-    time_range: Option<&str>,
-) -> Result<Vec<SearchSource>, String> {
-    let mut body = serde_json::json!({
-        "query": query,
-        "max_results": max_results,
-        "include_answer": false,
-        "include_raw_content": false,
-        "include_favicon": true,
-    });
-    if let Some(tr) = time_range {
-        body["time_range"] = serde_json::Value::String(tr.to_string());
-    }
-
-    let resp = client
-        .post("https://api.tavily.com/search")
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Tavily request failed: {e}"))?;
-
-    let status = resp.status();
-    let body = read_body_capped(resp).await?;
-    if !status.is_success() {
-        let text = String::from_utf8_lossy(&body);
-        return Err(format!("Tavily API error {status}: {text}"));
-    }
-
-    let data: TavilyResponse =
-        serde_json::from_slice(&body).map_err(|e| format!("failed to parse Tavily response: {e}"))?;
-
-    Ok(data
-        .results
-        .into_iter()
-        .map(|r| {
-            let site_name = extract_domain(&r.url);
-            SearchSource {
-                title: r.title,
-                url: r.url,
-                content: r.content,
-                favicon: r.favicon,
-                site_name,
-            }
-        })
-        .collect())
-}
-
-// --- Zhipu Web Search ---
-
-#[derive(Deserialize)]
-struct ZhipuResponse {
-    #[serde(default)]
-    search_result: Vec<ZhipuResult>,
-}
-
-#[derive(Deserialize)]
-struct ZhipuResult {
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    link: String,
-    #[serde(default)]
-    media: Option<String>,
-    #[serde(default)]
-    icon: Option<String>,
-}
-
-fn map_time_range_zhipu(time_range: Option<&str>) -> &str {
-    match time_range {
-        Some("day") => "oneDay",
-        Some("week") => "oneWeek",
-        Some("month") => "oneMonth",
-        Some("year") => "oneYear",
-        _ => "noLimit",
-    }
-}
-
-async fn search_zhipu(
-    client: &reqwest::Client,
-    api_key: &str,
-    query: &str,
-    max_results: usize,
-    time_range: Option<&str>,
-) -> Result<Vec<SearchSource>, String> {
-    let count = max_results.min(50);
-    let body = serde_json::json!({
-        "search_query": query,
-        "search_engine": "search_std",
-        "search_intent": false,
-        "count": count,
-        "search_recency_filter": map_time_range_zhipu(time_range),
-    });
-
-    let resp = client
-        .post("https://open.bigmodel.cn/api/paas/v4/web_search")
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Zhipu request failed: {e}"))?;
-
-    let status = resp.status();
-    let body = read_body_capped(resp).await?;
-    if !status.is_success() {
-        let text = String::from_utf8_lossy(&body);
-        return Err(format!("Zhipu API error {status}: {text}"));
-    }
-
-    let data: ZhipuResponse =
-        serde_json::from_slice(&body).map_err(|e| format!("failed to parse Zhipu response: {e}"))?;
-
-    Ok(data
-        .search_result
-        .into_iter()
-        .map(|r| {
-            let site_name = r.media.or_else(|| extract_domain(&r.link));
-            SearchSource {
-                title: r.title,
-                url: r.link,
-                content: r.content,
-                favicon: r.icon,
-                site_name,
-            }
-        })
-        .collect())
 }

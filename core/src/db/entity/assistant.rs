@@ -37,6 +37,8 @@ pub struct Model {
     pub thinking_budget: Option<i32>,
     pub tool_preset_id: Option<String>,
     pub auto_compact_enabled: SqlBool,
+    pub logical_model_id: Option<String>,
+    pub deployment_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -92,5 +94,7 @@ pub struct AssistantChangeset {
     pub thinking_budget: Option<Option<i32>>,
     pub tool_preset_id: Option<Option<String>>,
     pub auto_compact_enabled: Option<SqlBool>,
+    pub logical_model_id: Option<Option<String>>,
+    pub deployment_id: Option<Option<String>>,
     pub updated_at: Option<EpochMs>,
 }

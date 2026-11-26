@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "family": "google-gemini",
+  "origin_vendor": "google",
+  "canonical_protocols": [
+    "gemini_generate_content",
+    "gemini_interactions"
+  ],
+  "models": [
+    {
+      "prefix": "gemini-2.5-pro",
+      "thinking_style": "budget",
+      "supports_thinking_off": false,
+      "supports_temperature": true,
+      "supports_top_p": true,
+      "max_temperature": 2
+    },
+    {
+      "prefix": "gemini-2.5-flash",
+      "thinking_style": "budget",
+      "supports_thinking_off": true,
+      "supports_temperature": true,
+      "supports_top_p": true,
+      "max_temperature": 2
+    },
+    {
+      "prefix": "gemini-3.8-flash",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium"
+    },
+    {
+      "prefix": "gemini-3.7-flash",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium"
+    },
+    {
+      "prefix": "gemini-3.6-flash",
+      "supported_efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium"
+    },
+    {
+      "prefix": "gemini-3.5-flash-lite",
+      "supported_efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "minimal"
+    },
+    {
+      "prefix": "gemini-3.5-flash",
+      "supported_efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium"
+    },
+    {
+      "prefix": "gemini-3.1-flash-lite",
+      "supported_efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "minimal"
+    },
+    {
+      "prefix": "gemini-3.1-pro",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "high"
+    },
+    {
+      "prefix": "gemini-3-pro-preview",
+      "supported_efforts": [
+        "low",
+        "high"
+      ],
+      "default_effort": "high"
+    },
+    {
+      "prefix": "gemini-3-flash-preview",
+      "supported_efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "high"
+    }
+  ]
+}

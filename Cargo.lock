@@ -2923,6 +2923,8 @@ dependencies = [
  "libc",
  "libsqlite3-sys",
  "litert-lm",
+ "meridian-provider-sdk",
+ "meridian-providers",
  "mime_guess",
  "ndk-context",
  "os_info",
@@ -2954,6 +2956,55 @@ dependencies = [
  "trybuild",
  "uuid",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "meridian-provider-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bigdecimal",
+ "bytes",
+ "chrono",
+ "eventsource-stream",
+ "futures",
+ "http",
+ "rand 0.9.5",
+ "regex",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "meridian-providers"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "eventsource-stream",
+ "futures",
+ "http",
+ "litert-lm",
+ "meridian-provider-sdk",
+ "os_info",
+ "percent-encoding",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "zhipu",
+  "provider_type": null,
+  "name": "Zhipu Web Search",
+  "icon": "zhipu",
+  "sort_order": 210,
+  "domains": ["web_search"],
+  "balance": false,
+  "websites": {
+    "official": "https://open.bigmodel.cn",
+    "api_key": "https://open.bigmodel.cn/usercenter/apikeys",
+    "docs": "https://open.bigmodel.cn/dev/api",
+    "models": null
+  },
+  "auth": [],
+  "config_fields": [
+    {
+      "key": "SERVICE_ZHIPU_SEARCH_KEY",
+      "label": "Zhipu Search API Key",
+      "kind": "secret",
+      "required": true,
+      "secret": true,
+      "default_value": null,
+      "placeholder": null,
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    }
+  ],
+  "models_dev": null,
+  "models": []
+}

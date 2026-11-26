@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "anthropic",
+  "provider_type": "anthropic",
+  "name": "Anthropic",
+  "icon": "anthropic",
+  "sort_order": 20,
+  "domains": ["chat"],
+  "balance": false,
+  "websites": {
+    "official": "https://anthropic.com",
+    "api_key": "https://console.anthropic.com/settings/keys",
+    "docs": "https://docs.anthropic.com",
+    "models": "https://docs.anthropic.com/en/docs/about-claude/models"
+  },
+  "auth": [
+    {
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["chat_completions"],
+      "default_base_url": {
+        "chat_completions": "https://api.anthropic.com"
+      }
+    }
+  ],
+  "config_fields": [],
+  "models_dev": {
+    "default": ["anthropic"],
+    "cn": []
+  },
+  "models": []
+}

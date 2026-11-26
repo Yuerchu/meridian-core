@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "id": "openrouter",
+  "provider_type": "openai",
+  "name": "OpenRouter",
+  "icon": "openrouter",
+  "sort_order": 90,
+  "domains": ["chat"],
+  "balance": false,
+  "websites": {
+    "official": "https://openrouter.ai",
+    "api_key": "https://openrouter.ai/keys",
+    "docs": "https://openrouter.ai/docs",
+    "models": "https://openrouter.ai/models"
+  },
+  "auth": [
+    {
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["chat_completions", "responses"],
+      "default_base_url": {
+        "chat_completions": "https://openrouter.ai/api/v1",
+        "responses": "https://openrouter.ai/api/v1"
+      }
+    }
+  ],
+  "config_fields": [],
+  "models_dev": {
+    "default": ["openrouter"],
+    "cn": []
+  },
+  "models": []
+}

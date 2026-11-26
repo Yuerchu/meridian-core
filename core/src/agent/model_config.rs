@@ -143,6 +143,12 @@ mod tests {
             capability_overrides: Some(r#"{"supports_fast":true}"#.into()),
             created_at: 0,
             updated_at: 0,
+            canonical_id: None,
+            capability_domain: crate::provider::CapabilityDomain::Chat,
+            family: None,
+            icon: None,
+            routing_policy: crate::provider::RoutingPolicy::StickyManual,
+            is_archived: SqlBool::FALSE,
         }
     }
 
@@ -162,6 +168,10 @@ mod tests {
             server_tool_price: Some(decimal("5")),
             created_at: 0,
             updated_at: 0,
+            protocol_override: None,
+            is_enabled: SqlBool::TRUE,
+            priority: 0,
+            capability_overrides: None,
         }
     }
 

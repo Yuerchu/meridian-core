@@ -1,0 +1,363 @@
+{
+  "version": 1,
+  "family": "openai-gpt",
+  "origin_vendor": "openai",
+  "canonical_protocols": [
+    "openai_responses",
+    "openai_chat"
+  ],
+  "models": [
+    {
+      "prefix": "gpt-6-astra",
+      "_comment": [
+        "Measured, not guessed: a capture of a real Codex client reaching this model through a relay",
+        "carried `x-openai-internal-codex-responses-lite: true`, which is Codex's `use_responses_lite`.",
+        "That flag rewrites the request body -- no top-level `tools`, no `instructions`, both moved",
+        "into `input` as developer items, and `parallel_tool_calls` forced off -- so getting it wrong",
+        "is not a rejected request, it is a worse answer. Only the Codex request shape acts on it.",
+        "The same capture showed `reasoning_effort: high`. Context and output ceilings are the family's",
+        "and are the one part here nothing has measured; a model page can correct them per row."
+      ],
+      "responses_lite": true,
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5.6-sol",
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "low",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5.6-terra",
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5.6-luna",
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5.6",
+      "_comment": "Bare gpt-5.6 is a server-side alias that routes to Sol.",
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "low",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5.5",
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5.4-mini",
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "medium",
+      "supports_verbosity": true,
+      "default_verbosity": "medium",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5.4",
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "medium",
+      "supports_fast": true,
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5.2",
+      "supports_thinking": true,
+      "max_context_tokens": 272000,
+      "max_output_tokens": 128000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "medium",
+      "supports_verbosity": true,
+      "default_verbosity": "low",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-5",
+      "_comment": "Catch-all for gpt-5 / gpt-5.1 and their mini/nano variants. Context left unset on purpose -- no authoritative figure, so the provider default applies and users can override per model.",
+      "supports_thinking": true,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium",
+      "supports_verbosity": true,
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "o3",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 100000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "o4-mini",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 100000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "o1",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 200000,
+      "max_output_tokens": 100000,
+      "thinking_style": "effort_only",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-4.1",
+      "max_context_tokens": 1047576,
+      "max_output_tokens": 32768,
+      "thinking_style": "none",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-4o",
+      "max_context_tokens": 128000,
+      "max_output_tokens": 16384,
+      "thinking_style": "none",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-4-turbo",
+      "max_context_tokens": 128000,
+      "max_output_tokens": 4096,
+      "thinking_style": "none",
+      "readable_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp"
+      ]
+    },
+    {
+      "prefix": "gpt-4",
+      "max_context_tokens": 8192,
+      "max_output_tokens": 4096,
+      "thinking_style": "none"
+    },
+    {
+      "prefix": "gpt-3.5",
+      "max_context_tokens": 16385,
+      "max_output_tokens": 4096,
+      "thinking_style": "none"
+    }
+  ]
+}

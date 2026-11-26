@@ -132,6 +132,8 @@ pub async fn bootstrap_with_secrets(
                     thinking_budget: None,
                     tool_preset_id: None,
                     auto_compact_enabled: SqlBool::FALSE,
+                    logical_model_id: None,
+                    deployment_id: None,
                 },
             )
             .await
@@ -194,6 +196,8 @@ pub async fn bootstrap_with_secrets(
                         // and nothing here has said the address is a relay for one.
                         codex_request_shape: SqlBool::FALSE,
                         local_backend: None,
+                        capability_domain: crate::provider::CapabilityDomain::Chat,
+                        config_json: None,
                     };
                     // The row and the default assistant pointed at it, together.
                     let written = sea

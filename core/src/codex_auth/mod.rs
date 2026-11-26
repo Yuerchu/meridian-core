@@ -199,6 +199,34 @@ impl Manager {
     pub async fn refresh_after_rejection(&self, rejected: &str) -> Result<(), AuthError> {
         self.refresh(Some(rejected)).await.map(|_| ())
     }
+}
+
+#[async_trait::async_trait]
+impl meridian_provider_sdk::auth::BearerSession for Manager {
+    async fn bearer(
+        &self,
+    ) -> Result<meridian_provider_sdk::auth::BearerToken, meridian_provider_sdk::auth::BearerSessionError> {
+        let token = Manager::bearer(self)
+            .await
+            .map_err(|e| meridian_provider_sdk::auth::BearerSessionError::Message(e.to_string()))?;
+        Ok(meridian_provider_sdk::auth::BearerToken {
+            access_token: token.access_token,
+            account_id: token.account_id,
+            is_fedramp: token.is_fedramp,
+        })
+    }
+
+    async fn refresh_after_rejection(
+        &self,
+        failed_access_token: &str,
+    ) -> Result<(), meridian_provider_sdk::auth::BearerSessionError> {
+        Manager::refresh_after_rejection(self, failed_access_token)
+            .await
+            .map_err(|e| meridian_provider_sdk::auth::BearerSessionError::Message(e.to_string()))
+    }
+}
+
+impl Manager {
 
     /// Exchange the refresh token, unless it turns out not to be needed.
     ///

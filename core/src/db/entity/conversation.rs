@@ -39,6 +39,8 @@ pub struct Model {
     pub agent_kind: Option<String>,
     pub agent_provider_id: Option<String>,
     pub agent_model_id: Option<String>,
+    pub logical_model_id: Option<String>,
+    pub deployment_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

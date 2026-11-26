@@ -14,6 +14,8 @@ pub struct Model {
     pub model_id: String,
     pub model_name: String,
     pub fetched_at: EpochMs,
+    pub suggested_canonical_id: Option<String>,
+    pub suggested_protocol: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

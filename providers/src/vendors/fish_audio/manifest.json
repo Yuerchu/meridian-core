@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "fish_audio",
+  "provider_type": null,
+  "name": "Fish Audio",
+  "icon": "fishaudio",
+  "sort_order": 300,
+  "domains": ["tts"],
+  "balance": false,
+  "websites": {
+    "official": "https://fish.audio",
+    "api_key": "https://fish.audio/go-api/",
+    "docs": "https://docs.fish.audio",
+    "models": null
+  },
+  "auth": [],
+  "config_fields": [
+    {
+      "key": "SERVICE_FISH_AUDIO_KEY",
+      "label": "Fish Audio API Key",
+      "kind": "secret",
+      "required": true,
+      "secret": true,
+      "default_value": null,
+      "placeholder": null,
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    }
+  ],
+  "models_dev": null,
+  "models": []
+}

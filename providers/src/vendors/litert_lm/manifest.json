@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "id": "litert_lm",
+  "provider_type": "litert_lm",
+  "name": "LiteRT-LM (On-Device)",
+  "icon": "litert",
+  "sort_order": 80,
+  "domains": ["chat"],
+  "balance": false,
+  "websites": {
+    "official": "https://ai.google.dev/edge/litert-lm",
+    "api_key": null,
+    "docs": "https://ai.google.dev/edge/litert-lm/overview",
+    "models": null
+  },
+  "auth": [
+    {
+      "id": "local",
+      "credential_kind": "none",
+      "transport_profile": "local_native",
+      "api_formats": ["litert_lm"],
+      "default_base_url": {
+        "litert_lm": "local://"
+      }
+    }
+  ],
+  "config_fields": [
+    {
+      "key": "local_backend",
+      "label": "Inference Backend",
+      "kind": "select",
+      "required": true,
+      "secret": false,
+      "default_value": "auto",
+      "placeholder": null,
+      "options": [
+        { "value": "auto", "label": "Auto" },
+        { "value": "gpu", "label": "GPU" },
+        { "value": "cpu", "label": "CPU" },
+        { "value": "npu", "label": "NPU" }
+      ],
+      "visible_when_protocol": ["litert_lm"],
+      "visible_when_auth": ["local"]
+    }
+  ],
+  "models_dev": null,
+  "models": []
+}

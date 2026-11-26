@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "siliconflow",
+  "provider_type": "openai",
+  "name": "SiliconFlow",
+  "icon": "siliconcloud",
+  "sort_order": 50,
+  "domains": ["chat"],
+  "balance": true,
+  "websites": {
+    "official": "https://www.siliconflow.cn",
+    "api_key": "https://cloud.siliconflow.cn/account/ak",
+    "docs": "https://docs.siliconflow.cn",
+    "models": "https://cloud.siliconflow.cn/models"
+  },
+  "auth": [
+    {
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["chat_completions"],
+      "default_base_url": {
+        "chat_completions": "https://api.siliconflow.cn/v1"
+      }
+    }
+  ],
+  "config_fields": [],
+  "models_dev": {
+    "default": ["siliconflow", "siliconflow-cn"],
+    "cn": ["siliconflow-cn", "siliconflow"]
+  },
+  "models": []
+}

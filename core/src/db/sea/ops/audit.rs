@@ -26,6 +26,8 @@ struct Snapshot {
     sender_name: Option<String>,
     prices: Prices,
     billing_mode: BillingMode,
+    logical_model_id: Option<String>,
+    deployment_id: Option<String>,
 }
 
 /// What this reply was priced at, taken now rather than looked up later.
@@ -38,37 +40,46 @@ struct Prices {
     server_tool_price: Option<Decimal>,
 }
 
-/// The rates this reply was charged, with any tier already resolved from this
-/// prompt's size. An unknown base rate snapshots no token rate but keeps the
-/// provider-tool rate, which no tier changes.
-async fn prices_for(
+/// The rates this reply was charged, plus the logical model & deployment IDs
+/// that served it.
+async fn prices_and_deployment_for(
     tx: &WriteTx,
     provider_id: Option<&str>,
     model_id: Option<&str>,
     prompt_tokens: Option<i32>,
-) -> Result<Prices, DbErr> {
+) -> Result<(Prices, Option<String>, Option<String>), DbErr> {
     let (Some(provider_id), Some(model_id)) = (provider_id, model_id) else {
-        return Ok(Prices::default());
+        return Ok((Prices::default(), None, None));
     };
     let Some((config, profile)) = model_config::get_with_profile(tx, provider_id, model_id).await? else {
-        return Ok(Prices::default());
+        return Ok((Prices::default(), None, None));
     };
+    let logical_model_id = Some(profile.id.clone());
+    let deployment_id = Some(config.id.clone());
     let config = crate::agent::model_config::effective(&config, &profile);
     let effective = crate::agent::pricing::Prices::for_prompt(&config, prompt_tokens.map(i64::from))
         .map_err(|error| DbErr::Type(error.to_string()))?;
     if !effective.known() {
-        return Ok(Prices {
-            server_tool_price: effective.server_tool_price,
-            ..Default::default()
-        });
+        return Ok((
+            Prices {
+                server_tool_price: effective.server_tool_price,
+                ..Default::default()
+            },
+            logical_model_id,
+            deployment_id,
+        ));
     }
-    Ok(Prices {
-        input_price: effective.input_price,
-        output_price: effective.output_price,
-        cache_read_price: effective.cache_read_price,
-        cache_write_price: effective.cache_write_price,
-        server_tool_price: effective.server_tool_price,
-    })
+    Ok((
+        Prices {
+            input_price: effective.input_price,
+            output_price: effective.output_price,
+            cache_read_price: effective.cache_read_price,
+            cache_write_price: effective.cache_write_price,
+            server_tool_price: effective.server_tool_price,
+        },
+        logical_model_id,
+        deployment_id,
+    ))
 }
 
 /// The lookups, from identifiers rather than a row: a side request has no
@@ -121,14 +132,18 @@ async fn snapshot_of(tx: &WriteTx, subject: Subject<'_>) -> Result<Snapshot, DbE
         conversation.as_ref().and_then(|c| c.agent_kind.as_deref()),
     )
     .await?;
+    let (prices, logical_model_id, deployment_id) =
+        prices_and_deployment_for(tx, subject.provider_id, subject.model_id, subject.prompt_tokens).await?;
     Ok(Snapshot {
         source_type: project.as_ref().map(|p| p.source_type.as_str().to_owned()),
         source_id: project.and_then(|p| p.source_id),
         turn_origin,
         self_id,
         sender_name,
-        prices: prices_for(tx, subject.provider_id, subject.model_id, subject.prompt_tokens).await?,
+        prices,
         billing_mode,
+        logical_model_id,
+        deployment_id,
     })
 }
 
@@ -205,6 +220,8 @@ pub async fn record(tx: &WriteTx, msg: &message::Model) -> Result<(), DbErr> {
         server_tool_price: Set(snap.prices.server_tool_price),
         billing_mode: Set(snap.billing_mode),
         response_model_id: Set(msg.response_model_id.clone()),
+        logical_model_id: Set(snap.logical_model_id),
+        deployment_id: Set(snap.deployment_id),
     })
     .exec_without_returning(tx.conn()?)
     .await?;
@@ -348,6 +365,8 @@ pub async fn record_side_request(tx: &WriteTx, cost: SideRequestCost<'_>) -> Res
         server_tool_price: Set(snap.prices.server_tool_price),
         billing_mode: Set(snap.billing_mode),
         response_model_id: Set(None),
+        logical_model_id: Set(snap.logical_model_id),
+        deployment_id: Set(snap.deployment_id),
     })
     .exec_without_returning(tx.conn()?)
     .await?;
@@ -413,6 +432,12 @@ mod tests {
             capability_overrides: None,
             created_at: 0,
             updated_at: 0,
+            canonical_id: None,
+            capability_domain: crate::provider::CapabilityDomain::Chat,
+            family: None,
+            icon: None,
+            routing_policy: crate::provider::RoutingPolicy::StickyManual,
+            is_archived: SqlBool::FALSE,
         };
         let config = config_entity::Model {
             id: format!("{model_id}-config"),
@@ -429,6 +454,10 @@ mod tests {
             server_tool_price: tool.map(decimal),
             created_at: 0,
             updated_at: 0,
+            protocol_override: None,
+            is_enabled: SqlBool::TRUE,
+            priority: 0,
+            capability_overrides: None,
         };
         db.write(async |tx| {
             match model_profile::Entity::find_by_id(profile.id.clone())

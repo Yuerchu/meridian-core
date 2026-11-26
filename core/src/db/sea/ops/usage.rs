@@ -77,6 +77,7 @@ pub enum UsageDimension {
     Total,
     Provider,
     Model,
+    LogicalModel,
     Bot,
     Source,
     Conversation,
@@ -101,6 +102,7 @@ impl UsageDimension {
             // keeps; the id only stands in when a row predates that column.
             UsageDimension::Provider => "COALESCE(provider_name, provider_id, '')",
             UsageDimension::Model => "COALESCE(model_id, '')",
+            UsageDimension::LogicalModel => "COALESCE(logical_model_id, model_id, '')",
             UsageDimension::Bot => "COALESCE(CAST(self_id AS TEXT), '')",
             // Type and id together: a private chat with user 12345 and a group
             // numbered 12345 are different places with the same number.
@@ -1063,6 +1065,22 @@ fn group_row(row: &QueryResult) -> Result<GroupRow, DbErr> {
 /// deleted conversation should read as deleted, not as a title nobody chose.
 async fn label(db: &impl Read, dimension: UsageDimension, buckets: &mut [UsageBucket]) -> Result<(), DbErr> {
     match dimension {
+        UsageDimension::LogicalModel => {
+            let ids: Vec<&str> = buckets.iter().map(|b| b.key.as_str()).collect();
+            let names: HashMap<String, String> = crate::db::entity::model_profile::Entity::find()
+                .filter(crate::db::entity::model_profile::Column::Id.is_in(ids))
+                .select_only()
+                .column(crate::db::entity::model_profile::Column::Id)
+                .column(crate::db::entity::model_profile::Column::Name)
+                .into_tuple::<(String, String)>()
+                .all(db.conn()?)
+                .await?
+                .into_iter()
+                .collect();
+            for bucket in buckets {
+                bucket.label = names.get(&bucket.key).cloned();
+            }
+        }
         UsageDimension::Conversation => {
             let ids: Vec<&str> = buckets.iter().map(|b| b.key.as_str()).collect();
             let titles: HashMap<String, Option<String>> = conversation::Entity::find()
@@ -1155,6 +1173,8 @@ mod tests {
             server_tool_price: None,
             billing_mode: BillingMode::Metered,
             response_model_id: None,
+            logical_model_id: None,
+            deployment_id: None,
         }
     }
 
@@ -1362,6 +1382,7 @@ mod tests {
             UsageDimension::Total,
             UsageDimension::Provider,
             UsageDimension::Model,
+            UsageDimension::LogicalModel,
             UsageDimension::Bot,
             UsageDimension::Source,
             UsageDimension::Conversation,

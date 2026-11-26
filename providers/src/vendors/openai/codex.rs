@@ -1,0 +1,880 @@
+//! The Responses API as reached through a ChatGPT subscription.
+//!
+//! Its own adapter rather than a flavour of [`super::openai_responses`], because
+//! the differences are not cosmetic: the endpoint is different, `store` is off
+//! so reasoning has to travel back with the next request, sampling parameters
+//! mean nothing, a handful of extra headers are required, and the credential is
+//! a session that expires rather than a key that does not.
+//!
+//! **The parsing is shared, the building is not.** `parse_responses_event` is a
+//! pure function over the same event grammar and is reused as-is; the request
+//! shape is forked. Parameterising one builder for both would need five or six
+//! switches, and — more to the point — the file boundary is what guarantees that
+//! xAI and DeepSeek can never start sending `include` or `store: false`. That is
+//! a structural guarantee rather than a default nobody has changed yet.
+
+use async_trait::async_trait;
+use eventsource_stream::Eventsource;
+use futures::StreamExt;
+use std::sync::Arc;
+
+use crate::openai_responses::{StreamState, parse_responses_event};
+use crate::{
+    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, ToolCall,
+    ToolDefinition,
+};
+use meridian_provider_sdk::auth::{BearerSession, BearerSessionError, BearerToken};
+use meridian_provider_sdk::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
+
+/// What this app calls itself to the ChatGPT backend.
+///
+/// **Not `codex_cli_rs`.** Impersonating the CLI would very likely work and was
+/// considered; sending our own name is the honest option and was measured to be
+/// accepted. If a future refusal names the originator, that is a decision to
+/// revisit deliberately rather than a value to quietly change — see
+/// `tests/codex_smoke.rs`, which exists to answer exactly this.
+pub(super) const ORIGINATOR: &str = "meridian";
+
+pub struct CodexProvider {
+    base_url: String,
+    auth: Arc<dyn BearerSession>,
+    transport: Arc<dyn HttpTransport>,
+    /// Stable for the life of this provider, which is one turn. The backend uses
+    /// it to group requests; a fresh one per request would look like a fresh
+    /// conversation each time.
+    session_id: String,
+}
+
+impl CodexProvider {
+    pub fn new(base_url: &str, auth: Arc<dyn BearerSession>) -> Self {
+        Self::with_transport(base_url, auth, Arc::new(ReqwestTransport::shared()))
+    }
+
+    pub fn with_transport(base_url: &str, auth: Arc<dyn BearerSession>, transport: Arc<dyn HttpTransport>) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            auth,
+            transport,
+            session_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    fn build_request(
+        &self,
+        bearer: &BearerToken,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolDefinition]>,
+        params: &ChatParams,
+        stream: bool,
+    ) -> Result<Request, ProviderError> {
+        let (instructions, input) = serialize_codex_input(messages, &params.model)?;
+
+        let mut body = serde_json::json!({
+            "model": params.model,
+            "input": input,
+            "stream": stream,
+            // The upstream keeps nothing. That is what makes the reasoning
+            // round-trip above necessary, and it is not negotiable here: this
+            // backend does not offer stored responses.
+            "store": false,
+            // Ask for the reasoning in a form that can be sent back. Without
+            // it the items arrive with nothing replayable inside them.
+            "include": ["reasoning.encrypted_content"],
+        });
+
+        if let Some(instructions) = instructions {
+            body["instructions"] = serde_json::Value::String(instructions);
+        }
+
+        // Deliberately absent: temperature, top_p, service_tier,
+        // max_output_tokens. The first two are not honoured on this backend,
+        // `service_tier` prices a request against an API account that a
+        // subscription does not have, and `max_output_tokens` is rejected
+        // outright — the Codex backend does not accept it.
+        if let Some(effort) = params.thinking_effort.as_deref() {
+            body["reasoning"] = serde_json::json!({ "effort": effort, "summary": "auto" });
+        }
+        if let Some(verbosity) = params.verbosity.as_deref() {
+            body["text"] = serde_json::json!({ "verbosity": verbosity });
+        }
+        if let Some(key) = params.cache_key.as_deref() {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+
+        if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+            body["tools"] = serde_json::json!(
+                tools
+                    .iter()
+                    .map(|t| serde_json::json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                        "strict": false,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            body["tool_choice"] = serde_json::json!("auto");
+            body["parallel_tool_calls"] = serde_json::json!(true);
+        }
+
+        let mut req = Request::new(http::Method::POST, format!("{}/responses", self.base_url));
+        req.headers.insert(
+            http::header::AUTHORIZATION,
+            crate::auth_header_value(&format!("Bearer {}", bearer.access_token)),
+        );
+        insert_header(&mut req, "chatgpt-account-id", &bearer.account_id);
+        insert_header(&mut req, "originator", ORIGINATOR);
+        insert_header(
+            &mut req,
+            "user-agent",
+            &format!(
+                "{ORIGINATOR}/{} ({}; {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            ),
+        );
+        // `session-id`, not `session_id`. The underscore spelling was right for
+        // the Codex this adapter was written against and appears nowhere in the
+        // Codex tree now — `codex-api/src/requests/headers.rs` sends `session-id`
+        // and `thread-id`, and `endpoint/responses.rs` adds `x-client-request-id`.
+        // The old name was never *rejected*, because an unknown header is
+        // ignored; it simply stopped being read, which is the quiet half of
+        // getting a header wrong.
+        insert_header(&mut req, "session-id", &self.session_id);
+        // The conversation. Absent on the background passes that clear the cache
+        // key, exactly as Codex sends neither when it has no thread.
+        if let Some(thread) = params.cache_key.as_deref() {
+            insert_header(&mut req, "thread-id", thread);
+            insert_header(&mut req, "x-client-request-id", thread);
+        }
+        if stream {
+            req.headers.insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("text/event-stream"),
+            );
+        }
+        if bearer.is_fedramp {
+            // Not an endpoint change — the same URL, routed differently.
+            insert_header(&mut req, "x-openai-fedramp", "true");
+        }
+        req.body = Some(RequestBody::Json(body));
+        Ok(req)
+    }
+
+    /// Send, and if the session was refused once, renew it and send again.
+    ///
+    /// One retry, and only before the first byte. `transport.stream` resolves
+    /// the status before handing back a body, so a 401 here cannot arrive with
+    /// events already delivered downstream — which is what makes retrying safe
+    /// at all. A failure mid-stream is a different thing and is not retried.
+    async fn send<T, F, Fut>(&self, attempt: F) -> Result<T, ProviderError>
+    where
+        F: Fn(BearerToken) -> Fut,
+        Fut: Future<Output = Result<T, ProviderError>>,
+    {
+        let bearer = self.auth.bearer().await.map_err(to_provider_error)?;
+        match attempt(bearer.clone()).await {
+            Err(ProviderError::Api { status: 401, .. }) => {
+                self.auth
+                    .refresh_after_rejection(&bearer.access_token)
+                    .await
+                    .map_err(to_provider_error)?;
+                let renewed = self.auth.bearer().await.map_err(to_provider_error)?;
+                attempt(renewed).await
+            }
+            other => other,
+        }
+    }
+}
+
+fn insert_header(req: &mut Request, name: &'static str, value: &str) {
+    if let Ok(value) = http::HeaderValue::from_str(value) {
+        req.headers.insert(http::HeaderName::from_static(name), value);
+    }
+}
+
+/// A credential problem, in the vocabulary the turn loop understands.
+///
+/// Everything maps to 401 so the turn stops rather than retrying: none of these
+/// gets better by being asked again, and the message says what would fix it.
+fn to_provider_error(e: BearerSessionError) -> ProviderError {
+    ProviderError::Api {
+        status: 401,
+        body: e.to_string(),
+    }
+}
+
+/// Build the `input` array, replaying reasoning where the model can use it.
+///
+/// Forked from `openai_responses::serialize_responses_input`; the difference is
+/// the reasoning, which that one has no reason to carry.
+fn serialize_codex_input(
+    messages: &[ChatMessage],
+    model: &str,
+) -> Result<(Option<String>, Vec<serde_json::Value>), ProviderError> {
+    let mut instructions: Option<String> = None;
+    let mut input = Vec::new();
+
+    for m in messages {
+        match m.role.as_str() {
+            "system" => match instructions {
+                Some(ref mut existing) => {
+                    existing.push('\n');
+                    existing.push_str(&m.content);
+                }
+                None => instructions = Some(m.content.clone()),
+            },
+            "user" => {
+                // Responses input items have no `name` field, so the speaker
+                // goes in as a prefix.
+                let rendered =
+                    crate::render_message(m, crate::SenderRendering::Prefix).map_err(ProviderError::Parse)?;
+                input.push(serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": rendered.content}],
+                }));
+            }
+            "assistant" => input.extend(replay_assistant_turn(m, model)),
+            "tool" => {
+                if let Some(ref call_id) = m.tool_call_id {
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": crate::openai_responses::responses_tool_output(m)?,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok((instructions, input))
+}
+
+/// One assistant row as input items, with its reasoning replayed in place.
+///
+/// `pub(super)` because `openai_responses` needs the identical merge under
+/// `CodexShape`, and two copies of it would be two copies of the ordering rule
+/// below — which has already been got wrong once, in exactly the way that does
+/// not fail loudly.
+pub(crate) fn replay_assistant_turn(m: &ChatMessage, model: &str) -> Vec<serde_json::Value> {
+    let mut input = Vec::new();
+
+    // The reasoning goes back interleaved where it originally stood, not merely
+    // sorted among itself. `position` is the item's index in the original
+    // output, and the sequence the model emitted was reasoning *adjacent to the
+    // item it produced* — `[reasoning, call, reasoning, call]`, routinely.
+    // Replaying all reasoning first, which this used to do, kept the reasoning
+    // items ordered and moved every one of them away from its call: exactly the
+    // reordering the position field was stored to prevent. Items whose stored
+    // JSON no longer parses are skipped rather than failing the turn: losing the
+    // reasoning costs continuity, sending malformed input costs the whole
+    // request.
+    let mut replayed: Vec<_> = m
+        .provider_state
+        .as_ref()
+        .and_then(|state| state.codex_reasoning_for(model))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            serde_json::from_str::<serde_json::Value>(&item.item_json)
+                .ok()
+                .map(|value| (item.position, value))
+        })
+        .collect();
+    replayed.sort_by_key(|(position, _)| *position);
+
+    // The non-reasoning items, in the order the turn stored them — which is the
+    // order they streamed. Their own indices were not stored, so the merge
+    // places each reasoning item at its recorded index and lets these fill the
+    // gaps in between; a position beyond the sequence (older rows, a dropped
+    // item) degrades to appending, never to losing anything.
+    let mut others = std::collections::VecDeque::new();
+    if !m.content.is_empty() {
+        others.push_back(crate::openai_responses::assistant_message_item(
+            &m.content,
+            m.provider_state.as_ref().and_then(|s| s.responses_phase()),
+        ));
+    }
+    if let Some(ref tool_calls) = m.tool_calls {
+        for tc in tool_calls {
+            others.push_back(serde_json::json!({
+                "type": "function_call",
+                "name": tc.name,
+                "arguments": tc.arguments,
+                "call_id": tc.id,
+            }));
+        }
+    }
+
+    let total = replayed.len() + others.len();
+    let mut reasoning = replayed.into_iter().peekable();
+    for index in 0..total {
+        let its_turn = reasoning.peek().is_some_and(|(position, _)| *position <= index);
+        if its_turn || others.is_empty() {
+            if let Some((_, value)) = reasoning.next() {
+                input.push(value);
+            }
+        } else if let Some(other) = others.pop_front() {
+            input.push(other);
+        }
+    }
+
+    input
+}
+
+/// Turn a completed `reasoning` output item into state to be stored.
+///
+/// Everything else about the event is left to the shared parser; this only
+/// intercepts what that parser has no reason to keep.
+pub(crate) fn reasoning_update(data: &str, model: &str) -> Option<StreamEvent> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let item = value.get("item")?;
+    if item.get("type")?.as_str()? != "reasoning" {
+        return None;
+    }
+    // Without `encrypted_content` there is nothing replayable — a summary alone
+    // cannot be sent back, and storing it would produce input the upstream
+    // rejects.
+    item.get("encrypted_content")?.as_str()?;
+    Some(StreamEvent::ProviderStateUpdate {
+        update: crate::state::ProviderStateUpdate::CodexReasoningItem {
+            model: model.to_string(),
+            position: value.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize,
+            item_json: item.to_string(),
+        },
+    })
+}
+
+#[async_trait]
+impl ChatProvider for CodexProvider {
+    fn adapter_name(&self) -> &'static str {
+        "CodexProvider"
+    }
+
+    async fn stream_chat_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        params: ChatParams,
+    ) -> Result<ChatStream, ProviderError> {
+        let model = params.model.clone();
+        let resp = self
+            .send(|bearer| {
+                let req = self.build_request(&bearer, &messages, Some(&tools), &params, true);
+                async move { self.transport.stream(req?).await.map_err(ProviderError::from) }
+            })
+            .await?;
+
+        // `openai-model` off the HTTP headers, which the event parser never
+        // sees — see `openai_responses::http_response_model`. This is the
+        // backend the header was measured on, so it is the likeliest of the
+        // three sources to be the one that answers.
+        let header_model = crate::openai_responses::http_response_model(&resp.headers);
+        let mut state = StreamState::default();
+        let stream = resp
+            .bytes
+            .map(|r| r.map_err(ProviderError::Transport))
+            .eventsource()
+            .flat_map(move |event| {
+                let events: Vec<Result<StreamEvent, ProviderError>> = match event {
+                    Ok(ev) => {
+                        let mut out = Vec::new();
+                        // Intercept first, then delegate: the shared parser has
+                        // no interest in reasoning items or a message item's
+                        // phase, and drops both.
+                        if ev.event == "response.output_item.done" {
+                            if let Some(captured) = reasoning_update(&ev.data, &model) {
+                                out.push(Ok(captured));
+                            }
+                            if let Some(captured) = crate::openai_responses::message_phase_update(
+                                &ev.data,
+                                crate::state::CODEX_RESPONSES_PROTOCOL,
+                                &model,
+                            ) {
+                                out.push(Ok(captured));
+                            }
+                        }
+                        out.extend(parse_responses_event(&ev.event, &ev.data, &mut state));
+                        out
+                    }
+                    Err(e) => vec![Err(ProviderError::Parse(e.to_string()))],
+                };
+                futures::stream::iter(events)
+            });
+
+        let stream =
+            futures::stream::iter(header_model.map(|model| Ok(StreamEvent::ResponseModel { model }))).chain(stream);
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn chat(&self, messages: Vec<ChatMessage>, params: ChatParams) -> Result<String, ProviderError> {
+        let response = self.chat_with_tools(messages, Vec::new(), params).await?;
+        if response.text.is_empty() {
+            Err(ProviderError::Parse("no content in response".into()))
+        } else {
+            Ok(response.text)
+        }
+    }
+
+    /// The stream, drained. The backend refuses `stream: false`, and the side
+    /// requests — the summariser, the title, the reviewer — call this rather
+    /// than `chat` for the usage it hands back. Folding the one stream parser
+    /// keeps the reasoning capture in a single implementation.
+    async fn chat_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        params: ChatParams,
+    ) -> Result<AgentResponse, ProviderError> {
+        let stream = self.stream_chat_with_tools(messages, tools, params).await?;
+        fold_stream(stream).await
+    }
+}
+
+/// One streamed response as the non-streaming shape.
+///
+/// A stream that ends without its terminal event is an error rather than an
+/// answer: a summary cut off mid-sentence would otherwise replace the history
+/// it was meant to stand for.
+async fn fold_stream(mut stream: ChatStream) -> Result<AgentResponse, ProviderError> {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut calls: std::collections::BTreeMap<usize, ToolCall> = std::collections::BTreeMap::new();
+    let mut state = crate::state::ProviderStateAccumulator::default();
+    let mut usage = None;
+    let mut stopped = false;
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::Text { content } => text.push_str(&content),
+            StreamEvent::Reasoning { content } => reasoning.push_str(&content),
+            StreamEvent::ToolCallStart { index, id, name } => {
+                calls.insert(
+                    index,
+                    ToolCall {
+                        id,
+                        name,
+                        arguments: String::new(),
+                    },
+                );
+            }
+            StreamEvent::ToolCallDelta { index, arguments } => {
+                if let Some(call) = calls.get_mut(&index) {
+                    call.arguments.push_str(&arguments);
+                }
+            }
+            StreamEvent::ToolCallDone { index, arguments } => {
+                if let Some(call) = calls.get_mut(&index) {
+                    call.arguments = arguments;
+                }
+            }
+            StreamEvent::ProviderStateUpdate { update } => state.apply(update).map_err(ProviderError::Parse)?,
+            StreamEvent::UsageUpdate { usage: u } => usage = Some(u),
+            StreamEvent::Stop { usage: u, .. } => {
+                if u.is_some() {
+                    usage = u;
+                }
+                stopped = true;
+            }
+            StreamEvent::Error { message } => return Err(ProviderError::Upstream(message)),
+            StreamEvent::MessageStart { .. }
+            | StreamEvent::CompactionResult { .. }
+            | StreamEvent::ServerToolCall(_)
+            | StreamEvent::ResponseModel { .. } => {}
+        }
+    }
+
+    if !stopped {
+        return Err(ProviderError::Parse(
+            "the stream ended before the response completed".into(),
+        ));
+    }
+
+    Ok(AgentResponse {
+        text,
+        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+        tool_calls: calls.into_values().collect(),
+        usage,
+        provider_state: state.finish(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{
+        CODEX_RESPONSES_PROTOCOL, CodexReasoningItem, ProviderState, ProviderStatePayload, ProviderStateProducer,
+        ProviderStateUpdate,
+    };
+
+    fn reasoning_state(model: &str, items: Vec<(usize, &str)>) -> ProviderState {
+        ProviderState {
+            version: 1,
+            producer: ProviderStateProducer {
+                vendor: "openai".into(),
+                protocol: CODEX_RESPONSES_PROTOCOL.into(),
+                model: model.into(),
+            },
+            payload: ProviderStatePayload::CodexReasoning {
+                items: items
+                    .into_iter()
+                    .map(|(position, id)| CodexReasoningItem {
+                        position,
+                        item_json: serde_json::json!({
+                            "type": "reasoning",
+                            "id": id,
+                            "encrypted_content": "blob",
+                        })
+                        .to_string(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    fn assistant(content: &str, state: Option<ProviderState>) -> ChatMessage {
+        ChatMessage {
+            provider_state: state,
+            ..ChatMessage::assistant(content)
+        }
+    }
+
+    /// Reasoning goes back at the index it originally held, not merely ahead
+    /// of everything — the model has to see the sequence it actually emitted.
+    /// Positions 0 and 2 around one message means the message stood at 1.
+    #[test]
+    fn reasoning_is_replayed_at_its_original_index() {
+        let messages = vec![assistant(
+            "done",
+            Some(reasoning_state("gpt-5.6", vec![(2, "second"), (0, "first")])),
+        )];
+        let (_, input) = serialize_codex_input(&messages, "gpt-5.6").unwrap();
+
+        let kinds: Vec<_> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["reasoning", "message", "reasoning"]);
+        assert_eq!(input[0]["id"], "first", "sorted by position, not arrival");
+        assert_eq!(input[2]["id"], "second");
+    }
+
+    /// **The interleaving the position field was stored for.** A tool round
+    /// comes out as `[reasoning, call, reasoning, call]` — each reasoning item
+    /// adjacent to the call it produced. Replaying all reasoning first keeps
+    /// the reasoning sorted and moves every item away from its call, which is
+    /// the reordering a `store:false` backend can reject outright.
+    #[test]
+    fn reasoning_is_interleaved_with_the_calls_it_produced() {
+        let mut msg = assistant("", Some(reasoning_state("gpt-5.6", vec![(0, "for-a"), (2, "for-b")])));
+        msg.tool_calls = Some(vec![
+            crate::ToolCall {
+                id: "call-a".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            crate::ToolCall {
+                id: "call-b".into(),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+            },
+        ]);
+        let (_, input) = serialize_codex_input(&[msg], "gpt-5.6").unwrap();
+
+        let kinds: Vec<_> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["reasoning", "function_call", "reasoning", "function_call"]);
+        assert_eq!(input[0]["id"], "for-a");
+        assert_eq!(input[1]["call_id"], "call-a");
+        assert_eq!(input[2]["id"], "for-b");
+        assert_eq!(input[3]["call_id"], "call-b");
+    }
+
+    /// A position beyond the rebuilt sequence — an older row, a dropped item —
+    /// degrades to appending. Nothing is lost and nothing panics.
+    #[test]
+    fn a_position_past_the_sequence_appends_rather_than_losing_the_item() {
+        let messages = vec![assistant("done", Some(reasoning_state("gpt-5.6", vec![(7, "stray")])))];
+        let (_, input) = serialize_codex_input(&messages, "gpt-5.6").unwrap();
+        let kinds: Vec<_> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["message", "reasoning"]);
+    }
+
+    /// Another model's reasoning is not replayed: the upstream would reject it,
+    /// so the chain starts over instead.
+    #[test]
+    fn another_models_reasoning_is_left_out() {
+        let messages = vec![assistant("done", Some(reasoning_state("gpt-5.4", vec![(0, "old")])))];
+        let (_, input) = serialize_codex_input(&messages, "gpt-5.6").unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+    }
+
+    /// Losing the reasoning costs continuity; sending malformed input costs the
+    /// whole request. So a corrupt item is skipped, not fatal.
+    #[test]
+    fn an_unparseable_stored_item_is_skipped() {
+        let mut state = reasoning_state("gpt-5.6", vec![(0, "good")]);
+        if let ProviderStatePayload::CodexReasoning { items } = &mut state.payload {
+            items.push(CodexReasoningItem {
+                position: 1,
+                item_json: "{not json".into(),
+            });
+        }
+        let (_, input) = serialize_codex_input(&[assistant("done", Some(state))], "gpt-5.6").unwrap();
+        let kinds: Vec<_> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["reasoning", "message"]);
+    }
+
+    /// The two fields that make this transport what it is, plus the absence of
+    /// the three that do not belong on a subscription.
+    #[test]
+    fn the_request_asks_for_replayable_reasoning_and_stores_nothing() {
+        let provider = CodexProvider::new("https://example.invalid", test_manager());
+        let params = ChatParams {
+            model: "gpt-5.6".into(),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_tokens: Some(16384),
+            fast: true,
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(&test_bearer(false), &[], None, &params, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("expected a JSON body")
+        };
+
+        assert_eq!(body["store"], false);
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        assert!(body.get("temperature").is_none(), "not honoured on this backend");
+        assert!(body.get("top_p").is_none());
+        assert!(
+            body.get("service_tier").is_none(),
+            "priority pricing belongs to an API account"
+        );
+        assert!(body.get("max_output_tokens").is_none(), "rejected by the Codex backend");
+    }
+
+    /// The headers the backend requires, and the one that is ours to choose.
+    ///
+    /// **Pinned by spelling.** This assertion said `session_id` for as long as
+    /// the request did, and both were right for the Codex this adapter was
+    /// written against; current Codex sends `session-id` and the underscore
+    /// appears nowhere in its tree. Nothing failed in between, because an
+    /// unknown header is ignored rather than refused — so the test agreeing
+    /// with the code was all the evidence there was, and it was not evidence
+    /// about Codex at all.
+    #[test]
+    fn the_request_identifies_this_app_and_the_account() {
+        let provider = CodexProvider::new("https://example.invalid", test_manager());
+        let params = ChatParams {
+            cache_key: Some("conv-7".into()),
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(&test_bearer(false), &[], None, &params, true)
+            .unwrap();
+
+        assert_eq!(req.headers["chatgpt-account-id"], "acct-1");
+        assert_eq!(req.headers["originator"], ORIGINATOR);
+        assert!(req.headers["user-agent"].to_str().unwrap().starts_with(ORIGINATOR));
+        assert!(req.headers.contains_key("session-id"));
+        assert!(!req.headers.contains_key("session_id"), "the dead spelling is gone");
+        assert_eq!(req.headers["thread-id"], "conv-7");
+        assert_eq!(req.headers["x-client-request-id"], "conv-7");
+        assert_eq!(req.headers[http::header::ACCEPT], "text/event-stream");
+        assert!(
+            !req.headers.contains_key("x-openai-fedramp"),
+            "only sent for a workspace that needs it"
+        );
+        assert!(req.url.ends_with("/responses"));
+    }
+
+    /// A background pass clears the cache key, and Codex sends no thread
+    /// headers when it has no thread. An empty value would be worse than the
+    /// omission: it names a conversation that does not exist.
+    #[test]
+    fn a_request_with_no_conversation_sends_no_thread_headers() {
+        let provider = CodexProvider::new("https://example.invalid", test_manager());
+        let req = provider
+            .build_request(&test_bearer(false), &[], None, &ChatParams::default(), true)
+            .unwrap();
+        assert!(req.headers.contains_key("session-id"), "the session still has one");
+        assert!(!req.headers.contains_key("thread-id"));
+        assert!(!req.headers.contains_key("x-client-request-id"));
+    }
+
+    #[test]
+    fn a_fedramp_workspace_is_routed_with_a_header() {
+        let provider = CodexProvider::new("https://example.invalid", test_manager());
+        let req = provider
+            .build_request(&test_bearer(true), &[], None, &ChatParams::default(), true)
+            .unwrap();
+        assert_eq!(req.headers["x-openai-fedramp"], "true");
+    }
+
+    /// The session groups a turn's requests; a new one each time would look like
+    /// a new conversation to the backend.
+    #[test]
+    fn the_session_is_stable_across_requests() {
+        let provider = CodexProvider::new("https://example.invalid", test_manager());
+        let first = provider
+            .build_request(&test_bearer(false), &[], None, &ChatParams::default(), true)
+            .unwrap();
+        let second = provider
+            .build_request(&test_bearer(false), &[], None, &ChatParams::default(), true)
+            .unwrap();
+        assert_eq!(first.headers["session-id"], second.headers["session-id"]);
+    }
+
+    /// A completed reasoning item becomes state; anything without replayable
+    /// content does not, because sending a summary back is input the upstream
+    /// rejects.
+    #[test]
+    fn only_a_replayable_reasoning_item_is_captured() {
+        let captured = reasoning_update(
+            &serde_json::json!({
+                "output_index": 3,
+                "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "blob" }
+            })
+            .to_string(),
+            "gpt-5.6",
+        );
+        let Some(StreamEvent::ProviderStateUpdate {
+            update: ProviderStateUpdate::CodexReasoningItem { position, model, .. },
+        }) = captured
+        else {
+            panic!("expected a reasoning update")
+        };
+        assert_eq!(position, 3);
+        assert_eq!(model, "gpt-5.6");
+
+        // A summary with nothing encrypted inside it.
+        assert!(
+            reasoning_update(
+                &serde_json::json!({ "item": { "type": "reasoning", "summary": ["thinking"] } }).to_string(),
+                "gpt-5.6"
+            )
+            .is_none()
+        );
+        // And an ordinary message item is somebody else's business.
+        assert!(
+            reasoning_update(
+                &serde_json::json!({ "item": { "type": "message" } }).to_string(),
+                "gpt-5.6"
+            )
+            .is_none()
+        );
+    }
+
+    /// Wire events through the same parser and reasoning capture the turn uses.
+    fn parsed_stream(events: &[(&str, serde_json::Value)]) -> ChatStream {
+        let mut state = StreamState::default();
+        let mut out = Vec::new();
+        for (event, data) in events {
+            let data = data.to_string();
+            if *event == "response.output_item.done"
+                && let Some(captured) = reasoning_update(&data, "gpt-5.6")
+            {
+                out.push(Ok(captured));
+            }
+            out.extend(parse_responses_event(event, &data, &mut state));
+        }
+        Box::pin(futures::stream::iter(out))
+    }
+
+    /// The summariser, the title and the reviewer reach this transport through
+    /// `chat_with_tools`, which used to refuse outright — so compaction failed
+    /// for every Codex conversation.
+    #[tokio::test]
+    async fn a_drained_stream_carries_the_answer_the_calls_the_reasoning_and_the_usage() {
+        let response = fold_stream(parsed_stream(&[
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "blob" }
+                }),
+            ),
+            (
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index": 1,
+                    "item": { "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file" }
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                serde_json::json!({ "item_id": "fc_1", "delta": "{\"pa" }),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                        "name": "read_file", "arguments": "{\"path\":\"a\"}"
+                    }
+                }),
+            ),
+            ("response.output_text.delta", serde_json::json!({ "delta": "summary" })),
+            (
+                "response.completed",
+                serde_json::json!({
+                    "response": { "usage": { "input_tokens": 120, "output_tokens": 30, "total_tokens": 150 } }
+                }),
+            ),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(response.text, "summary");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].arguments, "{\"path\":\"a\"}");
+        assert_eq!(response.usage.unwrap().prompt_tokens, Some(120));
+        assert!(
+            response
+                .provider_state
+                .as_ref()
+                .and_then(|s| s.codex_reasoning_for("gpt-5.6"))
+                .is_some_and(|items| items.len() == 1),
+            "the reasoning is kept exactly as the streaming path keeps it"
+        );
+    }
+
+    /// Half a summary would replace the history it was meant to stand for.
+    #[tokio::test]
+    async fn a_stream_cut_off_before_completion_is_an_error() {
+        let cut = parsed_stream(&[("response.output_text.delta", serde_json::json!({ "delta": "half a" }))]);
+        assert!(fold_stream(cut).await.is_err());
+    }
+
+    fn test_bearer(is_fedramp: bool) -> BearerToken {
+        BearerToken {
+            access_token: "token-1".into(),
+            account_id: "acct-1".into(),
+            is_fedramp,
+        }
+    }
+
+    struct DummyBearerSession;
+
+    #[async_trait]
+    impl BearerSession for DummyBearerSession {
+        async fn bearer(&self) -> Result<BearerToken, BearerSessionError> {
+            Ok(test_bearer(false))
+        }
+
+        async fn refresh_after_rejection(&self, _failed: &str) -> Result<(), BearerSessionError> {
+            Ok(())
+        }
+    }
+
+    fn test_manager() -> Arc<dyn BearerSession> {
+        Arc::new(DummyBearerSession)
+    }
+}

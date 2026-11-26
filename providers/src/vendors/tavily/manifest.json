@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "tavily",
+  "provider_type": null,
+  "name": "Tavily",
+  "icon": "tavily",
+  "sort_order": 200,
+  "domains": ["web_search"],
+  "balance": false,
+  "websites": {
+    "official": "https://tavily.com",
+    "api_key": "https://app.tavily.com/home",
+    "docs": "https://docs.tavily.com",
+    "models": null
+  },
+  "auth": [],
+  "config_fields": [
+    {
+      "key": "SERVICE_TAVILY_KEY",
+      "label": "Tavily API Key",
+      "kind": "secret",
+      "required": true,
+      "secret": true,
+      "default_value": null,
+      "placeholder": "tvly-...",
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    }
+  ],
+  "models_dev": null,
+  "models": []
+}

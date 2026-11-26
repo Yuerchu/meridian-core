@@ -13,7 +13,8 @@
 
 use sea_orm::entity::prelude::*;
 
-use crate::db::types::{EpochMs, SqlBool, text_enum_column};
+use crate::db::types::{EpochMs, SqlBool};
+use crate::provider::CapabilityDomain;
 use crate::provider::registry::{ApiFormat, CredentialKind, LocalInferenceBackend, ProviderType, TransportProfile};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -29,7 +30,7 @@ pub struct Model {
     pub created_at: EpochMs,
     pub updated_at: EpochMs,
     pub api_format: ApiFormat,
-    /// Which entry in `provider_catalog.json` this row is an instance of, or
+    /// Which entry in `vendors/<id>/manifest.json` this row is an instance of, or
     /// `None` for one the catalog does not describe. Display and prefill only.
     pub catalog_id: Option<String>,
     pub credential_kind: CredentialKind,
@@ -41,6 +42,8 @@ pub struct Model {
     /// own — see migration 63.
     pub codex_request_shape: SqlBool,
     pub local_backend: Option<LocalInferenceBackend>,
+    pub capability_domain: CapabilityDomain,
+    pub config_json: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -74,15 +77,13 @@ pub struct ProviderChangeset {
     pub icon: Option<Option<String>>,
     pub codex_request_shape: Option<SqlBool>,
     pub local_backend: Option<Option<LocalInferenceBackend>>,
+    pub capability_domain: Option<CapabilityDomain>,
+    pub config_json: Option<Option<String>>,
 }
 
-// The registry's enums are used far beyond this table; none of the four
-// columns has a `CHECK`, so each type's `parse` is what keeps it closed.
-text_enum_column!(ProviderType);
-text_enum_column!(ApiFormat);
-text_enum_column!(CredentialKind);
-text_enum_column!(TransportProfile);
-text_enum_column!(LocalInferenceBackend);
+// SeaORM TEXT column mappings for `ProviderType`, `ApiFormat`,
+// `CredentialKind`, `TransportProfile`, and `LocalInferenceBackend` live beside
+// their definitions under the optional `sea-orm` feature.
 
 #[cfg(test)]
 mod tests {

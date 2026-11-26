@@ -91,6 +91,8 @@ pub(crate) mod tests {
             thinking_budget: None,
             tool_preset_id: None,
             auto_compact_enabled: SqlBool::FALSE,
+            logical_model_id: None,
+            deployment_id: None,
         }
     }
 

@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "id": "openai",
+  "provider_type": "openai",
+  "name": "OpenAI",
+  "icon": "openai",
+  "sort_order": 10,
+  "domains": ["chat"],
+  "balance": false,
+  "websites": {
+    "official": "https://openai.com",
+    "api_key": "https://platform.openai.com/api-keys",
+    "docs": "https://platform.openai.com/docs",
+    "models": "https://platform.openai.com/docs/models"
+  },
+  "auth": [
+    {
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["chat_completions", "responses"],
+      "default_base_url": {
+        "chat_completions": "https://api.openai.com/v1",
+        "responses": "https://api.openai.com/v1"
+      }
+    },
+    {
+      "id": "codex_cli",
+      "credential_kind": "codex_cli",
+      "transport_profile": "chatgpt_codex",
+      "api_formats": ["responses"],
+      "default_base_url": {
+        "responses": "https://chatgpt.com/backend-api/codex"
+      }
+    }
+  ],
+  "config_fields": [
+    {
+      "key": "codex_request_shape",
+      "label": "Codex Request Shape",
+      "kind": "boolean",
+      "required": false,
+      "secret": false,
+      "default_value": "false",
+      "placeholder": null,
+      "options": [],
+      "visible_when_protocol": ["responses"],
+      "visible_when_auth": ["api_key"]
+    }
+  ],
+  "models_dev": {
+    "default": ["openai"],
+    "cn": []
+  },
+  "models": []
+}

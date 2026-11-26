@@ -1,0 +1,47 @@
+[package]
+name = "meridian-providers"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Built-in protocol implementations, vendor presets, model catalogs, and web-search/TTS providers for Meridian."
+repository = "https://github.com/Yuerchu/meridian-core"
+authors = ["于小丘 Yuerchu <admin@yuxiaoqiu.cn>"]
+
+[lib]
+name = "meridian_providers"
+
+[lints.clippy]
+result_large_err = "allow"
+large_enum_variant = "allow"
+too_many_arguments = "allow"
+new_without_default = "allow"
+should_implement_trait = "allow"
+
+[features]
+default = []
+sea-orm = ["meridian-provider-sdk/sea-orm"]
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+eventsource-stream = "0.2"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+http = "1"
+litert-lm = { path = "../litert-lm" }
+meridian-provider-sdk = { path = "../provider-sdk" }
+os_info = { version = "3", default-features = false }
+percent-encoding = "2"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-webpki-roots"], default-features = false }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+strum = { version = "0.27", features = ["derive"] }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+meridian-provider-sdk = { path = "../provider-sdk", features = ["conformance"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
