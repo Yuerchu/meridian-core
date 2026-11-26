@@ -5,7 +5,7 @@
   "name": "Google Gemini",
   "icon": "google",
   "sort_order": 70,
-  "domains": ["chat"],
+  "domains": ["chat", "image_gen", "video_gen"],
   "balance": false,
   "websites": {
     "official": "https://ai.google.dev",

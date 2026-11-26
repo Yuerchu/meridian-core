@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "family": "kling-video",
+  "origin_vendor": "kling",
+  "canonical_protocols": ["kling_video"],
+  "models": [
+    { "prefix": "kling-4.0" },
+    { "prefix": "kling-3.0" }
+  ]
+}

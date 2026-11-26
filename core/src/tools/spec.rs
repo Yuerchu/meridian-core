@@ -145,6 +145,8 @@ mod tests {
             "search_files",
             "load_skill",
             "web_search",
+            "generate_image",
+            "generate_video",
         ]);
         #[cfg(not(target_os = "android"))]
         parallel.extend(["read_background_output", "list_background_tasks"]);

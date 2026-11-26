@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "family": "volcengine-seedream",
+  "origin_vendor": "volcengine",
+  "canonical_protocols": ["volcengine_seedream"],
+  "models": [
+    { "prefix": "doubao-seedream-5-0" },
+    { "prefix": "doubao-seedream-4-5" },
+    { "prefix": "doubao-seedream-4-0" }
+  ]
+}

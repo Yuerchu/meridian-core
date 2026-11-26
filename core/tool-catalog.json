@@ -364,6 +364,114 @@
     },
     {
       "bridged": false,
+      "description": "Generate one or more images from a text prompt using the configured image generation model (OpenAI Images, Google Gemini Image, or Volcengine Seedream). Returns generated images inline.",
+      "name": "generate_image",
+      "parameters": {
+        "properties": {
+          "aspect_ratio": {
+            "description": "Optional aspect ratio such as '1:1', '16:9', '9:16', '4:3', or '3:4'.",
+            "type": "string"
+          },
+          "count": {
+            "description": "Optional number of images to generate (1-4).",
+            "type": "integer"
+          },
+          "description": {
+            "description": "One short line saying what this call does and why, written for the user to read — in the language they are writing in. It is shown in place of the raw arguments on the tool card and in the approval prompt.",
+            "type": "string"
+          },
+          "model_id": {
+            "description": "Optional logical image model ID. Omit to use the user's default image model.",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "Detailed visual description of the image to generate.",
+            "type": "string"
+          },
+          "quality": {
+            "description": "Optional quality tier (e.g. 'low', 'medium', 'high', 'auto').",
+            "type": "string"
+          },
+          "seed": {
+            "description": "Optional random seed for reproducibility.",
+            "type": "integer"
+          },
+          "size": {
+            "description": "Optional explicit resolution/size string (e.g. '1024x1024', '2048x2048', '2K').",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "permission": "ask",
+      "spec": {
+        "effect": "network",
+        "explore": false,
+        "loop_handled": false,
+        "parallel": true,
+        "plan_mode": false,
+        "reviewer": false
+      }
+    },
+    {
+      "bridged": false,
+      "description": "Generate a video from a text prompt using the configured video generation model (Google Veo, Volcengine Seedance, Kling, MiniMax Hailuo, Vidu, or Alibaba Bailian Wan). Polls asynchronously until complete and returns the generated video inline.",
+      "name": "generate_video",
+      "parameters": {
+        "properties": {
+          "aspect_ratio": {
+            "description": "Optional aspect ratio such as '16:9', '9:16', '1:1', '4:3', or '3:4'.",
+            "type": "string"
+          },
+          "description": {
+            "description": "One short line saying what this call does and why, written for the user to read — in the language they are writing in. It is shown in place of the raw arguments on the tool card and in the approval prompt.",
+            "type": "string"
+          },
+          "duration_seconds": {
+            "description": "Optional target video duration in seconds (e.g. 5, 6, 8, 10).",
+            "type": "integer"
+          },
+          "generate_audio": {
+            "description": "Optional flag requesting native audio generation when supported by the model.",
+            "type": "boolean"
+          },
+          "model_id": {
+            "description": "Optional logical video model ID. Omit to use the user's default video model.",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "Detailed motion and scene description of the video to generate.",
+            "type": "string"
+          },
+          "resolution": {
+            "description": "Optional video resolution such as '480p', '720p', '1080p', or '4k'.",
+            "type": "string"
+          },
+          "seed": {
+            "description": "Optional random seed for reproducibility.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "permission": "ask",
+      "spec": {
+        "effect": "network",
+        "explore": false,
+        "loop_handled": false,
+        "parallel": true,
+        "plan_mode": false,
+        "reviewer": false
+      }
+    },
+    {
+      "bridged": false,
       "description": "Find files matching a glob pattern (e.g. '**/*.rs', 'src/**/*.ts'). Respects .gitignore rules automatically. Returns file paths relative to the search directory.",
       "name": "glob",
       "parameters": {

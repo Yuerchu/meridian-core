@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use crate::chat::ChatProvider;
 use crate::domain::{CapabilityDomain, ProtocolCompliance, SwitchImpact};
+use crate::media_gen::{ImageGenProvider, VideoGenProvider};
 use crate::schema::{ConfigFieldKind, VendorManifest};
 use crate::tts::TtsProvider;
 use crate::web_search::WebSearchProvider;
@@ -148,6 +149,28 @@ pub fn assert_tts_provider_conformance(provider: &dyn TtsProvider) {
         provider.switch_impact(),
         SwitchImpact::Stateless,
         "TtsProvider `{}` must declare Stateless switch impact",
+        provider.provider_id()
+    );
+}
+
+/// Assert baseline invariants on any [`ImageGenProvider`] implementation.
+pub fn assert_image_gen_provider_conformance(provider: &dyn ImageGenProvider) {
+    assert!(!provider.provider_id().trim().is_empty());
+    assert_eq!(
+        provider.switch_impact(),
+        SwitchImpact::Stateless,
+        "ImageGenProvider `{}` must declare Stateless switch impact",
+        provider.provider_id()
+    );
+}
+
+/// Assert baseline invariants on any [`VideoGenProvider`] implementation.
+pub fn assert_video_gen_provider_conformance(provider: &dyn VideoGenProvider) {
+    assert!(!provider.provider_id().trim().is_empty());
+    assert_eq!(
+        provider.switch_impact(),
+        SwitchImpact::Stateless,
+        "VideoGenProvider `{}` must declare Stateless switch impact",
         provider.provider_id()
     );
 }

@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "id": "volcengine",
+  "provider_type": null,
+  "name": "Volcengine Ark (Seedream / Seedance)",
+  "icon": "volcengine",
+  "sort_order": 400,
+  "domains": ["image_gen", "video_gen"],
+  "balance": false,
+  "websites": {
+    "official": "https://www.volcengine.com/product/ark",
+    "api_key": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey",
+    "docs": "https://www.volcengine.com/docs/82379",
+    "models": null
+  },
+  "auth": [],
+  "config_fields": [
+    {
+      "key": "SERVICE_VOLCENGINE_ARK_KEY",
+      "label": "Volcengine Ark API Key",
+      "kind": "secret",
+      "required": true,
+      "secret": true,
+      "default_value": null,
+      "placeholder": null,
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    },
+    {
+      "key": "SERVICE_VOLCENGINE_ARK_BASE_URL",
+      "label": "Ark Base URL",
+      "kind": "text",
+      "required": false,
+      "secret": false,
+      "default_value": "https://ark.cn-beijing.volces.com/api/v3",
+      "placeholder": "https://ark.cn-beijing.volces.com/api/v3",
+      "options": [],
+      "visible_when_protocol": null,
+      "visible_when_auth": null
+    }
+  ],
+  "models_dev": null,
+  "models": [
+    {
+      "family": "volcengine-seedream",
+      "ids": ["doubao-seedream-4-5-251128", "doubao-seedream-5-0-260128"]
+    },
+    {
+      "family": "volcengine-seedance",
+      "ids": ["doubao-seedance-1-5-pro-251215", "doubao-seedance-2-0-260328"]
+    }
+  ]
+}
