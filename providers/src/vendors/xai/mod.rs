@@ -53,8 +53,8 @@ impl XaiOpenAIChatProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::openai_chat::{ChatChunk, ChunkUsage, normalise_openai_usage, parse_openai_sse_events};
     use crate::ChatMessage;
+    use crate::protocols::openai_chat::{ChatChunk, ChunkUsage, normalise_openai_usage, parse_openai_sse_events};
     use meridian_provider_sdk::client::RequestBody;
 
     fn params() -> ChatParams {

@@ -364,9 +364,7 @@ impl MigrationTrait for M0012ManyToManyModels {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let conn = manager.get_connection();
         if conn.get_database_backend() != DbBackend::Sqlite {
-            return Err(DbErr::Migration(
-                "m0012_many_to_many_models requires SQLite".into(),
-            ));
+            return Err(DbErr::Migration("m0012_many_to_many_models requires SQLite".into()));
         }
         for statement in m0012_many_to_many_models::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;

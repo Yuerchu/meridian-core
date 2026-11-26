@@ -19,8 +19,8 @@ use crate::dto::{ExtraIgnore, embedded_upstream_error, warn_extra_fields};
 use crate::mixins::{OpenAISamplingParamsMixin, SseStreamMixin, ToolImageCarryMixin};
 use crate::state::ProviderState;
 use crate::{
-    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, TokenUsage,
-    ToolCall, ToolDefinition,
+    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, ProviderError, StreamEvent, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 use meridian_provider_sdk::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
 
@@ -193,7 +193,9 @@ impl OpenAIChatRequestBase {
     pub fn into_json_object(self) -> Result<Map<String, Value>, ProviderError> {
         match serde_json::to_value(self).map_err(|e| ProviderError::Parse(e.to_string()))? {
             Value::Object(map) => Ok(map),
-            _ => Err(ProviderError::Parse("OpenAIChatRequestBase must serialize to an object".into())),
+            _ => Err(ProviderError::Parse(
+                "OpenAIChatRequestBase must serialize to an object".into(),
+            )),
         }
     }
 }
@@ -729,7 +731,9 @@ fn billable_completion_tokens(u: &OpenAIChatUsageResponse) -> Option<i32> {
     }
 }
 
-pub fn parse_openai_sse_events(chunk: &OpenAIChatChunkResponse) -> (Vec<StreamEvent>, Option<String>, Option<TokenUsage>) {
+pub fn parse_openai_sse_events(
+    chunk: &OpenAIChatChunkResponse,
+) -> (Vec<StreamEvent>, Option<String>, Option<TokenUsage>) {
     let mut events = Vec::new();
     let mut finish_reason = None;
     let mut usage = None;
@@ -862,7 +866,9 @@ impl ChatProvider for OpenAIChatProvider {
 
         let mut parsed = parse_chat_response(&resp.body)?;
         if let Some(choice) = parsed.choices.first_mut() {
-            let _ = self.extension.extract_response_state(&mut choice.message, &params.model)?;
+            let _ = self
+                .extension
+                .extract_response_state(&mut choice.message, &params.model)?;
         }
         parsed.warn_ignored_fields();
 
@@ -892,7 +898,9 @@ impl ChatProvider for OpenAIChatProvider {
 
         let mut parsed = parse_chat_response(&resp.body)?;
         let provider_state = match parsed.choices.first_mut() {
-            Some(choice) => self.extension.extract_response_state(&mut choice.message, &params.model)?,
+            Some(choice) => self
+                .extension
+                .extract_response_state(&mut choice.message, &params.model)?,
             None => None,
         };
         parsed.warn_ignored_fields();
@@ -1071,7 +1079,11 @@ mod openai_tests {
         }))
         .unwrap();
         let call = &chunk.choices[0].delta.as_ref().unwrap().tool_calls.as_ref().unwrap()[0];
-        assert!(call.extra.is_empty(), "`custom` is a documented field: {:?}", call.extra.keys());
+        assert!(
+            call.extra.is_empty(),
+            "`custom` is a documented field: {:?}",
+            call.extra.keys()
+        );
         let (events, _, _) = parse_openai_sse_events(&chunk);
         assert!(
             matches!(&events[..], [StreamEvent::ToolCallStart { id, .. }] if id == "call_f"),
@@ -1169,8 +1181,7 @@ mod openai_tests {
 
     #[test]
     fn a_user_file_part_is_refused_on_chat_completions() {
-        let content =
-            r#"[{"type":"file","file":{"url":"data:application/pdf;base64,AAAA","mime_type":"application/pdf","name":"a.pdf"}}]"#;
+        let content = r#"[{"type":"file","file":{"url":"data:application/pdf;base64,AAAA","mime_type":"application/pdf","name":"a.pdf"}}]"#;
         let error = serialize_openai_messages(&[ChatMessage::user(content)]).unwrap_err();
         assert!(error.to_string().contains("cannot take a file part"), "{error}");
     }

@@ -25,8 +25,16 @@ pub fn assert_manifest_conformance(manifest: &VendorManifest) {
         "manifest id `{}` must be lowercase snake_case",
         manifest.id
     );
-    assert!(!manifest.name.trim().is_empty(), "manifest `{}` missing name", manifest.id);
-    assert!(!manifest.icon.trim().is_empty(), "manifest `{}` missing icon", manifest.id);
+    assert!(
+        !manifest.name.trim().is_empty(),
+        "manifest `{}` missing name",
+        manifest.id
+    );
+    assert!(
+        !manifest.icon.trim().is_empty(),
+        "manifest `{}` missing icon",
+        manifest.id
+    );
     assert!(
         !manifest.domains.is_empty(),
         "manifest `{}` must declare at least one capability domain",

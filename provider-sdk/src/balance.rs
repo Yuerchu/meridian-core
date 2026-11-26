@@ -80,8 +80,10 @@ pub fn site_currency(base_url: &str) -> &'static str {
 pub async fn get_json(api: &'static str, url: String, api_key: &str) -> Result<Vec<u8>, BalanceError> {
     let transport = ReqwestTransport::shared();
     let mut req = Request::new(http::Method::GET, url);
-    req.headers
-        .insert(http::header::AUTHORIZATION, auth_header_value(&format!("Bearer {api_key}")));
+    req.headers.insert(
+        http::header::AUTHORIZATION,
+        auth_header_value(&format!("Bearer {api_key}")),
+    );
     req.headers
         .insert(http::header::ACCEPT, "application/json".parse().unwrap());
 

@@ -80,9 +80,7 @@ pub enum RoutingPolicy {
 
 impl RoutingPolicy {
     pub fn parse(value: &str) -> Result<Self, String> {
-        value
-            .parse()
-            .map_err(|_| format!("unknown routing policy `{value}`"))
+        value.parse().map_err(|_| format!("unknown routing policy `{value}`"))
     }
 
     pub fn as_str(self) -> &'static str {

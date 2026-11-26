@@ -47,9 +47,7 @@ macro_rules! impl_sea_orm_text_enum {
         }
 
         impl $crate::__sea_orm::sea_query::ValueType for $ty {
-            fn try_from(
-                value: $crate::__sea_orm::Value,
-            ) -> Result<Self, $crate::__sea_orm::sea_query::ValueTypeErr> {
+            fn try_from(value: $crate::__sea_orm::Value) -> Result<Self, $crate::__sea_orm::sea_query::ValueTypeErr> {
                 match value {
                     $crate::__sea_orm::Value::String(Some(raw)) => {
                         <$ty>::parse(&raw).map_err(|_| $crate::__sea_orm::sea_query::ValueTypeErr)

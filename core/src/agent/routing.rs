@@ -164,12 +164,10 @@ pub fn decide_failover(
             next,
             impact: switch_impact,
         },
-        RoutingPolicy::StickyManual | RoutingPolicy::AutoFailoverStateless => {
-            FailoverDecision::RequireUserDecision {
-                impact: switch_impact,
-                alternatives: remaining,
-            }
-        }
+        RoutingPolicy::StickyManual | RoutingPolicy::AutoFailoverStateless => FailoverDecision::RequireUserDecision {
+            impact: switch_impact,
+            alternatives: remaining,
+        },
     }
 }
 
@@ -277,9 +275,6 @@ mod tests {
 
         // Only explicit opt-in switches automatically, and carries an explicit notice
         let opt_in = decide_failover(RoutingPolicy::UserOptInFailover, impact, "a", &[a, b.clone()], true);
-        assert_eq!(
-            opt_in,
-            FailoverDecision::AutoSwitchWithNotice { next: b, impact }
-        );
+        assert_eq!(opt_in, FailoverDecision::AutoSwitchWithNotice { next: b, impact });
     }
 }

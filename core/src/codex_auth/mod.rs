@@ -227,7 +227,6 @@ impl meridian_provider_sdk::auth::BearerSession for Manager {
 }
 
 impl Manager {
-
     /// Exchange the refresh token, unless it turns out not to be needed.
     ///
     /// **The reload under the lock is the whole point, and it is not an

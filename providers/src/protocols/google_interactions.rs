@@ -17,10 +17,10 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
 use crate::dto::{ExtraIgnore, embedded_upstream_error, warn_extra_fields, warn_unknown_event};
+use crate::mixins::GoogleSamplingParamsMixin;
 use crate::mixins::vertex_auth::VertexServiceAccountAuthMixin;
 #[cfg(test)]
 use crate::mixins::vertex_auth::parse_vertex_service_account as parse_service_account;
-use crate::mixins::GoogleSamplingParamsMixin;
 use crate::state::{ProviderStateAccumulator, ProviderStateUpdate};
 use crate::{
     AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, MessageContentPart, ProviderError,

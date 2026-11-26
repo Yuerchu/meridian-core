@@ -140,8 +140,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(assistant.try_get::<Option<String>>("", "logical_model_id").unwrap().as_deref(), Some("mp1"));
-        assert_eq!(assistant.try_get::<Option<String>>("", "deployment_id").unwrap().as_deref(), Some("mc1"));
+        assert_eq!(
+            assistant
+                .try_get::<Option<String>>("", "logical_model_id")
+                .unwrap()
+                .as_deref(),
+            Some("mp1")
+        );
+        assert_eq!(
+            assistant
+                .try_get::<Option<String>>("", "deployment_id")
+                .unwrap()
+                .as_deref(),
+            Some("mc1")
+        );
 
         let audit = db
             .query_one_raw(Statement::from_string(
@@ -151,8 +163,17 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(audit.try_get::<Option<String>>("", "logical_model_id").unwrap().as_deref(), Some("mp1"));
-        assert_eq!(audit.try_get::<Option<String>>("", "deployment_id").unwrap().as_deref(), Some("mc1"));
+        assert_eq!(
+            audit
+                .try_get::<Option<String>>("", "logical_model_id")
+                .unwrap()
+                .as_deref(),
+            Some("mp1")
+        );
+        assert_eq!(
+            audit.try_get::<Option<String>>("", "deployment_id").unwrap().as_deref(),
+            Some("mc1")
+        );
 
         let cfg = db
             .query_one_raw(Statement::from_string(

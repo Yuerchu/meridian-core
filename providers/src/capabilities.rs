@@ -558,7 +558,8 @@ impl ProviderCapabilityOverrides {
             }
         }
         if let OverrideField::Set(mimes) = &self.readable_mime_types {
-            let unique: std::collections::BTreeSet<meridian_provider_sdk::media::ReadableMime> = mimes.iter().copied().collect();
+            let unique: std::collections::BTreeSet<meridian_provider_sdk::media::ReadableMime> =
+                mimes.iter().copied().collect();
             if unique.len() != mimes.len() {
                 return Err("capability_overrides.readable_mime_types cannot contain duplicates".into());
             }

@@ -145,10 +145,7 @@ pub async fn upsert(tx: &WriteTx, new: model_config::Model) -> Result<model_conf
 
 /// List all provider deployments serving a given logical model (`profile_id`),
 /// ordered by ascending `priority`.
-pub async fn list_by_profile(
-    db: &impl Read,
-    profile_id: &str,
-) -> Result<Vec<model_config::Model>, DbErr> {
+pub async fn list_by_profile(db: &impl Read, profile_id: &str) -> Result<Vec<model_config::Model>, DbErr> {
     model_config::Entity::find()
         .filter(model_config::Column::ProfileId.eq(profile_id))
         .order_by_asc(model_config::Column::Priority)

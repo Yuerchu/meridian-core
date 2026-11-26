@@ -70,8 +70,8 @@ pub struct CanonicalModelEntry {
 static FAMILIES: LazyLock<Vec<ModelFamilyCatalog>> = LazyLock::new(|| {
     let mut families = Vec::with_capacity(MODEL_FAMILY_SOURCES.len());
     for &(stem, raw) in MODEL_FAMILY_SOURCES {
-        let catalog: ModelFamilyCatalog = serde_json::from_str(raw)
-            .unwrap_or_else(|err| panic!("models/{stem}.json is malformed: {err}"));
+        let catalog: ModelFamilyCatalog =
+            serde_json::from_str(raw).unwrap_or_else(|err| panic!("models/{stem}.json is malformed: {err}"));
         assert_eq!(
             catalog.version, 1,
             "models/{stem}.json has unsupported version {}",
@@ -334,11 +334,7 @@ pub fn resolve_layered_capabilities(
     })
 }
 
-fn narrow_to_protocol_ceiling(
-    actual_protocol: &str,
-    transport_profile: Option<&str>,
-    caps: &mut ProviderCapabilities,
-) {
+fn narrow_to_protocol_ceiling(actual_protocol: &str, transport_profile: Option<&str>, caps: &mut ProviderCapabilities) {
     match actual_protocol {
         "openai_chat" => {
             // OpenAI Chat Completions cannot transport PDF/audio/video natively
@@ -399,7 +395,10 @@ mod tests {
 
         let gemini = canonicalize_model_id("models/gemini-2.5-pro").unwrap();
         assert_eq!(gemini.canonical_id, "google/gemini-2.5-pro");
-        assert_eq!(gemini.canonical_protocols, vec!["gemini_generate_content", "gemini_interactions"]);
+        assert_eq!(
+            gemini.canonical_protocols,
+            vec!["gemini_generate_content", "gemini_interactions"]
+        );
 
         let grok = canonicalize_model_id("x-ai/grok-4.6:free").unwrap();
         assert_eq!(grok.canonical_id, "xai/grok-4.6");
@@ -428,17 +427,28 @@ mod tests {
         }
 
         // Layered intersection: Claude over openai_chat loses PDF & server_tools
-        let layered = resolve_layered_capabilities("anthropic/claude-sonnet-4-6", "openai_chat", None, None, None)
-            .unwrap();
+        let layered =
+            resolve_layered_capabilities("anthropic/claude-sonnet-4-6", "openai_chat", None, None, None).unwrap();
         assert!(matches!(layered.compliance, ProtocolCompliance::Degraded { .. }));
-        assert!(!layered.capabilities.readable_mime_types.contains(&ReadableMime::ApplicationPdf));
+        assert!(
+            !layered
+                .capabilities
+                .readable_mime_types
+                .contains(&ReadableMime::ApplicationPdf)
+        );
         assert!(layered.capabilities.server_tools.is_empty());
 
         // Same model over official anthropic_messages keeps PDF!
-        let official = resolve_layered_capabilities("anthropic/claude-sonnet-4-6", "anthropic_messages", None, None, None)
-            .unwrap();
+        let official =
+            resolve_layered_capabilities("anthropic/claude-sonnet-4-6", "anthropic_messages", None, None, None)
+                .unwrap();
         assert_eq!(official.compliance, ProtocolCompliance::Standard);
-        assert!(official.capabilities.readable_mime_types.contains(&ReadableMime::ApplicationPdf));
+        assert!(
+            official
+                .capabilities
+                .readable_mime_types
+                .contains(&ReadableMime::ApplicationPdf)
+        );
     }
 
     #[test]

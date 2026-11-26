@@ -71,8 +71,15 @@ mod tests {
     #[test]
     fn all_manifests_parse_and_cover_every_domain() {
         let all = all_manifests();
-        assert!(all.len() >= 12, "expected chat + web_search + tts manifests, got {}", all.len());
-        assert!(find_manifest("openrouter").is_some(), "L1 declarative openrouter vendor");
+        assert!(
+            all.len() >= 12,
+            "expected chat + web_search + tts manifests, got {}",
+            all.len()
+        );
+        assert!(
+            find_manifest("openrouter").is_some(),
+            "L1 declarative openrouter vendor"
+        );
         assert!(find_manifest("brave").is_some(), "web_search brave vendor");
         assert!(find_manifest("tavily").is_some());
         assert!(find_manifest("zhipu").is_some());

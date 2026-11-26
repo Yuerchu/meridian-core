@@ -217,10 +217,7 @@ fn validate_field_value(field: &ConfigFieldSpec, value: &serde_json::Value) -> R
                 .as_str()
                 .ok_or_else(|| format!("config field `{}` must be a string", field.key))?;
             if !field.options.iter().any(|opt| opt.value == s) {
-                return Err(format!(
-                    "config field `{}` has unsupported option `{s}`",
-                    field.key
-                ));
+                return Err(format!("config field `{}` has unsupported option `{s}`", field.key));
             }
         }
         ConfigFieldKind::Text | ConfigFieldKind::FilePath => {
@@ -332,7 +329,10 @@ mod tests {
 
         // Missing required visible field fails
         let empty = BTreeMap::new();
-        assert!(m.validate_non_secret_config(Some("chat_completions"), None, &empty).is_err());
+        assert!(
+            m.validate_non_secret_config(Some("chat_completions"), None, &empty)
+                .is_err()
+        );
 
         // Hidden required field is allowed to be omitted
         assert!(m.validate_non_secret_config(Some("responses"), None, &empty).is_ok());
@@ -341,22 +341,34 @@ mod tests {
         let mut ok = BTreeMap::new();
         ok.insert("region".into(), serde_json::json!("us"));
         ok.insert("enable_beta".into(), serde_json::json!(true));
-        assert!(m.validate_non_secret_config(Some("chat_completions"), None, &ok).is_ok());
+        assert!(
+            m.validate_non_secret_config(Some("chat_completions"), None, &ok)
+                .is_ok()
+        );
 
         // Invalid select value fails
         let mut bad_opt = BTreeMap::new();
         bad_opt.insert("region".into(), serde_json::json!("ap"));
-        assert!(m.validate_non_secret_config(Some("chat_completions"), None, &bad_opt).is_err());
+        assert!(
+            m.validate_non_secret_config(Some("chat_completions"), None, &bad_opt)
+                .is_err()
+        );
 
         // Unknown field fails
         let mut unknown = ok.clone();
         unknown.insert("extra_junk".into(), serde_json::json!("x"));
-        assert!(m.validate_non_secret_config(Some("chat_completions"), None, &unknown).is_err());
+        assert!(
+            m.validate_non_secret_config(Some("chat_completions"), None, &unknown)
+                .is_err()
+        );
 
         // Secret field in config_json fails
         let mut leaked = ok.clone();
         leaked.insert("api_secret".into(), serde_json::json!("sk-leak"));
-        assert!(m.validate_non_secret_config(Some("chat_completions"), None, &leaked).is_err());
+        assert!(
+            m.validate_non_secret_config(Some("chat_completions"), None, &leaked)
+                .is_err()
+        );
     }
 
     #[test]

@@ -25,10 +25,7 @@ pub async fn get(db: &impl Read, id: &str) -> Result<Option<model_profile::Model
 /// Find an active (non-archived) logical model by its canonical ID (e.g.
 /// `anthropic/claude-sonnet-4-6`) so explicit model discovery opt-in merges
 /// multiple providers under the same logical model by default.
-pub async fn find_by_canonical_id(
-    db: &impl Read,
-    canonical_id: &str,
-) -> Result<Option<model_profile::Model>, DbErr> {
+pub async fn find_by_canonical_id(db: &impl Read, canonical_id: &str) -> Result<Option<model_profile::Model>, DbErr> {
     model_profile::Entity::find()
         .filter(model_profile::Column::CanonicalId.eq(canonical_id))
         .filter(model_profile::Column::IsArchived.eq(crate::db::types::SqlBool::from(false)))
@@ -107,11 +104,7 @@ pub async fn update_meta(
 
 /// Explicitly delete a logical model (fails via FK if deployments still point at it,
 /// or removes its deployments first when `cascade_deployments` is true).
-pub async fn delete_logical_model(
-    tx: &WriteTx,
-    id: &str,
-    cascade_deployments: bool,
-) -> Result<bool, DbErr> {
+pub async fn delete_logical_model(tx: &WriteTx, id: &str, cascade_deployments: bool) -> Result<bool, DbErr> {
     if cascade_deployments {
         model_config::Entity::delete_many()
             .filter(model_config::Column::ProfileId.eq(id))

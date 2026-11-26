@@ -51,11 +51,7 @@ fn generate_model_families(manifest_dir: &Path, out_dir: &Path) {
         for entry in read_dir.flatten() {
             let path = entry.path();
             if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
-                let stem = path
-                    .file_stem()
-                    .expect("json file stem")
-                    .to_string_lossy()
-                    .into_owned();
+                let stem = path.file_stem().expect("json file stem").to_string_lossy().into_owned();
                 println!("cargo:rerun-if-changed={}", path.display());
                 entries.push((stem, path));
             }

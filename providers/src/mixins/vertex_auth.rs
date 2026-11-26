@@ -133,9 +133,10 @@ impl VertexServiceAccountAuthMixin {
     /// Mint or reuse a cached OAuth2 bearer token and attach it to `request`.
     pub async fn apply_bearer(&self, request: &mut Request) -> Result<(), ProviderError> {
         let token = self.access_token().await?;
-        request
-            .headers
-            .insert(http::header::AUTHORIZATION, auth_header_value(&format!("Bearer {token}")));
+        request.headers.insert(
+            http::header::AUTHORIZATION,
+            auth_header_value(&format!("Bearer {token}")),
+        );
         Ok(())
     }
 
@@ -143,10 +144,7 @@ impl VertexServiceAccountAuthMixin {
         let now = unix_timestamp()?;
         {
             let cached = vertex_token_cache().lock().await;
-            if let Some(token) = cached
-                .get(&self.cache_key)
-                .filter(|token| token.expires_at > now + 60)
-            {
+            if let Some(token) = cached.get(&self.cache_key).filter(|token| token.expires_at > now + 60) {
                 return Ok(token.access_token.clone());
             }
         }

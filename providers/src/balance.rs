@@ -26,14 +26,14 @@
 //! vendor *documents* that it refuses requests below a figure, reading that
 //! figure is quoting the upstream rather than guessing, and the arm says so.
 
-use serde::de::IgnoredAny;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 
+use super::ProviderError;
+use super::dto::{ExtraIgnore, warn_extra_fields};
 pub use meridian_provider_sdk::balance::{BalanceAccount, ProviderBalance};
 use meridian_provider_sdk::client::{HttpTransport, Request, ReqwestTransport};
 use meridian_provider_sdk::decimal::Decimal;
-use super::ProviderError;
-use super::dto::{ExtraIgnore, warn_extra_fields};
 
 /// A vendor whose account endpoint this app knows how to speak.
 ///

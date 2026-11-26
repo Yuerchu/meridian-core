@@ -15,16 +15,7 @@ use crate::media::{MediaCategory, ReadableMime};
 pub use crate::wire::auth_header_value;
 
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    strum::EnumString,
-    strum::IntoStaticStr,
-    strum::EnumIter,
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString, strum::IntoStaticStr, strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -654,48 +645,19 @@ pub struct ChatParams {
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    MessageStart {
-        message_id: String,
-    },
-    Text {
-        content: String,
-    },
-    Reasoning {
-        content: String,
-    },
-    ProviderStateUpdate {
-        update: state::ProviderStateUpdate,
-    },
-    ToolCallStart {
-        index: usize,
-        id: String,
-        name: String,
-    },
-    ToolCallDelta {
-        index: usize,
-        arguments: String,
-    },
-    ToolCallDone {
-        index: usize,
-        arguments: String,
-    },
-    CompactionResult {
-        encrypted_content: String,
-    },
+    MessageStart { message_id: String },
+    Text { content: String },
+    Reasoning { content: String },
+    ProviderStateUpdate { update: state::ProviderStateUpdate },
+    ToolCallStart { index: usize, id: String, name: String },
+    ToolCallDelta { index: usize, arguments: String },
+    ToolCallDone { index: usize, arguments: String },
+    CompactionResult { encrypted_content: String },
     ServerToolCall(ServerToolCall),
-    ResponseModel {
-        model: String,
-    },
-    UsageUpdate {
-        usage: TokenUsage,
-    },
-    Stop {
-        reason: String,
-        usage: Option<TokenUsage>,
-    },
-    Error {
-        message: String,
-    },
+    ResponseModel { model: String },
+    UsageUpdate { usage: TokenUsage },
+    Stop { reason: String, usage: Option<TokenUsage> },
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

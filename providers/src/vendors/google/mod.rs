@@ -282,11 +282,7 @@ pub struct GoogleOpenAIChatProvider;
 
 impl GoogleOpenAIChatProvider {
     pub fn new(base_url: &str, api_key: &str, thinking_mode: GoogleCompatThinkingMode) -> OpenAIChatProvider {
-        OpenAIChatProvider::with_extension(
-            base_url,
-            api_key,
-            Arc::new(GoogleOpenAIChatExtension { thinking_mode }),
-        )
+        OpenAIChatProvider::with_extension(base_url, api_key, Arc::new(GoogleOpenAIChatExtension { thinking_mode }))
     }
 }
 
@@ -427,9 +423,9 @@ fn append_interrupted_results(out: &mut Vec<Value>, results: Vec<(String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolCall;
     use crate::protocols::openai_chat::{ChatChunk, parse_openai_sse_events};
     use crate::state::{GoogleThoughtSignature, ProviderStatePayload, ProviderStateProducer};
-    use crate::ToolCall;
     use meridian_provider_sdk::client::RequestBody;
 
     fn google_state(location: GoogleSignatureLocation) -> ProviderState {

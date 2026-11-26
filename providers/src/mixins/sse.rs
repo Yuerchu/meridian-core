@@ -14,9 +14,7 @@ impl SseStreamMixin {
     /// Wrap a raw HTTP byte stream from `HttpTransport::stream` into a typed
     /// Server-Sent Events stream whose transport errors map to
     /// `ProviderError::Transport`.
-    pub fn from_bytes<S>(
-        bytes: S,
-    ) -> impl Stream<Item = Result<Event, EventStreamError<ProviderError>>> + Send
+    pub fn from_bytes<S>(bytes: S) -> impl Stream<Item = Result<Event, EventStreamError<ProviderError>>> + Send
     where
         S: Stream<Item = Result<Bytes, TransportError>> + Send + 'static,
     {

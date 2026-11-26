@@ -48,10 +48,8 @@ impl BraveWebSearchProvider {
         let mut req = Request::new(http::Method::GET, url);
         req.headers
             .insert("X-Subscription-Token", auth_header_value(&self.api_key));
-        req.headers.insert(
-            http::header::ACCEPT,
-            http::HeaderValue::from_static("application/json"),
-        );
+        req.headers
+            .insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
         req
     }
 
@@ -127,7 +125,11 @@ mod tests {
             time_range: Some("week".into()),
         });
         assert_eq!(req.method, http::Method::GET);
-        assert!(req.url.contains("q=rust%20sea%2Dorm&count=5&freshness=pw"), "url={}", req.url);
+        assert!(
+            req.url.contains("q=rust%20sea%2Dorm&count=5&freshness=pw"),
+            "url={}",
+            req.url
+        );
         assert_eq!(req.headers.get("X-Subscription-Token").unwrap(), "BSA-test-token");
     }
 

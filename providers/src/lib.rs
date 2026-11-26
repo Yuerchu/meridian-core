@@ -167,9 +167,8 @@ mod usage_tests {
         assert_eq!(cold.cache_read_tokens, None);
         assert_eq!(cold.uncached_prompt_tokens(), Some(200));
 
-        let warm = responses_style(
-            r#"{"input_tokens":200,"output_tokens":10,"input_tokens_details":{"cached_tokens":0}}"#,
-        );
+        let warm =
+            responses_style(r#"{"input_tokens":200,"output_tokens":10,"input_tokens_details":{"cached_tokens":0}}"#);
         assert_eq!(warm.cache_read_tokens, Some(0));
         assert_eq!(warm.uncached_prompt_tokens(), Some(200));
     }
