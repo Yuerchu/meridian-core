@@ -381,6 +381,7 @@ impl InteractionUsage {
             total_tokens: self.total_tokens,
             cache_read_tokens: self.total_cached_tokens,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             billable_tool_calls: None,
         }
     }

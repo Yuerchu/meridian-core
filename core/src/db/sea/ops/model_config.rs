@@ -124,6 +124,7 @@ pub async fn upsert(tx: &WriteTx, new: model_config::Model) -> Result<model_conf
         output_price: Set(new.output_price),
         cache_read_price: Set(new.cache_read_price),
         cache_write_price: Set(new.cache_write_price),
+        cache_write_1h_price: Set(new.cache_write_1h_price),
         pricing_tiers: Set(new.pricing_tiers),
         server_tools: Set(new.server_tools),
         server_tool_price: Set(new.server_tool_price),
@@ -326,6 +327,8 @@ pub async fn seed_flat(tx: &WriteTx, flat: &FlatModelConfig<'_>) -> Result<model
         output_price: Set(flat.output_price.clone()),
         cache_read_price: Set(flat.cache_read_price.clone()),
         cache_write_price: Set(flat.cache_write_price.clone()),
+        cache_write_1h_price: Set(None),
+        cache_ttl: Set(None),
         pricing_tiers: Set(flat.pricing_tiers.map(str::to_owned)),
         capability_overrides: Set(flat.capability_overrides.map(str::to_owned)),
         created_at: Set(flat.created_at),
@@ -366,6 +369,7 @@ pub async fn seed_flat(tx: &WriteTx, flat: &FlatModelConfig<'_>) -> Result<model
         output_price: Set(None),
         cache_read_price: Set(None),
         cache_write_price: Set(None),
+        cache_write_1h_price: Set(None),
         pricing_tiers: Set(None),
         server_tools: Set(flat.server_tools.map(str::to_owned)),
         server_tool_price: Set(flat.server_tool_price.clone()),
@@ -402,7 +406,7 @@ mod tests {
     use crate::db::types::SqlBool;
     use crate::decimal::Decimal;
 
-    const TIERS: &str = r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":null,"cache_write_price":null}]"#;
+    const TIERS: &str = r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null}]"#;
 
     fn decimal(raw: &str) -> Decimal {
         raw.parse().unwrap()
@@ -428,6 +432,8 @@ mod tests {
                 output_price: None,
                 cache_read_price: None,
                 cache_write_price: None,
+                cache_write_1h_price: None,
+                cache_ttl: None,
                 pricing_tiers: None,
                 capability_overrides: None,
                 created_at: 0,
@@ -457,6 +463,7 @@ mod tests {
             output_price: None,
             cache_read_price: None,
             cache_write_price: None,
+            cache_write_1h_price: None,
             pricing_tiers: None,
             server_tools: None,
             server_tool_price: None,
@@ -497,6 +504,7 @@ mod tests {
                 output_price: Some(decimal("6")),
                 cache_read_price: Some(decimal("0.5")),
                 cache_write_price: Some(decimal("1.5")),
+                cache_write_1h_price: Some(decimal("2.5")),
                 pricing_tiers: Some(TIERS.into()),
                 server_tools: Some(r#"["web_search"]"#.into()),
                 server_tool_price: Some(decimal("5")),
@@ -516,6 +524,7 @@ mod tests {
                 output_price: Some(decimal("6")),
                 cache_read_price: Some(decimal("0.5")),
                 cache_write_price: Some(decimal("1.5")),
+                cache_write_1h_price: Some(decimal("2.5")),
                 pricing_tiers: Some(TIERS.into()),
                 server_tools: Some(r#"["web_search"]"#.into()),
                 server_tool_price: Some(decimal("5")),

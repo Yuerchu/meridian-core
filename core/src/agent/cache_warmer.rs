@@ -18,7 +18,55 @@ use crate::db::models::message::MessageUsage;
 use crate::db::sea::cap::Db;
 use crate::db::sea::ops::audit::{self, SideRequestCost};
 use crate::decimal::Decimal;
-use crate::provider::{ChatMessage, ChatParams, ChatProvider, ThinkingStyle, ToolDefinition};
+use crate::provider::{ChatMessage, ChatParams, ChatProvider, PromptCacheTtl, ThinkingStyle, ToolDefinition};
+
+/// What happens right before an idle conversation's prompt cache expires.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheExpiryPolicy {
+    /// No idle scheduling after a turn finishes (in-turn streaming warmer only).
+    Off,
+    /// Proactively refresh the warm prefix before expiry, up to
+    /// `cache_max_warm_count` consecutive times.
+    Warm,
+    /// Before the warm cache expires, run prefix-preserving forked compaction
+    /// using the conversation's own model if prompt tokens reach the threshold.
+    #[default]
+    Compact,
+    /// Refresh up to `cache_max_warm_count` times, then run forked compaction
+    /// right before the final refreshed cache expires if still idle.
+    WarmThenCompact,
+}
+
+impl CacheExpiryPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warm => "warm",
+            Self::Compact => "compact",
+            Self::WarmThenCompact => "warm_then_compact",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "off" => Ok(Self::Off),
+            "warm" => Ok(Self::Warm),
+            "compact" => Ok(Self::Compact),
+            "warm_then_compact" => Ok(Self::WarmThenCompact),
+            _ => Err(format!("unknown cache expiry policy `{value}`")),
+        }
+    }
+}
+
+impl std::fmt::Display for CacheExpiryPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub const DEFAULT_CACHE_MAX_WARM_COUNT: i32 = 3;
+pub const DEFAULT_CACHE_COMPACT_MIN_TOKENS: i32 = 40_000;
 
 /// Below this, a prompt is cheap enough that a refresh costs more thought than
 /// it saves. The same floor Pi uses before it tries the arithmetic.
@@ -44,16 +92,22 @@ pub struct WarmSeed {
 /// capped at one token would ask a different question and, on Anthropic, key
 /// the cache on different bytes — so it is not a refresh at all. Adaptive
 /// thinking is replayable; it takes no budget from the cap.
-fn replayable(params: &ChatParams) -> bool {
+pub(crate) fn replayable(params: &ChatParams) -> bool {
     !(params.thinking_enabled && params.thinking_style == ThinkingStyle::Budget)
 }
 
 /// Whether one refresh is expected to be cheaper than the miss it prevents.
 ///
-/// A miss bills the prompt at the input rate; a refresh bills one cache read
-/// and the request it saves bills another. Nothing is decided when a price is
-/// missing — the arithmetic would be a guess, and guesses here spend money.
-fn worthwhile(prices: Option<&Prices>, prompt_tokens: usize) -> bool {
+/// A miss bills the prompt at the write/input rate matching the active cache
+/// TTL (`cache_write_1h_price` for 1h, `cache_write_price` for 5m, otherwise
+/// `input_price`); a refresh bills one cache read and the request it saves
+/// bills another. Nothing is decided when a price is missing — the arithmetic
+/// would be a guess, and guesses here spend money.
+pub(crate) fn worthwhile_for_ttl(
+    prices: Option<&Prices>,
+    prompt_tokens: usize,
+    cache_ttl: Option<PromptCacheTtl>,
+) -> bool {
     if prompt_tokens < MIN_WARM_PROMPT_TOKENS {
         return false;
     }
@@ -63,14 +117,28 @@ fn worthwhile(prices: Option<&Prices>, prompt_tokens: usize) -> bool {
     let Some(input) = prices.input_price.as_ref() else {
         return false;
     };
+    let miss_rate = match cache_ttl {
+        Some(PromptCacheTtl::OneHour) => prices
+            .cache_write_1h_price
+            .as_ref()
+            .or(prices.cache_write_price.as_ref())
+            .unwrap_or(input),
+        Some(PromptCacheTtl::FiveMinutes) => prices.cache_write_price.as_ref().unwrap_or(input),
+        _ => input,
+    };
     let read = prices.cache_read_price.as_ref().unwrap_or(input);
-    let per_token = input.clone() - read.clone() - read.clone();
+    let per_token = miss_rate.clone() - read.clone() - read.clone();
     if per_token.is_negative() {
         return false;
     }
     let per_million: Decimal = PER_MILLION.parse().expect("constant decimal");
     let floor: Decimal = MINIMUM_EXPECTED_SAVINGS.parse().expect("constant decimal");
     Decimal::from(prompt_tokens as i64) * per_token * per_million >= floor
+}
+
+#[cfg(test)]
+fn worthwhile(prices: Option<&Prices>, prompt_tokens: usize) -> bool {
+    worthwhile_for_ttl(prices, prompt_tokens, None)
 }
 
 /// One request the turn actually sent.
@@ -108,7 +176,7 @@ impl WarmGuard {
     /// Asked before the snapshot is built so an ordinary short turn does not
     /// pay for cloning its history into a refresh that would be refused.
     pub fn should_touch(&self, params: &ChatParams, prompt_tokens: usize) -> bool {
-        replayable(params) && self.seed.worthwhile(prompt_tokens)
+        replayable(params) && worthwhile_for_ttl(self.seed.prices.as_ref(), prompt_tokens, params.cache_ttl)
     }
 
     pub fn touch(&self, snapshot: WarmSnapshot) {
@@ -153,11 +221,7 @@ impl Drop for WarmGuard {
 }
 
 impl WarmSeed {
-    fn worthwhile(&self, prompt_tokens: usize) -> bool {
-        worthwhile(self.prices.as_ref(), prompt_tokens)
-    }
-
-    async fn warm_once(&self, snapshot: WarmSnapshot) -> Result<(), String> {
+    pub(crate) async fn warm_once(&self, snapshot: WarmSnapshot) -> Result<(), String> {
         let params = ChatParams {
             max_tokens: Some(1),
             ..snapshot.params
@@ -175,6 +239,7 @@ impl WarmSeed {
             output_tokens: usage.completion_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             cache_write_tokens: usage.cache_write_tokens,
+            cache_write_1h_tokens: usage.cache_write_1h_tokens,
             server_tool_calls: usage.billable_tool_calls,
         };
         let cost = SideRequestCost {
@@ -222,6 +287,7 @@ mod tests {
             output_price: Some("4".parse().unwrap()),
             cache_read_price: Some(read.parse().unwrap()),
             cache_write_price: Some("2.5".parse().unwrap()),
+            cache_write_1h_price: None,
             server_tool_price: None,
         }
     }

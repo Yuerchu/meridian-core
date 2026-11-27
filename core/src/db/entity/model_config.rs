@@ -26,6 +26,7 @@ pub struct Model {
     pub output_price: Option<Decimal>,
     pub cache_read_price: Option<Decimal>,
     pub cache_write_price: Option<Decimal>,
+    pub cache_write_1h_price: Option<Decimal>,
     pub pricing_tiers: Option<String>,
     pub server_tools: Option<String>,
     /// Per **thousand** provider-side tool calls. Independent of

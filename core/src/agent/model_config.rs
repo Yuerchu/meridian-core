@@ -14,6 +14,7 @@
 
 use crate::db::entity::{model_config as config_entity, model_profile};
 use crate::decimal::Decimal;
+use crate::provider::PromptCacheTtl;
 
 /// One model, as one provider serves it, with every value resolved.
 ///
@@ -37,6 +38,8 @@ pub struct EffectiveModelConfig {
     pub output_price: Option<Decimal>,
     pub cache_read_price: Option<Decimal>,
     pub cache_write_price: Option<Decimal>,
+    pub cache_write_1h_price: Option<Decimal>,
+    pub cache_ttl: Option<PromptCacheTtl>,
     pub pricing_tiers: Option<String>,
     pub server_tools: Option<String>,
     pub server_tool_price: Option<Decimal>,
@@ -54,13 +57,14 @@ pub struct EffectiveModelConfig {
 /// upstream runs a search on its own side, and what it charges per call for it,
 /// is a fact about the upstream.
 pub fn effective(config: &config_entity::Model, profile: &model_profile::Model) -> EffectiveModelConfig {
-    let (input_price, output_price, cache_read_price, cache_write_price, pricing_tiers) =
+    let (input_price, output_price, cache_read_price, cache_write_price, cache_write_1h_price, pricing_tiers) =
         if config.overrides_pricing.get() {
             (
                 config.input_price.clone(),
                 config.output_price.clone(),
                 config.cache_read_price.clone(),
                 config.cache_write_price.clone(),
+                config.cache_write_1h_price.clone(),
                 config.pricing_tiers.clone(),
             )
         } else {
@@ -69,6 +73,7 @@ pub fn effective(config: &config_entity::Model, profile: &model_profile::Model) 
                 profile.output_price.clone(),
                 profile.cache_read_price.clone(),
                 profile.cache_write_price.clone(),
+                profile.cache_write_1h_price.clone(),
                 profile.pricing_tiers.clone(),
             )
         };
@@ -87,6 +92,8 @@ pub fn effective(config: &config_entity::Model, profile: &model_profile::Model) 
         output_price,
         cache_read_price,
         cache_write_price,
+        cache_write_1h_price,
+        cache_ttl: profile.cache_ttl,
         pricing_tiers,
         server_tools: config.server_tools.clone(),
         server_tool_price: config.server_tool_price.clone(),
@@ -139,6 +146,8 @@ mod tests {
             output_price: Some(decimal("15")),
             cache_read_price: Some(decimal("0.3")),
             cache_write_price: Some(decimal("3.75")),
+            cache_write_1h_price: None,
+            cache_ttl: None,
             pricing_tiers: Some(r#"[{"min_prompt_tokens":200000}]"#.into()),
             capability_overrides: Some(r#"{"supports_fast":true}"#.into()),
             created_at: 0,
@@ -163,6 +172,7 @@ mod tests {
             output_price: Some(decimal("20")),
             cache_read_price: None,
             cache_write_price: None,
+            cache_write_1h_price: None,
             pricing_tiers: None,
             server_tools: Some(r#"["web_search"]"#.into()),
             server_tool_price: Some(decimal("5")),

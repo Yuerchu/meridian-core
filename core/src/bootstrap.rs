@@ -134,6 +134,10 @@ pub async fn bootstrap_with_secrets(
                     auto_compact_enabled: SqlBool::FALSE,
                     logical_model_id: None,
                     deployment_id: None,
+                    cache_ttl: None,
+                    cache_expiry_policy: crate::agent::cache_warmer::CacheExpiryPolicy::Compact,
+                    cache_max_warm_count: crate::agent::cache_warmer::DEFAULT_CACHE_MAX_WARM_COUNT,
+                    cache_compact_min_tokens: crate::agent::cache_warmer::DEFAULT_CACHE_COMPACT_MIN_TOKENS,
                 },
             )
             .await
@@ -299,6 +303,7 @@ pub async fn bootstrap_with_secrets(
         plan_reviews: PlanReviewWaiters::new(),
         sub_agent_inboxes: AppSubAgentInboxes::default(),
         compact_breakers: Mutex::new(HashMap::new()),
+        cache_lifecycle: Arc::new(crate::agent::cache_lifecycle::CacheLifecycleManager::new()),
         voice: VoiceState::new(),
         // 语料目录的锁在这里被拿到，或者拿不到。拿不到不是启动失败——它只是
         // 让采集整个停用，而应用的其余部分与语料无关。

@@ -399,6 +399,7 @@ impl ChatProvider for LiteRtLmProvider {
                         total_tokens: Some(tokens_after),
                         cache_read_tokens: None,
                         cache_write_tokens: None,
+                        cache_write_1h_tokens: None,
                         billable_tool_calls: None,
                     }),
                 }));

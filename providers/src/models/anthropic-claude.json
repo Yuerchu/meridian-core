@@ -185,14 +185,22 @@
       "supports_thinking": true,
       "max_context_tokens": 200000,
       "max_output_tokens": 64000,
-      "thinking_style": "budget"
+      "thinking_style": "budget",
+      "supported_cache_ttls": [
+        "5m"
+      ],
+      "default_cache_ttl": "5m"
     },
     {
       "prefix": "claude-3-5-sonnet",
       "supports_thinking": false,
       "max_context_tokens": 200000,
       "max_output_tokens": 8192,
-      "thinking_style": "none"
+      "thinking_style": "none",
+      "supported_cache_ttls": [
+        "5m"
+      ],
+      "default_cache_ttl": "5m"
     },
     {
       "prefix": "claude-3-5-haiku",
@@ -200,6 +208,10 @@
       "max_context_tokens": 200000,
       "max_output_tokens": 8192,
       "thinking_style": "none",
+      "supported_cache_ttls": [
+        "5m"
+      ],
+      "default_cache_ttl": "5m",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -213,6 +225,10 @@
       "max_context_tokens": 200000,
       "max_output_tokens": 4096,
       "thinking_style": "none",
+      "supported_cache_ttls": [
+        "5m"
+      ],
+      "default_cache_ttl": "5m",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -226,6 +242,10 @@
       "max_context_tokens": 200000,
       "max_output_tokens": 4096,
       "thinking_style": "none",
+      "supported_cache_ttls": [
+        "5m"
+      ],
+      "default_cache_ttl": "5m",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -239,6 +259,10 @@
       "max_context_tokens": 200000,
       "max_output_tokens": 4096,
       "thinking_style": "none",
+      "supported_cache_ttls": [
+        "5m"
+      ],
+      "default_cache_ttl": "5m",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",

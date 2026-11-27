@@ -75,6 +75,7 @@ pub fn new_row(id: &str, conversation_id: &str, role: &str, content: &str, creat
         tool_outcome: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
+        cache_write_1h_tokens: None,
         provider_name: None,
         provider_state: None,
         auto_review: None,
@@ -226,6 +227,7 @@ pub async fn update_assistant(
             output_tokens: Set(usage.output_tokens),
             cache_read_tokens: Set(usage.cache_read_tokens),
             cache_write_tokens: Set(usage.cache_write_tokens),
+            cache_write_1h_tokens: Set(usage.cache_write_1h_tokens),
             server_tool_calls: Set(usage.server_tool_calls),
             response_model_id: Set(response_model_id.map(str::to_owned)),
             ttft_ms: Set(timing.ttft_ms),
@@ -777,6 +779,7 @@ mod tests {
             tool_outcome: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             provider_name: None,
             provider_state: None,
             auto_review: None,
@@ -932,6 +935,7 @@ mod tests {
             tool_outcome: Some("success".into()),
             cache_read_tokens: Some(41),
             cache_write_tokens: Some(43),
+            cache_write_1h_tokens: Some(45),
             provider_name: Some("DeepSeek".into()),
             provider_state: Some("state".into()),
             auto_review: None,
@@ -968,6 +972,7 @@ mod tests {
             tool_outcome,
             cache_read_tokens,
             cache_write_tokens,
+            cache_write_1h_tokens,
             provider_name,
             provider_state,
             auto_review,
@@ -984,7 +989,10 @@ mod tests {
         assert_eq!((content.as_str(), provider_id), ("the answer", None));
         assert_eq!(model_id.as_deref(), Some("deepseek-chat"));
         assert_eq!((input_tokens, output_tokens), (Some(7), Some(11)));
-        assert_eq!((cache_read_tokens, cache_write_tokens), (Some(41), Some(43)));
+        assert_eq!(
+            (cache_read_tokens, cache_write_tokens, cache_write_1h_tokens),
+            (Some(41), Some(43), Some(45))
+        );
         assert_eq!(server_tool_calls, Some(47));
         assert_eq!(
             (tool_calls.as_deref(), tool_call_id.as_deref()),
@@ -1107,6 +1115,7 @@ mod tests {
             output_tokens: Some(6),
             cache_read_tokens: Some(1),
             cache_write_tokens: Some(2),
+            cache_write_1h_tokens: Some(4),
             server_tool_calls: Some(3),
         };
         db.write(async |tx| {

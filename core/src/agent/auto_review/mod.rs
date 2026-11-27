@@ -654,6 +654,7 @@ fn usage_of(usage: Option<&TokenUsage>) -> MessageUsage {
             output_tokens: u.completion_tokens,
             cache_read_tokens: u.cache_read_tokens,
             cache_write_tokens: u.cache_write_tokens,
+            cache_write_1h_tokens: u.cache_write_1h_tokens,
             server_tool_calls: None,
         },
     }
@@ -685,6 +686,7 @@ fn add(a: MessageUsage, b: MessageUsage) -> MessageUsage {
         output_tokens: sum(a.output_tokens, b.output_tokens),
         cache_read_tokens: sum(a.cache_read_tokens, b.cache_read_tokens),
         cache_write_tokens: sum(a.cache_write_tokens, b.cache_write_tokens),
+        cache_write_1h_tokens: sum(a.cache_write_1h_tokens, b.cache_write_1h_tokens),
         server_tool_calls: None,
     }
 }

@@ -27,6 +27,7 @@ pub mod m0011_custom_tool_execution;
 pub mod m0012_many_to_many_models;
 pub mod m0013_media_generations;
 pub mod m0014_emoji_embeddings;
+pub mod m0015_cache_ttl_and_lifecycle;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -55,6 +56,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0012ManyToManyModels),
             Box::new(M0013MediaGenerations),
             Box::new(M0014EmojiEmbeddings),
+            Box::new(M0015CacheTtlAndLifecycle),
         ]
     }
 }
@@ -115,6 +117,7 @@ pub fn sqlite_statements() -> Vec<String> {
     all.extend(m0012_many_to_many_models::sqlite_statements());
     all.extend(m0013_media_generations::sqlite_statements());
     all.extend(m0014_emoji_embeddings::sqlite_statements());
+    all.extend(m0015_cache_ttl_and_lifecycle::sqlite_statements());
     all
 }
 
@@ -426,6 +429,55 @@ impl MigrationTrait for M0014EmojiEmbeddings {
         }
         for statement in m0014_emoji_embeddings::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0015CacheTtlAndLifecycle;
+
+impl MigrationName for M0015CacheTtlAndLifecycle {
+    fn name(&self) -> &str {
+        "m0015_cache_ttl_and_lifecycle"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0015CacheTtlAndLifecycle {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration("m0015_cache_ttl_and_lifecycle requires SQLite".into()));
+        }
+        for statement in m0015_cache_ttl_and_lifecycle::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        for table in ["model_profiles", "model_configs"] {
+            let rows = conn
+                .query_all_raw(sea_orm::Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("SELECT id, pricing_tiers FROM {table} WHERE pricing_tiers IS NOT NULL"),
+                ))
+                .await?;
+            for row in rows {
+                let id: String = row.try_get("", "id")?;
+                let raw: String = row.try_get("", "pricing_tiers")?;
+                let Some(next) =
+                    m0015_cache_ttl_and_lifecycle::backfill_tier_1h_price(&raw).map_err(DbErr::Migration)?
+                else {
+                    continue;
+                };
+                conn.execute_raw(sea_orm::Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("UPDATE {table} SET pricing_tiers = ? WHERE id = ?"),
+                    [next.into(), id.into()],
+                ))
+                .await?;
+            }
         }
         Ok(())
     }

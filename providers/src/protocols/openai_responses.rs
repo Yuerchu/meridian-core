@@ -231,6 +231,15 @@ impl OpenAIResponsesProvider {
         if let Some(key) = params.cache_key.as_deref() {
             body["prompt_cache_key"] = serde_json::json!(key);
         }
+        if !self.codex_shape
+            && let Some(retention) = params.cache_ttl.and_then(|ttl| match ttl {
+                crate::PromptCacheTtl::InMemory => Some("in_memory"),
+                crate::PromptCacheTtl::TwentyFourHours => Some("24h"),
+                _ => None,
+            })
+        {
+            body["prompt_cache_retention"] = serde_json::json!(retention);
+        }
 
         let mut req = Request::new(http::Method::POST, format!("{}/responses", self.base_url));
         req.headers.insert(
@@ -709,6 +718,7 @@ pub(crate) fn normalise_responses_usage(u: &ResponseUsage) -> TokenUsage {
             .as_ref()
             .and_then(|d| d.cache_write_tokens)
             .map(|v| v as i32),
+        cache_write_1h_tokens: None,
     }
 }
 
@@ -1843,6 +1853,24 @@ mod tests {
         // chat-completions form and must not appear here.
         assert_eq!(body["prompt_cache_key"], "conv-9");
         assert!(req.headers.get("x-grok-conv-id").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn openai_responses_emits_prompt_cache_retention_when_configured() {
+        let provider = OpenAIResponsesProvider::new("https://api.openai.com/v1", "k", CodexShape::off());
+        let params = ChatParams {
+            model: "gpt-5.4".into(),
+            cache_ttl: Some(crate::PromptCacheTtl::TwentyFourHours),
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(&[ChatMessage::user("hi")], None, &params, true)
+            .unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body");
+        };
+        assert_eq!(body["prompt_cache_retention"], "24h");
     }
 
     /// A turn with server-side tools and none of our own still sends an array —

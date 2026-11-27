@@ -41,6 +41,72 @@ impl LocalInferenceBackend {
 #[cfg(feature = "sea-orm")]
 crate::impl_sea_orm_text_enum!(LocalInferenceBackend);
 
+/// Request-level prompt cache retention / TTL tier.
+///
+/// Each variant reflects a real upstream wire option rather than a synthetic
+/// cross-vendor guess. Models without a configurable wire knob leave
+/// `supported_cache_ttls` empty and advertise `default_cache_ttl_secs` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PromptCacheTtl {
+    /// Anthropic 5-minute ephemeral cache (default, 1.25x write price).
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// Anthropic 1-hour extended ephemeral cache (2x write price).
+    #[serde(rename = "1h")]
+    OneHour,
+    /// OpenAI standard in-memory cache (~5-10 minutes).
+    #[serde(rename = "in_memory")]
+    InMemory,
+    /// OpenAI 24-hour extended retention cache.
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+}
+
+impl PromptCacheTtl {
+    pub const ALL: &'static [Self] = &[Self::FiveMinutes, Self::OneHour, Self::InMemory, Self::TwentyFourHours];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+            Self::InMemory => "in_memory",
+            Self::TwentyFourHours => "24h",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "5m" => Ok(Self::FiveMinutes),
+            "1h" => Ok(Self::OneHour),
+            "in_memory" => Ok(Self::InMemory),
+            "24h" => Ok(Self::TwentyFourHours),
+            _ => Err(format!("unknown prompt cache ttl `{value}`")),
+        }
+    }
+
+    /// Effective cache lifetime used by the warmer and expiry scheduler.
+    pub const fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.duration_secs())
+    }
+
+    pub const fn duration_secs(self) -> u64 {
+        match self {
+            Self::FiveMinutes | Self::InMemory => 300,
+            Self::OneHour => 3_600,
+            Self::TwentyFourHours => 86_400,
+        }
+    }
+}
+
+impl std::fmt::Display for PromptCacheTtl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "sea-orm")]
+crate::impl_sea_orm_text_enum!(PromptCacheTtl);
+
 /// Who a speaker is, carried structurally from the platform event all the way to
 /// the provider payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +140,11 @@ pub enum MessageOrigin {
     SystemContext,
     UserProvidedContext,
     CompactSummary,
+    /// Trailing instruction appended to a live cached prefix for forked
+    /// compaction. Sent as wire role `user`, never rendered with `<sent_at>`
+    /// or `<sender>`, and excluded from Anthropic's `last_user` breakpoint so
+    /// the cached history breakpoint stays pinned where the previous turn wrote it.
+    CompactInstruction,
 }
 
 impl MessageOrigin {
@@ -155,6 +226,20 @@ impl ChatMessage {
             tool_error: false,
             provider_state: None,
             origin: MessageOrigin::CompactSummary,
+            sent_at: None,
+        }
+    }
+
+    pub fn compact_instruction(content: &str) -> Self {
+        Self {
+            role: "user".into(),
+            content: content.into(),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_error: false,
+            provider_state: None,
+            origin: MessageOrigin::CompactInstruction,
             sent_at: None,
         }
     }
@@ -635,6 +720,12 @@ pub struct ChatParams {
     pub fast: bool,
     pub verbosity: Option<String>,
     pub cache_key: Option<String>,
+    pub cache_ttl: Option<PromptCacheTtl>,
+    /// Keep prefix cache breakpoints intact so this request reads the warm
+    /// cache, but do not place a new breakpoint on the trailing message (used by
+    /// forked compaction so the throwaway summary prompt does not trigger a
+    /// cache write).
+    pub cache_read_only_tail: bool,
     pub server_tools: Vec<ServerToolKind>,
     pub thinking_style: ThinkingStyle,
     pub supports_remote_compaction: bool,
@@ -729,6 +820,11 @@ pub struct TokenUsage {
     pub cache_read_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<i32>,
+    /// Subset of `cache_write_tokens` billed at the 1-hour extended cache write
+    /// rate (e.g. Anthropic's `ephemeral_1h_input_tokens`, 2x input vs 1.25x
+    /// for 5m). Always <= `cache_write_tokens` when both are reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billable_tool_calls: Option<i32>,
 }
@@ -740,6 +836,14 @@ impl TokenUsage {
         // domain-default: an absent cache figure itemises none of the prompt; the uncached rest is billed whole (usage contract)
         let write = self.cache_write_tokens.unwrap_or(0);
         (read, write)
+    }
+
+    /// Split total cache write tokens into `(standard_or_5m, extended_1h)`.
+    pub fn billed_cache_write_split(&self) -> (i32, i32) {
+        let total_write = self.cache_write_tokens.unwrap_or(0).max(0);
+        let write_1h = self.cache_write_1h_tokens.unwrap_or(0).max(0).min(total_write);
+        let write_5m = total_write.saturating_sub(write_1h);
+        (write_5m, write_1h)
     }
 
     pub fn uncached_prompt_tokens(&self) -> Option<i32> {
@@ -827,6 +931,9 @@ pub struct ProviderCapabilities {
     pub server_tools: Vec<ServerToolKind>,
     pub supports_remote_compaction: bool,
     pub responses_lite: bool,
+    pub supported_cache_ttls: Vec<PromptCacheTtl>,
+    pub default_cache_ttl: Option<PromptCacheTtl>,
+    pub default_cache_ttl_secs: Option<u32>,
 }
 
 impl ProviderCapabilities {
@@ -938,7 +1045,7 @@ mod capability_contract_tests {
     fn provider_capabilities_are_a_closed_complete_wire_contract() {
         let value = serde_json::to_value(ProviderCapabilities::default()).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 19);
+        assert_eq!(object.len(), 22);
         assert!(object.get("readable_mime_types").is_some());
         assert!(object.get("supports_images").is_none());
         assert!(object.get("supports_pdf").is_none());

@@ -112,11 +112,17 @@ pub fn apply_standard_openai_chat_params(
     if params.fast {
         body.insert("service_tier".into(), serde_json::json!("priority"));
     }
-    if allow_openai_prompt_cache_key
-        && let Some(key) = params.cache_key.as_deref()
-        && is_openai_host(base_url)
-    {
-        body.insert("prompt_cache_key".into(), serde_json::json!(key));
+    if allow_openai_prompt_cache_key && is_openai_host(base_url) {
+        if let Some(key) = params.cache_key.as_deref() {
+            body.insert("prompt_cache_key".into(), serde_json::json!(key));
+        }
+        if let Some(retention) = params.cache_ttl.and_then(|ttl| match ttl {
+            crate::PromptCacheTtl::InMemory => Some("in_memory"),
+            crate::PromptCacheTtl::TwentyFourHours => Some("24h"),
+            _ => None,
+        }) {
+            body.insert("prompt_cache_retention".into(), serde_json::json!(retention));
+        }
     }
 }
 
@@ -706,6 +712,7 @@ pub fn normalise_openai_usage(u: &OpenAIChatUsageResponse) -> TokenUsage {
         total_tokens: u.total_tokens,
         cache_read_tokens: cache_read,
         cache_write_tokens: None,
+        cache_write_1h_tokens: None,
         billable_tool_calls: None,
     }
 }
