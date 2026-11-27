@@ -86,6 +86,7 @@ impl IdleCacheSeed {
             .unwrap_or(crate::agent::cache_warmer::DEFAULT_CACHE_MAX_WARM_COUNT as u32);
         let configured_min = assistant
             .map(|a| a.cache_compact_min_tokens)
+            // domain-default: fallback idle-compaction token floor when a conversation has no assistant row
             .unwrap_or(crate::agent::cache_warmer::DEFAULT_CACHE_COMPACT_MIN_TOKENS);
         let compact_min_tokens = if configured_min > 0 {
             configured_min as usize

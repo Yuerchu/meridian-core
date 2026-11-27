@@ -552,6 +552,7 @@ pub async fn do_compact_with_warm_cache(
         .params
         .max_tokens
         .filter(|m| *m > 0)
+        // domain-default: summary output cap when params.max_tokens is unspecified (mirrors compact.rs ceiling)
         .map_or(SUMMARY_OUTPUT_CAP, |m| m as usize);
     let ceiling = configured.min(SUMMARY_OUTPUT_CAP.max(budget_floor)).min(room);
     if ceiling < budget_floor {
