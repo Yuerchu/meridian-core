@@ -1767,8 +1767,10 @@ mod tests {
         assert!(error.contains("gone:cheap"), "{error}");
     }
 
+    type CapturedWarmRequest = (Vec<ChatMessage>, Vec<ToolDefinition>, provider::ChatParams);
+
     struct RecordingWarmProvider {
-        captured: Mutex<Option<(Vec<ChatMessage>, Vec<ToolDefinition>, provider::ChatParams)>>,
+        captured: Mutex<Option<CapturedWarmRequest>>,
     }
 
     #[async_trait::async_trait]
