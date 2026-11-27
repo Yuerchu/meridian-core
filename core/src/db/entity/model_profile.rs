@@ -55,6 +55,7 @@ impl ActiveModelBehavior for ActiveModel {}
 #[derive(Debug, Clone)]
 pub struct ModelProfileChangeset {
     pub name: String,
+    pub capability_domain: CapabilityDomain,
     pub context_window: i32,
     pub compact_threshold: i32,
     pub max_output_tokens: Option<i32>,
@@ -72,6 +73,7 @@ impl ModelProfileChangeset {
     pub fn into_active_model(self) -> ActiveModel {
         ActiveModel {
             name: Set(self.name),
+            capability_domain: Set(self.capability_domain),
             context_window: Set(self.context_window),
             compact_threshold: Set(self.compact_threshold),
             max_output_tokens: Set(self.max_output_tokens),

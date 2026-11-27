@@ -298,6 +298,7 @@ mod tests {
 
         let changes = ModelProfileChangeset {
             name: "Claude 2".into(),
+            capability_domain: crate::provider::CapabilityDomain::Chat,
             context_window: 200_000,
             compact_threshold: 150_000,
             max_output_tokens: None,
@@ -327,6 +328,7 @@ mod tests {
             .write(async |tx| {
                 let changes = ModelProfileChangeset {
                     name: "x".into(),
+                    capability_domain: crate::provider::CapabilityDomain::Chat,
                     context_window: 1,
                     compact_threshold: 1,
                     max_output_tokens: None,

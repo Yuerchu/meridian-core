@@ -10,6 +10,7 @@ pub use compliance::{
     CleanOriginalCompliancePort, ExportWatermarkMode, ExportWatermarkPolicy, GeneratedAssetMeta, MediaCompliancePort,
 };
 pub use meridian_provider_sdk::media_gen::{MediaReference, MediaReferenceRole};
+pub use meridian_providers::media_registry::resolve_media_protocol;
 pub use runner::{
     DEFAULT_IMAGE_MODEL_PREF, DEFAULT_VIDEO_MODEL_PREF, MediaGenerationJobSpec, MediaGenerationParams,
     MediaGenerationRecord, MediaRunner, StoredMediaAsset,

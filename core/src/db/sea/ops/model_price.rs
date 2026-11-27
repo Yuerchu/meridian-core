@@ -131,6 +131,7 @@ pub async fn fill_one(
 async fn write_prices(tx: &WriteTx, profile: &model_profile::Model, facts: &ModelFacts) -> Result<(), sea_orm::DbErr> {
     let changeset = model_profile::ModelProfileChangeset {
         name: profile.name.clone(),
+        capability_domain: profile.capability_domain,
         context_window: profile.context_window,
         compact_threshold: profile.compact_threshold,
         max_output_tokens: profile.max_output_tokens,
@@ -394,6 +395,7 @@ mod tests {
                 "prof",
                 model_profile::ModelProfileChangeset {
                     name: "profile prof".into(),
+                    capability_domain: crate::provider::CapabilityDomain::Chat,
                     context_window: 200_000,
                     compact_threshold: 150_000,
                     max_output_tokens: None,

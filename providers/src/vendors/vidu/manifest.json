@@ -1,7 +1,7 @@
 {
   "version": 1,
   "id": "vidu",
-  "provider_type": null,
+  "provider_type": "media",
   "name": "Vidu",
   "icon": "vidu",
   "sort_order": 430,
@@ -13,33 +13,18 @@
     "docs": "https://docs.platform.vidu.com",
     "models": null
   },
-  "auth": [],
-  "config_fields": [
+  "auth": [
     {
-      "key": "SERVICE_VIDU_KEY",
-      "label": "Vidu API Key",
-      "kind": "secret",
-      "required": true,
-      "secret": true,
-      "default_value": null,
-      "placeholder": null,
-      "options": [],
-      "visible_when_protocol": null,
-      "visible_when_auth": null
-    },
-    {
-      "key": "SERVICE_VIDU_BASE_URL",
-      "label": "Vidu Base URL",
-      "kind": "text",
-      "required": false,
-      "secret": false,
-      "default_value": "https://api.vidu.cn",
-      "placeholder": "https://api.vidu.cn",
-      "options": [],
-      "visible_when_protocol": null,
-      "visible_when_auth": null
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["media_native"],
+      "default_base_url": {
+        "media_native": "https://api.vidu.cn"
+      }
     }
   ],
+  "config_fields": [],
   "models_dev": null,
   "models": [
     {
