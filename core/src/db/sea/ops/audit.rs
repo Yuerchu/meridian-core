@@ -470,6 +470,7 @@ mod tests {
                         &profile.id,
                         crate::db::entity::model_profile::ModelProfileChangeset {
                             name: profile.name.clone(),
+                            capability_domain: profile.capability_domain,
                             context_window: profile.context_window,
                             compact_threshold: profile.compact_threshold,
                             max_output_tokens: None,

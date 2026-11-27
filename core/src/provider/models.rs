@@ -91,6 +91,7 @@ pub async fn fetch_models_on(
             .map_err(ProviderError::Upstream)?;
             local_file_models(&snapshot.file_name)
         }
+        super::registry::ProviderType::Media => Ok(Vec::new()),
     }
 }
 

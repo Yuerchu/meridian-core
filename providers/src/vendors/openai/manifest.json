@@ -52,5 +52,10 @@
     "default": ["openai"],
     "cn": []
   },
-  "models": []
+  "models": [
+    {
+      "family": "openai-image",
+      "ids": ["gpt-image-1", "gpt-image-1.5", "gpt-image-1-mini"]
+    }
+  ]
 }

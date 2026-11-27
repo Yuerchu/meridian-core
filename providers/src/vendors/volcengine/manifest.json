@@ -1,7 +1,7 @@
 {
   "version": 1,
   "id": "volcengine",
-  "provider_type": null,
+  "provider_type": "media",
   "name": "Volcengine Ark (Seedream / Seedance)",
   "icon": "volcengine",
   "sort_order": 400,
@@ -13,33 +13,18 @@
     "docs": "https://www.volcengine.com/docs/82379",
     "models": null
   },
-  "auth": [],
-  "config_fields": [
+  "auth": [
     {
-      "key": "SERVICE_VOLCENGINE_ARK_KEY",
-      "label": "Volcengine Ark API Key",
-      "kind": "secret",
-      "required": true,
-      "secret": true,
-      "default_value": null,
-      "placeholder": null,
-      "options": [],
-      "visible_when_protocol": null,
-      "visible_when_auth": null
-    },
-    {
-      "key": "SERVICE_VOLCENGINE_ARK_BASE_URL",
-      "label": "Ark Base URL",
-      "kind": "text",
-      "required": false,
-      "secret": false,
-      "default_value": "https://ark.cn-beijing.volces.com/api/v3",
-      "placeholder": "https://ark.cn-beijing.volces.com/api/v3",
-      "options": [],
-      "visible_when_protocol": null,
-      "visible_when_auth": null
+      "id": "api_key",
+      "credential_kind": "api_key",
+      "transport_profile": "standard",
+      "api_formats": ["media_native"],
+      "default_base_url": {
+        "media_native": "https://ark.cn-beijing.volces.com/api/v3"
+      }
     }
   ],
+  "config_fields": [],
   "models_dev": null,
   "models": [
     {

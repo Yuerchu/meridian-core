@@ -31,6 +31,7 @@ pub enum ApiFormat {
     GeminiInteractions,
     GemmaTool,
     LitertLm,
+    MediaNative,
 }
 
 impl ApiFormat {
@@ -66,6 +67,7 @@ pub enum ProviderType {
     Xai,
     Google,
     LitertLm,
+    Media,
 }
 
 impl ProviderType {
@@ -252,6 +254,7 @@ pub fn validate_stored_contract(
             )
         }
         ProviderType::LitertLm => api_format == ApiFormat::LitertLm,
+        ProviderType::Media => api_format == ApiFormat::MediaNative,
     };
     if supported {
         Ok(())
@@ -440,14 +443,22 @@ pub fn create_provider(wire: ProviderWire<'_>) -> Result<Box<dyn ChatProvider>, 
                     provider_type.as_str()
                 ));
             }
-            ApiFormat::LitertLm => {
-                return Err("the litert_lm API format is not supported by provider type `openai`".into());
+            ApiFormat::LitertLm | ApiFormat::MediaNative => {
+                return Err(format!(
+                    "the `{}` API format is not supported by provider type `openai`",
+                    api_format.as_str()
+                ));
             }
         },
         ProviderType::LitertLm => {
             let backend = local_backend.ok_or("LiteRT-LM requires local_backend")?;
             let provider = super::litert_lm_provider::LiteRtLmProvider::from_model_path(base_url, backend)?;
             return Ok(Box::new(provider));
+        }
+        ProviderType::Media => {
+            return Err(
+                "provider type `media` is for image/video generation and does not support chat completions".into(),
+            );
         }
     };
     Ok(provider)
@@ -525,7 +536,13 @@ impl DialectMedia {
                 video: false,
                 audio: false,
             },
-            (_, ApiFormat::LitertLm | ApiFormat::GeminiGenerateContent | ApiFormat::GeminiInteractions) => Self {
+            (
+                _,
+                ApiFormat::LitertLm
+                | ApiFormat::MediaNative
+                | ApiFormat::GeminiGenerateContent
+                | ApiFormat::GeminiInteractions,
+            ) => Self {
                 image: false,
                 document: false,
                 video: false,

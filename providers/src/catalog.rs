@@ -105,16 +105,17 @@ impl From<&VendorManifest> for CatalogEntry {
     }
 }
 
-static CHAT_CATALOG: LazyLock<Vec<CatalogEntry>> = LazyLock::new(|| {
-    crate::vendors::manifests_for_domain(CapabilityDomain::Chat)
-        .into_iter()
+static PROVIDER_CATALOG: LazyLock<Vec<CatalogEntry>> = LazyLock::new(|| {
+    crate::vendors::all_manifests()
+        .iter()
+        .filter(|manifest| manifest.provider_type.is_some())
         .map(CatalogEntry::from)
         .collect()
 });
 
-/// Every chat vendor, in the manifest `sort_order` order.
+/// Every interactive provider vendor (`chat`, `image_gen`, `video_gen`), in the manifest `sort_order` order.
 pub fn entries() -> &'static [CatalogEntry] {
-    &CHAT_CATALOG
+    &PROVIDER_CATALOG
 }
 
 /// Every vendor manifest across all capability domains (`chat`, `web_search`, `tts`, ...).
@@ -122,9 +123,9 @@ pub fn all_manifests() -> &'static [VendorManifest] {
     crate::vendors::all_manifests()
 }
 
-/// Look up one chat vendor by catalog id.
+/// Look up one provider vendor by catalog id.
 pub fn find(id: &str) -> Option<&'static CatalogEntry> {
-    CHAT_CATALOG.iter().find(|entry| entry.id == id)
+    PROVIDER_CATALOG.iter().find(|entry| entry.id == id)
 }
 
 fn normalize_url(url: &str) -> String {

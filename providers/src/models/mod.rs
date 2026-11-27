@@ -125,6 +125,16 @@ pub struct CanonicalModelMatch {
     pub matched_prefix: String,
 }
 
+impl CanonicalModelMatch {
+    /// Capability domain derived from this model family's primary official wire protocol.
+    pub fn capability_domain(&self) -> meridian_provider_sdk::domain::CapabilityDomain {
+        self.canonical_protocols
+            .iter()
+            .find_map(|id| find_protocol(id).map(|desc| desc.domain))
+            .unwrap_or(meridian_provider_sdk::domain::CapabilityDomain::Chat)
+    }
+}
+
 /// Strip vendor routing namespaces (`anthropic/`, `openai/`, `google/`,
 /// `deepseek/`, `x-ai/`, `models/`, etc.), `:variant` tags (`:free`, `:beta`,
 /// `:thinking`), and trailing date stamps (`-20250514`, `-2025-05-14`).
