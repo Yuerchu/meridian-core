@@ -670,7 +670,20 @@ async fn exact_decimal_migration_canonicalizes_existing_money() {
     assert!(tiers[0].get("input").is_none());
     assert!(tiers[0].get("output").is_none());
     assert!(tiers[0].get("cache_read").is_none());
-    assert!(crate::agent::pricing::parse_tiers(model.pricing_tiers.as_deref()).is_ok());
+    // Migration 49 produces the 5-key tier shape; m0015 later backfills
+    // `cache_write_1h_price: null` so current `parse_tiers` accepts it.
+    let mut tier_keys: Vec<&str> = tiers[0].as_object().unwrap().keys().map(String::as_str).collect();
+    tier_keys.sort();
+    assert_eq!(
+        tier_keys,
+        vec![
+            "cache_read_price",
+            "cache_write_price",
+            "input_price",
+            "min_prompt_tokens",
+            "output_price"
+        ]
+    );
 
     let future = decimal_row(
         &conn,

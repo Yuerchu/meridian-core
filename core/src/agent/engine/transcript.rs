@@ -58,6 +58,7 @@ fn turn_row(id: &str, conversation_id: &str, turn_id: &str, role: &str, content:
         tool_outcome: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
+        cache_write_1h_tokens: None,
         provider_name: None,
         provider_state: None,
         auto_review: None,
@@ -364,6 +365,7 @@ mod tests {
             output_tokens: Some(11),
             cache_read_tokens: Some(41),
             cache_write_tokens: Some(43),
+            cache_write_1h_tokens: None,
             server_tool_calls: Some(47),
         }
     }

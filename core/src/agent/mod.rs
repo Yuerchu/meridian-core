@@ -1,6 +1,7 @@
 pub mod auto_review;
 pub mod auxiliary;
 mod base_prompt;
+pub mod cache_lifecycle;
 pub mod cache_warmer;
 pub mod call_identity;
 pub mod codex_install;

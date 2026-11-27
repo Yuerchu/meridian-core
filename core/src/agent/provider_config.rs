@@ -410,6 +410,8 @@ pub(crate) fn without_thinking(params: ChatParams) -> ChatParams {
         thinking_effort: None,
         server_tools: Vec::new(),
         cache_key: None,
+        cache_ttl: None,
+        cache_read_only_tail: false,
         ..params
     }
 }
@@ -427,6 +429,9 @@ pub struct TurnParams {
     pub max_output: usize,
     /// `None` leaves the budget free to derive its own threshold.
     pub compact_threshold: Option<usize>,
+    /// Effective prompt cache lifetime for this model/protocol and active TTL
+    /// selection (`None` when the upstream's lifetime is unknown).
+    pub cache_ttl_duration: Option<std::time::Duration>,
     /// Handed back so callers that also need pricing don't query it twice.
     /// Already resolved against the model's profile — see
     /// `agent::model_config::effective`, which is the only place the override
@@ -597,6 +602,11 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
         thinking_level,
     )?;
 
+    let requested_cache_ttl = assistant
+        .and_then(|a| a.cache_ttl)
+        .or_else(|| model_config.as_ref().and_then(|mc| mc.cache_ttl))
+        .or(caps.default_cache_ttl);
+
     let mut params = ChatParams {
         model: model.to_string(),
         temperature: assistant.and_then(|a| a.temperature.map(|t| t as f64)),
@@ -606,6 +616,7 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
         thinking_budget,
         thinking_effort,
         fast,
+        cache_ttl: requested_cache_ttl,
         server_tools,
         // Assembled only for a row that asked for the Codex shape: an ordinary
         // OpenAI request must not grow a header describing this app's sandbox,
@@ -623,12 +634,18 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
     };
     provider::capabilities::filter_params(&mut params, &caps)?;
 
+    let cache_ttl_duration = params.cache_ttl.map(provider::PromptCacheTtl::duration).or_else(|| {
+        caps.default_cache_ttl_secs
+            .map(|secs| std::time::Duration::from_secs(u64::from(secs)))
+    });
+
     Ok(TurnParams {
         params,
         caps,
         context_limit,
         max_output,
         compact_threshold: model_config.as_ref().map(|mc| mc.compact_threshold as usize),
+        cache_ttl_duration,
         model_config,
     })
 }
@@ -737,6 +754,10 @@ mod tests {
             thinking_budget: Some(4096),
             tool_preset_id: None,
             auto_compact_enabled: crate::db::types::SqlBool::TRUE,
+            cache_ttl: None,
+            cache_expiry_policy: crate::agent::cache_warmer::CacheExpiryPolicy::Compact,
+            cache_max_warm_count: crate::agent::cache_warmer::DEFAULT_CACHE_MAX_WARM_COUNT,
+            cache_compact_min_tokens: crate::agent::cache_warmer::DEFAULT_CACHE_COMPACT_MIN_TOKENS,
             logical_model_id: None,
             deployment_id: None,
         }
@@ -1301,6 +1322,8 @@ mod tests {
             output_price: Some(decimal("6")),
             cache_read_price: None,
             cache_write_price: None,
+            cache_write_1h_price: None,
+            cache_ttl: None,
             pricing_tiers: None,
             server_tools: server_tools.map(str::to_string),
             server_tool_price: None,
@@ -1361,5 +1384,116 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("Settings"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cache_ttl_follows_model_profile_and_allows_assistant_override() {
+        let db = sea_test_db().await;
+        let row = provider_row(
+            ProviderType::Anthropic,
+            "Anthropic",
+            "https://api.anthropic.com",
+            ApiFormat::ChatCompletions,
+        );
+        seed(&db, row, None).await;
+        let profile = crate::db::entity::model_profile::Model {
+            id: "prof-claude".into(),
+            name: "Claude Sonnet 4.6".into(),
+            context_window: 200_000,
+            compact_threshold: 160_000,
+            max_output_tokens: None,
+            input_price: None,
+            output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
+            cache_write_1h_price: None,
+            cache_ttl: Some(provider::PromptCacheTtl::OneHour),
+            pricing_tiers: None,
+            capability_overrides: None,
+            created_at: 0,
+            updated_at: 0,
+            canonical_id: None,
+            capability_domain: provider::CapabilityDomain::Chat,
+            family: None,
+            icon: None,
+            routing_policy: provider::RoutingPolicy::StickyManual,
+            is_archived: crate::db::types::SqlBool::FALSE,
+        };
+        let config = crate::db::entity::model_config::Model {
+            id: "cfg-claude".into(),
+            provider_id: "p1".into(),
+            model_id: "claude-sonnet-4-6".into(),
+            profile_id: "prof-claude".into(),
+            overrides_pricing: crate::db::types::SqlBool::FALSE,
+            input_price: None,
+            output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
+            cache_write_1h_price: None,
+            pricing_tiers: None,
+            server_tools: None,
+            server_tool_price: None,
+            created_at: 0,
+            updated_at: 0,
+            protocol_override: None,
+            is_enabled: crate::db::types::SqlBool::TRUE,
+            priority: 0,
+            capability_overrides: None,
+        };
+        db.write(async |tx| {
+            crate::db::sea::ops::model_profile::insert(tx, profile).await?;
+            crate::db::sea::ops::model_config::upsert(tx, config).await
+        })
+        .await
+        .unwrap();
+
+        let inherit_assistant = assistant_with(None);
+        let inherited = resolve_turn_params(
+            &db,
+            TurnParamsResolveRequest {
+                assistant: Some(&inherit_assistant),
+                provider_id: Some("p1"),
+                provider_type: "anthropic",
+                api_format: "chat_completions",
+                transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
+                model: "claude-sonnet-4-6",
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(inherited.params.cache_ttl, Some(provider::PromptCacheTtl::OneHour));
+        assert_eq!(inherited.cache_ttl_duration, Some(std::time::Duration::from_secs(3600)));
+
+        let mut override_assistant = assistant_with(None);
+        override_assistant.cache_ttl = Some(provider::PromptCacheTtl::FiveMinutes);
+        let overridden = resolve_turn_params(
+            &db,
+            TurnParamsResolveRequest {
+                assistant: Some(&override_assistant),
+                provider_id: Some("p1"),
+                provider_type: "anthropic",
+                api_format: "chat_completions",
+                transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
+                model: "claude-sonnet-4-6",
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(overridden.params.cache_ttl, Some(provider::PromptCacheTtl::FiveMinutes));
+        assert_eq!(overridden.cache_ttl_duration, Some(std::time::Duration::from_secs(300)));
+
+        let utility = without_thinking(inherited.params);
+        assert_eq!(utility.cache_ttl, None);
+        assert!(!utility.cache_read_only_tail);
     }
 }

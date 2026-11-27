@@ -77,7 +77,7 @@ macro_rules! usage_grouping {
             $key,
             " AS bucket_key,
                 provider_id, model_id,
-                input_price, output_price, cache_read_price, cache_write_price,
+                input_price, output_price, cache_read_price, cache_write_price, cache_write_1h_price,
                 server_tool_price, billing_mode,
                 COUNT(*) AS messages,
                 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL
@@ -92,6 +92,9 @@ macro_rules! usage_grouping {
                 COALESCE(SUM(output_tokens), 0) AS output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                 COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(cache_write_1h_tokens), 0) AS cache_write_1h_tokens,
+                SUM(CASE WHEN COALESCE(cache_write_1h_tokens, 0) > 0 THEN 1 ELSE 0 END)
+                    AS cache_write_1h_messages,
                 COALESCE(SUM(input_tokens), 0) AS reported_input_tokens,
                 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL
                                   THEN COALESCE(cache_read_tokens, 0)
@@ -188,7 +191,7 @@ macro_rules! usage_grouping {
             $extra,
             "
        GROUP BY bucket_key, provider_id, model_id,
-                input_price, output_price, cache_read_price, cache_write_price,
+                input_price, output_price, cache_read_price, cache_write_price, cache_write_1h_price,
                 server_tool_price, billing_mode"
         ))
     };

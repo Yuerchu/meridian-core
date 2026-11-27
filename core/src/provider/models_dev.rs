@@ -614,6 +614,8 @@ mod tests {
             output_price: output.and_then(price_of),
             cache_read_price: cache_read.and_then(price_of),
             cache_write_price: cache_write.and_then(price_of),
+            cache_write_1h_price: None,
+            cache_ttl: None,
             pricing_tiers: None,
             capability_overrides: None,
             created_at: 0,

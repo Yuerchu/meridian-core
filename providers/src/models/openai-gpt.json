@@ -34,6 +34,11 @@
       "supports_fast": true,
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "supported_cache_ttls": [
+        "24h"
+      ],
+      "default_cache_ttl": "24h",
+      "default_cache_ttl_secs": 86400,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -58,6 +63,11 @@
       "supports_fast": true,
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "supported_cache_ttls": [
+        "24h"
+      ],
+      "default_cache_ttl": "24h",
+      "default_cache_ttl_secs": 86400,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -82,6 +92,11 @@
       "supports_fast": true,
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "supported_cache_ttls": [
+        "24h"
+      ],
+      "default_cache_ttl": "24h",
+      "default_cache_ttl_secs": 86400,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -106,6 +121,11 @@
       "supports_fast": true,
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "supported_cache_ttls": [
+        "24h"
+      ],
+      "default_cache_ttl": "24h",
+      "default_cache_ttl_secs": 86400,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -131,6 +151,11 @@
       "supports_fast": true,
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "supported_cache_ttls": [
+        "24h"
+      ],
+      "default_cache_ttl": "24h",
+      "default_cache_ttl_secs": 86400,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -154,6 +179,11 @@
       "supports_fast": true,
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "supported_cache_ttls": [
+        "24h"
+      ],
+      "default_cache_ttl": "24h",
+      "default_cache_ttl_secs": 86400,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -176,6 +206,12 @@
       "default_effort": "medium",
       "supports_verbosity": true,
       "default_verbosity": "medium",
+      "supported_cache_ttls": [
+        "in_memory",
+        "24h"
+      ],
+      "default_cache_ttl": "in_memory",
+      "default_cache_ttl_secs": 300,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -199,6 +235,12 @@
       "supports_fast": true,
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "supported_cache_ttls": [
+        "in_memory",
+        "24h"
+      ],
+      "default_cache_ttl": "in_memory",
+      "default_cache_ttl_secs": 300,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -221,6 +263,12 @@
       "default_effort": "medium",
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "supported_cache_ttls": [
+        "in_memory",
+        "24h"
+      ],
+      "default_cache_ttl": "in_memory",
+      "default_cache_ttl_secs": 300,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -241,6 +289,12 @@
       ],
       "default_effort": "medium",
       "supports_verbosity": true,
+      "supported_cache_ttls": [
+        "in_memory",
+        "24h"
+      ],
+      "default_cache_ttl": "in_memory",
+      "default_cache_ttl_secs": 300,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -316,6 +370,12 @@
       "max_context_tokens": 1047576,
       "max_output_tokens": 32768,
       "thinking_style": "none",
+      "supported_cache_ttls": [
+        "in_memory",
+        "24h"
+      ],
+      "default_cache_ttl": "in_memory",
+      "default_cache_ttl_secs": 300,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -328,6 +388,7 @@
       "max_context_tokens": 128000,
       "max_output_tokens": 16384,
       "thinking_style": "none",
+      "default_cache_ttl_secs": 300,
       "readable_mime_types": [
         "image/jpeg",
         "image/png",

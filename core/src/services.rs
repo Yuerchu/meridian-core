@@ -61,6 +61,9 @@ pub struct ServicesInner {
     pub plan_reviews: PlanReviewWaiters,
     pub sub_agent_inboxes: AppSubAgentInboxes,
     pub compact_breakers: Mutex<HashMap<String, Arc<CompactCircuitBreaker>>>,
+    /// Conversation-level idle prompt cache lifecycle timers (warm / expiry
+    /// forked compaction), shared across Desktop and OneBot runners.
+    pub cache_lifecycle: Arc<crate::agent::cache_lifecycle::CacheLifecycleManager>,
     pub voice: VoiceState,
     /// 谁现在可以往语音语料里写。
     ///
@@ -223,6 +226,7 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         plan_reviews: PlanReviewWaiters::new(),
         sub_agent_inboxes: AppSubAgentInboxes::default(),
         compact_breakers: Mutex::new(HashMap::new()),
+        cache_lifecycle: Arc::new(crate::agent::cache_lifecycle::CacheLifecycleManager::new()),
         voice: VoiceState::new(),
         corpus: Arc::new(crate::voice_corpus::CorpusCoordinator::new(dir)),
         voice_limiter: Arc::new(crate::tts::limiter::VoiceLimiter::default()),

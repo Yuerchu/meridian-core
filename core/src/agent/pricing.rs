@@ -311,6 +311,10 @@ pub struct Prices {
     pub output_price: Option<Decimal>,
     pub cache_read_price: Option<Decimal>,
     pub cache_write_price: Option<Decimal>,
+    /// Rate per 1M tokens for 1-hour extended cache writes (e.g. Anthropic 2x).
+    /// `None` means unconfigured; any positive `cache_write_1h` count without a
+    /// configured rate produces a cache pricing gap rather than guessing.
+    pub cache_write_1h_price: Option<Decimal>,
     /// What one provider-side tool invocation costs, per **thousand** calls —
     /// the unit the upstreams publish it in. `None` means nobody has said, which
     /// is not zero: a searching turn priced at nothing is under-reported, not
@@ -336,6 +340,7 @@ pub struct PriceTier {
     pub output_price: Decimal,
     pub cache_read_price: Option<Decimal>,
     pub cache_write_price: Option<Decimal>,
+    pub cache_write_1h_price: Option<Decimal>,
 }
 
 impl<'de> serde::Deserialize<'de> for PriceTier {
@@ -377,6 +382,7 @@ impl<'de> serde::Deserialize<'de> for PriceTier {
             output_price: Decimal,
             cache_read_price: RequiredNullableDecimal,
             cache_write_price: RequiredNullableDecimal,
+            cache_write_1h_price: RequiredNullableDecimal,
         }
 
         let document = <PriceTierDocument as serde::Deserialize>::deserialize(deserializer)?;
@@ -386,6 +392,7 @@ impl<'de> serde::Deserialize<'de> for PriceTier {
             output_price: document.output_price,
             cache_read_price: document.cache_read_price.0,
             cache_write_price: document.cache_write_price.0,
+            cache_write_1h_price: document.cache_write_1h_price.0,
         })
     }
 }
@@ -400,6 +407,7 @@ impl PriceTier {
             output_price: Some(self.output_price.clone()),
             cache_read_price: self.cache_read_price.clone(),
             cache_write_price: self.cache_write_price.clone(),
+            cache_write_1h_price: self.cache_write_1h_price.clone(),
             server_tool_price: None,
         }
     }
@@ -439,6 +447,7 @@ pub fn validate_tiers(mut tiers: Vec<PriceTier>) -> Result<Vec<PriceTier>, Prici
             ("output_price", Some(&tier.output_price)),
             ("cache_read_price", tier.cache_read_price.as_ref()),
             ("cache_write_price", tier.cache_write_price.as_ref()),
+            ("cache_write_1h_price", tier.cache_write_1h_price.as_ref()),
         ] {
             if value.is_some_and(Decimal::is_negative) {
                 return Err(PricingError::InvalidTierTable(format!("{field} must be non-negative")));
@@ -462,6 +471,7 @@ impl Prices {
             output_price: config.output_price.clone(),
             cache_read_price: config.cache_read_price.clone(),
             cache_write_price: config.cache_write_price.clone(),
+            cache_write_1h_price: config.cache_write_1h_price.clone(),
             server_tool_price: config.server_tool_price.clone(),
         }
     }
@@ -525,11 +535,13 @@ impl Prices {
 /// the time, and today it is what the usage report shows.
 pub fn compute_cost(usage: &TokenUsage, prices: &Prices) -> RequestCost {
     let (cache_read, cache_write) = usage.billed_cache_tokens();
+    let (_, cache_write_1h) = usage.billed_cache_write_split();
     price_parts(
         usage.uncached_prompt_tokens().map(i64::from),
         usage.completion_tokens.map(i64::from),
         i64::from(cache_read),
         i64::from(cache_write),
+        i64::from(cache_write_1h),
         // A usage block that itemises no provider-side tool call carried none
         // this request could be charged for: those charges exist only where the
         // upstream itemises them (see `TokenUsage::billable_tool_calls`).
@@ -550,6 +562,8 @@ pub struct BilledTokens {
     pub uncached_input: i64,
     pub cache_read: i64,
     pub cache_write: i64,
+    /// Subset of `cache_write` billed at `cache_write_1h_price`.
+    pub cache_write_1h: i64,
     pub output: i64,
     /// Billable provider-side tool invocations. Not a token count; see
     /// `TokenUsage::billable_tool_calls`.
@@ -566,6 +580,7 @@ impl BilledTokens {
             uncached_input: prompt.saturating_sub(cache_read).saturating_sub(cache_write).max(0),
             cache_read,
             cache_write,
+            cache_write_1h: 0,
             output,
             server_tool_calls,
         }
@@ -578,6 +593,7 @@ pub fn cost_of(tokens: &BilledTokens, prices: &Prices) -> RequestCost {
         Some(tokens.output),
         tokens.cache_read,
         tokens.cache_write,
+        tokens.cache_write_1h,
         tokens.server_tool_calls,
         prices,
     )
@@ -604,6 +620,7 @@ fn price_parts(
     output: Option<i64>,
     cache_read: i64,
     cache_write: i64,
+    cache_write_1h: i64,
     server_tool_calls: i64,
     prices: &Prices,
 ) -> RequestCost {
@@ -616,21 +633,23 @@ fn price_parts(
     // rate either, the cache rate is as unknown as the input one.
     let read_price = prices.cache_read_price.as_ref().or(prices.input_price.as_ref());
     // Anthropic charges 1.25x input for a five-minute cache entry and 2x for an
-    // hour. A blank column means this upstream charges no premium, which is true
-    // of every provider except that one — and the same reading every row written
-    // before migration 30 already had.
+    // hour. A blank 5m column means this upstream charges no premium, while a
+    // positive 1h write count with a blank `cache_write_1h_price` is a real
+    // pricing gap rather than guessing the 5m or base rate.
     let write_price = prices.cache_write_price.as_ref().or(prices.input_price.as_ref());
+    let write_1h = cache_write_1h.max(0).min(cache_write.max(0));
+    let write_5m = cache_write.max(0).saturating_sub(write_1h);
 
     let input = priced(uncached_input, prices.input_price.as_ref(), &per_million);
     let output = priced(output, prices.output_price.as_ref(), &per_million);
-    // Both cache legs report under one heading because the breakdown has three
-    // slots and "input" there means the part that paid full price. Splitting
-    // writes out would need a fourth slot to say something nobody can act on.
+    // All cache legs report under one heading because the breakdown has three
+    // slots and "input" there means the part that paid full price.
     let cache = match (
         priced(Some(cache_read), read_price, &per_million),
-        priced(Some(cache_write), write_price, &per_million),
+        priced(Some(write_5m), write_price, &per_million),
+        priced(Some(write_1h), prices.cache_write_1h_price.as_ref(), &per_million),
     ) {
-        (Some(read), Some(write)) => Some(read + write),
+        (Some(read), Some(write_5m), Some(write_1h)) => Some(read + write_5m + write_1h),
         _ => None,
     };
     // Per *thousand*, not per million: that is the unit the upstreams publish an
@@ -715,6 +734,8 @@ mod pricing_tests {
             output_price: output.map(decimal),
             cache_read_price: cache.map(decimal),
             cache_write_price: cache_write.map(decimal),
+            cache_write_1h_price: None,
+            cache_ttl: None,
             pricing_tiers: None,
             server_tools: None,
             server_tool_price: None,
@@ -730,6 +751,7 @@ mod pricing_tests {
             total_tokens: Some(2_000_000),
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             billable_tool_calls: None,
         };
         let config = mock_config(Some("15"), Some("60"), None);
@@ -757,6 +779,7 @@ mod pricing_tests {
             total_tokens: None,
             cache_read_tokens: Some(900_000),
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             billable_tool_calls: None,
         };
         let config = mock_config(Some("15"), Some("60"), Some("1.5"));
@@ -774,6 +797,7 @@ mod pricing_tests {
             total_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: Some(100_000),
+            cache_write_1h_tokens: None,
             billable_tool_calls: None,
         }
     }
@@ -803,6 +827,49 @@ mod pricing_tests {
         );
     }
 
+    #[test]
+    fn one_hour_cache_writes_are_billed_separately_from_five_minute_writes() {
+        let mut config = priced(Some("3"), Some("15"), Some("0.3"), Some("3.75"));
+        config.cache_write_1h_price = Some(decimal("6"));
+        let usage = TokenUsage {
+            prompt_tokens: Some(200_000),
+            completion_tokens: Some(0),
+            total_tokens: Some(200_000),
+            cache_read_tokens: None,
+            cache_write_tokens: Some(100_000),
+            cache_write_1h_tokens: Some(60_000),
+            billable_tool_calls: None,
+        };
+        let cost = compute_cost(&usage, &Prices::of(&config));
+        assert_eq!(cost.input_cost, decimal("0.3"), "100k uncached at 3/M");
+        // 40k 5m writes at 3.75/M (= 0.15) + 60k 1h writes at 6/M (= 0.36) = 0.51
+        assert_eq!(cost.cache_cost, decimal("0.51"));
+        assert_eq!(cost.total(), Some(decimal("0.81")));
+        assert!(cost.is_complete());
+    }
+
+    #[test]
+    fn one_hour_cache_writes_without_a_1h_price_report_a_cache_gap() {
+        let config = priced(Some("3"), Some("15"), Some("0.3"), Some("3.75"));
+        let usage = TokenUsage {
+            prompt_tokens: Some(100_000),
+            completion_tokens: Some(0),
+            total_tokens: Some(100_000),
+            cache_read_tokens: None,
+            cache_write_tokens: Some(100_000),
+            cache_write_1h_tokens: Some(60_000),
+            billable_tool_calls: None,
+        };
+        let cost = compute_cost(&usage, &Prices::of(&config));
+        assert!(cost.gaps.cache, "missing 1h cache write rate must be a gap");
+        assert_eq!(
+            cost.cache_cost,
+            Decimal::zero(),
+            "an incomplete cache leg reports zero known cache cost and flags gaps.cache"
+        );
+        assert_eq!(cost.total(), None);
+    }
+
     /// A provider contradicting itself must not produce a negative bill.
     #[test]
     fn an_over_reported_cache_count_cannot_produce_a_negative_bill() {
@@ -812,6 +879,7 @@ mod pricing_tests {
             total_tokens: None,
             cache_read_tokens: Some(9_999),
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             billable_tool_calls: None,
         };
         let config = mock_config(Some("15"), Some("60"), Some("1.5"));
@@ -833,7 +901,7 @@ mod pricing_tests {
     fn grok() -> EffectiveModelConfig {
         let mut config = priced(Some("2"), Some("6"), Some("0.5"), None);
         config.pricing_tiers = Some(
-            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":"1","cache_write_price":null}]"#.into(),
+            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":"1","cache_write_price":null,"cache_write_1h_price":null}]"#.into(),
         );
         config
     }
@@ -896,8 +964,8 @@ mod pricing_tests {
     fn the_highest_applicable_tier_is_the_one_that_applies() {
         let mut config = priced(Some("1"), Some("2"), None, None);
         config.pricing_tiers = Some(
-            r#"[{"min_prompt_tokens":1000000,"input_price":"9","output_price":"9","cache_read_price":null,"cache_write_price":null},
-                {"min_prompt_tokens":200000,"input_price":"3","output_price":"3","cache_read_price":null,"cache_write_price":null}]"#
+            r#"[{"min_prompt_tokens":1000000,"input_price":"9","output_price":"9","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null},
+                {"min_prompt_tokens":200000,"input_price":"3","output_price":"3","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null}]"#
                 .into(),
         );
         // Stored out of order on purpose: the reader sorts rather than trusting.
@@ -926,7 +994,7 @@ mod pricing_tests {
     fn a_tier_without_a_cache_rate_prices_reads_at_its_own_input() {
         let mut config = priced(Some("2"), Some("6"), Some("0.5"), None);
         config.pricing_tiers = Some(
-            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":null,"cache_write_price":null}]"#.into(),
+            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null}]"#.into(),
         );
         let usage = TokenUsage {
             prompt_tokens: Some(300_000),
@@ -945,11 +1013,12 @@ mod pricing_tests {
             "input_price": "4",
             "output_price": "12",
             "cache_read_price": null,
-            "cache_write_price": null
+            "cache_write_price": null,
+            "cache_write_1h_price": null
         }]);
         assert!(parse_tiers(Some(&complete.to_string())).is_ok());
 
-        for key in ["cache_read_price", "cache_write_price"] {
+        for key in ["cache_read_price", "cache_write_price", "cache_write_1h_price"] {
             let mut missing = complete.clone();
             missing[0].as_object_mut().unwrap().remove(key);
             assert!(
@@ -1037,6 +1106,7 @@ mod pricing_tests {
             total_tokens: Some(4625),
             cache_read_tokens: Some(1152),
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             billable_tool_calls: Some(1),
         };
 
@@ -1074,7 +1144,7 @@ mod pricing_tests {
         let mut config = priced(Some("2"), Some("6"), Some("0.5"), None);
         config.server_tool_price = Some(decimal("5"));
         config.pricing_tiers = Some(
-            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":null,"cache_write_price":null}]"#.into(),
+            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null}]"#.into(),
         );
 
         let long = Prices::for_prompt(&config, Some(250_000)).unwrap();
@@ -1111,7 +1181,7 @@ mod pricing_tests {
         let mut config = mock_config(None, None, None);
         config.server_tool_price = Some(decimal("15"));
         config.pricing_tiers = Some(
-            r#"[{"min_prompt_tokens":1,"input_price":"99","output_price":"99","cache_read_price":null,"cache_write_price":null}]"#.into(),
+            r#"[{"min_prompt_tokens":1,"input_price":"99","output_price":"99","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null}]"#.into(),
         );
 
         let pricing = TurnPricing::of(&config)
@@ -1228,7 +1298,7 @@ mod pricing_tests {
     fn tiers_alone_do_not_price_a_model_nobody_has_priced() {
         let mut config = priced(None, None, None, None);
         config.pricing_tiers = Some(
-            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":null,"cache_write_price":null}]"#.into(),
+            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null}]"#.into(),
         );
 
         let prices = Prices::for_prompt(&config, Some(500_000)).unwrap();
@@ -1242,9 +1312,9 @@ mod pricing_tests {
     #[test]
     fn a_negative_tier_rate_is_rejected() {
         for raw in [
-            r#"[{"min_prompt_tokens":200000,"input_price":"-4","output_price":"12","cache_read_price":null,"cache_write_price":null}]"#,
-            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"-12","cache_read_price":null,"cache_write_price":null}]"#,
-            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":"-1","cache_write_price":null}]"#,
+            r#"[{"min_prompt_tokens":200000,"input_price":"-4","output_price":"12","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null}]"#,
+            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"-12","cache_read_price":null,"cache_write_price":null,"cache_write_1h_price":null}]"#,
+            r#"[{"min_prompt_tokens":200000,"input_price":"4","output_price":"12","cache_read_price":"-1","cache_write_price":null,"cache_write_1h_price":null}]"#,
         ] {
             let mut config = priced(Some("2"), Some("6"), None, None);
             config.pricing_tiers = Some(raw.into());

@@ -1,4 +1,4 @@
-use super::{ChatParams, ProviderCapabilities, ServerToolKind, ThinkingStyle};
+use super::{ChatParams, PromptCacheTtl, ProviderCapabilities, ServerToolKind, ThinkingStyle};
 use crate::models::CanonicalModelEntry;
 use serde::Deserialize;
 
@@ -109,6 +109,15 @@ fn apply(base: &mut ProviderCapabilities, entry: &CanonicalModelEntry) {
     if let Some(v) = entry.responses_lite {
         base.responses_lite = v;
     }
+    if let Some(ref v) = entry.supported_cache_ttls {
+        base.supported_cache_ttls = v.clone();
+    }
+    if let Some(v) = entry.default_cache_ttl {
+        base.default_cache_ttl = Some(v);
+    }
+    if let Some(v) = entry.default_cache_ttl_secs {
+        base.default_cache_ttl_secs = Some(v);
+    }
 }
 
 fn find_longest_prefix_match(provider: &str, model: &str) -> Option<&'static CanonicalModelEntry> {
@@ -132,6 +141,9 @@ fn anthropic_default() -> ProviderCapabilities {
         max_output_tokens: Some(64_000),
         max_temperature: Some(1.0),
         thinking_style: ThinkingStyle::Budget,
+        supported_cache_ttls: vec![PromptCacheTtl::FiveMinutes, PromptCacheTtl::OneHour],
+        default_cache_ttl: Some(PromptCacheTtl::FiveMinutes),
+        default_cache_ttl_secs: Some(300),
         ..Default::default()
     }
 }
@@ -150,6 +162,7 @@ fn openai_responses_default() -> ProviderCapabilities {
         max_temperature: Some(2.0),
         thinking_style: ThinkingStyle::EffortOnly,
         supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+        default_cache_ttl_secs: Some(300),
         ..Default::default()
     }
 }
@@ -165,6 +178,7 @@ fn deepseek_default() -> ProviderCapabilities {
         max_temperature: Some(2.0),
         thinking_style: ThinkingStyle::ToggleOff,
         supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+        default_cache_ttl_secs: Some(300),
         ..Default::default()
     }
 }
@@ -197,6 +211,7 @@ fn xai_default() -> ProviderCapabilities {
         thinking_style: ThinkingStyle::EffortOnly,
         supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
         default_effort: Some("high".into()),
+        default_cache_ttl_secs: Some(300),
         ..Default::default()
     }
 }
@@ -297,6 +312,8 @@ pub fn resolve_on(
         caps.supports_temperature = false;
         caps.supports_top_p = false;
         caps.supports_fast = false;
+        caps.supported_cache_ttls.clear();
+        caps.default_cache_ttl = None;
     }
     caps
 }
@@ -318,6 +335,8 @@ pub fn resolve_on(
 pub fn narrow_to_codex_shape(caps: &mut ProviderCapabilities) {
     caps.supports_temperature = false;
     caps.supports_top_p = false;
+    caps.supported_cache_ttls.clear();
+    caps.default_cache_ttl = None;
 }
 
 /// Narrow a Google model's capabilities to what the selected wire adapter can
@@ -399,6 +418,12 @@ fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> 
     }
     if catalog_provider == "google" {
         narrow_to_google_wire(api_format, model, &mut caps);
+    }
+    if catalog_provider == "openai" && provider_type != "openai" {
+        // Third-party OpenAI-compatible relays may reject OpenAI's
+        // `prompt_cache_retention` parameter; keep it opt-in via overrides.
+        caps.supported_cache_ttls.clear();
+        caps.default_cache_ttl = None;
     }
     caps
 }
@@ -534,6 +559,9 @@ pub struct ProviderCapabilityOverrides {
     max_context_tokens: OverrideField<Option<u32>>,
     max_output_tokens: OverrideField<Option<u32>>,
     max_temperature: OverrideField<Option<f32>>,
+    supported_cache_ttls: OverrideField<Vec<PromptCacheTtl>>,
+    default_cache_ttl: OverrideField<Option<PromptCacheTtl>>,
+    default_cache_ttl_secs: OverrideField<Option<u32>>,
 }
 
 impl ProviderCapabilityOverrides {
@@ -577,6 +605,15 @@ impl ProviderCapabilityOverrides {
         {
             return Err("capability_overrides.max_temperature must be non-negative or null".into());
         }
+        if let OverrideField::Set(ttls) = &self.supported_cache_ttls {
+            let unique: std::collections::BTreeSet<PromptCacheTtl> = ttls.iter().copied().collect();
+            if unique.len() != ttls.len() {
+                return Err("capability_overrides.supported_cache_ttls cannot contain duplicates".into());
+            }
+        }
+        if matches!(self.default_cache_ttl_secs, OverrideField::Set(Some(0))) {
+            return Err("capability_overrides.default_cache_ttl_secs must be positive or null".into());
+        }
         Ok(())
     }
 }
@@ -617,6 +654,9 @@ pub fn apply_overrides(caps: &mut ProviderCapabilities, overrides: Option<&str>)
     apply_value!(max_context_tokens);
     apply_value!(max_output_tokens);
     apply_value!(max_temperature);
+    apply_value!(supported_cache_ttls);
+    apply_value!(default_cache_ttl);
+    apply_value!(default_cache_ttl_secs);
 
     if let OverrideField::Set(mut efforts) = patch.supported_efforts {
         efforts.sort_unstable();
@@ -633,6 +673,13 @@ pub fn apply_overrides(caps: &mut ProviderCapabilities, overrides: Option<&str>)
     {
         return Err(format!(
             "capability_overrides.default_effort '{default}' is not present in supported_efforts"
+        ));
+    }
+    if let Some(default) = updated.default_cache_ttl
+        && !updated.supported_cache_ttls.contains(&default)
+    {
+        return Err(format!(
+            "capability_overrides.default_cache_ttl '{default}' is not present in supported_cache_ttls"
         ));
     }
     *caps = updated;
@@ -764,6 +811,16 @@ pub fn filter_params(params: &mut ChatParams, caps: &ProviderCapabilities) -> Re
     }
     params.supports_remote_compaction = caps.supports_remote_compaction;
     params.responses_lite = caps.responses_lite;
+    if let Some(ttl) = params.cache_ttl
+        && !caps.supported_cache_ttls.contains(&ttl)
+    {
+        tracing::debug!(
+            model = %params.model,
+            requested = %ttl,
+            "requested prompt cache TTL is not supported by this model/protocol; falling back to model default"
+        );
+        params.cache_ttl = caps.default_cache_ttl;
+    }
     Ok(())
 }
 

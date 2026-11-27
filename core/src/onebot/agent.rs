@@ -435,6 +435,7 @@ pub(super) async fn oneshot_completion(
                         output_tokens: usage.completion_tokens,
                         cache_read_tokens: usage.cache_read_tokens,
                         cache_write_tokens: usage.cache_write_tokens,
+                        cache_write_1h_tokens: usage.cache_write_1h_tokens,
                         server_tool_calls: usage.billable_tool_calls,
                     },
                     peak_prompt_tokens: usage.prompt_tokens,
@@ -582,7 +583,8 @@ async fn headless_chat_inner(
         .map_err(|e| e.to_string())??;
 
     let resolved = resolve_provider_config(secrets, sea, assistant.as_ref()).await?;
-    let provider = provider::registry::create_provider(resolved.wire())?;
+    let provider: Arc<dyn crate::provider::ChatProvider> =
+        Arc::from(provider::registry::create_provider(resolved.wire())?);
     let crate::agent::ResolvedProvider {
         provider_type,
         model,
@@ -1037,6 +1039,28 @@ async fn headless_chat_inner(
         sender_names: &sender_names,
     });
 
+    let pricing = turn_params
+        .model_config
+        .as_ref()
+        .map(crate::agent::pricing::TurnPricing::of)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    let base_prices = pricing.as_ref().map(|p| p.base().clone());
+    let warm = turn_params
+        .cache_ttl_duration
+        .map(|ttl| crate::agent::cache_warmer::WarmSeed {
+            provider: Arc::clone(&provider),
+            db: sea.clone(),
+            ttl,
+            prices: base_prices.clone(),
+            provider_id: Some(provider_id.clone()),
+            provider_name: Some(provider_name.clone()),
+            model_id: Some(effective_model.clone()),
+            conversation_id: conversation_id.to_string(),
+            turn_id: turn_id.to_string(),
+        });
+
     let outcome = engine::run_turn(
         &engine::TurnServices {
             db: sea,
@@ -1065,13 +1089,13 @@ async fn headless_chat_inner(
             // Whatever the resolver landed on — there is no per-request picker
             // on this side, so this is the assistant's provider or the first
             // enabled one, and either way it is the endpoint that was called.
-            provider_id: Some(provider_id),
-            provider_name: Some(provider_name),
+            provider_id: Some(provider_id.clone()),
+            provider_name: Some(provider_name.clone()),
             parent_cursor,
             cancel: cancel.clone(),
             keep_recent,
             context_limit,
-            warm: None,
+            warm,
             // The declared permission and nothing else: no reach check, and no
             // standing yes to project edits — there is no project. The desktop
             // consults both. On the drift list. The open registry tools are the
@@ -1096,10 +1120,7 @@ async fn headless_chat_inner(
             }),
             interrupted,
             compaction: engine::CompactionPolicy::OneBot,
-            // A QQ turn accumulates tokens for the session summary and has
-            // nowhere to show a price. The bill for it is built from the audit
-            // rows like everyone else's, and those are tier-priced at write time.
-            pricing: None,
+            pricing,
         },
         engine::TurnPorts {
             emit,
@@ -1115,6 +1136,34 @@ async fn headless_chat_inner(
         },
     )
     .await;
+
+    // Arm the conversation-level idle cache timer when this round completed
+    // cleanly; a follow-up `TurnEnd::Continue` round in `handler.rs` cancels it
+    // immediately on entry.
+    if outcome.reply.is_ok()
+        && let (Some(services), Some(ttl), Some(snapshot)) = (
+            services,
+            turn_params.cache_ttl_duration,
+            outcome.progress.last_round.clone(),
+        )
+    {
+        let seed = crate::agent::cache_lifecycle::IdleCacheSeed::from_turn(
+            assistant.as_ref(),
+            turn_params.compact_threshold,
+            conversation_id.to_string(),
+            turn_id.to_string(),
+            Arc::clone(&provider),
+            Some(provider_id),
+            Some(provider_name),
+            effective_model,
+            base_prices,
+            ttl,
+            keep_recent,
+            context_limit,
+            snapshot,
+        );
+        services.cache_lifecycle.arm(services.clone(), seed);
+    }
 
     // Handed over whole, and before the reply is unwrapped: this is what the
     // caller closes the turn out with whatever became of the round, and a round
@@ -1209,6 +1258,7 @@ mod tests {
                 tool_outcome: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_write_1h_tokens: None,
                 server_tool_calls: None,
                 provider_name: None,
                 provider_state: None,

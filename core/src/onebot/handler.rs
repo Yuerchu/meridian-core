@@ -709,6 +709,10 @@ pub(super) async fn run_agent_turn(
     let mut reply_anchor = reply_to;
 
     loop {
+        // Cancel any pending idle warm / expiry compaction timer before this
+        // round touches the conversation.
+        state.services.cache_lifecycle.cancel(&conversation_id);
+
         // Rebuilt per round rather than hoisted, because the executor carries
         // this round's authority into its own defence-in-depth check. What
         // arrives *during* a round is the steering port's business instead —
@@ -812,6 +816,9 @@ pub(super) async fn run_agent_turn(
                     | crate::events::ChatStopReason::MaxTurnRequests
                     | crate::events::ChatStopReason::Refusal => (TurnStatus::Done, None),
                 };
+                if status != TurnStatus::Done {
+                    state.services.cache_lifecycle.cancel(&conversation_id);
+                }
                 crate::agent::turn_record::finish(&state.services.db, &turn_id, status, error).await;
                 return actions;
             }
@@ -1854,6 +1861,7 @@ async fn dispatch_new(
     };
 
     let reset = {
+        state.services.cache_lifecycle.cancel(&conversation_id);
         let mut sessions = state.sessions.lock().await;
         sessions
             .reset_conversation(
@@ -1923,6 +1931,7 @@ async fn dispatch_compact(
         Err(e) => return server_error_for_event(event, state, session_key, reply_to, &e).await,
     };
 
+    state.services.cache_lifecycle.cancel(&conversation_id);
     match crate::agent::do_compact(
         &state.services.db,
         secrets,

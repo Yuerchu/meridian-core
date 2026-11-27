@@ -246,6 +246,7 @@ pub(crate) struct GroupRow {
     pub(crate) output_price: Option<Decimal>,
     pub(crate) cache_read_price: Option<Decimal>,
     pub(crate) cache_write_price: Option<Decimal>,
+    pub(crate) cache_write_1h_price: Option<Decimal>,
     pub(crate) server_tool_price: Option<Decimal>,
     /// Grouped on, not just carried: the same model under the same rates can be
     /// billed two ways over its life — an API key today, a subscription
@@ -262,6 +263,8 @@ pub(crate) struct GroupRow {
     pub(crate) output_tokens: i64,
     pub(crate) cache_read_tokens: i64,
     pub(crate) cache_write_tokens: i64,
+    pub(crate) cache_write_1h_tokens: i64,
+    pub(crate) cache_write_1h_messages: i64,
     pub(crate) reported_input_tokens: i64,
     pub(crate) reported_input_cache_read_tokens: i64,
     pub(crate) cache_reported_input_tokens: i64,
@@ -451,6 +454,7 @@ impl UsageAccumulator {
             output: group.output_tokens,
             cache_read: group.cache_read_tokens,
             cache_write: group.cache_write_tokens,
+            cache_write_1h: group.cache_write_1h_tokens,
             server_tool_calls: group.server_tool_calls,
         };
         let cost = cost_of(&tokens, &resolved.prices);
@@ -460,13 +464,18 @@ impl UsageAccumulator {
         self.bucket.tool_cost += cost.tool_cost;
         self.bucket.total_cost += cost.total_cost;
 
+        let unpriced_1h_cache = if resolved.token_prices_known && cost.gaps.cache {
+            group.cache_write_1h_messages
+        } else {
+            0
+        };
         if resolved.token_prices_known {
             // Preserve each reported side independently. A provider is allowed
             // to send output without input (and vice versa); the known side is
             // still a useful lower bound, but the absent side is not zero.
             self.has_known_input_amount |= group.messages > group.missing_input_messages;
             self.has_known_output_amount |= group.messages > group.missing_output_messages;
-            self.has_known_cache_amount |= group.messages > group.missing_token_usage_messages;
+            self.has_known_cache_amount |= !cost.gaps.cache && group.messages > group.missing_token_usage_messages;
         } else if group.explicit_zero_messages > 0 {
             // Unknown rates still cannot change an explicitly reported all-zero
             // request. Keep that exact zero without treating a partial zero as
@@ -478,14 +487,14 @@ impl UsageAccumulator {
         self.has_priced_tool_calls |= group.server_tool_messages > 0 && resolved.prices.server_tool_price.is_some();
 
         let token_incomplete = if resolved.token_prices_known {
-            group.incomplete_token_usage_messages
+            group.incomplete_token_usage_messages.max(unpriced_1h_cache)
         } else {
             group.incomplete_or_positive_token_messages
         };
         if resolved.token_prices_known {
             self.unpriced_input_messages += group.missing_input_messages;
             self.unpriced_output_messages += group.missing_output_messages;
-            self.unpriced_cache_messages += group.missing_token_usage_messages;
+            self.unpriced_cache_messages += group.missing_token_usage_messages.max(unpriced_1h_cache);
         } else {
             self.unpriced_input_messages += group.unpriced_input_usage_messages;
             self.unpriced_output_messages += group.unpriced_output_usage_messages;
@@ -504,8 +513,8 @@ impl UsageAccumulator {
         // never once for tokens and again for tools.
         self.bucket.unpriced_messages +=
             match (resolved.token_prices_known, resolved.prices.server_tool_price.is_some()) {
-                (true, true) => group.incomplete_token_usage_messages,
-                (true, false) => group.incomplete_token_or_tool_messages,
+                (true, true) => group.incomplete_token_usage_messages.max(unpriced_1h_cache),
+                (true, false) => group.incomplete_token_or_tool_messages.max(unpriced_1h_cache),
                 (false, true) => group.incomplete_or_positive_token_messages,
                 (false, false) => group.unpriced_usage_messages,
             };
@@ -642,6 +651,7 @@ fn resolve(group: &GroupRow, current: &HashMap<(String, String), Prices>) -> Res
             output_price: Some(output),
             cache_read_price: group.cache_read_price.clone(),
             cache_write_price: group.cache_write_price.clone(),
+            cache_write_1h_price: group.cache_write_1h_price.clone(),
             server_tool_price: group.server_tool_price.clone(),
         }),
         _ => None,
@@ -964,6 +974,7 @@ async fn current_prices(db: &impl Snapshot) -> Result<HashMap<(String, String), 
                     output_price: config.output_price,
                     cache_read_price: config.cache_read_price,
                     cache_write_price: config.cache_write_price,
+                    cache_write_1h_price: config.cache_write_1h_price,
                     server_tool_price: config.server_tool_price,
                 },
             )
@@ -1026,6 +1037,7 @@ fn group_row(row: &QueryResult) -> Result<GroupRow, DbErr> {
         output_price: price("output_price")?,
         cache_read_price: price("cache_read_price")?,
         cache_write_price: price("cache_write_price")?,
+        cache_write_1h_price: price("cache_write_1h_price")?,
         server_tool_price: price("server_tool_price")?,
         billing_mode: text("billing_mode")?,
         messages: int("messages")?,
@@ -1034,6 +1046,8 @@ fn group_row(row: &QueryResult) -> Result<GroupRow, DbErr> {
         output_tokens: int("output_tokens")?,
         cache_read_tokens: int("cache_read_tokens")?,
         cache_write_tokens: int("cache_write_tokens")?,
+        cache_write_1h_tokens: int("cache_write_1h_tokens")?,
+        cache_write_1h_messages: int("cache_write_1h_messages")?,
         reported_input_tokens: int("reported_input_tokens")?,
         reported_input_cache_read_tokens: int("reported_input_cache_read_tokens")?,
         cache_reported_input_tokens: int("cache_reported_input_tokens")?,
@@ -1163,11 +1177,13 @@ mod tests {
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             created_at,
             input_price: None,
             output_price: None,
             cache_read_price: None,
             cache_write_price: None,
+            cache_write_1h_price: None,
             self_id: None,
             server_tool_calls: None,
             server_tool_price: None,

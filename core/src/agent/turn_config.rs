@@ -392,6 +392,10 @@ mod tests {
             thinking_budget: None,
             tool_preset_id: preset.map(str::to_string),
             auto_compact_enabled: crate::db::types::SqlBool::FALSE,
+            cache_ttl: None,
+            cache_expiry_policy: crate::agent::cache_warmer::CacheExpiryPolicy::Compact,
+            cache_max_warm_count: crate::agent::cache_warmer::DEFAULT_CACHE_MAX_WARM_COUNT,
+            cache_compact_min_tokens: crate::agent::cache_warmer::DEFAULT_CACHE_COMPACT_MIN_TOKENS,
             logical_model_id: None,
             deployment_id: None,
         }

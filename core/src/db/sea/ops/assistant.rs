@@ -91,6 +91,10 @@ pub(crate) mod tests {
             thinking_budget: None,
             tool_preset_id: None,
             auto_compact_enabled: SqlBool::FALSE,
+            cache_ttl: None,
+            cache_expiry_policy: crate::agent::cache_warmer::CacheExpiryPolicy::Compact,
+            cache_max_warm_count: crate::agent::cache_warmer::DEFAULT_CACHE_MAX_WARM_COUNT,
+            cache_compact_min_tokens: crate::agent::cache_warmer::DEFAULT_CACHE_COMPACT_MIN_TOKENS,
             logical_model_id: None,
             deployment_id: None,
         }

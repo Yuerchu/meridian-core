@@ -48,6 +48,9 @@ pub struct MessageUsage {
     /// Prompt tokens the upstream wrote into its cache, charged at a premium so
     /// later reads are cheap. Also a subset of `input_tokens`.
     pub cache_write_tokens: Option<i32>,
+    /// Subset of `cache_write_tokens` billed at the 1-hour extended cache write
+    /// rate (e.g. Anthropic's `ephemeral_1h_input_tokens`).
+    pub cache_write_1h_tokens: Option<i32>,
     /// Billable provider-side tool invocations — searches the upstream ran
     /// itself. Not a token count: charged per call, on top of the tokens.
     pub server_tool_calls: Option<i32>,

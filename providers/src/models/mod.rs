@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::capabilities::{CapabilityEffort, CapabilityVerbosity};
 use crate::protocols::find_protocol;
-use crate::{ProviderCapabilities, ServerToolKind, ThinkingStyle};
+use crate::{PromptCacheTtl, ProviderCapabilities, ServerToolKind, ThinkingStyle};
 use meridian_provider_sdk::domain::ProtocolCompliance;
 use meridian_provider_sdk::media::{MediaCategory, ReadableMime};
 
@@ -65,6 +65,9 @@ pub struct CanonicalModelEntry {
     pub server_tools: Option<Vec<ServerToolKind>>,
     pub supports_remote_compaction: Option<bool>,
     pub responses_lite: Option<bool>,
+    pub supported_cache_ttls: Option<Vec<PromptCacheTtl>>,
+    pub default_cache_ttl: Option<PromptCacheTtl>,
+    pub default_cache_ttl_secs: Option<u32>,
 }
 
 static FAMILIES: LazyLock<Vec<ModelFamilyCatalog>> = LazyLock::new(|| {

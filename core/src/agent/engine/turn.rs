@@ -399,6 +399,7 @@ fn row_usage(usage: Option<&crate::provider::TokenUsage>) -> MessageUsage {
             output_tokens: u.completion_tokens,
             cache_read_tokens: u.cache_read_tokens,
             cache_write_tokens: u.cache_write_tokens,
+            cache_write_1h_tokens: u.cache_write_1h_tokens,
             server_tool_calls: u.billable_tool_calls,
         },
         None => MessageUsage::default(),
@@ -464,6 +465,9 @@ pub struct TurnProgress {
     /// calls: a round that made three is still one step, and a round that made
     /// none still cost a request.
     pub steps: usize,
+    /// Snapshot of the last completed API round, handed back so the caller can
+    /// arm conversation-level idle cache warming or cache-expiry compaction.
+    pub last_round: Option<crate::agent::cache_lifecycle::CompletedRoundSnapshot>,
     /// The last row this turn wrote that is still on the active path.
     ///
     /// Not `message_id`. That is the last *assistant* row, and a turn's last
@@ -1019,6 +1023,25 @@ async fn run(
                 _ => Vec::new(),
             };
             if steered.is_empty() {
+                let mut last_assistant = ChatMessage::assistant(&result.text);
+                if !result.reasoning.is_empty() {
+                    last_assistant.reasoning_content = Some(result.reasoning.clone());
+                }
+                last_assistant.provider_state = result.provider_state.clone();
+                let prompt_tokens = result
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.prompt_tokens)
+                    .map(|t| t.max(0) as usize)
+                    .unwrap_or(budget.current_estimate);
+                progress.last_round = Some(crate::agent::cache_lifecycle::CompletedRoundSnapshot {
+                    params: params.clone(),
+                    warm_messages: chat_messages.clone(),
+                    last_assistant: Some(last_assistant),
+                    tools: tool_defs.clone(),
+                    prompt_tokens,
+                    message_id: assistant_msg_id.clone(),
+                });
                 break;
             }
             continuations += 1;

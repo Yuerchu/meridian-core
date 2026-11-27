@@ -122,6 +122,7 @@ pub enum CompactTrigger {
     Manual,
     Threshold,
     ApiError,
+    CacheExpiry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

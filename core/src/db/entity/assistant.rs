@@ -10,7 +10,11 @@
 
 use sea_orm::entity::prelude::*;
 
-use crate::db::types::{EpochMs, Json, SqlBool};
+use crate::agent::cache_warmer::CacheExpiryPolicy;
+use crate::db::types::{EpochMs, Json, SqlBool, text_enum_column};
+use crate::provider::PromptCacheTtl;
+
+text_enum_column!(CacheExpiryPolicy);
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "assistants")]
@@ -39,6 +43,10 @@ pub struct Model {
     pub auto_compact_enabled: SqlBool,
     pub logical_model_id: Option<String>,
     pub deployment_id: Option<String>,
+    pub cache_ttl: Option<PromptCacheTtl>,
+    pub cache_expiry_policy: CacheExpiryPolicy,
+    pub cache_max_warm_count: i32,
+    pub cache_compact_min_tokens: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -96,5 +104,9 @@ pub struct AssistantChangeset {
     pub auto_compact_enabled: Option<SqlBool>,
     pub logical_model_id: Option<Option<String>>,
     pub deployment_id: Option<Option<String>>,
+    pub cache_ttl: Option<Option<PromptCacheTtl>>,
+    pub cache_expiry_policy: Option<CacheExpiryPolicy>,
+    pub cache_max_warm_count: Option<i32>,
+    pub cache_compact_min_tokens: Option<i32>,
     pub updated_at: Option<EpochMs>,
 }

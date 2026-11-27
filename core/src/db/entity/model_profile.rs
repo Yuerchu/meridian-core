@@ -13,7 +13,7 @@ use sea_orm::entity::prelude::*;
 
 use crate::db::types::{EpochMs, SqlBool};
 use crate::decimal::Decimal;
-use crate::provider::{CapabilityDomain, RoutingPolicy};
+use crate::provider::{CapabilityDomain, PromptCacheTtl, RoutingPolicy};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "model_profiles")]
@@ -29,6 +29,8 @@ pub struct Model {
     pub output_price: Option<Decimal>,
     pub cache_read_price: Option<Decimal>,
     pub cache_write_price: Option<Decimal>,
+    pub cache_write_1h_price: Option<Decimal>,
+    pub cache_ttl: Option<PromptCacheTtl>,
     pub pricing_tiers: Option<String>,
     pub capability_overrides: Option<String>,
     pub created_at: EpochMs,
@@ -63,6 +65,8 @@ pub struct ModelProfileChangeset {
     pub output_price: Option<Decimal>,
     pub cache_read_price: Option<Decimal>,
     pub cache_write_price: Option<Decimal>,
+    pub cache_write_1h_price: Option<Decimal>,
+    pub cache_ttl: Option<PromptCacheTtl>,
     pub pricing_tiers: Option<String>,
     pub capability_overrides: Option<String>,
     pub updated_at: EpochMs,
@@ -81,6 +85,8 @@ impl ModelProfileChangeset {
             output_price: Set(self.output_price),
             cache_read_price: Set(self.cache_read_price),
             cache_write_price: Set(self.cache_write_price),
+            cache_write_1h_price: Set(self.cache_write_1h_price),
+            cache_ttl: Set(self.cache_ttl),
             pricing_tiers: Set(self.pricing_tiers),
             capability_overrides: Set(self.capability_overrides),
             updated_at: Set(self.updated_at),

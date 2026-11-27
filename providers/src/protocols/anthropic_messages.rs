@@ -9,8 +9,8 @@ use serde::de::IgnoredAny;
 use crate::dto::{ExtraIgnore, warn_extra_fields, warn_unknown_event};
 use crate::state::{ProviderState, ProviderStatePayload, ProviderStateProducer, ProviderStateUpdate};
 use crate::{
-    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, MessageContentPart, ProviderError,
-    ServerToolCall, ServerToolKind, StreamEvent, ThinkingStyle, TokenUsage, ToolCall, ToolDefinition,
+    AgentResponse, ChatMessage, ChatParams, ChatProvider, ChatStream, MessageContentPart, PromptCacheTtl,
+    ProviderError, ServerToolCall, ServerToolKind, StreamEvent, ThinkingStyle, TokenUsage, ToolCall, ToolDefinition,
 };
 use meridian_provider_sdk::client::{HttpTransport, Request, RequestBody, ReqwestTransport};
 
@@ -22,12 +22,16 @@ pub struct AnthropicMessagesProvider {
 /// Compatibility alias for callers migrating from `AnthropicProvider`.
 pub type AnthropicProvider = AnthropicMessagesProvider;
 
-/// The one cache marker this adapter places, on the system prompt and on the
-/// last block of the last message. Two of the four breakpoints the API allows;
-/// the rest of the prefix is covered by the second one moving forward each
-/// turn, which is what makes a long conversation's history hit.
-fn ephemeral() -> serde_json::Value {
-    serde_json::json!({ "type": "ephemeral" })
+/// The cache marker this adapter places on breakpoints.
+///
+/// The 5-minute default omits `ttl` so older Anthropic-compatible relays that
+/// predate the `ttl` property keep working without modification; 1-hour
+/// extended caching sends `"ttl": "1h"` explicitly.
+fn ephemeral(ttl: Option<PromptCacheTtl>) -> serde_json::Value {
+    match ttl {
+        Some(PromptCacheTtl::OneHour) => serde_json::json!({ "type": "ephemeral", "ttl": "1h" }),
+        _ => serde_json::json!({ "type": "ephemeral" }),
+    }
 }
 
 impl AnthropicMessagesProvider {
@@ -233,9 +237,9 @@ impl AnthropicMessagesProvider {
     /// Within a turn, the prefix up to here is what the next round repeats
     /// verbatim, so this is the marker that makes the tool loop cacheable rather
     /// than only the system prompt.
-    fn mark_last_block_cacheable(messages: &mut [serde_json::Value]) {
+    fn mark_last_block_cacheable(messages: &mut [serde_json::Value], ttl: Option<PromptCacheTtl>) {
         if let Some(last) = messages.last_mut() {
-            Self::mark_block_cacheable(last);
+            Self::mark_block_cacheable(last, ttl);
         }
     }
 
@@ -243,17 +247,17 @@ impl AnthropicMessagesProvider {
     /// promoted to one text block, since only a block can carry the marker.
     /// Idempotent: marking a message twice leaves one marker, which is what
     /// lets the "last user message" and "last message" breakpoints coincide.
-    fn mark_block_cacheable(message: &mut serde_json::Value) {
+    fn mark_block_cacheable(message: &mut serde_json::Value, ttl: Option<PromptCacheTtl>) {
         match message.get_mut("content") {
             Some(serde_json::Value::Array(blocks)) => {
                 if let Some(serde_json::Value::Object(block)) = blocks.last_mut() {
-                    block.insert("cache_control".into(), ephemeral());
+                    block.insert("cache_control".into(), ephemeral(ttl));
                 }
             }
             Some(serde_json::Value::String(text)) if !text.is_empty() => {
                 let text = std::mem::take(text);
                 message["content"] =
-                    serde_json::json!([{ "type": "text", "text": text, "cache_control": ephemeral() }]);
+                    serde_json::json!([{ "type": "text", "text": text, "cache_control": ephemeral(ttl) }]);
             }
             _ => {}
         }
@@ -309,9 +313,11 @@ impl AnthropicMessagesProvider {
         // last message the two markers land on the same block, once.
         let (mut wire_messages, last_user) = Self::serialize_messages_marking_user(messages, &params.model)?;
         if let Some(i) = last_user {
-            Self::mark_block_cacheable(&mut wire_messages[i]);
+            Self::mark_block_cacheable(&mut wire_messages[i], params.cache_ttl);
         }
-        Self::mark_last_block_cacheable(&mut wire_messages);
+        if !params.cache_read_only_tail {
+            Self::mark_last_block_cacheable(&mut wire_messages, params.cache_ttl);
+        }
 
         let mut body = serde_json::json!({
             "model": params.model,
@@ -374,7 +380,7 @@ impl AnthropicMessagesProvider {
             // the cache marker — and the system prompt is the front of the
             // prefix every turn repeats.
             body["system"] = serde_json::json!([
-                { "type": "text", "text": system, "cache_control": ephemeral() }
+                { "type": "text", "text": system, "cache_control": ephemeral(params.cache_ttl) }
             ]);
         }
         if let Some(ref effort) = params.thinking_effort {
@@ -414,7 +420,7 @@ impl AnthropicMessagesProvider {
             // prompt; without it the system breakpoint is the first one, and a
             // change there invalidates the tools with it.
             if let Some(last) = wire_tools.last_mut() {
-                last["cache_control"] = ephemeral();
+                last["cache_control"] = ephemeral(params.cache_ttl);
             }
             body["tools"] = serde_json::json!(wire_tools);
         }
@@ -624,10 +630,11 @@ impl AnthropicUsage {
 
 #[derive(Deserialize)]
 struct AnthropicCacheCreation {
-    #[serde(default, rename = "ephemeral_5m_input_tokens")]
-    _ephemeral_5m_input_tokens: IgnoredAny,
-    #[serde(default, rename = "ephemeral_1h_input_tokens")]
-    _ephemeral_1h_input_tokens: IgnoredAny,
+    #[serde(default)]
+    #[allow(dead_code)]
+    ephemeral_5m_input_tokens: Option<i32>,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: Option<i32>,
     #[serde(default, flatten)]
     extra: ExtraIgnore,
 }
@@ -732,6 +739,11 @@ pub(crate) fn normalise_anthropic_usage(u: &AnthropicUsage) -> TokenUsage {
         total_tokens: None,
         cache_read_tokens: u.cache_read_input_tokens,
         cache_write_tokens: u.cache_creation_input_tokens,
+        cache_write_1h_tokens: u
+            .cache_creation
+            .as_ref()
+            .and_then(|c| c.ephemeral_1h_input_tokens)
+            .filter(|count| *count > 0),
         // Web search and web fetch each carry a per-call charge on top of the
         // tokens. Only what was itemised counts; a usage block with no
         // `server_tool_use` said nothing rather than zero.
@@ -770,6 +782,7 @@ fn merge_stop_usage(prompt_side: Option<&TokenUsage>, delta: Option<&AnthropicUs
         usage.prompt_tokens = d.prompt_tokens;
         usage.cache_read_tokens = d.cache_read_tokens;
         usage.cache_write_tokens = d.cache_write_tokens;
+        usage.cache_write_1h_tokens = d.cache_write_1h_tokens;
     }
     // The server tool count is only known once the turn has finished
     // running them, which is the delta.
@@ -1685,10 +1698,115 @@ mod tests {
             "claude-test",
         )
         .unwrap();
-        AnthropicProvider::mark_last_block_cacheable(&mut messages);
+        AnthropicProvider::mark_last_block_cacheable(&mut messages, None);
         let blocks = messages[0]["content"].as_array().unwrap();
         assert!(blocks[0].get("cache_control").is_none());
         assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[1]["cache_control"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn one_hour_cache_ttl_writes_ttl_field_on_all_breakpoints() {
+        let model = "claude-opus-4-8";
+        let caps = crate::capabilities::resolve("anthropic", None, model);
+        let mut params = ChatParams {
+            model: model.into(),
+            max_tokens: Some(8_192),
+            cache_ttl: Some(PromptCacheTtl::OneHour),
+            ..Default::default()
+        };
+        crate::capabilities::filter_params(&mut params, &caps).unwrap();
+        let provider = AnthropicProvider::new("https://example.test", "k");
+        let tools = [ToolDefinition {
+            name: "echo".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let all = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "be brief".into(),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                tool_error: false,
+                provider_state: None,
+                origin: crate::MessageOrigin::Assistant,
+                sent_at: None,
+            },
+            ChatMessage::persisted_user("hello", 1_700_000_000_000, None),
+        ];
+        let req = provider.build_request(&all, Some(&tools), &params, false).unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body");
+        };
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[test]
+    fn forked_compaction_pins_last_user_breakpoint_and_skips_tail_write() {
+        let model = "claude-opus-4-8";
+        let params = ChatParams {
+            model: model.into(),
+            max_tokens: Some(8_192),
+            cache_ttl: Some(PromptCacheTtl::OneHour),
+            cache_read_only_tail: true,
+            ..Default::default()
+        };
+        let provider = AnthropicProvider::new("https://example.test", "k");
+        let all = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "be brief".into(),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                tool_error: false,
+                provider_state: None,
+                origin: crate::MessageOrigin::Assistant,
+                sent_at: None,
+            },
+            ChatMessage::persisted_user("hello", 1_700_000_000_000, None),
+            ChatMessage::assistant("hi there"),
+            ChatMessage::compact_instruction("summarize everything above"),
+        ];
+        let req = provider.build_request(&all, None, &params, false).unwrap();
+        let Some(RequestBody::Json(body)) = req.body else {
+            panic!("JSON body");
+        };
+        // Breakpoint stays on the persisted user message (index 0) with matching 1h ttl.
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        // Appended compact instruction (index 2) gets no cache_control so it does not trigger a throwaway write.
+        assert_eq!(body["messages"][2]["content"], "summarize everything above");
+    }
+
+    #[test]
+    fn anthropic_usage_splits_1h_cache_creation_tokens() {
+        let usage: AnthropicUsage = serde_json::from_str(
+            r#"{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":500,"cache_creation_input_tokens":400,
+                "cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":300}}"#,
+        )
+        .unwrap();
+        let norm = normalise_anthropic_usage(&usage);
+        assert_eq!(norm.prompt_tokens, Some(1000));
+        assert_eq!(norm.cache_read_tokens, Some(500));
+        assert_eq!(norm.cache_write_tokens, Some(400));
+        assert_eq!(norm.cache_write_1h_tokens, Some(300));
+        assert_eq!(norm.billed_cache_write_split(), (100, 300));
     }
 
     /// `body_for` with a conversation of one's own behind the system prompt.

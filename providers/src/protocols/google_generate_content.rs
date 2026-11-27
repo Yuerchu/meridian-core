@@ -729,6 +729,7 @@ impl GeminiUsage {
             total_tokens: self.total_token_count,
             cache_read_tokens: self.cached_content_token_count,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             billable_tool_calls: server_tool_calls.filter(|calls| *calls > 0),
         }
     }
