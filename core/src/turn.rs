@@ -915,7 +915,9 @@ mod tests {
                 .unwrap(),
         );
         drop(c.try_acquire_mutation("conv-2", "a delete").unwrap());
-        let _busy = c.try_acquire_turn_as("conv-3", TurnOrigin::Channel, "u".into()).unwrap();
+        let _busy = c
+            .try_acquire_turn_as("conv-3", TurnOrigin::Channel, "u".into())
+            .unwrap();
 
         assert!(c.unchanged_since(&seen), "none of that was about conv-1");
 

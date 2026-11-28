@@ -431,10 +431,7 @@ impl CoreSubAgentRunner {
             &tool_context,
         );
         let child_plugin_mixins = child_character.plugin_mixins.clone();
-        let config = match self
-            .build_config(assistant, sub_conversation_id, child_character)
-            .await
-        {
+        let config = match self.build_config(assistant, sub_conversation_id, child_character).await {
             Ok(c) => c,
             Err(e) => return engine::TurnOutcome::failed(e),
         };
@@ -869,7 +866,11 @@ mod tests {
             .build()
     }
 
-    async fn resolve_child(parent_character: &CharacterAssembly, child: assistant::Model, kind: SubAgentKind) -> TurnConfig {
+    async fn resolve_child(
+        parent_character: &CharacterAssembly,
+        child: assistant::Model,
+        kind: SubAgentKind,
+    ) -> TurnConfig {
         let db = crate::db::sea::sea_test_db().await;
         db.write(async |tx| crate::db::sea::ops::conversation::create(tx, "sub-1", None, None, None, 1).await)
             .await

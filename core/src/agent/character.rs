@@ -134,11 +134,7 @@ impl CharacterAssembly {
 
     /// Effective mode after enforcing that switchable modes require `PlanModeMixin`.
     pub fn effective_mode(&self) -> Modes {
-        if self.has_plan_mode() {
-            self.mode
-        } else {
-            Modes::Fixed
-        }
+        if self.has_plan_mode() { self.mode } else { Modes::Fixed }
     }
 
     /// The resolved [`CommandShell`] from [`BuiltinMixin::ShellExec`], if mounted.

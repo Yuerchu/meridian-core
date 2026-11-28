@@ -99,8 +99,7 @@ pub fn resolve_tool_policy(
     // and recorded in `approved_always_tools_json`. An explicit per-tool
     // `always` override already names the exact tool and passes directly.
     if merged_approval == ToolApprovalPolicy::Always && explicit_tool_approval != Some(ToolApprovalPolicy::Always) {
-        let acknowledged = approved_always_tools
-            .is_some_and(|list| list.iter().any(|name| name == tool_name));
+        let acknowledged = approved_always_tools.is_some_and(|list| list.iter().any(|name| name == tool_name));
         if !acknowledged {
             return ResolvedMcpToolPolicy {
                 scope,
@@ -137,8 +136,8 @@ pub async fn read_global_default(db: &impl Read) -> Result<McpToolPolicy, String
 
 /// Persist the global default [`McpToolPolicy`] into `preferences`.
 pub async fn write_global_default(tx: &WriteTx, policy: McpToolPolicy, now: EpochMs) -> Result<(), String> {
-    let encoded = serde_json::to_string(&policy)
-        .map_err(|e| format!("failed to encode `{MCP_DEFAULT_POLICY_PREF}`: {e}"))?;
+    let encoded =
+        serde_json::to_string(&policy).map_err(|e| format!("failed to encode `{MCP_DEFAULT_POLICY_PREF}`: {e}"))?;
     preference::set(tx, MCP_DEFAULT_POLICY_PREF, &encoded, now)
         .await
         .map_err(|e| format!("failed to write `{MCP_DEFAULT_POLICY_PREF}`: {e}"))
@@ -217,7 +216,12 @@ mod tests {
 
     #[test]
     fn policy_contracts_reject_unknown_fields() {
-        assert!(serde_json::from_str::<McpToolPolicy>(r#"{"scope":"local_only","loading":"deferred","approval":"request_approve","extra":1}"#).is_err());
+        assert!(
+            serde_json::from_str::<McpToolPolicy>(
+                r#"{"scope":"local_only","loading":"deferred","approval":"request_approve","extra":1}"#
+            )
+            .is_err()
+        );
         assert!(serde_json::from_str::<McpToolPolicyOverride>(r#"{"approval":"ask_human"}"#).is_err());
         assert!(serde_json::from_str::<McpToolPolicyOverride>(r#"{"approval":"request_approve"}"#).is_ok());
     }

@@ -110,8 +110,7 @@ impl OpenAIResponsesProvider {
         // OpenAI-compatible endpoint has never heard of an `additional_tools`
         // item — so the model's own flag is not enough to turn it on.
         let lite = self.codex_shape && params.responses_lite;
-        let native_tool_search =
-            !lite && params.deferred_tool_mode == crate::DeferredToolMode::ResponsesClientSearch;
+        let native_tool_search = !lite && params.deferred_tool_mode == crate::DeferredToolMode::ResponsesClientSearch;
         let (instructions, mut input) =
             serialize_responses_input_with_tool_search(messages, self.reasoning_replay(params), native_tool_search)?;
         if compaction == Compaction::Yes {
@@ -574,9 +573,10 @@ fn serialize_responses_input_with_tool_search(
                     if let Some(ref tool_calls) = m.tool_calls {
                         for tc in tool_calls {
                             if tc.name == crate::TOOL_SEARCH_CALL_SENTINEL && native_tool_search {
-                                let arguments: serde_json::Value = serde_json::from_str(&tc.arguments).map_err(|e| {
-                                    ProviderError::Parse(format!("invalid tool_search_call arguments JSON: {e}"))
-                                })?;
+                                let arguments: serde_json::Value =
+                                    serde_json::from_str(&tc.arguments).map_err(|e| {
+                                        ProviderError::Parse(format!("invalid tool_search_call arguments JSON: {e}"))
+                                    })?;
                                 input.push(serde_json::json!({
                                     "type": "tool_search_call",
                                     "call_id": tc.id,

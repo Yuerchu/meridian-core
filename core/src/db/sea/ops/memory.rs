@@ -218,7 +218,14 @@ pub async fn visible_user_memories(
     subject_scope_id: &str,
     ctx: &VisibilityCtx,
 ) -> Result<Vec<memory::Model>, DbErr> {
-    list_by_scopes(db, MemoryScope::ExternalSubject, &[subject_scope_id.to_string()], ctx, None).await
+    list_by_scopes(
+        db,
+        MemoryScope::ExternalSubject,
+        &[subject_scope_id.to_string()],
+        ctx,
+        None,
+    )
+    .await
 }
 
 /// Live or in the trash; `None` once purged.

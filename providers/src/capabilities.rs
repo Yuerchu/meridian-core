@@ -436,9 +436,12 @@ fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> 
             ("anthropic", None | Some("messages"), DeferredToolMode::AnthropicDeferred, _) => {
                 DeferredToolMode::AnthropicDeferred
             }
-            ("deepseek", Some("messages"), DeferredToolMode::ResponsesClientSearch | DeferredToolMode::AnthropicDeferred, _) => {
-                DeferredToolMode::AnthropicDeferred
-            }
+            (
+                "deepseek",
+                Some("messages"),
+                DeferredToolMode::ResponsesClientSearch | DeferredToolMode::AnthropicDeferred,
+                _,
+            ) => DeferredToolMode::AnthropicDeferred,
             (_, Some("responses"), DeferredToolMode::ResponsesClientSearch, false) => {
                 DeferredToolMode::ResponsesClientSearch
             }

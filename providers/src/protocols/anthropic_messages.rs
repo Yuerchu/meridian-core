@@ -509,8 +509,7 @@ impl AnthropicMessagesProvider {
             betas.push("advanced-tool-use-2025-11-20");
         }
         if !betas.is_empty() {
-            req.headers
-                .insert("anthropic-beta", betas.join(",").parse().unwrap());
+            req.headers.insert("anthropic-beta", betas.join(",").parse().unwrap());
         }
         req.body = Some(RequestBody::Json(body));
         Ok(req)
@@ -2511,9 +2510,7 @@ mod deferred_tool_tests {
             deferred_tool_names: vec!["mcp__luckin__order_coffee".into()],
             ..Default::default()
         };
-        let req = provider
-            .build_request(&messages, Some(&tools), &params, true)
-            .unwrap();
+        let req = provider.build_request(&messages, Some(&tools), &params, true).unwrap();
         assert!(
             req.headers.get("anthropic-beta").is_none(),
             "DeepSeek Anthropic must use client tool_reference, not Anthropic server beta"

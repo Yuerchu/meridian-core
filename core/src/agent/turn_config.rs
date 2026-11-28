@@ -309,7 +309,7 @@ mod tests {
 
     use super::*;
     use crate::agent::character::CharacterBase;
-    use crate::agent::hooks::{ToolMixin};
+    use crate::agent::hooks::ToolMixin;
     use crate::agent::mixins::BuiltinMixin;
     use crate::agent::modes::Modes;
     use crate::db::sea::cap::Db;

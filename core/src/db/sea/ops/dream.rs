@@ -237,10 +237,7 @@ pub async fn undo_pruned_memories(tx: &WriteTx, run_id: &str, now: EpochMs) -> R
     let Some(run) = get_run(tx, run_id).await? else {
         return Ok(Err(format!("dream run `{run_id}` was not found")));
     };
-    let ids = run
-        .pruned_memory_ids_json
-        .map(|j| j.0)
-        .unwrap_or_default();
+    let ids = run.pruned_memory_ids_json.map(|j| j.0).unwrap_or_default();
     if ids.is_empty() {
         return Ok(Ok(0));
     }
@@ -287,22 +284,26 @@ pub async fn gather_scope_messages(
     limit: usize,
 ) -> Result<Vec<message::Model>, DbErr> {
     let conv_ids: Vec<String> = match scope_type {
-        MemoryScope::Project => conversation::Entity::find()
-            .filter(conversation::Column::ProjectId.eq(scope_id))
-            .filter(conversation::Column::ParentConversationId.is_null())
-            .select_only()
-            .column(conversation::Column::Id)
-            .into_tuple()
-            .all(db.conn()?)
-            .await?,
-        MemoryScope::ClientGlobal => conversation::Entity::find()
-            .filter(conversation::Column::ProjectId.is_null())
-            .filter(conversation::Column::ParentConversationId.is_null())
-            .select_only()
-            .column(conversation::Column::Id)
-            .into_tuple()
-            .all(db.conn()?)
-            .await?,
+        MemoryScope::Project => {
+            conversation::Entity::find()
+                .filter(conversation::Column::ProjectId.eq(scope_id))
+                .filter(conversation::Column::ParentConversationId.is_null())
+                .select_only()
+                .column(conversation::Column::Id)
+                .into_tuple()
+                .all(db.conn()?)
+                .await?
+        }
+        MemoryScope::ClientGlobal => {
+            conversation::Entity::find()
+                .filter(conversation::Column::ProjectId.is_null())
+                .filter(conversation::Column::ParentConversationId.is_null())
+                .select_only()
+                .column(conversation::Column::Id)
+                .into_tuple()
+                .all(db.conn()?)
+                .await?
+        }
         MemoryScope::ChannelGlobal => {
             let channel_projects: Vec<String> = project::Entity::find()
                 .filter(project::Column::SourceType.ne("local"))

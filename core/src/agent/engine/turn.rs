@@ -1476,44 +1476,45 @@ async fn run(
             // Universal client dual-tool gateway (`call_tool`): unwrap into the
             // target tool call so it traverses the exact same authorization,
             // approval, redaction, MCP/plugin execution, and media pipeline.
-            let tc_cow: std::borrow::Cow<'_, crate::provider::ToolCall> = if deferred_session.is_gateway_call(&raw_tc.name) {
-                match crate::agent::deferred_tools::parse_gateway_call(&raw_tc.arguments) {
-                    Ok((target_name, target_arguments)) => std::borrow::Cow::Owned(crate::provider::ToolCall {
-                        id: raw_tc.id.clone(),
-                        name: target_name,
-                        arguments: target_arguments,
-                    }),
-                    Err(error) => {
-                        let text = format!("Error: {error}");
-                        announce(ChatStreamEvent::ToolResult {
-                            call_id: raw_tc.id.clone(),
-                            result: text.clone(),
-                            media: Vec::new(),
-                            outcome: ToolOutcome::Error,
-                            message_id: assistant_msg_id.clone(),
-                            conversation_id: conversation_id.clone(),
-                        })?;
-                        if let Some(id) = append_tool_result(
-                            pool,
-                            &conversation_id,
-                            &turn_id,
-                            &raw_tc.id,
-                            &text,
-                            2,
-                            "error",
-                            parent_cursor.as_deref(),
-                        )
-                        .await
-                        {
-                            parent_cursor = Some(id);
+            let tc_cow: std::borrow::Cow<'_, crate::provider::ToolCall> =
+                if deferred_session.is_gateway_call(&raw_tc.name) {
+                    match crate::agent::deferred_tools::parse_gateway_call(&raw_tc.arguments) {
+                        Ok((target_name, target_arguments)) => std::borrow::Cow::Owned(crate::provider::ToolCall {
+                            id: raw_tc.id.clone(),
+                            name: target_name,
+                            arguments: target_arguments,
+                        }),
+                        Err(error) => {
+                            let text = format!("Error: {error}");
+                            announce(ChatStreamEvent::ToolResult {
+                                call_id: raw_tc.id.clone(),
+                                result: text.clone(),
+                                media: Vec::new(),
+                                outcome: ToolOutcome::Error,
+                                message_id: assistant_msg_id.clone(),
+                                conversation_id: conversation_id.clone(),
+                            })?;
+                            if let Some(id) = append_tool_result(
+                                pool,
+                                &conversation_id,
+                                &turn_id,
+                                &raw_tc.id,
+                                &text,
+                                2,
+                                "error",
+                                parent_cursor.as_deref(),
+                            )
+                            .await
+                            {
+                                parent_cursor = Some(id);
+                            }
+                            chat_messages.push(ChatMessage::tool_error(&raw_tc.id, &text));
+                            continue;
                         }
-                        chat_messages.push(ChatMessage::tool_error(&raw_tc.id, &text));
-                        continue;
                     }
-                }
-            } else {
-                std::borrow::Cow::Borrowed(raw_tc)
-            };
+                } else {
+                    std::borrow::Cow::Borrowed(raw_tc)
+                };
             let tc: &crate::provider::ToolCall = tc_cow.as_ref();
 
             let allowed = offered.contains(&tc.name) && ports.authorizer.is_none_or(|auth| auth.allows(&tc.name));
@@ -1577,7 +1578,9 @@ async fn run(
                                     Err(e) => (format!("Error: {e}"), "error"),
                                 }
                             }
-                            Some(ApprovalDecision::Denied(reason)) => (tool_denial_message(reason.as_deref()), "denied"),
+                            Some(ApprovalDecision::Denied(reason)) => {
+                                (tool_denial_message(reason.as_deref()), "denied")
+                            }
                             _ => (UNANSWERED_APPROVAL.to_string(), "denied"),
                         }
                     }
@@ -4961,11 +4964,11 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_mixin_authorizer_and_turn_hooks_fire_in_order() {
-        use std::sync::Arc;
         use crate::agent::hooks::{
             DeclaredTool, MixinResolveContext, ToolApprovalPolicy, ToolAuthorizer, ToolCallOutcomeEvent,
             ToolMediaEvent, ToolMixin, TurnEndEvent, TurnHooks, TurnStartContext,
         };
+        use std::sync::Arc;
 
         struct DemoMixin;
         #[async_trait::async_trait]

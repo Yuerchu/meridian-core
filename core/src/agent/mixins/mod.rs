@@ -97,11 +97,7 @@ const DIAGNOSTICS_TOOLS: &[&str] = &["read_app_logs"];
 
 const MEDIA_GEN_TOOLS: &[&str] = &["generate_image", "generate_video"];
 
-const REDACTION_TOOLS: &[&str] = &[
-    "add_redaction_rule",
-    "list_redaction_rules",
-    "remove_redaction_rule",
-];
+const REDACTION_TOOLS: &[&str] = &["add_redaction_rule", "list_redaction_rules", "remove_redaction_rule"];
 
 const SUB_AGENT_TOOLS: &[&str] = &["run_agent"];
 
@@ -329,7 +325,10 @@ pub(crate) fn merge_declared(
         }
     }
     for tool in plugin_declared {
-        if let Some(pos) = out.iter().position(|existing| existing.definition.name == tool.definition.name) {
+        if let Some(pos) = out
+            .iter()
+            .position(|existing| existing.definition.name == tool.definition.name)
+        {
             out[pos] = tool;
         } else {
             seen.insert(tool.definition.name.clone());

@@ -887,25 +887,54 @@ impl ChatParams {
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    MessageStart { message_id: String },
-    Text { content: String },
-    Reasoning { content: String },
-    ProviderStateUpdate { update: state::ProviderStateUpdate },
-    ToolCallStart { index: usize, id: String, name: String },
-    ToolCallDelta { index: usize, arguments: String },
-    ToolCallDone { index: usize, arguments: String },
+    MessageStart {
+        message_id: String,
+    },
+    Text {
+        content: String,
+    },
+    Reasoning {
+        content: String,
+    },
+    ProviderStateUpdate {
+        update: state::ProviderStateUpdate,
+    },
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        index: usize,
+        arguments: String,
+    },
+    ToolCallDone {
+        index: usize,
+        arguments: String,
+    },
     /// Native client-executed tool search call emitted by OpenAI / DeepSeek Responses API.
     ToolSearchCall {
         id: String,
         call_id: String,
         arguments: String,
     },
-    CompactionResult { encrypted_content: String },
+    CompactionResult {
+        encrypted_content: String,
+    },
     ServerToolCall(ServerToolCall),
-    ResponseModel { model: String },
-    UsageUpdate { usage: TokenUsage },
-    Stop { reason: String, usage: Option<TokenUsage> },
-    Error { message: String },
+    ResponseModel {
+        model: String,
+    },
+    UsageUpdate {
+        usage: TokenUsage,
+    },
+    Stop {
+        reason: String,
+        usage: Option<TokenUsage>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -210,7 +210,18 @@ mod tests {
         let offered = default_offered(&["recall_memory", "list_memories", "read_app_logs"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         assert_eq!(segments.len(), 1);
         assert!(matches!(&segments[0], Segment::Parallel(v) if v.len() == 3));
@@ -230,7 +241,18 @@ mod tests {
         let offered = default_offered(&["recall_memory", "list_memories", "save_memory"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         // [recall, list] -> Parallel, [save] -> Serial, [recall] -> Parallel
         assert_eq!(segments.len(), 3);
@@ -248,7 +270,18 @@ mod tests {
         let offered = default_offered(&["save_memory", "delete_memory"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         assert_eq!(segments.len(), 2);
         assert!(matches!(&segments[0], Segment::Serial(_)));
@@ -264,7 +297,18 @@ mod tests {
         let offered = default_offered(&["mcp__server__tool", "recall_memory"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         assert_eq!(segments.len(), 2);
         assert!(matches!(&segments[0], Segment::Serial(tc) if tc.name == "mcp__server__tool"));
@@ -280,7 +324,18 @@ mod tests {
         let offered = default_offered(&["recall_memory", "ask_user", "list_memories"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         assert_eq!(segments.len(), 3);
         assert!(matches!(&segments[0], Segment::Parallel(_)));
@@ -297,7 +352,18 @@ mod tests {
         let offered = default_offered(&["recall_memory"]); // list_memories not offered
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         assert_eq!(segments.len(), 2);
         assert!(matches!(&segments[0], Segment::Parallel(v) if v.len() == 1));
@@ -313,7 +379,18 @@ mod tests {
         let offered = default_offered(&["recall_memory", "run_agent"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         assert_eq!(segments.len(), 2);
         assert!(matches!(&segments[0], Segment::Parallel(v) if v.len() == 1));
@@ -342,7 +419,18 @@ mod tests {
         let rule = ApprovalRule::ByReach { accept_edits: false };
         let fake = FakeSubAgents;
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), Some(&fake));
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            Some(&fake),
+        );
 
         // All three should be in one Parallel segment.
         assert_eq!(segments.len(), 1);
@@ -357,7 +445,18 @@ mod tests {
         let offered = default_offered(&[]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&calls, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &calls,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         assert!(segments.is_empty());
     }
@@ -371,7 +470,18 @@ mod tests {
         let offered = default_offered(&["recall_memory"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
+        let segments = partition_tool_calls(
+            &refs,
+            &reg,
+            &offered,
+            &ctx,
+            &rule,
+            None,
+            &[],
+            None,
+            default_mode(),
+            None,
+        );
 
         assert_eq!(segments.len(), 1);
         assert!(matches!(&segments[0], Segment::Parallel(v) if v.len() == 1));

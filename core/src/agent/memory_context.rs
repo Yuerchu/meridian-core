@@ -600,7 +600,14 @@ pub(crate) async fn load_memory_block(
         Vec::new()
     } else {
         layer_rows(
-            list_by_scopes(db, MemoryScope::ExternalSubject, &scope_ids, &req.subject_visibility, None).await,
+            list_by_scopes(
+                db,
+                MemoryScope::ExternalSubject,
+                &scope_ids,
+                &req.subject_visibility,
+                None,
+            )
+            .await,
             "subject",
         )?
     };
@@ -975,7 +982,14 @@ async fn delta_injection(
         }
         if !newcomers.is_empty() {
             rows.extend(layer_rows(
-                list_by_scopes(db, MemoryScope::ExternalSubject, &newcomers, &req.subject_visibility, None).await,
+                list_by_scopes(
+                    db,
+                    MemoryScope::ExternalSubject,
+                    &newcomers,
+                    &req.subject_visibility,
+                    None,
+                )
+                .await,
                 "newcomers",
             )?);
         }
@@ -1916,7 +1930,11 @@ mod tests {
 
         let block = block(
             conn,
-            &MemoryRequest::channel_group(None, vec![MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))], 8_000),
+            &MemoryRequest::channel_group(
+                None,
+                vec![MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))],
+                8_000,
+            ),
         )
         .await
         .unwrap();
@@ -1959,7 +1977,11 @@ mod tests {
 
         let block = block(
             conn,
-            &MemoryRequest::channel_group(None, vec![MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))], 8_000),
+            &MemoryRequest::channel_group(
+                None,
+                vec![MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))],
+                8_000,
+            ),
         )
         .await
         .unwrap();
@@ -1978,7 +2000,10 @@ mod tests {
     fn person_attributes_are_escaped() {
         let roster = roster_block(&MemoryRequest::channel_group(
             None,
-            vec![MemorySubjectRef::from_channel_user("channel", 5, Some(r#"a"<b>"#.into())).with_standing(Some(r#"own"er"#.into()), None)],
+            vec![
+                MemorySubjectRef::from_channel_user("channel", 5, Some(r#"a"<b>"#.into()))
+                    .with_standing(Some(r#"own"er"#.into()), None),
+            ],
             8_000,
         ))
         .unwrap();
@@ -2033,7 +2058,11 @@ mod tests {
         let conn = &db;
         let req = group_req(None, &[7], 8_000);
         let req = MemoryRequest {
-            subjects: vec![MemorySubjectRef::from_channel_user("channel", 7, Some("Newcomer".into()))],
+            subjects: vec![MemorySubjectRef::from_channel_user(
+                "channel",
+                7,
+                Some("Newcomer".into()),
+            )],
             ..req
         };
 
@@ -2074,7 +2103,8 @@ mod tests {
         let roster = roster_block(&MemoryRequest::channel_group(
             None,
             vec![
-                MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into())).with_standing(Some("".into()), Some("   ".into())),
+                MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))
+                    .with_standing(Some("".into()), Some("   ".into())),
             ],
             8_000,
         ))

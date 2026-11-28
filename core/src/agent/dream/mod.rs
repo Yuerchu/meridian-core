@@ -340,7 +340,12 @@ pub struct DreamProposal {
 /// Pluggable sink receiving Auto-Dream proposals that require operator review.
 #[async_trait::async_trait]
 pub trait ProposalSink: Send + Sync {
-    async fn propose(&self, tx: &WriteTx, proposal: DreamProposal, now: EpochMs) -> Result<memory_proposal::Model, sea_orm::DbErr>;
+    async fn propose(
+        &self,
+        tx: &WriteTx,
+        proposal: DreamProposal,
+        now: EpochMs,
+    ) -> Result<memory_proposal::Model, sea_orm::DbErr>;
 }
 
 /// Default SQLite proposal sink persisting into `memory_proposals`.
@@ -529,10 +534,7 @@ pub struct DreamConsolidationPlan {
 pub fn parse_consolidation_plan(raw: &str) -> Result<DreamConsolidationPlan, String> {
     let trimmed = raw.trim();
     let stripped = if let Some(rest) = trimmed.strip_prefix("```") {
-        let after_lang = rest
-            .split_once('\n')
-            .map(|(_, body)| body)
-            .unwrap_or(rest);
+        let after_lang = rest.split_once('\n').map(|(_, body)| body).unwrap_or(rest);
         after_lang.trim().strip_suffix("```").unwrap_or(after_lang).trim()
     } else {
         trimmed
@@ -683,7 +685,12 @@ pub struct DreamScheduler {
 
 impl DreamScheduler {
     pub fn new(db: Db, secrets: Arc<SecretsManager>) -> Self {
-        Self::with_hooks(db, secrets, Arc::new(SqliteDreamMessageSource), Arc::new(SqliteProposalSink))
+        Self::with_hooks(
+            db,
+            secrets,
+            Arc::new(SqliteDreamMessageSource),
+            Arc::new(SqliteProposalSink),
+        )
     }
 
     pub fn with_hooks(
@@ -724,7 +731,12 @@ impl DreamScheduler {
                     Some(&sel.provider_id),
                 )
                 .await
-                .map_err(|e| format!("Auto-Dream model `{}:{}` cannot be used: {e}", sel.provider_id, sel.model_id))?;
+                .map_err(|e| {
+                    format!(
+                        "Auto-Dream model `{}:{}` cannot be used: {e}",
+                        sel.provider_id, sel.model_id
+                    )
+                })?;
                 let turn = resolve_turn_params(
                     &self.db,
                     TurnParamsResolveRequest {
@@ -742,7 +754,12 @@ impl DreamScheduler {
                     },
                 )
                 .await
-                .map_err(|e| format!("Auto-Dream model `{}:{}` parameters failed: {e}", sel.provider_id, sel.model_id))?;
+                .map_err(|e| {
+                    format!(
+                        "Auto-Dream model `{}:{}` parameters failed: {e}",
+                        sel.provider_id, sel.model_id
+                    )
+                })?;
                 (resolved, turn)
             }
             None => match auxiliary::configured(&self.secrets, &self.db, CodexRequestKind::Background).await? {
@@ -814,7 +831,9 @@ impl DreamScheduler {
                 let run_id = run_id.clone();
                 let scope_id = scope_id_owned.clone();
                 let model_label = model_label.clone();
-                async move |tx| dream_ops::begin_run(tx, &run_id, scope_type, &scope_id, trigger, model_label, now).await
+                async move |tx| {
+                    dream_ops::begin_run(tx, &run_id, scope_type, &scope_id, trigger, model_label, now).await
+                }
             })
             .await
             .map_err(|e| e.to_string())?;
@@ -956,10 +975,7 @@ impl DreamScheduler {
                 server_tool_calls: usage.billable_tool_calls,
             };
             let peak = usage.prompt_tokens;
-            let anchor_msg = projected
-                .newest_message_id
-                .clone()
-                .unwrap_or_else(|| run_id.to_owned());
+            let anchor_msg = projected.newest_message_id.clone().unwrap_or_else(|| run_id.to_owned());
             let anchor_conv = projected
                 .anchor_conversation_id
                 .clone()
@@ -994,16 +1010,10 @@ impl DreamScheduler {
         let plan = parse_consolidation_plan(&response.text)?;
 
         // Phase 4 — Apply & Prune atomically in one write transaction.
-        let existing_by_id: HashMap<String, memory::Model> = existing_memories
-            .iter()
-            .cloned()
-            .map(|m| (m.id.clone(), m))
-            .collect();
-        let existing_by_key: HashMap<String, memory::Model> = existing_memories
-            .iter()
-            .cloned()
-            .map(|m| (m.key.clone(), m))
-            .collect();
+        let existing_by_id: HashMap<String, memory::Model> =
+            existing_memories.iter().cloned().map(|m| (m.id.clone(), m)).collect();
+        let existing_by_key: HashMap<String, memory::Model> =
+            existing_memories.iter().cloned().map(|m| (m.key.clone(), m)).collect();
 
         // Enforce scope + visibility protection before pruning: never touch
         // another scope and never prune `OwnerOnly` operator annotations.
@@ -1087,8 +1097,7 @@ impl DreamScheduler {
                         key: key.clone(),
                         content,
                         memory_type: op.memory_type,
-                        subject_scope_id: (scope_type == MemoryScope::ExternalSubject)
-                            .then(|| scope_id_copy.clone()),
+                        subject_scope_id: (scope_type == MemoryScope::ExternalSubject).then(|| scope_id_copy.clone()),
                         origin,
                         visibility: Visibility::Normal,
                         source_session_id: origin_session.clone(),
@@ -1099,7 +1108,9 @@ impl DreamScheduler {
                     };
                     match mem_ops::remember(tx, row).await? {
                         Ok(_) => {
-                            if existing.is_some() && !valid_prune_ids.iter().any(|id| existing.map(|e| &e.id) == Some(id)) {
+                            if existing.is_some()
+                                && !valid_prune_ids.iter().any(|id| existing.map(|e| &e.id) == Some(id))
+                            {
                                 updated += 1;
                             } else {
                                 created += 1;
@@ -1302,9 +1313,7 @@ mod tests {
     use crate::agent::memory_context::{MemoryRequest, persist_injection, plan_injection_async};
     use crate::db::sea::ops as sea_ops;
     use crate::db::sea::{execute_for_tests, sea_test_db};
-    use crate::provider::{
-        AgentResponse, ChatStream, ProviderCapabilities, ProviderError, TokenUsage, ToolDefinition,
-    };
+    use crate::provider::{AgentResponse, ChatStream, ProviderCapabilities, ProviderError, TokenUsage, ToolDefinition};
 
     struct MockDreamProvider {
         reply: String,
@@ -1320,11 +1329,7 @@ mod tests {
             ProviderCapabilities::default()
         }
 
-        async fn chat(
-            &self,
-            _messages: Vec<ChatMessage>,
-            _params: ChatParams,
-        ) -> Result<String, ProviderError> {
+        async fn chat(&self, _messages: Vec<ChatMessage>, _params: ChatParams) -> Result<String, ProviderError> {
             Ok(self.reply.clone())
         }
 
@@ -1463,23 +1468,11 @@ mod tests {
             AutoGateVerdict::SkipMinTurns
         );
         assert_eq!(
-            evaluate_auto_gates(
-                &cfg,
-                Some(t0),
-                6,
-                "0.5".parse().unwrap(),
-                t0 + 25 * HOUR_MS
-            ),
+            evaluate_auto_gates(&cfg, Some(t0), 6, "0.5".parse().unwrap(), t0 + 25 * HOUR_MS),
             AutoGateVerdict::SkipDailyBudget
         );
         assert_eq!(
-            evaluate_auto_gates(
-                &cfg,
-                Some(t0),
-                5,
-                "0.49".parse().unwrap(),
-                t0 + 24 * HOUR_MS
-            ),
+            evaluate_auto_gates(&cfg, Some(t0), 5, "0.49".parse().unwrap(), t0 + 24 * HOUR_MS),
             AutoGateVerdict::Run
         );
     }
@@ -1508,8 +1501,8 @@ mod tests {
             msg.schema_version = 2;
             sea_ops::message::append(tx, msg, None).await?;
 
-            let mk = |id: &str, scope: MemoryScope, sid: &str, key: &str, content: &str, vis: Visibility| {
-                memory::Model {
+            let mk =
+                |id: &str, scope: MemoryScope, sid: &str, key: &str, content: &str, vis: Visibility| memory::Model {
                     id: id.into(),
                     scope_type: scope,
                     scope_id: sid.into(),
@@ -1524,11 +1517,46 @@ mod tests {
                     deleted_by: None,
                     created_at: t_base,
                     updated_at: t_base,
-                }
-            };
-            mem_ops::remember(tx, mk("mem-stale", MemoryScope::Project, "proj-1", "pkg", "Uses npm", Visibility::Normal)).await?.unwrap();
-            mem_ops::remember(tx, mk("mem-owner", MemoryScope::Project, "proj-1", "secret-note", "Operator note", Visibility::OwnerOnly)).await?.unwrap();
-            mem_ops::remember(tx, mk("mem-other", MemoryScope::ClientGlobal, GLOBAL_SCOPE_ID, "global-key", "Global", Visibility::Normal)).await?.unwrap();
+                };
+            mem_ops::remember(
+                tx,
+                mk(
+                    "mem-stale",
+                    MemoryScope::Project,
+                    "proj-1",
+                    "pkg",
+                    "Uses npm",
+                    Visibility::Normal,
+                ),
+            )
+            .await?
+            .unwrap();
+            mem_ops::remember(
+                tx,
+                mk(
+                    "mem-owner",
+                    MemoryScope::Project,
+                    "proj-1",
+                    "secret-note",
+                    "Operator note",
+                    Visibility::OwnerOnly,
+                ),
+            )
+            .await?
+            .unwrap();
+            mem_ops::remember(
+                tx,
+                mk(
+                    "mem-other",
+                    MemoryScope::ClientGlobal,
+                    GLOBAL_SCOPE_ID,
+                    "global-key",
+                    "Global",
+                    Visibility::Normal,
+                ),
+            )
+            .await?
+            .unwrap();
             Ok::<_, sea_orm::DbErr>(())
         })
         .await
@@ -1544,7 +1572,10 @@ mod tests {
         let ctx_id = persist_injection(&db, &turn1, "conv-1", "turn-1", Some("msg-1".into()), t_base + 500)
             .await
             .expect("persisted frozen context row");
-        assert_ne!(ctx_id, "msg-1", "persist_injection must insert a real frozen context row");
+        assert_ne!(
+            ctx_id, "msg-1",
+            "persist_injection must insert a real frozen context row"
+        );
         let ctx_row = sea_ops::message::get(&db, &ctx_id).await.unwrap().unwrap();
         assert_eq!(ctx_row.role, "context");
         let history = vec![ctx_row];
@@ -1603,8 +1634,22 @@ mod tests {
         let stale = mem_ops::get(&db, "mem-stale").await.unwrap().unwrap();
         assert_eq!(stale.deleted_by, Some(DeletedBy::Dream));
         assert!(stale.deleted_at.is_some());
-        assert!(mem_ops::get(&db, "mem-owner").await.unwrap().unwrap().deleted_at.is_none());
-        assert!(mem_ops::get(&db, "mem-other").await.unwrap().unwrap().deleted_at.is_none());
+        assert!(
+            mem_ops::get(&db, "mem-owner")
+                .await
+                .unwrap()
+                .unwrap()
+                .deleted_at
+                .is_none()
+        );
+        assert!(
+            mem_ops::get(&db, "mem-other")
+                .await
+                .unwrap()
+                .unwrap()
+                .deleted_at
+                .is_none()
+        );
 
         // Verify audit ledger recorded the side request under `DREAM_ROLE`.
         let recent_audit = audit::list_recent(&db, 5).await.unwrap();
@@ -1693,7 +1738,10 @@ mod tests {
 
         assert_eq!(run.status, DreamRunStatus::Done);
         assert_eq!(run.memories_created, 0, "ChannelGlobal must not write directly");
-        assert_eq!(run.proposals_created, 1, "ChannelGlobal upserts must route to proposals");
+        assert_eq!(
+            run.proposals_created, 1,
+            "ChannelGlobal upserts must route to proposals"
+        );
         let pending = mem_ops::list_proposals(&db, true).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].key, "no-politics");

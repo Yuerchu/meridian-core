@@ -553,10 +553,7 @@ pub fn resolve_sticker_parts_in_messages(messages: &mut [ChatMessage]) -> Result
         let mut changed = false;
         let mut provider_parts = Vec::with_capacity(parts.len());
         for part in parts {
-            let provider::MessageContentPart::Sticker {
-                name, seen_as, ..
-            } = part
-            else {
+            let provider::MessageContentPart::Sticker { name, seen_as, .. } = part else {
                 provider_parts.push(part);
                 continue;
             };

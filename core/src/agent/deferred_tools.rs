@@ -290,7 +290,8 @@ impl DeferredToolSession {
         let mode = match params.deferred_tool_mode {
             DeferredToolMode::AnthropicDeferred => {
                 let is_deepseek = params.model.to_ascii_lowercase().starts_with("deepseek");
-                if is_deepseek || params.anthropic_tool_search_strategy == AnthropicToolSearchStrategy::ClientToolReference
+                if is_deepseek
+                    || params.anthropic_tool_search_strategy == AnthropicToolSearchStrategy::ClientToolReference
                 {
                     DisclosureMode::AnthropicClientReference
                 } else {
@@ -399,7 +400,10 @@ impl DeferredToolSession {
             )];
             for tool in &matched {
                 let schema = serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".into());
-                lines.push(format!("- `{}`: {}\n  parameters: {}", tool.name, tool.description, schema));
+                lines.push(format!(
+                    "- `{}`: {}\n  parameters: {}",
+                    tool.name, tool.description, schema
+                ));
             }
             lines.join("\n")
         } else {
@@ -537,7 +541,10 @@ mod tests {
     fn bm25_ranks_matching_mcp_tool_first_and_respects_authorizer() {
         let index = Bm25ToolIndex::build(vec![
             def("mcp__github__create_issue", "Create a GitHub issue in a repository"),
-            def("mcp__luckin__order_coffee", "Order a cup of Luckin coffee with sugar level"),
+            def(
+                "mcp__luckin__order_coffee",
+                "Order a cup of Luckin coffee with sugar level",
+            ),
             def("mcp__fetch__get_url", "Fetch the contents of a web URL"),
         ]);
 
@@ -555,7 +562,10 @@ mod tests {
         let deferred: HashSet<String> = ["mcp__luckin__order_coffee".to_string()].into_iter().collect();
 
         // 1. Anthropic server BM25 (default for Claude)
-        let mut defs = vec![def("read_file", "Read a file"), def("mcp__luckin__order_coffee", "Order coffee")];
+        let mut defs = vec![
+            def("read_file", "Read a file"),
+            def("mcp__luckin__order_coffee", "Order coffee"),
+        ];
         let mut params = ChatParams {
             model: "claude-sonnet-4-6".into(),
             deferred_tool_mode: DeferredToolMode::AnthropicDeferred,
@@ -568,7 +578,10 @@ mod tests {
         assert!(!defs.iter().any(|d| d.name == SEARCH_TOOLS_NAME));
 
         // 2. Anthropic client tool_reference (DeepSeek Anthropic or user override)
-        let mut defs = vec![def("read_file", "Read a file"), def("mcp__luckin__order_coffee", "Order coffee")];
+        let mut defs = vec![
+            def("read_file", "Read a file"),
+            def("mcp__luckin__order_coffee", "Order coffee"),
+        ];
         let mut params = ChatParams {
             model: "deepseek-v4-flash".into(),
             deferred_tool_mode: DeferredToolMode::AnthropicDeferred,
@@ -581,7 +594,10 @@ mod tests {
         assert!(!defs.iter().any(|d| d.name == CALL_TOOL_NAME));
 
         // 3. Responses client search
-        let mut defs = vec![def("read_file", "Read a file"), def("mcp__luckin__order_coffee", "Order coffee")];
+        let mut defs = vec![
+            def("read_file", "Read a file"),
+            def("mcp__luckin__order_coffee", "Order coffee"),
+        ];
         let mut params = ChatParams {
             model: "gpt-5.4".into(),
             deferred_tool_mode: DeferredToolMode::ResponsesClientSearch,
@@ -593,7 +609,10 @@ mod tests {
         assert!(session.is_search_call(TOOL_SEARCH_CALL_SENTINEL));
 
         // 4. Fallback universal client dual-tool gateway (Chat Completions / deepseek-v4-pro)
-        let mut defs = vec![def("read_file", "Read a file"), def("mcp__luckin__order_coffee", "Order coffee")];
+        let mut defs = vec![
+            def("read_file", "Read a file"),
+            def("mcp__luckin__order_coffee", "Order coffee"),
+        ];
         let mut params = ChatParams {
             model: "deepseek-v4-pro".into(),
             deferred_tool_mode: DeferredToolMode::None,
@@ -612,7 +631,8 @@ mod tests {
 
     #[test]
     fn parse_gateway_call_validates_strict_shape() {
-        let (name, args) = parse_gateway_call(r#"{"name":"mcp__fetch__get","arguments":{"url":"https://a.test"}}"#).unwrap();
+        let (name, args) =
+            parse_gateway_call(r#"{"name":"mcp__fetch__get","arguments":{"url":"https://a.test"}}"#).unwrap();
         assert_eq!(name, "mcp__fetch__get");
         assert_eq!(args, r#"{"url":"https://a.test"}"#);
 

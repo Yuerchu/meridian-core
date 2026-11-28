@@ -344,7 +344,12 @@ mod tests {
         check::<Origin>("origin");
         check::<Visibility>("visibility");
         check::<MemoryType>("type");
-        for by in [DeletedBy::SelfRemoved, DeletedBy::Admin, DeletedBy::Lru, DeletedBy::Dream] {
+        for by in [
+            DeletedBy::SelfRemoved,
+            DeletedBy::Admin,
+            DeletedBy::Lru,
+            DeletedBy::Dream,
+        ] {
             assert_eq!(serde_json::to_value(by).unwrap().as_str(), Some(by.as_str()));
             assert_eq!(DeletedBy::parse(by.as_str()).unwrap(), by);
         }
