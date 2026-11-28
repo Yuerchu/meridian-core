@@ -50,10 +50,10 @@ serde = { version = "1", features = ["derive"] }
 # f64 in between. Moonshot's balance endpoint is the case — see
 # `provider::balance`.
 serde_json = { version = "1", features = ["raw_value"] }
-# Every monetary value crosses Rust, SQLite and IPC as an exact base-10
-# number. SQLite stores the canonical string representation; the wrapper in
-# `decimal.rs` supplies the Diesel and SeaORM Text mappings and strict string-only serde.
-bigdecimal = "0.4.10"
+# Every monetary value crosses Rust, SQLite/Postgres and IPC as an exact base-10
+# number via `meridian-decimal` (re-exported through `meridian-provider-sdk` and
+# `meridian_core::decimal`).
+meridian-decimal = { path = "../decimal", features = ["sea-orm"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-webpki-roots"], default-features = false }

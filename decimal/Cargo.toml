@@ -1,0 +1,26 @@
+[package]
+name = "meridian-decimal"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Exact NUMERIC(38, 18) decimal boundary type with strict canonical string serde and optional SeaORM TEXT mapping."
+repository = "https://github.com/Yuerchu/meridian-core"
+authors = ["于小丘 Yuerchu <admin@yuxiaoqiu.cn>"]
+
+[lib]
+name = "meridian_decimal"
+
+[features]
+default = []
+# Optional SeaORM TEXT mapping for `Decimal`. Enabled only by `meridian-core`
+# (via `meridian-provider-sdk/sea-orm`); standalone ledger or provider crates
+# can depend on `meridian-decimal` without pulling in SeaORM.
+sea-orm = ["dep:sea-orm"]
+
+[dependencies]
+bigdecimal = "0.4.10"
+serde = { version = "1", features = ["derive"] }
+sea-orm = { version = "2.0.4", default-features = false, optional = true }
+
+[dev-dependencies]
+serde_json = "1"

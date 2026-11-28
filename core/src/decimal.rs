@@ -1,4 +1,4 @@
-//! Re-export of the exact-decimal boundary type from `meridian-provider-sdk`
+//! Re-export of the exact-decimal boundary type from `meridian-decimal`
 //! (with SeaORM TEXT mappings enabled via the `sea-orm` feature).
 
-pub use meridian_provider_sdk::decimal::*;
+pub use meridian_decimal::*;
