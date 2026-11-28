@@ -79,3 +79,45 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  postgres:
+    runs-on: ubuntu-latest
+    name: Test (postgres)
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: probe
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: test-postgres
+          cache-directories: |
+            target/sherpa-onnx-prebuilt
+            target/tests/trybuild/sherpa-onnx-prebuilt
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+      - name: Drop a half-restored sherpa-onnx unpack
+        shell: bash
+        run: bash .github/scripts/require-sherpa-libs.sh
+      - name: Clippy (postgres)
+        run: cargo clippy -p meridian-core --all-targets --features postgres -- -D warnings
+      - name: Postgres ops, agent and registered SQL tests
+        env:
+          MERIDIAN_PG_URL: postgres://postgres:probe@localhost:5432/postgres
+        # After `--`, libtest accepts all four filters. In particular db::sql
+        # owns the dialect and query-plan gates; omitting it would leave the
+        # very tests this job exists for running on the SQLite leg only.
+        run: cargo test -p meridian-core --features postgres --lib -- db::sea::ops agent:: db::sql db::sea::migration::pg

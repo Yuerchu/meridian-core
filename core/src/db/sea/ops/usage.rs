@@ -94,8 +94,11 @@ impl UsageDimension {
     /// statement in `db/sql.rs` groups by, and the tests there hold the two
     /// together. The statements are literals; nothing a caller supplies is
     /// ever spliced in — everything is bound.
+    /// Only the calendar dimensions differ per backend: `strftime` is
+    /// SQLite's and `to_char` is PostgreSQL's, and neither has the other.
     #[cfg(test)]
-    pub(crate) fn key_expr(self) -> &'static str {
+    pub(crate) fn key_expr(self, backend: sea_orm::DbBackend) -> &'static str {
+        let postgres = matches!(backend, sea_orm::DbBackend::Postgres);
         match self {
             UsageDimension::Total => "''",
             // The name as it was at the time, because that is what the row
@@ -111,6 +114,14 @@ impl UsageDimension {
             // Local time, not UTC. A day boundary eight hours off puts an
             // evening's work under the wrong date, which is immediately visible
             // and reads as the numbers being wrong rather than the grouping.
+            //
+            // "Local" is the session's zone on both backends: SQLite's
+            // `localtime` reads the process zone, and `to_char` of a
+            // `timestamptz` renders in the connection's `TimeZone`. Serving
+            // someone in another zone is that connection's setting, not a
+            // value this statement binds.
+            UsageDimension::Day if postgres => "to_char(to_timestamp(created_at / 1000), 'YYYY-MM-DD')",
+            UsageDimension::Hour if postgres => "to_char(to_timestamp(created_at / 1000), 'YYYY-MM-DD\"T\"HH24')",
             UsageDimension::Day => "strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime')",
             UsageDimension::Hour => "strftime('%Y-%m-%dT%H', created_at / 1000, 'unixepoch', 'localtime')",
             UsageDimension::Kind => "role",

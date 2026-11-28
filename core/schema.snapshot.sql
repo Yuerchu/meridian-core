@@ -46,7 +46,7 @@ CREATE TABLE "mode_artifacts" ( "id" text NOT NULL PRIMARY KEY, "conversation_id
 
 CREATE TABLE "mcp_servers" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, "transport_type" text NOT NULL DEFAULT 'stdio', "command" text, "args" text, "env" text, "url" text, "headers" text, "is_enabled" integer NOT NULL DEFAULT 0, "sort_order" integer NOT NULL DEFAULT 0, "created_at" integer NOT NULL, "updated_at" integer NOT NULL , disabled_tools TEXT NOT NULL DEFAULT '[]', default_policy_json TEXT, tool_policies_json TEXT, approved_always_tools_json TEXT);
 
-CREATE TABLE "turns" ( "id" text NOT NULL PRIMARY KEY, "conversation_id" text NOT NULL, "origin" text NOT NULL, "status" text NOT NULL, "phase" text, "phase_tool" text, "error" text, "started_at" integer NOT NULL, "updated_at" integer NOT NULL, "ended_at" integer, "reported_at" integer, "parent_reported_at" integer, "self_id" integer, "trigger" text NOT NULL DEFAULT 'user', "trigger_ref" text, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE CASCADE, CHECK (trigger IN ('user', 'plan_continuation', 'task_completion', 'agent_autonomous')) );
+CREATE TABLE "turns" ( "id" text NOT NULL PRIMARY KEY, "conversation_id" text NOT NULL, "origin" text NOT NULL, "status" text NOT NULL, "phase" text, "phase_tool" text, "error" text, "started_at" integer NOT NULL, "updated_at" integer NOT NULL, "ended_at" integer, "reported_at" integer, "parent_reported_at" integer, "self_id" integer, "trigger" text NOT NULL DEFAULT 'user', "trigger_ref" text, seq INTEGER NOT NULL DEFAULT 0, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE CASCADE, CHECK (trigger IN ('user', 'plan_continuation', 'task_completion', 'agent_autonomous')) );
 
 CREATE TABLE "message_stickers" ( "message_id" text NOT NULL, "sticker_id" text NOT NULL, "position" integer NOT NULL DEFAULT 0, PRIMARY KEY ("message_id", "position"), FOREIGN KEY ("sticker_id") REFERENCES "emojis" ("id") ON DELETE RESTRICT, FOREIGN KEY ("message_id") REFERENCES "messages" ("id") ON DELETE CASCADE );
 
@@ -428,4 +428,6 @@ CREATE TABLE dream_runs (id TEXT PRIMARY KEY NOT NULL, scope_type TEXT NOT NULL,
 CREATE INDEX idx_dream_runs_scope_started ON dream_runs (scope_type, scope_id, started_at DESC);
 
 CREATE INDEX idx_dream_runs_started ON dream_runs (started_at DESC);
+
+CREATE INDEX idx_turns_seq ON turns (seq);
 

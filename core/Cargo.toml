@@ -33,6 +33,9 @@ should_implement_trait = "allow"
 # shell's own tests need one and `cfg(test)` does not reach across a crate
 # boundary; a feature keeps it out of anything shipped.
 test-support = []
+# PostgreSQL as a second backend. The desktop never turns this on; meridiand
+# and the shell stay SQLite. Server and the Postgres CI job enable it.
+postgres = ["sea-orm/sqlx-postgres", "sea-orm-migration/sqlx-postgres", "sqlx/postgres"]
 
 [dependencies]
 async-stream = "0.3"
