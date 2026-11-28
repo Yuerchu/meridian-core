@@ -155,6 +155,34 @@ pub struct CoreSubAgentRunner {
     /// never by `Explore`.
     pub accept_edits: bool,
     pub keep_recent: usize,
+    /// Optional speaker/session authorisation gate inherited from the parent
+    /// turn so delegated sub-agents in multi-party rooms cannot bypass
+    /// speaker-level restrictions on plugin mixins or deferred tools.
+    pub authorizer: Option<Arc<dyn crate::agent::hooks::ToolAuthorizer>>,
+    /// Session-scoped lifecycle hooks appended after global
+    /// `services.snapshot_turn_hooks()` (e.g. a channel media delivery hook
+    /// bound to the parent chat session).
+    pub extra_turn_hooks: Vec<Arc<dyn crate::agent::hooks::TurnHooks>>,
+}
+
+impl CoreSubAgentRunner {
+    pub fn with_authorizer(mut self, authorizer: Arc<dyn crate::agent::hooks::ToolAuthorizer>) -> Self {
+        self.authorizer = Some(authorizer);
+        self
+    }
+
+    pub fn with_extra_turn_hook(mut self, hook: Arc<dyn crate::agent::hooks::TurnHooks>) -> Self {
+        self.extra_turn_hooks.push(hook);
+        self
+    }
+
+    pub fn with_extra_turn_hooks(
+        mut self,
+        hooks: impl IntoIterator<Item = Arc<dyn crate::agent::hooks::TurnHooks>>,
+    ) -> Self {
+        self.extra_turn_hooks.extend(hooks);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -481,7 +509,7 @@ impl CoreSubAgentRunner {
             cancel: cancel.clone(),
         });
         let emitter = SubAgentEmit(self.services.events.clone());
-        let turn_hooks = self.services.snapshot_turn_hooks();
+        let turn_hooks = self.collect_turn_hooks();
 
         let mut params = turn_params.params.clone();
         params.cache_key = Some(sub_conversation_id.to_string());
@@ -540,11 +568,18 @@ impl CoreSubAgentRunner {
                 emit: Some(&emitter),
                 steering: Some(inbox),
                 mixins: &child_plugin_mixins,
+                authorizer: self.authorizer.as_deref(),
                 hooks: &turn_hooks,
                 ..engine::TurnPorts::with_approvals(approvals.as_ref())
             },
         ))
         .await
+    }
+
+    fn collect_turn_hooks(&self) -> Vec<Arc<dyn crate::agent::hooks::TurnHooks>> {
+        let mut hooks = self.services.snapshot_turn_hooks();
+        hooks.extend(self.extra_turn_hooks.iter().cloned());
+        hooks
     }
 
     async fn build_config(
@@ -1069,5 +1104,341 @@ mod tests {
             "sub_agent.explore.model"
         );
         assert_eq!(default_model_preference(SubAgentKind::Agent), "sub_agent.agent.model");
+    }
+
+    #[tokio::test]
+    async fn sub_agent_runner_merges_extra_turn_hooks_and_passes_authorizer_into_turn() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::agent::hooks::{ToolAuthorizer, ToolMediaEvent, TurnHooks};
+        use crate::provider::{AgentResponse, ChatMessage, ChatParams, ChatStream, ProviderError, StreamEvent};
+        use crate::tools::MediaOut;
+
+        struct DenySpecificTool(&'static str);
+        impl ToolAuthorizer for DenySpecificTool {
+            fn allows(&self, tool_name: &str) -> bool {
+                tool_name != self.0
+            }
+        }
+
+        struct CountingMediaMixin {
+            tool_name: &'static str,
+            executions: Arc<AtomicUsize>,
+            emit_media: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl ToolMixin for CountingMediaMixin {
+            fn id(&self) -> &'static str {
+                self.tool_name
+            }
+
+            fn owned_names(&self) -> Vec<String> {
+                vec![self.tool_name.to_string()]
+            }
+
+            fn declarations(&self, _ctx: &MixinResolveContext<'_>) -> Vec<DeclaredTool> {
+                vec![
+                    DeclaredTool::eager(ToolDefinition {
+                        name: self.tool_name.to_string(),
+                        description: "test mixin tool".into(),
+                        parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    })
+                    .with_approval(ToolApprovalPolicy::Always),
+                ]
+            }
+
+            fn allow_in_explore(&self) -> bool {
+                true
+            }
+
+            async fn execute_rich(
+                &self,
+                _name: &str,
+                _args: serde_json::Value,
+                _ctx: &tools::ToolContext,
+            ) -> Result<ToolOutput, String> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                if self.emit_media {
+                    Ok(ToolOutput {
+                        text: "generated".into(),
+                        media: vec![MediaOut::Bytes {
+                            mime: "image/png".into(),
+                            bytes: vec![137, 80, 78, 71],
+                            name: Some("cat.png".into()),
+                        }],
+                    })
+                } else {
+                    Ok(ToolOutput::text("ok".into()))
+                }
+            }
+        }
+
+        type RecordedMedia = Vec<(String, String, Option<String>)>;
+
+        struct RecordingMediaHook {
+            tag: &'static str,
+            seen: Arc<Mutex<RecordedMedia>>,
+        }
+
+        #[async_trait::async_trait]
+        impl TurnHooks for RecordingMediaHook {
+            async fn on_tool_media(&self, event: &ToolMediaEvent<'_>) {
+                for media in event.media {
+                    let name = match media {
+                        MediaOut::Bytes { name, .. } | MediaOut::ManagedFile { name, .. } => name.clone(),
+                    };
+                    self.seen
+                        .lock()
+                        .unwrap()
+                        .push((self.tag.to_string(), event.tool_name.to_string(), name));
+                }
+            }
+        }
+
+        struct TwoStepProvider {
+            step: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ChatProvider for TwoStepProvider {
+            fn adapter_name(&self) -> &'static str {
+                "two-step"
+            }
+
+            async fn stream_chat_with_tools(
+                &self,
+                _messages: Vec<ChatMessage>,
+                _tools: Vec<ToolDefinition>,
+                _params: ChatParams,
+            ) -> Result<ChatStream, ProviderError> {
+                let n = self.step.fetch_add(1, Ordering::SeqCst);
+                let events = if n == 0 {
+                    vec![
+                        Ok(StreamEvent::ToolCallStart {
+                            index: 0,
+                            id: "call-blocked".into(),
+                            name: "blocked_tool".into(),
+                        }),
+                        Ok(StreamEvent::ToolCallDone {
+                            index: 0,
+                            arguments: "{}".into(),
+                        }),
+                        Ok(StreamEvent::ToolCallStart {
+                            index: 1,
+                            id: "call-media".into(),
+                            name: "draw_tool".into(),
+                        }),
+                        Ok(StreamEvent::ToolCallDone {
+                            index: 1,
+                            arguments: "{}".into(),
+                        }),
+                        Ok(StreamEvent::Stop {
+                            reason: "tool_calls".into(),
+                            usage: None,
+                        }),
+                    ]
+                } else {
+                    vec![
+                        Ok(StreamEvent::Text { content: "done".into() }),
+                        Ok(StreamEvent::Stop {
+                            reason: "end_turn".into(),
+                            usage: None,
+                        }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+
+            async fn chat(&self, _messages: Vec<ChatMessage>, _params: ChatParams) -> Result<String, ProviderError> {
+                Err(ProviderError::NotImplemented("unused".into()))
+            }
+
+            async fn chat_with_tools(
+                &self,
+                _messages: Vec<ChatMessage>,
+                _tools: Vec<ToolDefinition>,
+                _params: ChatParams,
+            ) -> Result<AgentResponse, ProviderError> {
+                Err(ProviderError::NotImplemented("unused".into()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::services::bare_services(dir.path()).await;
+        let seen_media = Arc::new(Mutex::new(Vec::new()));
+        services.register_turn_hook(Arc::new(RecordingMediaHook {
+            tag: "global",
+            seen: seen_media.clone(),
+        }));
+
+        let blocked_runs = Arc::new(AtomicUsize::new(0));
+        let draw_runs = Arc::new(AtomicUsize::new(0));
+        let blocked_mixin: Arc<dyn ToolMixin> = Arc::new(CountingMediaMixin {
+            tool_name: "blocked_tool",
+            executions: blocked_runs.clone(),
+            emit_media: false,
+        });
+        let draw_mixin: Arc<dyn ToolMixin> = Arc::new(CountingMediaMixin {
+            tool_name: "draw_tool",
+            executions: draw_runs.clone(),
+            emit_media: true,
+        });
+
+        let parent_char = CharacterBase::new("Parent")
+            .with_plugin_mixin(blocked_mixin.clone())
+            .with_plugin_mixin(draw_mixin.clone())
+            .build();
+
+        let runner = CoreSubAgentRunner {
+            services: services.clone(),
+            secrets: services.secrets.clone(),
+            registry: services.tools.clone(),
+            coordinator: services.turns.clone(),
+            mcp: services.mcp.clone(),
+            approvals_factory: Arc::new(DenyApprovalsFactory),
+            sandbox_factory: Arc::new(InheritToolContextSandboxFactory),
+            parent_character: parent_char.clone(),
+            parent_conversation_id: "parent-conv".into(),
+            parent_cancel: CancellationToken::new(),
+            assistant: None,
+            project_id: None,
+            tool_context: test_tool_context(Some("sub-conv"), Some("turn-1")),
+            files_root: Some(dir.path().join("files")),
+            accept_edits: false,
+            keep_recent: 20_000,
+            authorizer: None,
+            extra_turn_hooks: Vec::new(),
+        }
+        .with_authorizer(Arc::new(DenySpecificTool("blocked_tool")))
+        .with_extra_turn_hook(Arc::new(RecordingMediaHook {
+            tag: "parent-session",
+            seen: seen_media.clone(),
+        }));
+
+        let collected_hooks = runner.collect_turn_hooks();
+        assert_eq!(collected_hooks.len(), 2, "global + extra parent-session hooks");
+
+        let sub_conv = "sub-conv";
+        let turn_id = "turn-1";
+        services
+            .db
+            .write(async |tx| {
+                db::sea::ops::conversation::create(tx, sub_conv, None, None, None, 1).await?;
+                db::sea::ops::turn::begin(tx, turn_id, sub_conv, TurnOrigin::SubAgent, None, 1).await
+            })
+            .await
+            .unwrap();
+
+        let derived = derive_child_character(
+            &parent_char,
+            SubAgentKind::Explore,
+            "Explore".into(),
+            true,
+            Vec::new(),
+            &test_tool_context(Some(sub_conv), Some(turn_id)),
+        );
+        let child_mixins = derived.plugin_mixins.clone();
+        let cfg = crate::agent::turn_config::resolve_on(
+            &services.db,
+            &services.tools,
+            TurnConfigResolveRequest {
+                assistant: None,
+                conversation_id: sub_conv.into(),
+                project_id: None,
+                character: derived,
+            },
+        )
+        .await
+        .unwrap();
+
+        let provider = TwoStepProvider {
+            step: AtomicUsize::new(0),
+        };
+        let approvals = runner.approvals_factory.build(SubAgentApprovalContext {
+            parent_conversation_id: &runner.parent_conversation_id,
+            parent_message_id: "pm-1",
+            parent_call_id: "pc-1",
+            sub_conversation_id: sub_conv,
+            turn_id,
+            kind: SubAgentKind::Explore,
+            cancel: CancellationToken::new(),
+        });
+
+        let outcome = Box::pin(engine::run_turn(
+            &engine::TurnServices {
+                db: &services.db,
+                tools: &services.tools,
+                mcp: &services.mcp,
+                redaction: &services.redaction,
+                redaction_mappings: &services.redaction_mappings,
+            },
+            engine::TurnSetup {
+                trigger: crate::turn::TurnTrigger::User,
+                provider: &provider,
+                params: ChatParams {
+                    model: "test-model".into(),
+                    ..Default::default()
+                },
+                chat_messages: vec![ChatMessage::user("check")],
+                tool_defs: cfg.tool_defs,
+                offered: cfg.offered,
+                deferred_tools: cfg.deferred_tools,
+                approval_policies: cfg.approval_policies,
+                mode: crate::agent::modes::Modes::Fixed.spec(),
+                tool_context: test_tool_context(Some(sub_conv), Some(turn_id)),
+                budget: crate::agent::TokenBudget::new("anthropic", "test-model", 100_000, 4_096, None),
+                turn_id: turn_id.into(),
+                conversation_id: sub_conv.into(),
+                provider_id: None,
+                provider_name: None,
+                parent_cursor: None,
+                cancel: CancellationToken::new(),
+                keep_recent: 20_000,
+                context_limit: 100_000,
+                warm: None,
+                approval_rule: engine::ApprovalRule::ByReach { accept_edits: false },
+                withheld: engine::WithheldWording::Explained,
+                files_root: Some(dir.path().join("files")),
+                user_media: crate::provider::registry::WireMediaPolicy::none(),
+                interrupted: None,
+                compaction: engine::CompactionPolicy::Unattended,
+                pricing: None,
+            },
+            engine::TurnPorts {
+                mixins: &child_mixins,
+                authorizer: runner.authorizer.as_deref(),
+                hooks: &collected_hooks,
+                ..engine::TurnPorts::with_approvals(approvals.as_ref())
+            },
+        ))
+        .await;
+
+        assert_eq!(outcome.reply.unwrap(), "done");
+        assert_eq!(
+            blocked_runs.load(Ordering::SeqCst),
+            0,
+            "authorizer must prevent child sub-agent from executing disallowed tool"
+        );
+        assert_eq!(draw_runs.load(Ordering::SeqCst), 1);
+
+        let seen = seen_media.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "global".to_string(),
+                    "draw_tool".to_string(),
+                    Some("cat.png".to_string())
+                ),
+                (
+                    "parent-session".to_string(),
+                    "draw_tool".to_string(),
+                    Some("cat.png".to_string())
+                ),
+            ],
+            "both global and parent-bound extra_turn_hooks must receive child media events"
+        );
     }
 }
