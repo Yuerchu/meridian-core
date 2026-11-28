@@ -65,18 +65,6 @@ pub struct ServicesInner {
     /// forked compaction), shared across Desktop and OneBot runners.
     pub cache_lifecycle: Arc<crate::agent::cache_lifecycle::CacheLifecycleManager>,
     pub voice: VoiceState,
-    /// 谁现在可以往语音语料里写。
-    ///
-    /// 在这里而不是 OneBot 的 `SharedState` 里，因为 `start_onebot` 会整个重建
-    /// 那份 state：跟着重建的协调器会把正在进行的采集和刚刚做出的撤权一起忘掉。
-    /// 语料目录的独占锁也挂在它上面，所以它的生命周期必须是进程，不是某一代
-    /// OneBot 服务。
-    pub corpus: Arc<crate::voice_corpus::CorpusCoordinator>,
-    /// 谁可以现在发一次语音。
-    ///
-    /// 在这里而不是 `QqToolExecutor` 上：那个每一轮重建，而"每轮最多一次"放在
-    /// 一个每轮重建的东西里根本约束不住任何事。
-    pub voice_limiter: Arc<crate::tts::limiter::VoiceLimiter>,
     pub sleep: AppSleepInhibitor,
     pub events: EventBus,
     /// Where a balance or usage alert comes out, beyond the configured webhook
@@ -126,9 +114,20 @@ pub struct ServicesInner {
     /// snapshotting secrets until restart.
     pub journal_shared: Arc<crate::journal::capture::JournalShared>,
     pub media_runner: Arc<crate::media::MediaRunner>,
-    pub sticker_embed: Arc<crate::tools::sticker_embed::StickerEmbedIndex>,
     pub redaction: Arc<crate::redaction::RedactionEngine>,
     pub redaction_mappings: crate::redaction::RedactionMappings,
+    /// Type-erased extension bag for external servers and plugins (e.g. voice
+    /// corpus coordinators, channel adapters, custom registries) without
+    /// coupling `meridian-core` to platform-specific types.
+    pub extensions: Arc<crate::agent::hooks::ServicesExtensions>,
+    /// Global [`ToolMixin`](crate::agent::hooks::ToolMixin) plugins registered
+    /// at startup or dynamically by the host.
+    pub plugin_mixins: std::sync::RwLock<Vec<Arc<dyn crate::agent::hooks::ToolMixin>>>,
+    /// Global [`TurnHooks`](crate::agent::hooks::TurnHooks) observers notified
+    /// across turns (media delivery, telemetry, Auto-Dream accounting).
+    pub turn_hooks: std::sync::RwLock<Vec<Arc<dyn crate::agent::hooks::TurnHooks>>>,
+    /// Shared Auto-Dream memory consolidation coordinator (owns per-scope locks).
+    pub dream: Arc<crate::agent::dream::DreamScheduler>,
     /// How to start an ordinary turn, once the shell has said.
     ///
     /// The one direction that has to cross the line the other way. Running a
@@ -173,6 +172,25 @@ impl Services {
     pub fn new(inner: ServicesInner) -> Self {
         Services(Arc::new(inner))
     }
+
+    pub fn register_plugin_mixin(&self, mixin: Arc<dyn crate::agent::hooks::ToolMixin>) {
+        self.plugin_mixins
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(mixin);
+    }
+
+    pub fn snapshot_plugin_mixins(&self) -> Vec<Arc<dyn crate::agent::hooks::ToolMixin>> {
+        self.plugin_mixins.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn register_turn_hook(&self, hook: Arc<dyn crate::agent::hooks::TurnHooks>) {
+        self.turn_hooks.write().unwrap_or_else(|e| e.into_inner()).push(hook);
+    }
+
+    pub fn snapshot_turn_hooks(&self) -> Vec<Arc<dyn crate::agent::hooks::TurnHooks>> {
+        self.turn_hooks.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// So a caller writes `services.db` rather than `services.inner().db`. The
@@ -208,14 +226,13 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         events.clone(),
         dir,
     ));
-    let sticker_embed = crate::tools::sticker_embed::StickerEmbedIndex::new(sea.clone(), dir.to_path_buf());
     let tools = Arc::new(tools::ToolRegistry::new(
         dir.join("skills"),
         dir.join("logs"),
         Arc::new(crate::redaction::RedactionEngine::disabled()),
     ));
     tools.attach_media_runner(media_runner.clone());
-    tools.attach_sticker_embed(sticker_embed.clone());
+    let dream = Arc::new(crate::agent::dream::DreamScheduler::new(sea.clone(), secrets.clone()));
     Services::new(ServicesInner {
         db: sea,
         secrets,
@@ -228,8 +245,6 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         compact_breakers: Mutex::new(HashMap::new()),
         cache_lifecycle: Arc::new(crate::agent::cache_lifecycle::CacheLifecycleManager::new()),
         voice: VoiceState::new(),
-        corpus: Arc::new(crate::voice_corpus::CorpusCoordinator::new(dir)),
-        voice_limiter: Arc::new(crate::tts::limiter::VoiceLimiter::default()),
         sleep: AppSleepInhibitor::new(),
         events,
         alert_sinks: crate::notify::AlertSinks::new(),
@@ -248,8 +263,11 @@ pub async fn bare_services(dir: &std::path::Path) -> Services {
         turn_starter: std::sync::OnceLock::new(),
         journal_shared: crate::journal::capture::JournalShared::new(),
         media_runner,
-        sticker_embed,
         redaction: Arc::new(crate::redaction::RedactionEngine::disabled()),
         redaction_mappings: crate::redaction::RedactionMappings::new(),
+        extensions: Arc::new(crate::agent::hooks::ServicesExtensions::new()),
+        plugin_mixins: std::sync::RwLock::new(Vec::new()),
+        turn_hooks: std::sync::RwLock::new(Vec::new()),
+        dream,
     })
 }

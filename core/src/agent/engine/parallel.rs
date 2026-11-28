@@ -30,6 +30,7 @@ pub(crate) enum Segment<'a> {
 }
 
 /// Whether a single call is eligible for parallel dispatch.
+#[allow(clippy::too_many_arguments)]
 fn is_parallel_eligible(
     tc: &ToolCall,
     tools: &ToolRegistry,
@@ -37,11 +38,13 @@ fn is_parallel_eligible(
     tool_context: &ToolContext,
     approval_rule: &ApprovalRule,
     surface_tools: Option<&dyn SurfaceTools>,
+    mixins: &[std::sync::Arc<dyn crate::agent::hooks::ToolMixin>],
+    authorizer: Option<&dyn crate::agent::hooks::ToolAuthorizer>,
     mode: &'static ModeSpec,
     has_sub_agents: bool,
 ) -> bool {
-    // Must be in the offered set.
-    if !offered.contains(&tc.name) {
+    // Must be in the offered set and allowed by the active authorizer.
+    if !offered.contains(&tc.name) || authorizer.is_some_and(|a| !a.allows(&tc.name)) {
         return false;
     }
 
@@ -57,8 +60,10 @@ fn is_parallel_eligible(
         return has_sub_agents;
     }
 
-    // Surface tools have their own dispatch path.
-    if surface_tools.is_some_and(|s| s.owns(&tc.name)) {
+    // Surface tools and custom plugin mixins have their own dispatch path.
+    if surface_tools.is_some_and(|s| s.owns(&tc.name))
+        || mixins.iter().any(|m| m.owned_names().iter().any(|n| n == &tc.name))
+    {
         return false;
     }
 
@@ -96,6 +101,7 @@ fn is_parallel_eligible(
 /// segment. A single eligible call is still wrapped in `Parallel` — the
 /// executor treats it the same way, and the overhead of spawning one task is
 /// negligible.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn partition_tool_calls<'a>(
     calls: &[&'a ToolCall],
     tools: &ToolRegistry,
@@ -103,6 +109,8 @@ pub(crate) fn partition_tool_calls<'a>(
     tool_context: &ToolContext,
     approval_rule: &ApprovalRule,
     surface_tools: Option<&dyn SurfaceTools>,
+    mixins: &[std::sync::Arc<dyn crate::agent::hooks::ToolMixin>],
+    authorizer: Option<&dyn crate::agent::hooks::ToolAuthorizer>,
     mode: &'static ModeSpec,
     sub_agents: Option<&dyn SubAgents>,
 ) -> Vec<Segment<'a>> {
@@ -118,6 +126,8 @@ pub(crate) fn partition_tool_calls<'a>(
             tool_context,
             approval_rule,
             surface_tools,
+            mixins,
+            authorizer,
             mode,
             has_sub_agents,
         ) {
@@ -200,7 +210,7 @@ mod tests {
         let offered = default_offered(&["recall_memory", "list_memories", "read_app_logs"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         assert_eq!(segments.len(), 1);
         assert!(matches!(&segments[0], Segment::Parallel(v) if v.len() == 3));
@@ -220,7 +230,7 @@ mod tests {
         let offered = default_offered(&["recall_memory", "list_memories", "save_memory"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         // [recall, list] -> Parallel, [save] -> Serial, [recall] -> Parallel
         assert_eq!(segments.len(), 3);
@@ -238,7 +248,7 @@ mod tests {
         let offered = default_offered(&["save_memory", "delete_memory"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         assert_eq!(segments.len(), 2);
         assert!(matches!(&segments[0], Segment::Serial(_)));
@@ -254,7 +264,7 @@ mod tests {
         let offered = default_offered(&["mcp__server__tool", "recall_memory"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         assert_eq!(segments.len(), 2);
         assert!(matches!(&segments[0], Segment::Serial(tc) if tc.name == "mcp__server__tool"));
@@ -270,7 +280,7 @@ mod tests {
         let offered = default_offered(&["recall_memory", "ask_user", "list_memories"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         assert_eq!(segments.len(), 3);
         assert!(matches!(&segments[0], Segment::Parallel(_)));
@@ -287,7 +297,7 @@ mod tests {
         let offered = default_offered(&["recall_memory"]); // list_memories not offered
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         assert_eq!(segments.len(), 2);
         assert!(matches!(&segments[0], Segment::Parallel(v) if v.len() == 1));
@@ -303,7 +313,7 @@ mod tests {
         let offered = default_offered(&["recall_memory", "run_agent"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         assert_eq!(segments.len(), 2);
         assert!(matches!(&segments[0], Segment::Parallel(v) if v.len() == 1));
@@ -332,7 +342,7 @@ mod tests {
         let rule = ApprovalRule::ByReach { accept_edits: false };
         let fake = FakeSubAgents;
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), Some(&fake));
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), Some(&fake));
 
         // All three should be in one Parallel segment.
         assert_eq!(segments.len(), 1);
@@ -347,7 +357,7 @@ mod tests {
         let offered = default_offered(&[]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&calls, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&calls, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         assert!(segments.is_empty());
     }
@@ -361,7 +371,7 @@ mod tests {
         let offered = default_offered(&["recall_memory"]);
         let rule = ApprovalRule::ByReach { accept_edits: false };
 
-        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, default_mode(), None);
+        let segments = partition_tool_calls(&refs, &reg, &offered, &ctx, &rule, None, &[], None, default_mode(), None);
 
         assert_eq!(segments.len(), 1);
         assert!(matches!(&segments[0], Segment::Parallel(v) if v.len() == 1));

@@ -35,7 +35,24 @@
         "medium",
         "high"
       ],
-      "default_effort": "medium"
+      "default_effort": "medium",
+      "deferred_tool_mode": "responses_client_search"
+    },
+    {
+      "prefix": "deepseek-flash",
+      "supports_thinking": true,
+      "supports_temperature": false,
+      "supports_top_p": false,
+      "max_context_tokens": 128000,
+      "max_output_tokens": 16000,
+      "thinking_style": "toggle_off",
+      "supported_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "medium",
+      "deferred_tool_mode": "responses_client_search"
     },
     {
       "prefix": "deepseek-reasoner",

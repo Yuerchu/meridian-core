@@ -68,6 +68,7 @@
       ],
       "default_cache_ttl": "24h",
       "default_cache_ttl_secs": 86400,
+      "deferred_tool_mode": "responses_client_search",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -97,6 +98,7 @@
       ],
       "default_cache_ttl": "24h",
       "default_cache_ttl_secs": 86400,
+      "deferred_tool_mode": "responses_client_search",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -126,6 +128,7 @@
       ],
       "default_cache_ttl": "24h",
       "default_cache_ttl_secs": 86400,
+      "deferred_tool_mode": "responses_client_search",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -156,6 +159,7 @@
       ],
       "default_cache_ttl": "24h",
       "default_cache_ttl_secs": 86400,
+      "deferred_tool_mode": "responses_client_search",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -184,6 +188,7 @@
       ],
       "default_cache_ttl": "24h",
       "default_cache_ttl_secs": 86400,
+      "deferred_tool_mode": "responses_client_search",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -212,6 +217,7 @@
       ],
       "default_cache_ttl": "in_memory",
       "default_cache_ttl_secs": 300,
+      "deferred_tool_mode": "responses_client_search",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",
@@ -241,6 +247,7 @@
       ],
       "default_cache_ttl": "in_memory",
       "default_cache_ttl_secs": 300,
+      "deferred_tool_mode": "responses_client_search",
       "readable_mime_types": [
         "image/jpeg",
         "image/png",

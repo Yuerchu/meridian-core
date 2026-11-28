@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod policy;
 pub mod protocol;
 pub mod stdio;
 pub mod streamable_http;
@@ -227,6 +228,53 @@ impl McpRegistry {
     /// other conversations from starting.
     pub fn tool_definitions(&self) -> Arc<Vec<ToolDefinition>> {
         Arc::clone(&self.snapshot.read().unwrap_or_else(|e| e.into_inner()).definitions)
+    }
+
+    /// Resolve connected, enabled MCP tools into [`crate::agent::hooks::DeclaredTool`]s
+    /// annotated with three-tier policy (`global -> server -> tool`), supply-chain
+    /// drift protection, and `session_scope` visibility filtering.
+    pub fn declared_tools(
+        &self,
+        servers: &[mcp_server::Model],
+        global_default: policy::McpToolPolicy,
+        session_scope: crate::agent::hooks::ToolScope,
+    ) -> Vec<crate::agent::hooks::DeclaredTool> {
+        let by_id: HashMap<&str, &mcp_server::Model> = servers.iter().map(|s| (s.id.as_str(), s)).collect();
+        let snapshot = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for tool in snapshot.tools.iter() {
+            if tool_is_disabled(&snapshot.disabled, &tool.server_id, &tool.name) {
+                continue;
+            }
+            let server_row = by_id.get(tool.server_id.as_str()).copied();
+            let server_override = server_row.and_then(|s| s.default_policy_json.as_ref().map(|j| &j.0));
+            let tool_override = server_row
+                .and_then(|s| s.tool_policies_json.as_ref())
+                .and_then(|j| j.0.get(&tool.name));
+            let approved_always = server_row
+                .and_then(|s| s.approved_always_tools_json.as_ref())
+                .map(|j| j.0.as_slice());
+            let resolved = policy::resolve_tool_policy(
+                global_default,
+                server_override,
+                tool_override,
+                approved_always,
+                &tool.name,
+            );
+            if !resolved.scope.is_visible_in(session_scope) {
+                continue;
+            }
+            out.push(crate::agent::hooks::DeclaredTool {
+                definition: ToolDefinition {
+                    name: tool.qualified_name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.input_schema.clone(),
+                },
+                loading: resolved.loading,
+                approval: Some(resolved.approval),
+            });
+        }
+        out
     }
 
     pub fn tools(&self) -> Arc<Vec<McpToolDef>> {

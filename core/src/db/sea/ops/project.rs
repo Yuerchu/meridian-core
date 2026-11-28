@@ -121,6 +121,7 @@ mod tests {
             path: Some(format!("/work/{id}")),
             source_type: ProjectSource::Local,
             source_id: None,
+            channel_kind: None,
             assistant_id: None,
             description: Some("notes".into()),
             created_at: 1,

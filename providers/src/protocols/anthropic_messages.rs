@@ -51,7 +51,7 @@ impl AnthropicMessagesProvider {
 
     #[cfg(test)]
     fn serialize_messages(messages: &[ChatMessage], model: &str) -> Result<Vec<serde_json::Value>, ProviderError> {
-        Self::serialize_messages_marking_user(messages, model).map(|(out, _)| out)
+        Self::serialize_messages_marking_user(messages, model, false).map(|(out, _)| out)
     }
 
     /// The wire messages, and the index of the last one that is a persisted user
@@ -63,6 +63,7 @@ impl AnthropicMessagesProvider {
     fn serialize_messages_marking_user(
         messages: &[ChatMessage],
         model: &str,
+        use_client_tool_reference: bool,
     ) -> Result<(Vec<serde_json::Value>, Option<usize>), ProviderError> {
         let mut out: Vec<serde_json::Value> = Vec::new();
         let mut pending_tool_results: Vec<serde_json::Value> = Vec::new();
@@ -77,22 +78,44 @@ impl AnthropicMessagesProvider {
             // requires every tool_result for a turn to share the user message that
             // immediately follows the tool_use.
             if m.role == "tool" {
-                // A result with pictures is a block list; `tool_result` takes
-                // text and image blocks natively.
-                let content = match crate::tool_result_parts(m).map_err(ProviderError::Parse)? {
-                    None => serde_json::json!(m.content),
-                    Some(parts) => serde_json::Value::Array(
-                        parts
-                            .into_iter()
-                            .filter(|part| !matches!(part, crate::ToolWirePart::Text(text) if text.is_empty()))
-                            .map(|part| match part {
-                                crate::ToolWirePart::Text(text) => serde_json::json!({"type": "text", "text": text}),
-                                crate::ToolWirePart::Image(url) => {
-                                    serde_json::json!({"type": "image", "source": Self::source_for(&url)})
-                                }
-                            })
-                            .collect(),
-                    ),
+                let content = if m.origin == crate::MessageOrigin::ToolSearchResult {
+                    let frozen = crate::decode_tool_search_result(&m.content).map_err(ProviderError::Parse)?;
+                    if use_client_tool_reference && !frozen.tool_names.is_empty() {
+                        serde_json::Value::Array(
+                            frozen
+                                .tool_names
+                                .iter()
+                                .map(|name| {
+                                    serde_json::json!({
+                                        "type": "tool_reference",
+                                        "tool_name": name,
+                                    })
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        serde_json::json!(frozen.summary)
+                    }
+                } else {
+                    // A result with pictures is a block list; `tool_result` takes
+                    // text and image blocks natively.
+                    match crate::tool_result_parts(m).map_err(ProviderError::Parse)? {
+                        None => serde_json::json!(m.content),
+                        Some(parts) => serde_json::Value::Array(
+                            parts
+                                .into_iter()
+                                .filter(|part| !matches!(part, crate::ToolWirePart::Text(text) if text.is_empty()))
+                                .map(|part| match part {
+                                    crate::ToolWirePart::Text(text) => {
+                                        serde_json::json!({"type": "text", "text": text})
+                                    }
+                                    crate::ToolWirePart::Image(url) => {
+                                        serde_json::json!({"type": "image", "source": Self::source_for(&url)})
+                                    }
+                                })
+                                .collect(),
+                        ),
+                    }
                 };
                 let mut block = serde_json::json!({
                     "type": "tool_result",
@@ -146,7 +169,10 @@ impl AnthropicMessagesProvider {
                 for tc in m.tool_calls.iter().flatten() {
                     let args = crate::decode_tool_arguments(&tc.arguments, &tc.id).map_err(ProviderError::Parse)?;
                     content.push(serde_json::json!({
-                        "type": "tool_use", "id": tc.id, "name": tc.name, "input": args
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": crate::wire_tool_call_name(&tc.name),
+                        "input": args,
                     }));
                 }
                 // An assistant message with nothing in it is a 400, and there
@@ -311,7 +337,20 @@ impl AnthropicMessagesProvider {
         // measured on QQ, not one history token was ever read back. The user
         // message is on the path and replays byte for byte. When it is also the
         // last message the two markers land on the same block, once.
-        let (mut wire_messages, last_user) = Self::serialize_messages_marking_user(messages, &params.model)?;
+        let is_deepseek = self.base_url.to_ascii_lowercase().contains("deepseek")
+            || params.model.to_ascii_lowercase().starts_with("deepseek");
+        let effective_strategy = if is_deepseek {
+            crate::AnthropicToolSearchStrategy::ClientToolReference
+        } else {
+            params.anthropic_tool_search_strategy
+        };
+        let has_deferred = params.deferred_tool_mode == crate::DeferredToolMode::AnthropicDeferred
+            && tools.is_some_and(|list| list.iter().any(|t| params.is_tool_deferred(&t.name)));
+        let use_client_tool_reference = params.deferred_tool_mode == crate::DeferredToolMode::AnthropicDeferred
+            && effective_strategy == crate::AnthropicToolSearchStrategy::ClientToolReference;
+
+        let (mut wire_messages, last_user) =
+            Self::serialize_messages_marking_user(messages, &params.model, use_client_tool_reference)?;
         if let Some(i) = last_user {
             Self::mark_block_cacheable(&mut wire_messages[i], params.cache_ttl);
         }
@@ -405,13 +444,37 @@ impl AnthropicMessagesProvider {
             .iter()
             .filter_map(|kind| Self::server_tool_definition(*kind, params.thinking_style))
             .collect();
+        let mut needs_tool_search_beta = false;
+        if has_deferred {
+            match effective_strategy {
+                crate::AnthropicToolSearchStrategy::ServerBm25 => {
+                    wire_tools.push(serde_json::json!({
+                        "type": "tool_search_tool_bm25_20251119",
+                        "name": "tool_search_tool_bm25",
+                    }));
+                    needs_tool_search_beta = true;
+                }
+                crate::AnthropicToolSearchStrategy::ServerRegex => {
+                    wire_tools.push(serde_json::json!({
+                        "type": "tool_search_tool_regex_20251119",
+                        "name": "tool_search_tool_regex",
+                    }));
+                    needs_tool_search_beta = true;
+                }
+                crate::AnthropicToolSearchStrategy::ClientToolReference => {}
+            }
+        }
         if let Some(tools) = tools {
             wire_tools.extend(tools.iter().map(|t| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "name": t.name,
                     "description": t.description,
                     "input_schema": t.parameters,
-                })
+                });
+                if has_deferred && params.is_tool_deferred(&t.name) {
+                    obj["defer_loading"] = serde_json::Value::Bool(true);
+                }
+                obj
             }));
         }
         if !wire_tools.is_empty() {
@@ -419,8 +482,16 @@ impl AnthropicMessagesProvider {
             // keeps every definition cached when a later turn edits the system
             // prompt; without it the system breakpoint is the first one, and a
             // change there invalidates the tools with it.
-            if let Some(last) = wire_tools.last_mut() {
-                last["cache_control"] = ephemeral(params.cache_ttl);
+            //
+            // Never place `cache_control` on a `defer_loading: true` tool:
+            // deferred definitions sit outside the eager prompt prefix, so the
+            // breakpoint must land on the last non-deferred tool instead.
+            if let Some(last_eager) = wire_tools
+                .iter_mut()
+                .rev()
+                .find(|t| t.get("defer_loading") != Some(&serde_json::Value::Bool(true)))
+            {
+                last_eager["cache_control"] = ephemeral(params.cache_ttl);
             }
             body["tools"] = serde_json::json!(wire_tools);
         }
@@ -428,11 +499,18 @@ impl AnthropicMessagesProvider {
         let mut req = Request::new(http::Method::POST, format!("{}/v1/messages", self.base_url));
         req.headers.insert("x-api-key", crate::auth_header_value(&self.api_key));
         req.headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        let mut betas: Vec<&'static str> = Vec::new();
         if params.fast {
             // Fast mode is a research preview and needs the beta opt-in
             // alongside the `speed` body field.
+            betas.push("fast-mode-2026-02-01");
+        }
+        if needs_tool_search_beta {
+            betas.push("advanced-tool-use-2025-11-20");
+        }
+        if !betas.is_empty() {
             req.headers
-                .insert("anthropic-beta", "fast-mode-2026-02-01".parse().unwrap());
+                .insert("anthropic-beta", betas.join(",").parse().unwrap());
         }
         req.body = Some(RequestBody::Json(body));
         Ok(req)
@@ -2344,5 +2422,113 @@ mod multimodal_sender_tests {
             "caption still carries a marker: {caption}"
         );
         assert!(caption.contains("&lt;sender&gt;"));
+    }
+}
+
+#[cfg(test)]
+mod deferred_tool_tests {
+    use super::*;
+
+    fn def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("Tool {name}"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn body_json(req: &Request) -> serde_json::Value {
+        match req.body.as_ref().expect("json body") {
+            RequestBody::Json(v) => v.clone(),
+            _ => panic!("expected json body"),
+        }
+    }
+
+    #[test]
+    fn server_bm25_injects_tool_search_beta_and_never_caches_deferred_tools() {
+        let provider = AnthropicMessagesProvider::new("https://api.anthropic.com", "k");
+        let tools = vec![def("read_file"), def("mcp__luckin__order_coffee")];
+        let params = ChatParams {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: Some(4096),
+            deferred_tool_mode: crate::DeferredToolMode::AnthropicDeferred,
+            anthropic_tool_search_strategy: crate::AnthropicToolSearchStrategy::ServerBm25,
+            deferred_tool_names: vec!["mcp__luckin__order_coffee".into()],
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(&[ChatMessage::user("order coffee")], Some(&tools), &params, true)
+            .unwrap();
+        assert_eq!(
+            req.headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some("advanced-tool-use-2025-11-20")
+        );
+        let body = body_json(&req);
+        let wire_tools = body["tools"].as_array().unwrap();
+        assert_eq!(wire_tools[0]["type"], "tool_search_tool_bm25_20251119");
+        assert_eq!(wire_tools[1]["name"], "read_file");
+        assert!(
+            wire_tools[1].get("cache_control").is_some(),
+            "cache breakpoint must land on last eager tool"
+        );
+        assert_eq!(wire_tools[2]["name"], "mcp__luckin__order_coffee");
+        assert_eq!(wire_tools[2]["defer_loading"], serde_json::json!(true));
+        assert!(
+            wire_tools[2].get("cache_control").is_none(),
+            "deferred tools must never carry cache_control"
+        );
+    }
+
+    #[test]
+    fn deepseek_anthropic_forces_client_tool_reference_and_replays_tool_references() {
+        let provider = AnthropicMessagesProvider::new("https://api.deepseek.com/anthropic", "k");
+        let tools = vec![def("search_tools"), def("mcp__luckin__order_coffee")];
+        let frozen = crate::FrozenToolSearchResult {
+            format: "anthropic_client_ref".into(),
+            tool_names: vec!["mcp__luckin__order_coffee".into()],
+            tools: vec![def("mcp__luckin__order_coffee")],
+            summary: "Loaded mcp__luckin__order_coffee".into(),
+        };
+        let encoded = crate::encode_tool_search_result(&frozen).unwrap();
+        let messages = vec![
+            ChatMessage::user("order coffee"),
+            ChatMessage::assistant_with_tools(
+                "",
+                None,
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: crate::TOOL_SEARCH_CALL_SENTINEL.into(),
+                    arguments: r#"{"query":"coffee"}"#.into(),
+                }],
+            ),
+            ChatMessage::tool_search_result("call_1", &encoded),
+        ];
+        let params = ChatParams {
+            model: "deepseek-v4-flash".into(),
+            max_tokens: Some(4096),
+            deferred_tool_mode: crate::DeferredToolMode::AnthropicDeferred,
+            anthropic_tool_search_strategy: crate::AnthropicToolSearchStrategy::ServerBm25,
+            deferred_tool_names: vec!["mcp__luckin__order_coffee".into()],
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(&messages, Some(&tools), &params, true)
+            .unwrap();
+        assert!(
+            req.headers.get("anthropic-beta").is_none(),
+            "DeepSeek Anthropic must use client tool_reference, not Anthropic server beta"
+        );
+        let body = body_json(&req);
+        let wire_tools = body["tools"].as_array().unwrap();
+        assert_eq!(wire_tools.len(), 2);
+        assert_eq!(wire_tools[0]["name"], "search_tools");
+        assert_eq!(wire_tools[1]["defer_loading"], serde_json::json!(true));
+        let wire_msgs = body["messages"].as_array().unwrap();
+        assert_eq!(wire_msgs[1]["content"][0]["name"], "search_tools");
+        assert_eq!(wire_msgs[2]["content"][0]["content"][0]["type"], "tool_reference");
+        assert_eq!(
+            wire_msgs[2]["content"][0]["content"][0]["tool_name"],
+            "mcp__luckin__order_coffee"
+        );
     }
 }

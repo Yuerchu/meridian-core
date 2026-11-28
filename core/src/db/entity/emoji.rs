@@ -86,12 +86,9 @@ pub enum EmojiSource {
     /// Imported from a file on this machine.
     #[sea_orm(string_value = "local")]
     Local,
-    #[sea_orm(string_value = "onebot_face")]
-    OnebotFace,
-    #[sea_orm(string_value = "onebot_mface")]
-    OnebotMface,
-    #[sea_orm(string_value = "onebot_image")]
-    OnebotImage,
+    /// Captured or supplied by an external channel/plugin.
+    #[sea_orm(string_value = "external")]
+    External,
 }
 
 impl EmojiSource {

@@ -1,4 +1,4 @@
-use super::{ChatParams, PromptCacheTtl, ProviderCapabilities, ServerToolKind, ThinkingStyle};
+use super::{ChatParams, DeferredToolMode, PromptCacheTtl, ProviderCapabilities, ServerToolKind, ThinkingStyle};
 use crate::models::CanonicalModelEntry;
 use serde::Deserialize;
 
@@ -117,6 +117,9 @@ fn apply(base: &mut ProviderCapabilities, entry: &CanonicalModelEntry) {
     }
     if let Some(v) = entry.default_cache_ttl_secs {
         base.default_cache_ttl_secs = Some(v);
+    }
+    if let Some(v) = entry.deferred_tool_mode {
+        base.deferred_tool_mode = v;
     }
 }
 
@@ -352,6 +355,7 @@ pub fn narrow_to_google_wire(api_format: Option<&str>, model: &str, caps: &mut P
             }
             caps.server_tools
                 .retain(|tool| matches!(tool, ServerToolKind::GoogleSearch | ServerToolKind::UrlContext));
+            caps.deferred_tool_mode = DeferredToolMode::None;
         }
         Some("gemini_interactions") => {
             if caps.thinking_style == ThinkingStyle::Budget {
@@ -365,6 +369,9 @@ pub fn narrow_to_google_wire(api_format: Option<&str>, model: &str, caps: &mut P
             }
             caps.server_tools
                 .retain(|tool| matches!(tool, ServerToolKind::GoogleSearch | ServerToolKind::UrlContext));
+            if caps.deferred_tool_mode != DeferredToolMode::GeminiServerSearch {
+                caps.deferred_tool_mode = DeferredToolMode::None;
+            }
         }
         Some("chat_completions") => {
             if caps.thinking_style == ThinkingStyle::Budget {
@@ -372,12 +379,14 @@ pub fn narrow_to_google_wire(api_format: Option<&str>, model: &str, caps: &mut P
                 caps.supports_thinking_off = false;
             }
             caps.server_tools.clear();
+            caps.deferred_tool_mode = DeferredToolMode::None;
         }
         _ => {
             if caps.thinking_style == ThinkingStyle::Budget {
                 caps.thinking_style = ThinkingStyle::EffortOnly;
                 caps.supports_thinking_off = false;
             }
+            caps.deferred_tool_mode = DeferredToolMode::None;
         }
     }
 }
@@ -418,6 +427,23 @@ fn resolve_inner(provider_type: &str, api_format: Option<&str>, model: &str) -> 
     }
     if catalog_provider == "google" {
         narrow_to_google_wire(api_format, model, &mut caps);
+    } else {
+        // Protocol gate: native deferred loading only works on the wire
+        // protocol designed for it; every other dialect (e.g. chat_completions
+        // or responses_lite) cleanly falls back to the universal client
+        // dual-tool gateway (`DeferredToolMode::None`).
+        caps.deferred_tool_mode = match (provider_type, api_format, caps.deferred_tool_mode, caps.responses_lite) {
+            ("anthropic", None | Some("messages"), DeferredToolMode::AnthropicDeferred, _) => {
+                DeferredToolMode::AnthropicDeferred
+            }
+            ("deepseek", Some("messages"), DeferredToolMode::ResponsesClientSearch | DeferredToolMode::AnthropicDeferred, _) => {
+                DeferredToolMode::AnthropicDeferred
+            }
+            (_, Some("responses"), DeferredToolMode::ResponsesClientSearch, false) => {
+                DeferredToolMode::ResponsesClientSearch
+            }
+            _ => DeferredToolMode::None,
+        };
     }
     if catalog_provider == "openai" && provider_type != "openai" {
         // Third-party OpenAI-compatible relays may reject OpenAI's
@@ -562,6 +588,7 @@ pub struct ProviderCapabilityOverrides {
     supported_cache_ttls: OverrideField<Vec<PromptCacheTtl>>,
     default_cache_ttl: OverrideField<Option<PromptCacheTtl>>,
     default_cache_ttl_secs: OverrideField<Option<u32>>,
+    deferred_tool_mode: OverrideField<DeferredToolMode>,
 }
 
 impl ProviderCapabilityOverrides {
@@ -657,6 +684,7 @@ pub fn apply_overrides(caps: &mut ProviderCapabilities, overrides: Option<&str>)
     apply_value!(supported_cache_ttls);
     apply_value!(default_cache_ttl);
     apply_value!(default_cache_ttl_secs);
+    apply_value!(deferred_tool_mode);
 
     if let OverrideField::Set(mut efforts) = patch.supported_efforts {
         efforts.sort_unstable();
@@ -811,6 +839,7 @@ pub fn filter_params(params: &mut ChatParams, caps: &ProviderCapabilities) -> Re
     }
     params.supports_remote_compaction = caps.supports_remote_compaction;
     params.responses_lite = caps.responses_lite;
+    params.deferred_tool_mode = caps.deferred_tool_mode;
     if let Some(ttl) = params.cache_ttl
         && !caps.supported_cache_ttls.contains(&ttl)
     {

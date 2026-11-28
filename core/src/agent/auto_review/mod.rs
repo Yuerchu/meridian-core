@@ -40,6 +40,7 @@ mod assessment;
 mod investigate;
 mod projection;
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 pub use assessment::{Assessment, AuthLevel, Outcome, Read, RiskLevel};
@@ -47,7 +48,7 @@ pub use assessment::{Assessment, AuthLevel, Outcome, Read, RiskLevel};
 use crate::agent::engine::{ApprovalDecision, Approvals};
 use crate::db::models::message::MessageUsage;
 use crate::db::sea::DbErr;
-use crate::db::sea::cap::{Read as DbRead, Snapshot};
+use crate::db::sea::cap::Snapshot;
 use crate::db::sea::ops as sea_ops;
 use crate::events::{
     ApprovalRetryKind, AutoReviewAuthorization, AutoReviewEvidence, AutoReviewOutcome as EventOutcome, AutoReviewRisk,
@@ -117,6 +118,17 @@ fn parse_stored_bool(key: &str, raw: Option<String>, default: bool) -> Result<bo
     }
 }
 
+/// Who can type into the reviewed conversation. Supplied explicitly by the
+/// caller so `auto_review` never peeks at platform-specific preference keys.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ReviewParty {
+    #[default]
+    Single,
+    Multi {
+        authorized_senders: Vec<i64>,
+    },
+}
+
 /// Where the turn being reviewed is running.
 pub struct Context {
     pub services: Services,
@@ -129,36 +141,22 @@ pub struct Context {
     /// The reviewed turn's own file boundary. The escalating pass runs inside
     /// it and never outside — see `investigate::context`.
     pub file_access: crate::tools::FileAccess,
-    /// Whether more than one person can type into this conversation.
-    ///
-    /// A flag rather than the roster itself, because the roster is
-    /// `onebot.admin_users` and reading it here keeps it out of a signature
-    /// that already carries nineteen arguments. It also makes the desktop case
-    /// unmistakable: `false` means there is nobody to distinguish, not that
-    /// somebody forgot to pass the list.
-    ///
-    /// **A QQ private chat is not multi-party.** There is one counterpart and
-    /// they are the reason the turn is running; marking them a bystander
-    /// because they are not in `onebot.admin_users` would mean the reviewer
-    /// sees a task nobody asked for and refuses everything. `qq_tools.rs`
-    /// narrows a private chat by `is_admin` for the same reason it can — one
-    /// counterpart cannot change under the session.
-    pub multi_party: bool,
-    /// True when nothing would be drawn if this fell back to asking. QQ used
-    /// to set this so a missed review denied; QQ writes now fall back to a Y
-    /// card (`false`) and only [`fail_closed`] tools still refuse on a miss.
+    /// Single-user or multi-party speaker trust boundary.
+    pub party: ReviewParty,
+    /// True when nothing would be drawn if this fell back to asking.
     pub unattended: bool,
-    /// Review even when the desktop toggle is off. QQ writes always go through
-    /// the reviewer; the desktop must leave this false so an off toggle stays off.
+    /// Review even when the desktop toggle is off.
     pub force_review: bool,
-    /// QQ may name the conversation's own model when `autoreview.model` is
-    /// empty. The desktop must not: that would bill a review at the answering
-    /// model. Trimmed empty is treated as absent.
+    /// Optional fallback `provider:model` when `autoreview.model` is unset.
     pub review_model_fallback: Option<String>,
-    /// Tool names that refuse when the reviewer produces no verdict, even if
-    /// a card could be drawn. QQ's `qq_manage_replies` is here: a Y card in a
-    /// group is self-approval of a voice hijack.
-    pub fail_closed: &'static [&'static str],
+    /// Tool names that refuse when the reviewer produces no verdict, even if a
+    /// card could be drawn.
+    pub fail_closed: HashSet<String>,
+    /// Tool names explicitly configured as `request_approve`: bypass automatic
+    /// LLM review completely and always forward straight to human approval.
+    pub request_approve: HashSet<String>,
+    /// Additional policy clauses supplied by active mixins or external plugins.
+    pub policy_addenda: Vec<String>,
 }
 
 /// Whether this wrapper should actually review. Force-review still constructs
@@ -189,8 +187,8 @@ pub(crate) fn activate_settings(
     }
 }
 
-pub(crate) fn refuses_on_miss(unattended: bool, fail_closed: &[&str], name: &str) -> bool {
-    unattended || fail_closed.contains(&name)
+pub(crate) fn refuses_on_miss(unattended: bool, fail_closed: &HashSet<String>, name: &str) -> bool {
+    unattended || fail_closed.contains(name)
 }
 
 #[derive(Debug, Default)]
@@ -235,50 +233,20 @@ pub struct AutoReviewed<'a> {
 struct Active {
     settings: Settings,
     context: Context,
-    /// Who may authorise things here, resolved once. Empty unless the
-    /// conversation is a multi-party one.
-    admins: Vec<i64>,
     circuit: Mutex<Circuit>,
-}
-
-/// The QQ admin roster, read the same way `onebot::load_config` reads it.
-///
-/// An absent list is an empty one, which makes every speaker a bystander — the
-/// cautious end. An unreadable list is a damaged first-party contract and must
-/// stop the turn rather than silently changing who may authorise it.
-async fn admin_roster(db: &impl DbRead) -> Result<Vec<i64>, String> {
-    let stored = sea_ops::preference::get(db, "onebot.admin_users")
-        .await
-        .map_err(|error| format!("failed to read preference onebot.admin_users: {error}"))?;
-    match stored {
-        None => Ok(Vec::new()),
-        Some(raw) => serde_json::from_str::<Vec<i64>>(&raw)
-            .map_err(|error| format!("preference onebot.admin_users has invalid JSON: {error}")),
-    }
 }
 
 impl<'a> AutoReviewed<'a> {
     /// A wrapper that reviews nothing, for a runner that has no [`Services`] to
-    /// review with — the OneBot tests, and nothing else today.
+    /// review with.
     pub fn inert(inner: &'a dyn Approvals) -> Self {
         AutoReviewed { inner, active: None }
     }
 
     /// Put automatic review in front of an asker, or don't.
-    ///
-    /// Always returns a wrapper. The wrapper is inert unless the feature is on
-    /// and a model is named — so a call site is one line with no branch — or
-    /// the runner asked for [`Context::force_review`]. A configured model is
-    /// part of being on the desktop: without one there is nothing to ask,
-    /// and silently falling back to the conversation's own model would bill a
-    /// review at whatever the user picked for answering. QQ is the carve-out:
-    /// `force_review` plus `review_model_fallback` keep writes reviewed when
-    /// the desktop toggle is off.
     pub async fn wrap(inner: &'a dyn Approvals, context: Context) -> Result<Self, String> {
-        let multi_party = context.multi_party;
         let force_review = context.force_review;
         let fallback = context.review_model_fallback.clone();
-        // The settings and the roster at one instant.
         let read = context
             .services
             .db
@@ -287,21 +255,11 @@ impl<'a> AutoReviewed<'a> {
                     Ok(settings) => settings,
                     Err(error) => return Ok::<_, DbErr>(Err(error)),
                 };
-                let Some(settings) = activate_settings(settings, force_review, fallback.clone()) else {
-                    return Ok(Ok(None));
-                };
-                let admins = match multi_party {
-                    true => match admin_roster(tx).await {
-                        Ok(admins) => admins,
-                        Err(error) => return Ok(Err(error)),
-                    },
-                    false => Vec::new(),
-                };
-                Ok(Ok(Some((settings, admins))))
+                Ok(Ok(activate_settings(settings, force_review, fallback.clone())))
             })
             .await
             .map_err(|error| format!("failed to read the auto-review settings: {error}"))??;
-        let Some((settings, admins)) = read else {
+        let Some(settings) = read else {
             return Ok(AutoReviewed { inner, active: None });
         };
         Ok(AutoReviewed {
@@ -309,7 +267,6 @@ impl<'a> AutoReviewed<'a> {
             active: Some(Active {
                 settings,
                 context,
-                admins,
                 circuit: Mutex::new(Circuit::default()),
             }),
         })
@@ -349,7 +306,7 @@ impl Active {
         });
     }
 
-    /// The reviewer's own brief: the shared policy plus whatever the user added.
+    /// The reviewer's own brief: the shared policy plus plugin addenda and user rules.
     fn system_prompt(&self) -> String {
         let section = |tag: &str, body: &str, prompt: String| {
             let body = body.trim();
@@ -358,7 +315,16 @@ impl Active {
             }
             prompt.replace(&format!("<{tag}>\n</{tag}>"), &format!("<{tag}>\n{body}\n</{tag}>"))
         };
+        let addenda = self
+            .context
+            .policy_addenda
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let prompt = POLICY.to_string();
+        let prompt = section("plugin_policy_addenda", &addenda, prompt);
         let prompt = section("user_environment", &self.settings.environment, prompt);
         let prompt = section("user_allow_rules", &self.settings.allow_rules, prompt);
         section("user_deny_rules", &self.settings.deny_rules, prompt)
@@ -387,14 +353,11 @@ impl Active {
             .map_err(|error| format!("failed to load conversation {id} for auto review: {error}"))??;
 
         let live = history.live();
-        // The roster only means anything where there is more than one person to
-        // apply it to. A private chat has an empty one *and* a single
-        // counterpart, and reading the first as the second is what made every
-        // one of their messages a bystander's.
-        let party = if self.context.multi_party {
-            projection::Party::Multi { admins: &self.admins }
-        } else {
-            projection::Party::Single
+        let party = match &self.context.party {
+            ReviewParty::Single => projection::Party::Single,
+            ReviewParty::Multi { authorized_senders } => projection::Party::Multi {
+                admins: authorized_senders,
+            },
         };
         projection::render(
             &projection::Scene {
@@ -699,7 +662,11 @@ impl Approvals for AutoReviewed<'_> {
         call: &ToolCall,
         retry: Option<crate::agent::engine::Escalation<'_>>,
     ) -> Result<Option<ApprovalDecision>, String> {
-        let Some(active) = self.active.as_ref().filter(|_| !Self::passthrough(&call.name)) else {
+        let Some(active) = self
+            .active
+            .as_ref()
+            .filter(|a| !Self::passthrough(&call.name) && !a.context.request_approve.contains(&call.name))
+        else {
             return self.inner.ask(assistant_message_id, call, retry).await;
         };
 
@@ -747,7 +714,7 @@ impl Approvals for AutoReviewed<'_> {
                 );
                 return self
                     .unresolved(
-                        refuses_on_miss(active.context.unattended, active.context.fail_closed, &call.name),
+                        refuses_on_miss(active.context.unattended, &active.context.fail_closed, &call.name),
                         assistant_message_id,
                         call,
                         retry,
@@ -798,7 +765,7 @@ impl Approvals for AutoReviewed<'_> {
                 // giving up.
                 active.announce(assistant_message_id, call, &event_verdict);
                 self.unresolved(
-                    refuses_on_miss(active.context.unattended, active.context.fail_closed, &call.name),
+                    refuses_on_miss(active.context.unattended, &active.context.fail_closed, &call.name),
                     assistant_message_id,
                     call,
                     retry,
@@ -896,19 +863,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn malformed_admin_roster_is_not_an_empty_roster() {
-        for value in ["not json", r#"{"admin": 1}"#, r#"[1,"2"]"#] {
-            let db = sea_test_db().await;
-            set_preference(&db, "onebot.admin_users", value).await;
-            let error = admin_roster(&db).await.expect_err("malformed admin roster must fail");
-            assert!(error.contains("onebot.admin_users"), "{value}: {error}");
-        }
-
-        let db = sea_test_db().await;
-        assert!(admin_roster(&db).await.unwrap().is_empty());
-        set_preference(&db, "onebot.admin_users", "[1,2]").await;
-        assert_eq!(admin_roster(&db).await.unwrap(), vec![1, 2]);
+    #[test]
+    fn refuses_on_miss_checks_unattended_and_dynamic_fail_closed_set() {
+        let mut set = HashSet::new();
+        set.insert("mcp__luckin__order".to_string());
+        assert!(refuses_on_miss(false, &set, "mcp__luckin__order"));
+        assert!(!refuses_on_miss(false, &set, "read_file"));
+        assert!(refuses_on_miss(true, &HashSet::new(), "read_file"));
     }
 
     #[tokio::test]
@@ -987,11 +948,13 @@ mod tests {
     }
 
     #[test]
-    fn manage_replies_miss_is_a_refusal_even_with_a_card() {
-        assert!(refuses_on_miss(true, &[], "run_command"));
-        assert!(!refuses_on_miss(false, &[], "run_command"));
-        assert!(refuses_on_miss(false, &["qq_manage_replies"], "qq_manage_replies"));
-        assert!(!refuses_on_miss(false, &["qq_manage_replies"], "qq_set_group_ban"));
+    fn fail_closed_tool_miss_is_a_refusal_even_with_a_card() {
+        let empty = HashSet::new();
+        let restricted = HashSet::from(["sensitive_tool".to_string()]);
+        assert!(refuses_on_miss(true, &empty, "run_command"));
+        assert!(!refuses_on_miss(false, &empty, "run_command"));
+        assert!(refuses_on_miss(false, &restricted, "sensitive_tool"));
+        assert!(!refuses_on_miss(false, &restricted, "other_tool"));
     }
 
     /// Off, or unconfigured. Every call goes through untouched, which is what

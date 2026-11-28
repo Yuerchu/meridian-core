@@ -150,6 +150,18 @@ pub(crate) async fn consume_stream(
                             entry.2 = arguments.clone();
                         }
                     }
+                    Ok(Some(Ok(provider::StreamEvent::ToolSearchCall {
+                        id: _,
+                        ref call_id,
+                        ref arguments,
+                    }))) => {
+                        mark_first_token(&mut first_token_at);
+                        tool_acc.push((
+                            call_id.clone(),
+                            provider::TOOL_SEARCH_CALL_SENTINEL.to_string(),
+                            arguments.clone(),
+                        ));
+                    }
                     Ok(Some(Ok(provider::StreamEvent::ServerToolCall(ref call)))) => {
                         // Announced, never dispatched: the upstream has already
                         // run it. Without this the reader gets a minute of

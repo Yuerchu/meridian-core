@@ -55,7 +55,6 @@ pub fn catalog(registry: &ToolRegistry) -> Value {
         "generated_by": "meridian-core tools::catalog. Do not edit; run UPDATE_TOOL_CATALOG=1 cargo test -p meridian-core --lib tools::catalog",
         "native": native.into_values().collect::<Vec<_>>(),
         "bridge_prefix": format!("mcp__{}__", crate::acp::bridge::SERVER_NAME),
-        "onebot": crate::onebot::qq_tool_spec_catalog(),
     })
 }
 

@@ -187,11 +187,21 @@ pub async fn clear(tx: &WriteTx, slot: &DraftSlot, revision: i64, now: EpochMs) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::entity::emoji::EmojiSemanticStatus;
-    use crate::db::entity::emoji_pack::EmojiPackKind;
     use crate::db::sea::cap::Db;
-    use crate::db::sea::ops::{emoji, emoji_pack};
     use crate::db::sea::{execute_for_tests, sea_test_db};
+
+    async fn seed_legacy_emoji(db: &Db, pack_id: &str, emoji_id: &str) {
+        execute_for_tests(
+            db,
+            &format!(
+                "INSERT INTO emoji_packs (id, name, created_at, updated_at) VALUES ('{pack_id}', 'Pack', 0, 0);
+                 INSERT INTO emojis (id, pack_id, name, file_name, file_format, created_at, semantic_status)
+                     VALUES ('{emoji_id}', '{pack_id}', 'wave', 'wave.png', 'png', 0, 'confirmed');"
+            ),
+        )
+        .await
+        .unwrap();
+    }
 
     async fn conversation(db: &Db, id: &str) {
         execute_for_tests(
@@ -271,8 +281,7 @@ mod tests {
     async fn a_rewrite_clears_what_it_leaves_out() {
         let db = sea_test_db().await;
         conversation(&db, "c1").await;
-        emoji_pack::tests::insert(&db, emoji_pack::tests::pack("p1", EmojiPackKind::Manual, None, 0)).await;
-        emoji::tests::insert(&db, emoji::tests::sticker("e1", "p1", EmojiSemanticStatus::Confirmed)).await;
+        seed_legacy_emoji(&db, "p1", "e1").await;
 
         let full = ComposerDraftContent {
             body: "look".to_string(),
@@ -435,8 +444,7 @@ mod tests {
     async fn deleting_the_sticker_takes_it_off_the_draft() {
         let db = sea_test_db().await;
         conversation(&db, "c1").await;
-        emoji_pack::tests::insert(&db, emoji_pack::tests::pack("p1", EmojiPackKind::Manual, None, 0)).await;
-        emoji::tests::insert(&db, emoji::tests::sticker("e1", "p1", EmojiSemanticStatus::Confirmed)).await;
+        seed_legacy_emoji(&db, "p1", "e1").await;
 
         let content = ComposerDraftContent {
             body: "look".to_string(),
@@ -444,7 +452,7 @@ mod tests {
             ..ComposerDraftContent::default()
         };
         write(&db, &slot("c1"), &content, 1, 100).await.unwrap();
-        db.write(async |tx| emoji::delete(tx, "e1").await).await.unwrap();
+        execute_for_tests(&db, "DELETE FROM emojis WHERE id = 'e1'").await.unwrap();
 
         let row = get(&db, &slot("c1")).await.unwrap().unwrap();
         assert_eq!((row.sticker_id, row.body.as_str()), (None, "look"));

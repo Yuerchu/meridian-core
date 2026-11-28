@@ -120,11 +120,27 @@ async fn snapshot_of(tx: &WriteTx, subject: Subject<'_>) -> Result<Snapshot, DbE
     let turn_origin = turn.as_ref().map(|t| t.origin.as_str().to_owned());
     let self_id = turn.as_ref().and_then(|t| t.self_id);
     let sender_name = match subject.sender_id {
-        Some(uid) => memory::get_subject(tx, &crate::db::entity::memory::onebot_user_scope_id(uid))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| s.display_name),
+        Some(uid) => {
+            let channel = project
+                .as_ref()
+                .and_then(|p| p.channel_kind.as_deref())
+                .unwrap_or("channel");
+            let scope_id = crate::db::entity::memory::external_subject_scope_id(channel, &uid.to_string());
+            match memory::get_subject(tx, &scope_id).await.ok().flatten() {
+                Some(s) => s.display_name,
+                None => {
+                    // Fallback lookup for archived legacy `onebot:<uid>` subject keys.
+                    memory::get_subject(
+                        tx,
+                        &crate::db::entity::memory::external_subject_scope_id("onebot", &uid.to_string()),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.display_name)
+                }
+            }
+        }
         None => None,
     };
     let billing_mode = billing_mode_for(
@@ -265,6 +281,9 @@ pub const EXTRACTION_ROLE: &str = "extraction";
 /// a conversation the user never asked anything extra of.
 pub const CACHE_WARM_ROLE: &str = "cache_warm";
 
+/// Background Auto-Dream memory consolidation pass.
+pub const DREAM_ROLE: &str = "dream";
+
 /// Every role that carries spend.
 ///
 /// The list `db::sea::ops::usage` filters on. A role missing from here is traffic
@@ -278,6 +297,7 @@ pub const BILLED_ROLES: &[&str] = &[
     TITLE_ROLE,
     EXTRACTION_ROLE,
     CACHE_WARM_ROLE,
+    DREAM_ROLE,
 ];
 
 /// What one request the app made on its own behalf cost.

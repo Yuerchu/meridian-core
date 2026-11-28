@@ -51,7 +51,7 @@ impl SubAgentKind {
 /// Prices remain optional so an unconfigured model is distinct from an
 /// explicitly free model. Amounts are exact decimals all the way into the
 /// model-facing catalog.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentModel {
     pub provider_id: String,
     pub provider_name: String,
@@ -101,7 +101,7 @@ impl AgentModel {
 }
 
 /// The models on offer this turn, cheapest first.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SubAgentCatalog {
     pub models: Vec<AgentModel>,
 }

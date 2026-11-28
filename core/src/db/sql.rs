@@ -180,7 +180,7 @@ macro_rules! usage_grouping {
                                AND COALESCE(server_tool_calls, 0) = 0
                          THEN 1 ELSE 0 END) AS explicit_zero_messages
            FROM audit_messages
-          WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction', 'cache_warm')
+          WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction', 'cache_warm', 'dream')
             AND (? IS NULL OR created_at >= ?)
             AND (? IS NULL OR created_at < ?)
             AND (? IS NULL OR turn_origin = ?)
@@ -269,7 +269,7 @@ macro_rules! gap_details {
             "SELECT id, created_at, conversation_id, role, provider_name, model_id, source_type,
             LENGTH(content) AS content_chars
        FROM audit_messages
-      WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction', 'cache_warm')
+      WHERE role IN ('assistant', 'auto_review', 'compaction', 'title', 'extraction', 'cache_warm', 'dream')
         AND (? IS NULL OR created_at >= ?)
         AND (? IS NULL OR created_at < ?)
         AND (? IS NULL OR turn_origin = ?)

@@ -25,8 +25,6 @@ pub mod run_command;
 pub mod search_files;
 pub mod skill;
 pub mod spec;
-pub mod sticker;
-pub mod sticker_embed;
 pub mod sub_agent;
 pub mod todo;
 pub mod usage;
@@ -640,7 +638,6 @@ pub struct ToolRegistry {
     builtin: Vec<Arc<dyn Tool>>,
     custom: std::sync::RwLock<Vec<Arc<dyn Tool>>>,
     media_runner: media_gen::SharedMediaRunner,
-    sticker_embed: sticker::SharedStickerEmbedIndex,
 }
 
 impl ToolRegistry {
@@ -655,7 +652,6 @@ impl ToolRegistry {
         redaction_engine: Arc<crate::redaction::RedactionEngine>,
     ) -> Self {
         let media_runner: media_gen::SharedMediaRunner = Arc::new(std::sync::OnceLock::new());
-        let sticker_embed: sticker::SharedStickerEmbedIndex = Arc::new(std::sync::OnceLock::new());
         #[allow(unused_mut)]
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ask_user::AskUserTool),
@@ -677,8 +673,6 @@ impl ToolRegistry {
             Arc::new(memory::ListMemoriesTool),
             Arc::new(memory::DeleteMemoryTool),
             Arc::new(todo::UpdateTodosTool),
-            Arc::new(sticker::ListStickersTool),
-            Arc::new(sticker::SendStickerTool::new(sticker_embed.clone())),
             Arc::new(plan::EnterPlanTool),
             Arc::new(plan::ReadPlanTool),
             Arc::new(plan::UpdatePlanTool),
@@ -693,7 +687,7 @@ impl ToolRegistry {
             // prefix — and self-limiting: it reads only conversations the user
             // has attached to the current one, so a session with no references
             // holds an empty grant set and every call is refused with the
-            // reason. See the module header for why QQ never reaches it.
+            // reason.
             Arc::new(read_conversation::ReadConversationTool::new()),
             Arc::new(web_search::WebSearchTool::new()),
             Arc::new(media_gen::GenerateImageTool::new(media_runner.clone())),
@@ -714,7 +708,6 @@ impl ToolRegistry {
             builtin: tools,
             custom: std::sync::RwLock::new(Vec::new()),
             media_runner,
-            sticker_embed,
         }
     }
 
@@ -722,12 +715,6 @@ impl ToolRegistry {
     /// `generate_image` and `generate_video` tools can execute media jobs.
     pub fn attach_media_runner(&self, runner: Arc<crate::media::MediaRunner>) {
         let _ = self.media_runner.set(runner);
-    }
-
-    /// Bind the shared [`sticker_embed::StickerEmbedIndex`] so desktop
-    /// `send_sticker` reads precomputed vectors without blocking turns.
-    pub fn attach_sticker_embed(&self, index: Arc<sticker_embed::StickerEmbedIndex>) {
-        let _ = self.sticker_embed.set(index);
     }
 
     /// Replace the set of user-defined tools. Called at startup and after every
@@ -738,14 +725,44 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> Vec<crate::provider::ToolDefinition> {
-        let def = |t: &Arc<dyn Tool>| crate::provider::ToolDefinition {
-            name: t.name().to_string(),
-            description: t.description().to_string(),
-            parameters: t.parameters_schema(),
-        };
-        let mut out: Vec<_> = self.builtin.iter().map(def).collect();
-        out.extend(self.custom.read().unwrap().iter().map(def));
+        let mut out = self.builtin_definitions();
+        out.extend(self.custom_definitions());
         out
+    }
+
+    pub fn builtin_definitions(&self) -> Vec<crate::provider::ToolDefinition> {
+        self.builtin
+            .iter()
+            .map(|t| crate::provider::ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters_schema(),
+            })
+            .collect()
+    }
+
+    pub fn builtin_definition(&self, name: &str) -> Option<crate::provider::ToolDefinition> {
+        self.builtin
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| crate::provider::ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters_schema(),
+            })
+    }
+
+    pub fn custom_definitions(&self) -> Vec<crate::provider::ToolDefinition> {
+        self.custom
+            .read()
+            .unwrap()
+            .iter()
+            .map(|t| crate::provider::ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters_schema(),
+            })
+            .collect()
     }
 
     /// The built-in tools whose spec answers yes, in registry order. Built-ins
