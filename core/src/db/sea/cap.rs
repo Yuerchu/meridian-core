@@ -86,8 +86,18 @@ pub trait Read: sealed::Access + Sync {}
 pub trait Snapshot: Read {}
 
 /// The pool.
+///
+/// `lock_key` is PostgreSQL-only: [`Db::write`] takes
+/// `pg_advisory_xact_lock` with it so one writer runs at a time, matching
+/// SQLite `BEGIN IMMEDIATE`. SQLite ignores it. The field is named `pool`
+/// rather than `conn`: a field with the sealed accessor's name would change
+/// the compile-fail contract from "method not found" to "private field".
 #[derive(Clone, Debug)]
-pub struct Db(DatabaseConnection);
+pub struct Db {
+    pool: DatabaseConnection,
+    #[cfg(feature = "postgres")]
+    lock_key: Option<i64>,
+}
 
 /// A deferred transaction. Reads only.
 #[derive(Debug)]
@@ -99,7 +109,30 @@ pub struct WriteTx(DatabaseTransaction);
 
 impl Db {
     pub fn new(conn: DatabaseConnection) -> Self {
-        Self(conn)
+        #[cfg(feature = "postgres")]
+        assert_ne!(
+            conn.get_database_backend(),
+            sea_orm::DbBackend::Postgres,
+            "PostgreSQL needs a writer lock key: construct it with Db::new_postgres"
+        );
+        Self {
+            pool: conn,
+            #[cfg(feature = "postgres")]
+            lock_key: None,
+        }
+    }
+
+    /// A PostgreSQL pool whose writes serialize on `lock_key`.
+    ///
+    /// One key per user schema: writers of different users do not block each
+    /// other. The key is an `i64` because that is what `pg_advisory_xact_lock`
+    /// takes.
+    #[cfg(feature = "postgres")]
+    pub fn new_postgres(conn: DatabaseConnection, lock_key: i64) -> Self {
+        Self {
+            pool: conn,
+            lock_key: Some(lock_key),
+        }
     }
 
     /// Runs `f` inside `BEGIN IMMEDIATE`: committed on `Ok`, rolled back on `Err`.
@@ -112,7 +145,11 @@ impl Db {
             sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
             ..Default::default()
         };
-        let tx = WriteTx(self.0.begin_with_options(options).await?);
+        let tx = WriteTx(self.pool.begin_with_options(options).await?);
+        #[cfg(feature = "postgres")]
+        if let Some(key) = self.lock_key {
+            crate::db::sql::lock_postgres_writer(&tx, key).await?;
+        }
         let out = ACTIVE_TX.scope(TxMode::Write, f(&tx)).await;
         settle(tx.0, out).await
     }
@@ -125,9 +162,11 @@ impl Db {
         refuse_inside_transaction("Db::read")?;
         let options = TransactionOptions {
             sqlite_transaction_mode: Some(SqliteTransactionMode::Deferred),
+            #[cfg(feature = "postgres")]
+            isolation_level: self.lock_key.map(|_| sea_orm::IsolationLevel::RepeatableRead),
             ..Default::default()
         };
-        let tx = ReadTx(self.0.begin_with_options(options).await?);
+        let tx = ReadTx(self.pool.begin_with_options(options).await?);
         let out = ACTIVE_TX.scope(TxMode::Read, f(&tx)).await;
         settle(tx.0, out).await
     }
@@ -163,7 +202,7 @@ impl sealed::Access for Db {
     type Conn = DatabaseConnection;
     fn conn(&self) -> Result<&DatabaseConnection, DbErr> {
         refuse_inside_transaction("a pool connection")?;
-        Ok(&self.0)
+        Ok(&self.pool)
     }
 }
 

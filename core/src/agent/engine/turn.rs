@@ -3227,14 +3227,7 @@ mod tests {
     async fn a_tool_row_the_database_refuses_does_not_stop_the_turn_or_move_the_cursor() {
         let pool = crate::db::sea::sea_test_db().await;
         conversation(&pool).await;
-        crate::db::sea::execute_for_tests(
-            &pool,
-            "CREATE TRIGGER no_tool_rows BEFORE INSERT ON messages \
-             WHEN NEW.role = 'tool' \
-             BEGIN SELECT RAISE(ABORT, 'refused'); END",
-        )
-        .await
-        .unwrap();
+        crate::db::sea::refuse_tool_message_rows_for_tests(&pool).await.unwrap();
         let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
         let provider = Scripted::of(vec![calls("call-1", "fixture", "{}"), says("carried on")]);
         let approvals = Answers::nobody();

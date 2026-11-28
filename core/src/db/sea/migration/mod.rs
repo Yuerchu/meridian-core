@@ -31,6 +31,9 @@ pub mod m0015_cache_ttl_and_lifecycle;
 pub mod m0016_generalize_channel_sources;
 pub mod m0017_mcp_tool_policies;
 pub mod m0018_dream_memory;
+pub mod m0019_turn_sequence;
+#[cfg(all(any(test, feature = "test-support"), feature = "postgres"))]
+pub mod pg;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -63,6 +66,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0016GeneralizeChannelSources),
             Box::new(M0017McpToolPolicies),
             Box::new(M0018DreamMemory),
+            Box::new(M0019TurnSequence),
         ]
     }
 }
@@ -127,6 +131,7 @@ pub fn sqlite_statements() -> Vec<String> {
     all.extend(m0016_generalize_channel_sources::sqlite_statements());
     all.extend(m0017_mcp_tool_policies::sqlite_statements());
     all.extend(m0018_dream_memory::sqlite_statements());
+    all.extend(m0019_turn_sequence::sqlite_statements());
     all
 }
 
@@ -678,6 +683,35 @@ impl MigrationTrait for M0018DreamMemory {
             ));
         }
         for statement in m0018_dream_memory::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0019TurnSequence;
+
+impl MigrationName for M0019TurnSequence {
+    fn name(&self) -> &str {
+        "m0019_turn_sequence"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0019TurnSequence {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "m0019_turn_sequence backfills from SQLite's rowid; other backends build the column in the baseline"
+                    .into(),
+            ));
+        }
+        for statement in m0019_turn_sequence::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;
         }
         Ok(())

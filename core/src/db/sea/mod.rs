@@ -107,6 +107,10 @@ pub async fn open(path: &Path) -> Result<Db, DbErr> {
 #[cfg(any(test, feature = "test-support"))]
 pub async fn sea_test_db() -> Db {
     use sea_orm::ConnectionTrait;
+    #[cfg(feature = "postgres")]
+    if migration::pg::url().is_some() {
+        return migration::pg::fresh(2).await;
+    }
 
     use self::cap::sealed::Access;
 
@@ -142,6 +146,10 @@ pub async fn memory_connection() -> sea_orm::DatabaseConnection {
 /// single-connection `sea_test_db` cannot give.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn file_test_db(dir: &Path) -> Db {
+    #[cfg(feature = "postgres")]
+    if migration::pg::url().is_some() {
+        return migration::pg::fresh(8).await;
+    }
     let path = dir.join("shared.sqlite");
     bridge::migrate_file(&path)
         .await
@@ -160,6 +168,52 @@ pub async fn execute_for_tests(db: &Db, sql: &str) -> Result<(), DbErr> {
     use self::cap::sealed::Access;
 
     db.conn()?.execute_unprepared(sql).await?;
+    Ok(())
+}
+
+/// Makes writes to `messages` fail, for tests of what a refused write does to
+/// a turn. SQLite has `PRAGMA query_only` and no `ADD CONSTRAINT`; PostgreSQL
+/// has the constraint and no pragma. Both spellings live here so the test only
+/// states intent. `NOT VALID` avoids rejecting rows already written.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn refuse_message_writes_for_tests(db: &Db, refuse: bool) -> Result<(), DbErr> {
+    use sea_orm::{ConnectionTrait, DbBackend};
+
+    use self::cap::sealed::Access;
+
+    let conn = db.conn()?;
+    let sql = match (conn.get_database_backend(), refuse) {
+        (DbBackend::Postgres, true) => {
+            "ALTER TABLE messages ADD CONSTRAINT refuse_writes_for_tests CHECK (false) NOT VALID"
+        }
+        (DbBackend::Postgres, false) => "ALTER TABLE messages DROP CONSTRAINT refuse_writes_for_tests",
+        (_, true) => "PRAGMA query_only=ON",
+        (_, false) => "PRAGMA query_only=OFF",
+    };
+    conn.execute_unprepared(sql).await?;
+    Ok(())
+}
+
+/// Makes an insert of a `tool` row into `messages` fail and leaves every other
+/// role alone, for the test of what a lost tool result does to a turn.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn refuse_tool_message_rows_for_tests(db: &Db) -> Result<(), DbErr> {
+    use sea_orm::{ConnectionTrait, DbBackend};
+
+    use self::cap::sealed::Access;
+
+    let conn = db.conn()?;
+    let sql = match conn.get_database_backend() {
+        DbBackend::Postgres => {
+            "ALTER TABLE messages ADD CONSTRAINT refuse_tool_rows_for_tests CHECK (role <> 'tool') NOT VALID"
+        }
+        _ => {
+            "CREATE TRIGGER refuse_tool_rows_for_tests BEFORE INSERT ON messages \
+             WHEN NEW.role = 'tool' \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END"
+        }
+    };
+    conn.execute_unprepared(sql).await?;
     Ok(())
 }
 

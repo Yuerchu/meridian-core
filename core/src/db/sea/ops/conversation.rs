@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use sea_orm::ActiveValue::Set;
-use sea_orm::sea_query::{Expr, ExprTrait, LikeExpr};
+use sea_orm::sea_query::{Expr, ExprTrait, Func, LikeExpr};
 use sea_orm::{
     ColumnTrait, Condition, DbErr, EntityTrait, IntoActiveModel, JoinType, QueryFilter, QueryOrder, QuerySelect,
     RelationTrait,
@@ -246,10 +246,18 @@ pub async fn set_archived(tx: &WriteTx, id: &str, archived: bool, now: EpochMs) 
 
 /// The conversations spawned by this one, oldest first, so two readings
 /// compare element by element and leases are always taken in one order.
+///
+/// `created_at` alone does not deliver that: delegating two sub-agents in one
+/// round writes both rows in the same millisecond, and the order left over is
+/// the physical row order — insertion order on SQLite today, and nothing in
+/// particular on another backend or after a vacuum. The id breaks the tie. It
+/// is a uuid, so the order it imposes means nothing; the point is that it is
+/// the same order every time. The other two walks below do the same.
 pub async fn sub_agent_conversation_ids(db: &impl Read, parent_id: &str) -> Result<Vec<String>, DbErr> {
     conversation::Entity::find()
         .filter(conversation::Column::ParentConversationId.eq(parent_id))
         .order_by_asc(conversation::Column::CreatedAt)
+        .order_by_asc(conversation::Column::Id)
         .select_only()
         .column(conversation::Column::Id)
         .into_tuple()
@@ -268,6 +276,7 @@ pub async fn descendants(db: &impl Snapshot, id: &str) -> Result<Vec<String>, Db
         let children: Vec<String> = conversation::Entity::find()
             .filter(conversation::Column::ParentConversationId.is_in(frontier.iter().map(String::as_str)))
             .order_by_asc(conversation::Column::CreatedAt)
+            .order_by_asc(conversation::Column::Id)
             .select_only()
             .column(conversation::Column::Id)
             .into_tuple()
@@ -301,6 +310,7 @@ pub async fn sub_agent_runs(db: &impl Snapshot, parent_id: &str) -> Result<Vec<S
     let rows = conversation::Entity::find()
         .filter(conversation::Column::ParentConversationId.eq(parent_id))
         .order_by_asc(conversation::Column::CreatedAt)
+        .order_by_asc(conversation::Column::Id)
         .all(db.conn()?)
         .await?;
     let turn_ids: Vec<String> = rows.iter().filter_map(|r| r.spawned_turn_id.clone()).collect();
@@ -368,8 +378,10 @@ const SEARCH_PAGE: u64 = 400;
 /// encoding hides a quote or a newline from LIKE. Keyset paging on
 /// (created_at, id) so a run of rows in one millisecond is neither skipped nor
 /// served twice. Several statements, so it takes a snapshot.
-// backend: sqlite-only — LIKE folds ASCII case on SQLite, which the recheck's
-// fold matches; PostgreSQL's LIKE is case-sensitive and would want ILIKE.
+/// The prefilter has to fold case the way the recheck does, or it drops rows
+/// the recheck would have accepted and the search quietly misses them —
+/// SQLite's `LIKE` folds ASCII case and PostgreSQL's does not.
+/// `a_search_finds_a_row_whatever_case_it_was_typed_in` is the gate.
 pub async fn search_transcripts(db: &impl Snapshot, query: &str, limit: usize) -> Result<Vec<TranscriptHit>, DbErr> {
     let trimmed = query.trim();
     if trimmed.is_empty() || limit == 0 {
@@ -379,6 +391,12 @@ pub async fn search_transcripts(db: &impl Snapshot, query: &str, limit: usize) -
     // the characters.
     let escaped = trimmed.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
     let pattern = LikeExpr::new(format!("%{escaped}%")).escape('\\');
+    // The folded half of the prefilter. `LOWER` on both sides is the portable
+    // spelling of a case-insensitive `LIKE`: SQLite's `LIKE` folds ASCII and
+    // PostgreSQL's does not, and PostgreSQL's `ILIKE` cannot carry the
+    // `ESCAPE` that keeps a searched-for `%` a literal. The pattern is folded
+    // in ASCII because `LOWER` is ASCII-only on SQLite and the recheck is too.
+    let folded = LikeExpr::new(format!("%{}%", escaped.to_ascii_lowercase())).escape('\\');
 
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
@@ -390,7 +408,17 @@ pub async fn search_transcripts(db: &impl Snapshot, query: &str, limit: usize) -
             .filter(message::Column::Role.is_in(["user", "assistant"]))
             .filter(
                 Condition::any()
+                    .add(
+                        Expr::expr(Func::lower(Expr::col((message::Entity, message::Column::Content))))
+                            .like(folded.clone()),
+                    )
+                    // Case as typed. On PostgreSQL `LOWER` folds beyond ASCII
+                    // while the pattern above and the recheck do not, so a
+                    // row matching exactly is caught here instead of being
+                    // dropped before the recheck sees it.
                     .add(Expr::col((message::Entity, message::Column::Content)).like(pattern.clone()))
+                    // Every block-array row, whose JSON hides the text from
+                    // any operator. Case does not arise in `[`.
                     .add(Expr::col((message::Entity, message::Column::Content)).like("[%")),
             );
         if let Some((at, id)) = &cursor {
@@ -691,6 +719,36 @@ mod tests {
         assert!(hits[0].snippet.contains("消息树"), "{}", hits[0].snippet);
         assert!(search(&db, "消息树", 0).await.is_empty());
         assert!(search(&db, "   ", 20).await.is_empty());
+    }
+
+    /// The SQL prefilter folds ASCII case the same way the Rust recheck does.
+    /// A plain `LIKE` folds on SQLite and not on PostgreSQL, where every row
+    /// typed in another case would be dropped before the recheck ever saw it.
+    /// Mutation: remove `LOWER` and this goes red on PostgreSQL while staying
+    /// green on SQLite.
+    #[tokio::test]
+    async fn a_search_finds_a_row_whatever_case_it_was_typed_in() {
+        let db = sea_test_db().await;
+        conversations(&db, vec![new_row("c1", 1), new_row("c2", 1)]).await;
+        say(&db, "m1", "c1", "user", "the Postgres migration", 10).await;
+        say(&db, "m2", "c2", "assistant", "SHOUTING ABOUT CACHES", 20).await;
+
+        for query in ["postgres", "POSTGRES", "PostGres"] {
+            let hits = search(&db, query, 20).await;
+            assert_eq!(
+                hits.iter().map(|h| h.conversation_id.as_str()).collect::<Vec<_>>(),
+                ["c1"],
+                "searching for {query:?}"
+            );
+        }
+        for query in ["caches", "CACHES"] {
+            let hits = search(&db, query, 20).await;
+            assert_eq!(
+                hits.iter().map(|h| h.conversation_id.as_str()).collect::<Vec<_>>(),
+                ["c2"],
+                "searching for {query:?}"
+            );
+        }
     }
 
     /// LIKE's wildcards are characters to the person searching; a quote that

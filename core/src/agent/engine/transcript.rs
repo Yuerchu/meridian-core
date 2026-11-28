@@ -477,13 +477,15 @@ mod tests {
     }
 
     /// Filling the row is the checkpoint before tools may run, so a refused
-    /// write must stop the turn. The test database is one connection, so
-    /// `query_only` set on it holds for the write that follows.
+    /// write must stop the turn. How a write is refused is the backend's
+    /// business, so the helper owns both spellings.
     #[tokio::test]
     async fn filling_a_row_in_propagates_a_database_write_error() {
         let db = conversation().await;
         let id = begin_assistant(&db, "c1", "t1", (None, None), "m", None).await.unwrap();
-        execute_for_tests(&db, "PRAGMA query_only=ON").await.unwrap();
+        crate::db::sea::refuse_message_writes_for_tests(&db, true)
+            .await
+            .unwrap();
         assert!(
             complete_assistant(
                 &db,
@@ -499,7 +501,9 @@ mod tests {
             .await
             .is_err()
         );
-        execute_for_tests(&db, "PRAGMA query_only=OFF").await.unwrap();
+        crate::db::sea::refuse_message_writes_for_tests(&db, false)
+            .await
+            .unwrap();
         assert_eq!(rows(&db).await[0].content, "", "and it really did not land");
     }
 

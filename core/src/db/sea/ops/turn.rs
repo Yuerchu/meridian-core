@@ -44,8 +44,21 @@ pub async fn begin_triggered(
     (trigger, trigger_ref): (TurnTrigger, Option<&str>),
     now: EpochMs,
 ) -> Result<(), DbErr> {
+    // The order `by_insertion` reads back. Taken inside the caller's write
+    // transaction, which is `BEGIN IMMEDIATE` on SQLite and holds the advisory
+    // lock on PostgreSQL, so no second writer can take the same number.
+    let seq = turn::Entity::find()
+        .select_only()
+        .column_as(turn::Column::Seq.max(), "high")
+        .into_tuple::<Option<i64>>()
+        .one(tx.conn()?)
+        .await?
+        .flatten()
+        .unwrap_or(0)
+        + 1;
     turn::Entity::insert(turn::ActiveModel {
         id: Set(id.to_owned()),
+        seq: Set(seq),
         conversation_id: Set(conversation_id.to_owned()),
         origin: Set(origin),
         status: Set(TurnStatus::Running),
@@ -143,19 +156,20 @@ pub struct InterruptedCandidate {
     pub child_title: Option<String>,
 }
 
-/// Tie-break for turns that started in the same millisecond: SQLite's rowid,
-/// assigned on insert. A turn refused by its provider can begin and end
-/// inside a millisecond, and the id is a uuid whose order means nothing.
-// backend: sqlite-only — `rowid`; PostgreSQL needs an insertion sequence column.
+/// Tie-break for turns that started in the same millisecond: the insertion
+/// sequence [`begin_triggered`] assigns. A turn refused by its provider can
+/// begin and end inside a millisecond, and the id is a uuid whose order means
+/// nothing. This was `rowid` until `m0019_turn_sequence`, which no second
+/// backend has.
 fn by_insertion(select: Select<turn::Entity>, newest_first: bool) -> Select<turn::Entity> {
     if newest_first {
         select
             .order_by_desc(turn::Column::StartedAt)
-            .order_by_desc(Expr::cust("rowid"))
+            .order_by_desc(turn::Column::Seq)
     } else {
         select
             .order_by_asc(turn::Column::StartedAt)
-            .order_by_asc(Expr::cust("rowid"))
+            .order_by_asc(turn::Column::Seq)
     }
 }
 

@@ -109,6 +109,11 @@ pub struct Model {
     pub trigger: TurnTrigger,
     /// What did the waking, for a turn nobody asked for.
     pub trigger_ref: Option<String>,
+    /// Insertion order, the tie-break between turns that started in the same
+    /// millisecond. Filled by `ops::turn::begin_triggered` from `MAX(seq) + 1`
+    /// under the write lock; `m0019_turn_sequence` says why it is a column
+    /// rather than `rowid`. `0` is a row no writer filled.
+    pub seq: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
