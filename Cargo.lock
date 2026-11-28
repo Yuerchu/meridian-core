@@ -2897,7 +2897,6 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "bigdecimal",
  "bytes",
  "bzip2 0.4.4",
  "cap-fs-ext",
@@ -2923,6 +2922,7 @@ dependencies = [
  "libc",
  "libsqlite3-sys",
  "litert-lm",
+ "meridian-decimal",
  "meridian-provider-sdk",
  "meridian-providers",
  "mime_guess",
@@ -2959,17 +2959,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-decimal"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "sea-orm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "meridian-provider-sdk"
 version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
- "bigdecimal",
  "bytes",
  "chrono",
  "eventsource-stream",
  "futures",
  "http",
+ "meridian-decimal",
  "rand 0.9.5",
  "regex",
  "reqwest",

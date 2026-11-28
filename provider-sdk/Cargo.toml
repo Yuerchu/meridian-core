@@ -20,14 +20,14 @@ should_implement_trait = "allow"
 default = []
 # Optional SeaORM TEXT mapping for `Decimal`. Enabled only by `meridian-core`;
 # external provider crates never pull in a database driver.
-sea-orm = ["dep:sea-orm"]
+sea-orm = ["dep:sea-orm", "meridian-decimal/sea-orm"]
 # Reusable conformance test assertions for external vendor PRs.
 conformance = []
 
 [dependencies]
 async-stream = "0.3"
 async-trait = "0.1"
-bigdecimal = "0.4.10"
+meridian-decimal = { path = "../decimal" }
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 eventsource-stream = "0.2"
