@@ -217,21 +217,25 @@ pub async fn bootstrap_with_secrets(
     {
         if let Some(api_key) = mgr
             .get(&SecretScope::Global, &SecretName::new("API_KEY").unwrap())
+            .await
             .ok()
             .flatten()
         {
             let provider_type = mgr
                 .get(&SecretScope::Global, &SecretName::new("PROVIDER_TYPE").unwrap())
+                .await
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "openai".into());
             let base_url = mgr
                 .get(&SecretScope::Global, &SecretName::new("API_BASE").unwrap())
+                .await
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "https://api.openai.com/v1".into());
             let model = mgr
                 .get(&SecretScope::Global, &SecretName::new("MODEL").unwrap())
+                .await
                 .ok()
                 .flatten();
 
@@ -290,7 +294,9 @@ pub async fn bootstrap_with_secrets(
                         Ok(None) => {}
                         Ok(Some(provider)) => {
                             let key_name = provider_secret_name(&provider.id);
-                            let _ = mgr.set(&SecretScope::Global, &SecretName::new(&key_name).unwrap(), &api_key);
+                            let _ = mgr
+                                .set(&SecretScope::Global, &SecretName::new(&key_name).unwrap(), &api_key)
+                                .await;
                         }
                         Err(error) => tracing::warn!(error = %error, "could not migrate the legacy provider"),
                     }
@@ -764,9 +770,11 @@ mod tests {
             ));
             secrets
                 .set(&SecretScope::Global, &SecretName::new("API_KEY").unwrap(), "sk-legacy")
+                .await
                 .unwrap();
             secrets
                 .set(&SecretScope::Global, &SecretName::new("MODEL").unwrap(), "gpt-legacy")
+                .await
                 .unwrap();
             super::bootstrap_with_secrets(dir.path().to_path_buf(), crate::events::EventBus::new(), secrets)
                 .await
@@ -783,7 +791,9 @@ mod tests {
         assert_eq!(assistant.provider_id.as_deref(), Some(providers[0].id.as_str()));
         assert_eq!(assistant.model_id.as_deref(), Some("gpt-legacy"));
         assert_eq!(
-            crate::agent::get_provider_api_key(&services.secrets, &providers[0].id).as_deref(),
+            crate::agent::get_provider_api_key(&services.secrets, &providers[0].id)
+                .await
+                .as_deref(),
             Some("sk-legacy")
         );
         drop(services);

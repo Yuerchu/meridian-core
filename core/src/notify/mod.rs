@@ -362,9 +362,9 @@ pub fn secret_scope() -> SecretScope {
     SecretScope::Global
 }
 
-pub fn read_webhook_secret(secrets: &SecretsManager, id: &str) -> Option<String> {
+pub async fn read_webhook_secret(secrets: &SecretsManager, id: &str) -> Option<String> {
     let name = SecretName::new(&webhook_secret_name(id)).ok()?;
-    match secrets.get(&secret_scope(), &name) {
+    match secrets.get(&secret_scope(), &name).await {
         Ok(value) => value.filter(|value| !value.is_empty()),
         Err(_) => {
             // Not silently "unsigned": an endpoint configured with a secret and
@@ -376,14 +376,16 @@ pub fn read_webhook_secret(secrets: &SecretsManager, id: &str) -> Option<String>
     }
 }
 
-pub fn write_webhook_secret(secrets: &SecretsManager, id: &str, secret: Option<&str>) -> Result<(), String> {
+pub async fn write_webhook_secret(secrets: &SecretsManager, id: &str, secret: Option<&str>) -> Result<(), String> {
     let name = SecretName::new(&webhook_secret_name(id)).map_err(|error| error.to_string())?;
     match secret.filter(|secret| !secret.is_empty()) {
         Some(secret) => secrets
             .set(&secret_scope(), &name, secret)
+            .await
             .map_err(|error| error.to_string()),
         None => secrets
             .delete(&secret_scope(), &name)
+            .await
             .map(|_| ())
             .map_err(|error| error.to_string()),
     }
@@ -412,7 +414,7 @@ pub async fn dispatch(services: &Services, alert: &Alert) -> usize {
         if !endpoint.wants(alert.event) {
             continue;
         }
-        let secret = read_webhook_secret(&services.secrets, &endpoint.id);
+        let secret = read_webhook_secret(&services.secrets, &endpoint.id).await;
         let report = webhook::deliver(&endpoint, secret.as_deref(), alert).await;
         if report.is_success() {
             accepted += 1;
@@ -529,7 +531,7 @@ pub async fn send_test(services: &Services, endpoint_id: &str) -> Result<Deliver
         summary: "如果你收到了这条消息，这个端点的地址、格式和签名都是对的。".to_string(),
         detail: AlertDetail::Test(TestAlert { format }),
     };
-    let secret = read_webhook_secret(&services.secrets, endpoint_id);
+    let secret = read_webhook_secret(&services.secrets, endpoint_id).await;
     let report = webhook::deliver(&endpoint, secret.as_deref(), &alert).await;
     record_attempt(services, endpoint_id, report.error.as_deref()).await;
     Ok(report)

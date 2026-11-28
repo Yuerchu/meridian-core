@@ -55,7 +55,7 @@ pub async fn check_all(services: &Services, threshold: &Decimal) -> Vec<(String,
         if !provider.is_enabled.get() || !supports_balance(identity) {
             continue;
         }
-        let Some(api_key) = crate::agent::get_provider_api_key(&services.secrets, &provider.id) else {
+        let Some(api_key) = crate::agent::get_provider_api_key(&services.secrets, &provider.id).await else {
             continue;
         };
         let outcome = match fetch_balance(identity, &api_key).await {

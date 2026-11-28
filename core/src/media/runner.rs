@@ -458,7 +458,7 @@ impl MediaRunner {
                 provider.catalog_id.as_deref(),
                 &dep.model_id,
             )?;
-            let credential = self.load_media_credential(provider, protocol_id)?;
+            let credential = self.load_media_credential(provider, protocol_id).await?;
             let compliance = evaluate_protocol_compliance(&dep.model_id, protocol_id);
             executable.push(ExecutableDeployment {
                 candidate: DeploymentCandidate {
@@ -498,7 +498,7 @@ impl MediaRunner {
         Ok((Some(profile.id), profile.routing_policy, ordered))
     }
 
-    fn load_media_credential(
+    async fn load_media_credential(
         &self,
         provider: &crate::db::entity::provider::Model,
         protocol_id: &str,
@@ -509,6 +509,7 @@ impl MediaRunner {
         let stored = self
             .secrets
             .get(&SecretScope::Global, &secret_name)
+            .await
             .map_err(|err| format!("failed to read credential for provider `{}`: {err}", provider.name))?;
 
         let raw_secret = match stored.filter(|s| !s.trim().is_empty()) {
@@ -525,7 +526,7 @@ impl MediaRunner {
                 };
                 if let Some(name) = fallback_key
                     && let Ok(secret_id) = SecretName::new(name)
-                    && let Ok(Some(value)) = self.secrets.get(&SecretScope::Global, &secret_id)
+                    && let Ok(Some(value)) = self.secrets.get(&SecretScope::Global, &secret_id).await
                     && !value.trim().is_empty()
                 {
                     value
