@@ -22,7 +22,7 @@ pub const GLOBAL_SCOPE_ID: &str = "_";
 pub const MAX_MEMORY_CONTENT_LEN: usize = 500;
 
 pub const MAX_MEMORIES_PER_PROJECT: usize = 100;
-pub const MAX_ONEBOT_GLOBAL_MEMORIES: usize = 50;
+pub const MAX_CHANNEL_GLOBAL_MEMORIES: usize = 50;
 /// The client-side counterpart of the OneBot global layer. Same order of
 /// magnitude: it is injected into every desktop turn, so it competes with the
 /// project layer for the same budget.
@@ -88,6 +88,7 @@ impl Model {
     Copy,
     PartialEq,
     Eq,
+    Hash,
     EnumIter,
     Serialize,
     Deserialize,
@@ -102,14 +103,14 @@ pub enum MemoryScope {
     #[sea_orm(string_value = "project")]
     Project,
     /// Everything the user says directly in Meridian, outside any project.
-    /// Deliberately separate from `OnebotGlobal`: the two are sibling roots, and
+    /// Deliberately separate from `ChannelGlobal`: the two are sibling roots, and
     /// neither is injected into the other's conversations.
     #[sea_orm(string_value = "client_global")]
     ClientGlobal,
-    #[sea_orm(string_value = "onebot_global")]
-    OnebotGlobal,
-    #[sea_orm(string_value = "onebot_user")]
-    OnebotUser,
+    #[sea_orm(string_value = "channel_global")]
+    ChannelGlobal,
+    #[sea_orm(string_value = "external_subject")]
+    ExternalSubject,
 }
 
 impl MemoryScope {
@@ -134,6 +135,7 @@ impl MemoryScope {
     Copy,
     PartialEq,
     Eq,
+    Hash,
     EnumIter,
     Serialize,
     Deserialize,
@@ -190,6 +192,7 @@ impl Origin {
     Copy,
     PartialEq,
     Eq,
+    Hash,
     EnumIter,
     Serialize,
     Deserialize,
@@ -229,6 +232,7 @@ impl Visibility {
     Copy,
     PartialEq,
     Eq,
+    Hash,
     EnumIter,
     Serialize,
     Deserialize,
@@ -282,6 +286,8 @@ pub enum DeletedBy {
     SelfRemoved,
     Admin,
     Lru,
+    /// Pruned or superseded during background Auto-Dream consolidation.
+    Dream,
 }
 
 impl DeletedBy {
@@ -298,16 +304,18 @@ impl DeletedBy {
 
 text_enum_column!(DeletedBy);
 
-/// Build the scope id for a OneBot user. The `onebot:` prefix is not decoration:
-/// bare numeric ids would collide across platforms, and a collision would
-/// silently inject one person's memories into a same-numbered stranger on
-/// another platform.
-pub fn onebot_user_scope_id(user_id: i64) -> String {
-    format!("onebot:{user_id}")
+/// Build a platform-namespaced scope id for an external channel subject.
+/// Bare numeric ids would collide across platforms, so callers supply a
+/// stable channel prefix (e.g. `"channel"`, `"telegram"`, `"qq"`).
+pub fn external_subject_scope_id(channel: &str, subject_id: &str) -> String {
+    format!("{channel}:{subject_id}")
 }
 
-pub fn parse_onebot_user_scope_id(scope_id: &str) -> Option<i64> {
-    scope_id.strip_prefix("onebot:")?.parse().ok()
+/// Extract a trailing numeric user id from a `<channel>:<id>` subject key
+/// (covering both newly written keys and archived legacy rows).
+pub fn parse_external_subject_numeric_id(scope_id: &str) -> Option<i64> {
+    let (_, raw) = scope_id.split_once(':')?;
+    raw.parse().ok()
 }
 
 #[cfg(test)]
@@ -336,7 +344,12 @@ mod tests {
         check::<Origin>("origin");
         check::<Visibility>("visibility");
         check::<MemoryType>("type");
-        for by in [DeletedBy::SelfRemoved, DeletedBy::Admin, DeletedBy::Lru] {
+        for by in [
+            DeletedBy::SelfRemoved,
+            DeletedBy::Admin,
+            DeletedBy::Lru,
+            DeletedBy::Dream,
+        ] {
             assert_eq!(serde_json::to_value(by).unwrap().as_str(), Some(by.as_str()));
             assert_eq!(DeletedBy::parse(by.as_str()).unwrap(), by);
         }

@@ -106,16 +106,18 @@ impl OpenAIResponsesProvider {
         stream: bool,
         compaction: Compaction,
     ) -> Result<Request, ProviderError> {
-        let (instructions, mut input) = serialize_responses_input(messages, self.reasoning_replay(params))?;
+        // Only the Codex shape knows how to send the lite form, and a plain
+        // OpenAI-compatible endpoint has never heard of an `additional_tools`
+        // item — so the model's own flag is not enough to turn it on.
+        let lite = self.codex_shape && params.responses_lite;
+        let native_tool_search = !lite && params.deferred_tool_mode == crate::DeferredToolMode::ResponsesClientSearch;
+        let (instructions, mut input) =
+            serialize_responses_input_with_tool_search(messages, self.reasoning_replay(params), native_tool_search)?;
         if compaction == Compaction::Yes {
             // "Must be the final input item" — pushed before the lite prefix is
             // spliced in, which goes to the front and cannot displace it.
             input.push(serde_json::json!({ "type": "compaction_trigger" }));
         }
-        // Only the Codex shape knows how to send the lite form, and a plain
-        // OpenAI-compatible endpoint has never heard of an `additional_tools`
-        // item — so the model's own flag is not enough to turn it on.
-        let lite = self.codex_shape && params.responses_lite;
 
         let mut body = serde_json::json!({
             "model": params.model,
@@ -216,8 +218,29 @@ impl OpenAIResponsesProvider {
                 .iter()
                 .map(|name| serde_json::json!({ "type": name }))
                 .collect();
+            let omit_deferred = native_tool_search && params.has_deferred_tools();
             if let Some(tools) = tools {
-                wire_tools.extend(tools.iter().map(wire_function));
+                wire_tools.extend(
+                    tools
+                        .iter()
+                        .filter(|t| !(omit_deferred && params.is_tool_deferred(&t.name)))
+                        .map(wire_function),
+                );
+            }
+            if omit_deferred {
+                let mut search_tool = serde_json::json!({
+                    "type": "tool_search",
+                    "execution": "client",
+                });
+                if let Some(desc) = params
+                    .client_tool_search_description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    search_tool["description"] = serde_json::json!(desc);
+                }
+                wire_tools.push(search_tool);
             }
             if !wire_tools.is_empty() {
                 body["tools"] = serde_json::Value::Array(wire_tools);
@@ -492,9 +515,18 @@ pub(crate) fn responses_tool_output(m: &ChatMessage) -> Result<serde_json::Value
 /// `reasoning_replay` names the model whose stored reasoning items go back into
 /// the input, or `None` to leave them out — see
 /// [`OpenAIResponsesProvider::reasoning_replay`].
+#[cfg(test)]
 fn serialize_responses_input(
     messages: &[ChatMessage],
     reasoning_replay: Option<&str>,
+) -> Result<(Option<String>, Vec<serde_json::Value>), ProviderError> {
+    serialize_responses_input_with_tool_search(messages, reasoning_replay, false)
+}
+
+fn serialize_responses_input_with_tool_search(
+    messages: &[ChatMessage],
+    reasoning_replay: Option<&str>,
+    native_tool_search: bool,
 ) -> Result<(Option<String>, Vec<serde_json::Value>), ProviderError> {
     let mut instructions: Option<String> = None;
     let mut input = Vec::new();
@@ -524,7 +556,13 @@ fn serialize_responses_input(
                 // The identical merge `CodexProvider` does, from the one
                 // implementation of it -- the interleaving rule there is subtle
                 // and a second copy would be a second chance to get it wrong.
-                Some(model) => input.extend(crate::codex::replay_assistant_turn(m, model)),
+                Some(model) => {
+                    input.extend(crate::codex::replay_assistant_turn_with_search(
+                        m,
+                        model,
+                        native_tool_search,
+                    )?);
+                }
                 None => {
                     if !m.content.is_empty() {
                         input.push(assistant_message_item(
@@ -534,23 +572,54 @@ fn serialize_responses_input(
                     }
                     if let Some(ref tool_calls) = m.tool_calls {
                         for tc in tool_calls {
-                            input.push(serde_json::json!({
-                                "type": "function_call",
-                                "name": tc.name,
-                                "arguments": tc.arguments,
-                                "call_id": tc.id,
-                            }));
+                            if tc.name == crate::TOOL_SEARCH_CALL_SENTINEL && native_tool_search {
+                                let arguments: serde_json::Value =
+                                    serde_json::from_str(&tc.arguments).map_err(|e| {
+                                        ProviderError::Parse(format!("invalid tool_search_call arguments JSON: {e}"))
+                                    })?;
+                                input.push(serde_json::json!({
+                                    "type": "tool_search_call",
+                                    "call_id": tc.id,
+                                    "execution": "client",
+                                    "arguments": arguments,
+                                }));
+                            } else {
+                                input.push(serde_json::json!({
+                                    "type": "function_call",
+                                    "name": crate::wire_tool_call_name(&tc.name),
+                                    "arguments": tc.arguments,
+                                    "call_id": tc.id,
+                                }));
+                            }
                         }
                     }
                 }
             },
             "tool" => {
                 if let Some(ref call_id) = m.tool_call_id {
-                    input.push(serde_json::json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": responses_tool_output(m)?,
-                    }));
+                    if m.origin == crate::MessageOrigin::ToolSearchResult {
+                        let frozen = crate::decode_tool_search_result(&m.content).map_err(ProviderError::Parse)?;
+                        if native_tool_search {
+                            input.push(serde_json::json!({
+                                "type": "tool_search_output",
+                                "call_id": call_id,
+                                "status": "completed",
+                                "tools": frozen.tools.iter().map(wire_function).collect::<Vec<_>>(),
+                            }));
+                        } else {
+                            input.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": frozen.summary,
+                            }));
+                        }
+                    } else {
+                        input.push(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": responses_tool_output(m)?,
+                        }));
+                    }
                 }
             }
             "compaction" => {
@@ -887,6 +956,9 @@ const IGNORED_EVENTS: &[&str] = &[
     "response.audio.done",
     "response.audio.transcript.delta",
     "response.audio.transcript.done",
+    "response.tool_search_call.in_progress",
+    "response.tool_search_call.searching",
+    "response.tool_search_call.completed",
 ];
 
 /// Output item types the provider runs on its own side and reports back as
@@ -1280,6 +1352,20 @@ pub(crate) fn parse_responses_event(
                         if let Some(&index) = state.call_id_to_index.get(call_id) {
                             return vec![Ok(StreamEvent::ToolCallDone { index, arguments })];
                         }
+                    }
+                    if item["type"].as_str() == Some("tool_search_call") {
+                        let id = item["id"].as_str().unwrap_or("").to_string();
+                        let call_id = item["call_id"]
+                            .as_str()
+                            .or_else(|| item["id"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = match &item["arguments"] {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Null => "{}".to_string(),
+                            other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+                        };
+                        return vec![Ok(StreamEvent::ToolSearchCall { id, call_id, arguments })];
                     }
                     if item["type"].as_str() == Some("compaction")
                         && let Some(encrypted) = item["encrypted_content"].as_str()
@@ -2892,5 +2978,97 @@ mod tests {
                 "{event} produced {out:?}",
             );
         }
+    }
+
+    #[test]
+    fn responses_client_tool_search_omits_deferred_tools_parses_sse_and_replays_cleanly() {
+        let provider = OpenAIResponsesProvider::new("https://api.openai.com/v1", "k", CodexShape::off());
+        let eager = ToolDefinition {
+            name: "read_file".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let deferred = ToolDefinition {
+            name: "mcp__luckin__order_coffee".into(),
+            description: "Order coffee".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let frozen = crate::FrozenToolSearchResult {
+            format: "responses_client".into(),
+            tool_names: vec!["mcp__luckin__order_coffee".into()],
+            tools: vec![deferred.clone()],
+            summary: "Loaded mcp__luckin__order_coffee".into(),
+        };
+        let encoded = crate::encode_tool_search_result(&frozen).unwrap();
+        let messages = vec![
+            ChatMessage::user("order coffee"),
+            ChatMessage::assistant_with_tools(
+                "",
+                None,
+                vec![ToolCall {
+                    id: "ts_1".into(),
+                    name: crate::TOOL_SEARCH_CALL_SENTINEL.into(),
+                    arguments: r#"{"query":"coffee"}"#.into(),
+                }],
+            ),
+            ChatMessage::tool_search_result("ts_1", &encoded),
+        ];
+
+        // 1. Native ResponsesClientSearch mode
+        let params = ChatParams {
+            model: "gpt-5.4".into(),
+            deferred_tool_mode: crate::DeferredToolMode::ResponsesClientSearch,
+            deferred_tool_names: vec!["mcp__luckin__order_coffee".into()],
+            client_tool_search_description: Some("Search MCP tools".into()),
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(&messages, Some(&[eager.clone(), deferred.clone()]), &params, true)
+            .unwrap();
+        let RequestBody::Json(body) = req.body.unwrap() else {
+            panic!("json body");
+        };
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "read_file");
+        assert_eq!(tools[1]["type"], "tool_search");
+        assert_eq!(tools[1]["execution"], "client");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "tool_search_call");
+        assert_eq!(input[1]["call_id"], "ts_1");
+        assert_eq!(input[2]["type"], "tool_search_output");
+        assert_eq!(input[2]["tools"][0]["name"], "mcp__luckin__order_coffee");
+
+        // 2. Mid-conversation switch onto non-deferred Responses model (e.g. deepseek-v4-pro):
+        // must degrade cleanly to function_call + function_call_output without 400s.
+        let fallback_params = ChatParams {
+            model: "deepseek-v4-pro".into(),
+            deferred_tool_mode: crate::DeferredToolMode::None,
+            ..Default::default()
+        };
+        let fallback_req = provider
+            .build_request(&messages, Some(&[eager]), &fallback_params, true)
+            .unwrap();
+        let RequestBody::Json(fb_body) = fallback_req.body.unwrap() else {
+            panic!("json body");
+        };
+        let fb_input = fb_body["input"].as_array().unwrap();
+        assert_eq!(fb_input[1]["type"], "function_call");
+        assert_eq!(fb_input[1]["name"], "search_tools");
+        assert_eq!(fb_input[2]["type"], "function_call_output");
+        assert_eq!(fb_input[2]["output"], "Loaded mcp__luckin__order_coffee");
+
+        // 3. SSE parsing of response.output_item.done with type=tool_search_call
+        let mut state = StreamState::default();
+        let events = parse_responses_event(
+            "response.output_item.done",
+            r#"{"item":{"type":"tool_search_call","id":"item_1","call_id":"call_ts","arguments":{"query":"coffee"}}}"#,
+            &mut state,
+        );
+        assert!(matches!(
+            events.first(),
+            Some(Ok(StreamEvent::ToolSearchCall { id, call_id, arguments }))
+                if id == "item_1" && call_id == "call_ts" && arguments.contains("coffee")
+        ));
     }
 }

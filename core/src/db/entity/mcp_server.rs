@@ -11,6 +11,7 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::db::types::{EpochMs, Json, SqlBool};
+use crate::mcp::policy::{McpToolPolicyMap, McpToolPolicyOverride};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "mcp_servers")]
@@ -31,6 +32,13 @@ pub struct Model {
     /// Empty means every discovered tool is on. A name that is not in the
     /// current `tools/list` is kept so a reconnect still honours it.
     pub disabled_tools: Json<Vec<String>>,
+    /// Server-level sparse override over global `mcp.default_policy`.
+    pub default_policy_json: Option<Json<McpToolPolicyOverride>>,
+    /// Per-tool sparse overrides keyed by server-native tool name.
+    pub tool_policies_json: Option<Json<McpToolPolicyMap>>,
+    /// Snapshot of server-native tool names explicitly acknowledged when
+    /// server/global approval is `always` (supply-chain drift guard).
+    pub approved_always_tools_json: Option<Json<Vec<String>>>,
     pub sort_order: i32,
     pub created_at: EpochMs,
     pub updated_at: EpochMs,
@@ -96,6 +104,9 @@ pub struct McpServerChangeset {
     pub headers: Option<Option<Json<BTreeMap<String, String>>>>,
     pub is_enabled: Option<SqlBool>,
     pub disabled_tools: Option<Json<Vec<String>>>,
+    pub default_policy_json: Option<Option<Json<McpToolPolicyOverride>>>,
+    pub tool_policies_json: Option<Option<Json<McpToolPolicyMap>>>,
+    pub approved_always_tools_json: Option<Option<Json<Vec<String>>>>,
     pub updated_at: Option<EpochMs>,
 }
 

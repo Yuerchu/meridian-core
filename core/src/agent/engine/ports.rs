@@ -314,8 +314,8 @@ impl Steering for Chain<'_> {
 /// implementations across several rounds of one turn — which is exactly what a
 /// `TurnEnd::Continue` round is.
 pub struct TurnPorts<'a> {
-    /// `None` emits nothing at all, which is the ordinary case for a QQ turn
-    /// with no window attached.
+    /// `None` emits nothing at all, which is the ordinary case for a headless
+    /// or channel turn with no window attached.
     pub emit: Option<&'a dyn Emit>,
     pub approvals: &'a dyn Approvals,
     pub interim: Option<&'a dyn Commentary>,
@@ -325,4 +325,31 @@ pub struct TurnPorts<'a> {
     /// `None` on every runner that cannot delegate — and on every sub-agent, so
     /// that a delegated run cannot delegate again.
     pub sub_agents: Option<&'a dyn SubAgents>,
+    /// Capability mixins supplying custom tools and execution outside the
+    /// built-in registry.
+    pub mixins: &'a [std::sync::Arc<dyn crate::agent::hooks::ToolMixin>],
+    /// Optional speaker/session authorisation gate evaluated before dispatch.
+    pub authorizer: Option<&'a dyn crate::agent::hooks::ToolAuthorizer>,
+    /// Lifecycle hooks notified on turn start, tool media output, tool outcome,
+    /// and turn completion.
+    pub hooks: &'a [std::sync::Arc<dyn crate::agent::hooks::TurnHooks>],
+}
+
+impl<'a> TurnPorts<'a> {
+    /// Minimal ports carrying only an approval handler, with every optional
+    /// port and hook list empty.
+    pub fn with_approvals(approvals: &'a dyn Approvals) -> Self {
+        Self {
+            emit: None,
+            approvals,
+            interim: None,
+            surface_tools: None,
+            steering: None,
+            transitions: None,
+            sub_agents: None,
+            mixins: &[],
+            authorizer: None,
+            hooks: &[],
+        }
+    }
 }

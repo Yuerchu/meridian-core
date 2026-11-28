@@ -314,6 +314,11 @@ pub struct TurnSetup<'a> {
     /// The only thing that authorises a call. Checked instead of the assistant's
     /// configuration, because a tool a mode removed is still in the registry.
     pub offered: HashSet<String>,
+    /// Tool names marked `ToolLoading::Deferred` for progressive disclosure.
+    pub deferred_tools: HashSet<String>,
+    /// Per-tool approval overrides resolved from MCP three-tier policy or
+    /// plugin mixins.
+    pub approval_policies: std::collections::HashMap<String, crate::agent::hooks::ToolApprovalPolicy>,
     pub mode: &'static ModeSpec,
     pub tool_context: ToolContext,
     pub budget: TokenBudget,
@@ -355,9 +360,6 @@ pub struct TurnSetup<'a> {
     /// intersected with this door's part shapes. Fixed for a model and a wire,
     /// so a replay agrees with the turn.
     pub user_media: crate::provider::registry::WireMediaPolicy,
-    /// What a steered message's sticker parts render against. `None` for a
-    /// runner whose messages never carry one.
-    pub stickers: Option<StickerRendering>,
     /// How earlier turns ended, for any that did not end cleanly. Retired by the
     /// first reply read all the way to the end — not by getting a request away,
     /// and not by reading the record.
@@ -370,16 +372,6 @@ pub struct TurnSetup<'a> {
     /// What set this turn going, announced with every round it opens so the
     /// transcript can tell a turn nobody asked for from the one before it.
     pub trigger: crate::turn::TurnTrigger,
-}
-
-/// Where sticker parts render from, and whether the model sees pictures: the
-/// arguments `resolve_sticker_parts_in_messages` takes for the turn's first
-/// request, held for the messages that arrive while it runs.
-#[derive(Clone)]
-pub struct StickerRendering {
-    pub db: crate::db::sea::cap::Db,
-    pub data_dir: std::path::PathBuf,
-    pub supports_images: bool,
 }
 
 /// What one reply reported, in the shape a row stores.
@@ -526,8 +518,30 @@ impl TurnOutcome {
 /// and a caller that had to write `let outcome = run_turn(..).await?` would
 /// throw that away at the only moment it matters.
 pub async fn run_turn(services: &TurnServices<'_>, setup: TurnSetup<'_>, ports: TurnPorts<'_>) -> TurnOutcome {
+    let conversation_id = setup.conversation_id.clone();
+    let turn_id = setup.turn_id.clone();
+    let hooks = ports.hooks;
+    let start_event = crate::agent::hooks::TurnStartContext {
+        conversation_id: &conversation_id,
+        turn_id: &turn_id,
+    };
+    for hook in hooks {
+        hook.on_turn_start(&start_event).await;
+    }
+
     let mut progress = TurnProgress::default();
     let reply = run(services, setup, ports, &mut progress).await;
+
+    let end_event = crate::agent::hooks::TurnEndEvent {
+        conversation_id: &conversation_id,
+        turn_id: &turn_id,
+        succeeded: reply.is_ok() && !progress.aborted,
+        steps: progress.steps,
+    };
+    for hook in hooks {
+        hook.on_turn_end(&end_event).await;
+    }
+
     TurnOutcome { reply, progress }
 }
 
@@ -539,10 +553,12 @@ async fn run(
 ) -> Result<String, String> {
     let TurnSetup {
         provider,
-        params,
+        mut params,
         mut chat_messages,
         mut tool_defs,
         mut offered,
+        mut deferred_tools,
+        mut approval_policies,
         mut mode,
         tool_context,
         mut budget,
@@ -559,7 +575,6 @@ async fn run(
         withheld,
         files_root,
         user_media,
-        stickers,
         mut interrupted,
         compaction,
         pricing,
@@ -567,6 +582,8 @@ async fn run(
     } = setup;
     let pool = services.db;
     let emit = ports.emit;
+    let mut deferred_session =
+        crate::agent::deferred_tools::DeferredToolSession::configure(&mut tool_defs, &deferred_tools, &mut params);
     // The rates the warmer's arithmetic needs are the same ones this turn
     // prices its rounds with; taking them from here keeps one answer. A caller
     // that already set them keeps its own.
@@ -1060,11 +1077,10 @@ async fn run(
                 &mut parent_cursor,
                 &mut chat_messages,
                 files_root.as_deref(),
-                stickers.as_ref(),
                 user_media.clone(),
             )
             .await?;
-            narrow_offered(&mut offered, ports.steering);
+            narrow_offered(&mut offered, ports.steering, ports.authorizer);
             whisper_conversation_updated();
             continue;
         }
@@ -1095,6 +1111,8 @@ async fn run(
             &tool_context,
             &approval_rule,
             ports.surface_tools,
+            ports.mixins,
+            ports.authorizer,
             mode,
             ports.sub_agents,
         );
@@ -1223,9 +1241,33 @@ async fn run(
 
                     // Post-process each result sequentially in wire order.
                     for (tc, (output, outcome, media)) in parallel_ok.iter().zip(results) {
+                        if outcome == "success" && !media.is_empty() && !ports.hooks.is_empty() {
+                            let media_event = crate::agent::hooks::ToolMediaEvent {
+                                conversation_id: &conversation_id,
+                                turn_id: &turn_id,
+                                tool_call_id: &tc.id,
+                                tool_name: &tc.name,
+                                media: &media,
+                            };
+                            for hook in ports.hooks {
+                                hook.on_tool_media(&media_event).await;
+                            }
+                        }
                         let settled =
                             settle_tool_result(files_root.as_deref(), &conversation_id, &output, outcome, media);
                         let (output, outcome) = (settled.text, settled.outcome);
+                        if !ports.hooks.is_empty() {
+                            let call_event = crate::agent::hooks::ToolCallOutcomeEvent {
+                                conversation_id: &conversation_id,
+                                turn_id: &turn_id,
+                                tool_call_id: &tc.id,
+                                tool_name: &tc.name,
+                                outcome,
+                            };
+                            for hook in ports.hooks {
+                                hook.on_after_tool_call(&call_event).await;
+                            }
+                        }
 
                         let event_outcome = match outcome {
                             "success" => ToolOutcome::Success,
@@ -1351,23 +1393,138 @@ async fn run(
             }
 
             // --- Serial dispatch: the original single-call path ---
-            let tc = match segment {
+            let raw_tc = match segment {
                 super::parallel::Segment::Serial(tc) => tc,
                 super::parallel::Segment::Parallel(_) => unreachable!(),
             };
 
             announce(ChatStreamEvent::ToolCall {
-                call_id: tc.id.clone(),
-                tool_name: tc.name.clone(),
-                arguments: tc.arguments.clone(),
+                call_id: raw_tc.id.clone(),
+                tool_name: crate::provider::wire_tool_call_name(&raw_tc.name).to_string(),
+                arguments: raw_tc.arguments.clone(),
                 message_id: assistant_msg_id.clone(),
                 conversation_id: conversation_id.clone(),
             })?;
 
-            let allowed = offered.contains(&tc.name);
+            // Progressive disclosure search calls (`__tool_search__` on
+            // Responses API or `search_tools` on Anthropic client reference /
+            // universal gateway) execute locally against the BM25 index,
+            // filtered strictly by `offered` + `ToolAuthorizer`, and persist as
+            // frozen `schema_version = 4` snapshots so the Prompt Cache prefix
+            // stays invariant across replays and model switches.
+            if deferred_session.is_search_call(&raw_tc.name) {
+                let search_outcome = deferred_session.execute_search(&raw_tc.arguments, &|name| {
+                    offered.contains(name) && ports.authorizer.is_none_or(|auth| auth.allows(name))
+                });
+                match search_outcome {
+                    Ok(frozen) => {
+                        let encoded = crate::provider::encode_tool_search_result(&frozen)?;
+                        announce(ChatStreamEvent::ToolResult {
+                            call_id: raw_tc.id.clone(),
+                            result: frozen.summary.clone(),
+                            media: Vec::new(),
+                            outcome: ToolOutcome::Success,
+                            message_id: assistant_msg_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                        })?;
+                        if let Some(id) = append_tool_result(
+                            pool,
+                            &conversation_id,
+                            &turn_id,
+                            &raw_tc.id,
+                            &encoded,
+                            crate::agent::deferred_tools::TOOL_SEARCH_RESULT_SCHEMA_VERSION,
+                            "success",
+                            parent_cursor.as_deref(),
+                        )
+                        .await
+                        {
+                            parent_cursor = Some(id);
+                        }
+                        chat_messages.push(ChatMessage::tool_search_result(&raw_tc.id, &encoded));
+                    }
+                    Err(error) => {
+                        let text = format!("Error: {error}");
+                        announce(ChatStreamEvent::ToolResult {
+                            call_id: raw_tc.id.clone(),
+                            result: text.clone(),
+                            media: Vec::new(),
+                            outcome: ToolOutcome::Error,
+                            message_id: assistant_msg_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                        })?;
+                        if let Some(id) = append_tool_result(
+                            pool,
+                            &conversation_id,
+                            &turn_id,
+                            &raw_tc.id,
+                            &text,
+                            2,
+                            "error",
+                            parent_cursor.as_deref(),
+                        )
+                        .await
+                        {
+                            parent_cursor = Some(id);
+                        }
+                        chat_messages.push(ChatMessage::tool_error(&raw_tc.id, &text));
+                    }
+                }
+                continue;
+            }
+
+            // Universal client dual-tool gateway (`call_tool`): unwrap into the
+            // target tool call so it traverses the exact same authorization,
+            // approval, redaction, MCP/plugin execution, and media pipeline.
+            let tc_cow: std::borrow::Cow<'_, crate::provider::ToolCall> =
+                if deferred_session.is_gateway_call(&raw_tc.name) {
+                    match crate::agent::deferred_tools::parse_gateway_call(&raw_tc.arguments) {
+                        Ok((target_name, target_arguments)) => std::borrow::Cow::Owned(crate::provider::ToolCall {
+                            id: raw_tc.id.clone(),
+                            name: target_name,
+                            arguments: target_arguments,
+                        }),
+                        Err(error) => {
+                            let text = format!("Error: {error}");
+                            announce(ChatStreamEvent::ToolResult {
+                                call_id: raw_tc.id.clone(),
+                                result: text.clone(),
+                                media: Vec::new(),
+                                outcome: ToolOutcome::Error,
+                                message_id: assistant_msg_id.clone(),
+                                conversation_id: conversation_id.clone(),
+                            })?;
+                            if let Some(id) = append_tool_result(
+                                pool,
+                                &conversation_id,
+                                &turn_id,
+                                &raw_tc.id,
+                                &text,
+                                2,
+                                "error",
+                                parent_cursor.as_deref(),
+                            )
+                            .await
+                            {
+                                parent_cursor = Some(id);
+                            }
+                            chat_messages.push(ChatMessage::tool_error(&raw_tc.id, &text));
+                            continue;
+                        }
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(raw_tc)
+                };
+            let tc: &crate::provider::ToolCall = tc_cow.as_ref();
+
+            let allowed = offered.contains(&tc.name) && ports.authorizer.is_none_or(|auth| auth.allows(&tc.name));
             let is_mcp = tc.name.starts_with("mcp__");
             let surface = ports.surface_tools.filter(|s| s.owns(&tc.name));
-            let tool = if allowed && !is_mcp && surface.is_none() {
+            let plugin_mixin = ports
+                .mixins
+                .iter()
+                .find(|m| m.owned_names().iter().any(|n| n == &tc.name));
+            let tool = if allowed && !is_mcp && surface.is_none() && plugin_mixin.is_none() {
                 services.tools.get(&tc.name)
             } else {
                 None
@@ -1376,7 +1533,7 @@ async fn run(
             // attention on the same dialog forty times.
             let verdict = loop_guard.observe(&tc.name, &tc.arguments);
 
-            // Filled only by the two branches whose tools can return media.
+            // Filled only by the branches whose tools can return media.
             let mut media: Vec<tools::MediaOut> = Vec::new();
             let (output, outcome): (String, &'static str) = if let crate::agent::LoopVerdict::Warn(n) = verdict {
                 (crate::agent::loop_warning_message(&tc.name, n), "error")
@@ -1385,6 +1542,49 @@ async fn run(
                 (crate::agent::loop_abort_message(&tc.name, n), "error")
             } else if !allowed {
                 (withheld.say(&tc.name), "error")
+            } else if let Some(mixin) = plugin_mixin {
+                match parse_tool_arguments(&tc.arguments) {
+                    Err(error) => (format!("Error: {error}"), "error"),
+                    Ok(mut args) => {
+                        services.redaction_mappings.restore_in_json(&conversation_id, &mut args);
+                        let policy = approval_policies
+                            .get(&tc.name)
+                            .copied()
+                            .or_else(|| mixin.approval_policy(&tc.name))
+                            .unwrap_or(crate::agent::hooks::ToolApprovalPolicy::RequestApprove);
+                        let decision = match policy {
+                            crate::agent::hooks::ToolApprovalPolicy::Always => Some(ApprovalDecision::Approved),
+                            crate::agent::hooks::ToolApprovalPolicy::Never => Some(ApprovalDecision::Denied(None)),
+                            crate::agent::hooks::ToolApprovalPolicy::AutoReview
+                            | crate::agent::hooks::ToolApprovalPolicy::RequestApprove => {
+                                ports.approvals.ask(&assistant_msg_id, tc, None).await?
+                            }
+                        };
+                        match decision {
+                            Some(ApprovalDecision::Approved) => {
+                                let ran = in_phase(
+                                    pool,
+                                    &turn_id,
+                                    TurnPhase::RunningTool,
+                                    Some(&tc.name),
+                                    mixin.execute_rich(&tc.name, args, &tool_context),
+                                )
+                                .await;
+                                match ran {
+                                    Ok(o) => {
+                                        media = o.media;
+                                        (o.text, "success")
+                                    }
+                                    Err(e) => (format!("Error: {e}"), "error"),
+                                }
+                            }
+                            Some(ApprovalDecision::Denied(reason)) => {
+                                (tool_denial_message(reason.as_deref()), "denied")
+                            }
+                            _ => (UNANSWERED_APPROVAL.to_string(), "denied"),
+                        }
+                    }
+                }
             } else if let Some(surface) = surface {
                 // Read-only query tools are scope-locked and go straight
                 // through; the ones that change a group ask first.
@@ -1500,7 +1700,7 @@ async fn run(
                 // falling past it lands on the registry tool, whose refusal
                 // to be called outside the loop would be read as a result.
                 let decision = ports.approvals.ask(&assistant_msg_id, tc, None).await?;
-                transitions::enter(
+                let res = transitions::enter(
                     pool,
                     ports.transitions.expect("guarded above"),
                     emit,
@@ -1509,7 +1709,20 @@ async fn run(
                     decision,
                 )
                 .await?
-                .apply(&mut mode, &mut chat_messages, &mut tool_defs, &mut offered)
+                .apply(
+                    &mut mode,
+                    &mut chat_messages,
+                    &mut tool_defs,
+                    &mut offered,
+                    &mut deferred_tools,
+                    &mut approval_policies,
+                );
+                deferred_session = crate::agent::deferred_tools::DeferredToolSession::configure(
+                    &mut tool_defs,
+                    &deferred_tools,
+                    &mut params,
+                );
+                res
             } else if let Some(transition_ports) = ports.transitions
                 && mode.exit_tool == Some(tc.name.as_str())
             {
@@ -1548,7 +1761,20 @@ async fn run(
                             {
                                 *ae = accept_edits;
                             }
-                            effect.apply(&mut mode, &mut chat_messages, &mut tool_defs, &mut offered)
+                            let res = effect.apply(
+                                &mut mode,
+                                &mut chat_messages,
+                                &mut tool_defs,
+                                &mut offered,
+                                &mut deferred_tools,
+                                &mut approval_policies,
+                            );
+                            deferred_session = crate::agent::deferred_tools::DeferredToolSession::configure(
+                                &mut tool_defs,
+                                &deferred_tools,
+                                &mut params,
+                            );
+                            res
                         }
                         Ok(transitions::ExitEffect::ClearContext {
                             result,
@@ -1567,9 +1793,22 @@ async fn run(
                 match parse_tool_arguments(&tc.arguments) {
                     Err(error) => (format!("Error: {error}"), "error"),
                     Ok(args) => {
-                        // External tools ask, always. They are the one class the
-                        // authorizer knows nothing about.
-                        match ports.approvals.ask(&assistant_msg_id, tc, None).await? {
+                        // Dispatch according to three-tier MCP policy (`always`,
+                        // `auto_review`, `request_approve`, `never`). Unannotated
+                        // tools fail safe to `request_approve`.
+                        let policy = approval_policies
+                            .get(&tc.name)
+                            .copied()
+                            .unwrap_or(crate::agent::hooks::ToolApprovalPolicy::RequestApprove);
+                        let decision = match policy {
+                            crate::agent::hooks::ToolApprovalPolicy::Always => Some(ApprovalDecision::Approved),
+                            crate::agent::hooks::ToolApprovalPolicy::Never => Some(ApprovalDecision::Denied(None)),
+                            crate::agent::hooks::ToolApprovalPolicy::AutoReview
+                            | crate::agent::hooks::ToolApprovalPolicy::RequestApprove => {
+                                ports.approvals.ask(&assistant_msg_id, tc, None).await?
+                            }
+                        };
+                        match decision {
                             Some(ApprovalDecision::Approved) => {
                                 // Awaited with nothing locked: the registry hands
                                 // back a handle and the call runs outside it.
@@ -1710,8 +1949,33 @@ async fn run(
                 plan_update_failed = true;
             }
 
+            if outcome == "success" && !media.is_empty() && !ports.hooks.is_empty() {
+                let media_event = crate::agent::hooks::ToolMediaEvent {
+                    conversation_id: &conversation_id,
+                    turn_id: &turn_id,
+                    tool_call_id: &tc.id,
+                    tool_name: &tc.name,
+                    media: &media,
+                };
+                for hook in ports.hooks {
+                    hook.on_tool_media(&media_event).await;
+                }
+            }
+
             let settled = settle_tool_result(files_root.as_deref(), &conversation_id, &output, outcome, media);
             let (output, outcome) = (settled.text, settled.outcome);
+            if !ports.hooks.is_empty() {
+                let call_event = crate::agent::hooks::ToolCallOutcomeEvent {
+                    conversation_id: &conversation_id,
+                    turn_id: &turn_id,
+                    tool_call_id: &tc.id,
+                    tool_name: &tc.name,
+                    outcome,
+                };
+                for hook in ports.hooks {
+                    hook.on_after_tool_call(&call_event).await;
+                }
+            }
 
             let event_outcome = match outcome {
                 "success" => ToolOutcome::Success,
@@ -1779,11 +2043,10 @@ async fn run(
                     &mut parent_cursor,
                     &mut chat_messages,
                     files_root.as_deref(),
-                    stickers.as_ref(),
                     user_media.clone(),
                 )
                 .await?;
-                narrow_offered(&mut offered, ports.steering);
+                narrow_offered(&mut offered, ports.steering, ports.authorizer);
                 whisper_conversation_updated();
             }
         }
@@ -1843,12 +2106,18 @@ fn scrub_upstream(
     report
 }
 
-fn narrow_offered(offered: &mut HashSet<String>, steering: Option<&dyn Steering>) {
-    let Some(narrowed) = steering.and_then(|s| s.narrowed()) else {
-        return;
-    };
+fn narrow_offered(
+    offered: &mut HashSet<String>,
+    steering: Option<&dyn Steering>,
+    authorizer: Option<&dyn crate::agent::hooks::ToolAuthorizer>,
+) {
     let before = offered.len();
-    offered.retain(|name| narrowed.contains(name));
+    if let Some(narrowed) = steering.and_then(|s| s.narrowed()) {
+        offered.retain(|name| narrowed.contains(name));
+    }
+    if let Some(narrowed) = authorizer.and_then(|a| a.narrowed_by_steering()) {
+        offered.retain(|name| narrowed.contains(name));
+    }
     if offered.len() != before {
         tracing::info!(
             withdrawn = before - offered.len(),
@@ -1927,7 +2196,6 @@ async fn inject_steering(
     parent_cursor: &mut Option<String>,
     chat_messages: &mut Vec<ChatMessage>,
     files_root: Option<&std::path::Path>,
-    stickers: Option<&StickerRendering>,
     user_media: crate::provider::registry::WireMediaPolicy,
 ) -> Result<(), String> {
     for item in items {
@@ -1973,15 +2241,7 @@ async fn inject_steering(
             }
             SteeredOrigin::System => ChatMessage::system_context(&item.text),
         }];
-        if let Some(s) = stickers {
-            crate::agent::resolve_sticker_parts_in_messages(
-                &mut injected,
-                Some(&s.db),
-                Some(&s.data_dir),
-                s.supports_images,
-            )
-            .await?;
-        }
+        crate::agent::resolve_sticker_parts_in_messages(&mut injected)?;
         // Steered messages are a person's: use the same policy the turn was
         // opened with, not a hardcoded "accept images".
         crate::agent::resolve_file_uris_in_messages(&mut injected, files_root, conversation_id, user_media.clone())?;
@@ -2383,11 +2643,7 @@ mod tests {
     #[async_trait::async_trait]
     impl transitions::Transitions for Rebuilt {
         async fn rebuild(&self, _mode: &'static ModeSpec) -> Result<Result<TurnConfig, String>, String> {
-            Ok(Ok(TurnConfig {
-                tool_defs: self.0.tool_defs.clone(),
-                system_prompt: self.0.system_prompt.clone(),
-                offered: self.0.offered.clone(),
-            }))
+            Ok(Ok(self.0.clone()))
         }
     }
 
@@ -2492,6 +2748,8 @@ mod tests {
             chat_messages: vec![system("you are helpful"), ChatMessage::user("do the thing")],
             tool_defs: offered.iter().map(|n| def(n)).collect(),
             offered: offered.iter().map(|n| n.to_string()).collect(),
+            deferred_tools: HashSet::new(),
+            approval_policies: std::collections::HashMap::new(),
             mode: crate::agent::modes::resolve(None).unwrap(),
             tool_context: context(pool, cancel),
             budget: TokenBudget::new("openai", "m", 128_000, 4096, None),
@@ -2511,9 +2769,8 @@ mod tests {
             withheld: WithheldWording::Explained,
             files_root: None,
             user_media: crate::provider::registry::WireMediaPolicy::native_images(),
-            stickers: None,
             interrupted: None,
-            compaction: CompactionPolicy::OneBot,
+            compaction: CompactionPolicy::Unattended,
             pricing: None,
         }
     }
@@ -2521,12 +2778,7 @@ mod tests {
     fn ports<'a>(approvals: &'a Answers, emit: Option<&'a dyn Emit>) -> TurnPorts<'a> {
         TurnPorts {
             emit,
-            approvals,
-            interim: None,
-            surface_tools: None,
-            steering: None,
-            transitions: None,
-            sub_agents: None,
+            ..TurnPorts::with_approvals(approvals)
         }
     }
 
@@ -3102,6 +3354,7 @@ mod tests {
             tool_defs: vec![def("read_file")],
             system_prompt: "# Plan mode\n\nyou are planning".into(),
             offered: ["read_file".to_string()].into_iter().collect(),
+            ..Default::default()
         });
 
         let outcome = run_turn(
@@ -3796,7 +4049,7 @@ mod tests {
         s.budget = TokenBudget::new("openai", "m", 32_000, 8_000, None);
         s.context_limit = 32_000;
         s.keep_recent = 2;
-        s.compaction = CompactionPolicy::Desktop {
+        s.compaction = CompactionPolicy::Attended {
             enabled: true,
             breaker: std::sync::Arc::new(crate::agent::CompactCircuitBreaker::new()),
         };
@@ -4542,15 +4795,7 @@ mod tests {
     }
 
     fn ports_with(approvals: &Sequence) -> TurnPorts<'_> {
-        TurnPorts {
-            emit: None,
-            approvals,
-            interim: None,
-            surface_tools: None,
-            steering: None,
-            transitions: None,
-            sub_agents: None,
-        }
+        TurnPorts::with_approvals(approvals)
     }
 
     /// **The card is offered, and a refusal runs nothing.** The command is
@@ -4715,5 +4960,124 @@ mod tests {
         assert_eq!(row.schema_version, 2);
         assert_eq!(row.tool_outcome.as_deref(), Some("error"));
         assert!(row.content.contains("no attachment directory"), "{}", row.content);
+    }
+
+    #[tokio::test]
+    async fn plugin_mixin_authorizer_and_turn_hooks_fire_in_order() {
+        use crate::agent::hooks::{
+            DeclaredTool, MixinResolveContext, ToolApprovalPolicy, ToolAuthorizer, ToolCallOutcomeEvent,
+            ToolMediaEvent, ToolMixin, TurnEndEvent, TurnHooks, TurnStartContext,
+        };
+        use std::sync::Arc;
+
+        struct DemoMixin;
+        #[async_trait::async_trait]
+        impl ToolMixin for DemoMixin {
+            fn id(&self) -> &'static str {
+                "demo"
+            }
+            fn owned_names(&self) -> Vec<String> {
+                vec!["demo_draw".into(), "demo_forbidden".into()]
+            }
+            fn declarations(&self, _ctx: &MixinResolveContext<'_>) -> Vec<DeclaredTool> {
+                Vec::new()
+            }
+            fn approval_policy(&self, tool_name: &str) -> Option<ToolApprovalPolicy> {
+                match tool_name {
+                    "demo_draw" => Some(ToolApprovalPolicy::Always),
+                    _ => Some(ToolApprovalPolicy::Never),
+                }
+            }
+            async fn execute_rich(
+                &self,
+                name: &str,
+                _args: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Result<tools::ToolOutput, String> {
+                Ok(tools::ToolOutput {
+                    text: format!("drew via {name}"),
+                    media: vec![tools::MediaOut::Bytes {
+                        mime: "image/png".into(),
+                        bytes: vec![0x89, b'P', b'N', b'G'],
+                        name: None,
+                    }],
+                })
+            }
+        }
+
+        struct DenyForbidden;
+        impl ToolAuthorizer for DenyForbidden {
+            fn allows(&self, tool_name: &str) -> bool {
+                tool_name != "demo_forbidden"
+            }
+        }
+
+        #[derive(Default)]
+        struct RecordingHook(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl TurnHooks for RecordingHook {
+            async fn on_turn_start(&self, event: &TurnStartContext<'_>) {
+                self.0.lock().unwrap().push(format!("start:{}", event.turn_id));
+            }
+            async fn on_tool_media(&self, event: &ToolMediaEvent<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("media:{}:{}", event.tool_name, event.media.len()));
+            }
+            async fn on_after_tool_call(&self, event: &ToolCallOutcomeEvent<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("after:{}:{}", event.tool_name, event.outcome));
+            }
+            async fn on_turn_end(&self, event: &TurnEndEvent<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("end:{}:{}", event.succeeded, event.steps));
+            }
+        }
+
+        let pool = crate::db::sea::sea_test_db().await;
+        conversation(&pool).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, mcp, cancel) = (registry(), McpRegistry::new(), CancellationToken::new());
+        let provider = Scripted::of(vec![
+            call_batch(&[("c1", "demo_draw", "{}"), ("c2", "demo_forbidden", "{}")]),
+            says("all done"),
+        ]);
+        let approvals = Answers::nobody();
+        let mut s = setup(&provider, &pool, &cancel, &["demo_draw", "demo_forbidden"]);
+        s.files_root = Some(dir.path().to_path_buf());
+
+        let mixins: Vec<Arc<dyn ToolMixin>> = vec![Arc::new(DemoMixin)];
+        let hook = Arc::new(RecordingHook::default());
+        let hooks: Vec<Arc<dyn TurnHooks>> = vec![hook.clone()];
+        let auth = DenyForbidden;
+
+        let outcome = run_turn(
+            &services(&pool, &tools, &mcp),
+            s,
+            TurnPorts {
+                mixins: &mixins,
+                authorizer: Some(&auth),
+                hooks: &hooks,
+                ..ports(&approvals, None)
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.reply.as_deref(), Ok("all done"));
+        assert_eq!(
+            *hook.0.lock().unwrap(),
+            vec![
+                "start:t1",
+                "media:demo_draw:1",
+                "after:demo_draw:success",
+                "after:demo_forbidden:error",
+                "end:true:2",
+            ]
+        );
     }
 }

@@ -37,9 +37,10 @@ use tokio_util::sync::CancellationToken;
 #[strum(serialize_all = "snake_case")]
 pub enum TurnOrigin {
     Desktop,
-    #[strum(serialize = "onebot")]
-    #[serde(rename = "onebot")]
-    OneBot,
+    /// An external messaging channel or server runner (e.g. a chat bot plugin).
+    Channel,
+    /// Background memory consolidation (Auto-Dream).
+    Dream,
     /// A turn a `run_agent` call delegated. It runs in a conversation of its
     /// own, so it contends with nobody — but the distinction is what lets an
     /// interruption report say "a sub-agent was partway through" instead of
@@ -174,10 +175,16 @@ impl std::fmt::Display for Busy {
                     "This conversation is already answering. Wait for it to finish, or stop it first."
                 )
             }
-            Busy::Turn(TurnOrigin::OneBot) => {
+            Busy::Turn(TurnOrigin::Channel) => {
                 write!(
                     f,
-                    "This conversation is being answered from QQ right now. Wait for that turn to finish."
+                    "This conversation is being answered from an external channel right now. Wait for that turn to finish."
+                )
+            }
+            Busy::Turn(TurnOrigin::Dream) => {
+                write!(
+                    f,
+                    "Background memory consolidation is running on this conversation. Wait for it to finish."
                 )
             }
             // Reachable from the sub-agent's own conversation, which the user
@@ -622,10 +629,10 @@ mod tests {
     #[test]
     fn the_refusal_names_the_origin_that_holds_it() {
         let c = coordinator();
-        let _held = c.try_acquire_turn("conv-1", TurnOrigin::OneBot).expect("free");
+        let _held = c.try_acquire_turn("conv-1", TurnOrigin::Channel).expect("free");
         assert_eq!(
             c.try_acquire_turn("conv-1", TurnOrigin::Desktop).err(),
-            Some(Busy::Turn(TurnOrigin::OneBot)),
+            Some(Busy::Turn(TurnOrigin::Channel)),
         );
     }
 
@@ -908,7 +915,9 @@ mod tests {
                 .unwrap(),
         );
         drop(c.try_acquire_mutation("conv-2", "a delete").unwrap());
-        let _busy = c.try_acquire_turn_as("conv-3", TurnOrigin::OneBot, "u".into()).unwrap();
+        let _busy = c
+            .try_acquire_turn_as("conv-3", TurnOrigin::Channel, "u".into())
+            .unwrap();
 
         assert!(c.unchanged_since(&seen), "none of that was about conv-1");
 
@@ -930,7 +939,7 @@ mod tests {
             .unwrap();
         let before = c.observe("conv-1");
 
-        assert!(c.try_acquire_turn("conv-1", TurnOrigin::OneBot).is_err());
+        assert!(c.try_acquire_turn("conv-1", TurnOrigin::Channel).is_err());
         assert!(c.try_acquire_mutation("conv-1", "a delete").is_err());
 
         assert!(c.unchanged_since(&before));

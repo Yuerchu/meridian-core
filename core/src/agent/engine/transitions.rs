@@ -19,10 +19,11 @@
 //! passes no [`Transitions`] at all, which is what keeps OneBot's current
 //! behaviour — see the drift list.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::hooks::ToolApprovalPolicy;
 use crate::agent::modes::ModeSpec;
 use crate::agent::turn_config::TurnConfig;
 
@@ -212,10 +213,19 @@ impl TransitionEffect {
         chat_messages: &mut [ChatMessage],
         tool_defs: &mut Vec<ToolDefinition>,
         offered: &mut HashSet<String>,
+        deferred_tools: &mut HashSet<String>,
+        approval_policies: &mut HashMap<String, ToolApprovalPolicy>,
     ) -> (String, &'static str) {
         if let Some(next) = self.next {
             *mode = next.mode;
-            apply_turn_config(chat_messages, tool_defs, offered, next.config);
+            apply_turn_config(
+                chat_messages,
+                tool_defs,
+                offered,
+                deferred_tools,
+                approval_policies,
+                next.config,
+            );
         }
         (self.result, self.outcome)
     }
@@ -227,17 +237,21 @@ impl TransitionEffect {
     }
 }
 
-/// Put a re-resolved turn into effect: prompt, definitions and authorisation
-/// together.
+/// Put a re-resolved turn into effect: prompt, definitions, authorisation,
+/// deferred tool names, and per-tool approval policies together.
 pub(crate) fn apply_turn_config(
     chat_messages: &mut [ChatMessage],
     tool_defs: &mut Vec<ToolDefinition>,
     offered: &mut HashSet<String>,
+    deferred_tools: &mut HashSet<String>,
+    approval_policies: &mut HashMap<String, ToolApprovalPolicy>,
     config: TurnConfig,
 ) {
     replace_system_prompt(chat_messages, &config.system_prompt);
     *tool_defs = config.tool_defs;
     *offered = config.offered;
+    *deferred_tools = config.deferred_tools;
+    *approval_policies = config.approval_policies;
 }
 
 /// Swap the system prompt, and only that.
@@ -496,6 +510,7 @@ mod tests {
             tool_defs: tools.iter().map(|t| def(t)).collect(),
             system_prompt: prompt.to_string(),
             offered: tools.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -530,11 +545,7 @@ mod tests {
         async fn rebuild(&self, mode: &'static ModeSpec) -> Result<Result<TurnConfig, String>, String> {
             self.asked.lock().unwrap().push(mode.id);
             match &self.answer {
-                Ok(Ok(c)) => Ok(Ok(TurnConfig {
-                    tool_defs: c.tool_defs.clone(),
-                    system_prompt: c.system_prompt.clone(),
-                    offered: c.offered.clone(),
-                })),
+                Ok(Ok(c)) => Ok(Ok(c.clone())),
                 Ok(Err(e)) => Ok(Err(e.clone())),
                 Err(e) => Err(e.clone()),
             }
@@ -573,6 +584,8 @@ mod tests {
         messages: Vec<ChatMessage>,
         tool_defs: Vec<ToolDefinition>,
         offered: HashSet<String>,
+        deferred_tools: HashSet<String>,
+        approval_policies: HashMap<String, ToolApprovalPolicy>,
     }
 
     impl Loop {
@@ -584,6 +597,8 @@ mod tests {
                 messages: vec![first, ChatMessage::user("do the thing")],
                 tool_defs: vec![def("write_file")],
                 offered: ["write_file".to_string()].into_iter().collect(),
+                deferred_tools: HashSet::new(),
+                approval_policies: HashMap::new(),
             }
         }
         fn apply(&mut self, effect: TransitionEffect) -> (String, &'static str) {
@@ -592,6 +607,8 @@ mod tests {
                 &mut self.messages,
                 &mut self.tool_defs,
                 &mut self.offered,
+                &mut self.deferred_tools,
+                &mut self.approval_policies,
             )
         }
         fn names(&self) -> Vec<&str> {

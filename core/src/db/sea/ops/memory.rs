@@ -15,9 +15,9 @@ use sea_orm::{
 };
 
 use crate::db::entity::memory::{
-    DeletedBy, MAX_CLIENT_GLOBAL_MEMORIES, MAX_MEMORIES_PER_PROJECT, MAX_MEMORIES_PER_SUBJECT, MAX_MEMORY_CONTENT_LEN,
-    MAX_ONEBOT_GLOBAL_MEMORIES, MAX_PINNED_SUBJECTS, MAX_REMEMBERED_SUBJECTS, MAX_TRACKED_SUBJECTS, MemoryChangeset,
-    MemoryScope, Origin, Visibility,
+    DeletedBy, MAX_CHANNEL_GLOBAL_MEMORIES, MAX_CLIENT_GLOBAL_MEMORIES, MAX_MEMORIES_PER_PROJECT,
+    MAX_MEMORIES_PER_SUBJECT, MAX_MEMORY_CONTENT_LEN, MAX_PINNED_SUBJECTS, MAX_REMEMBERED_SUBJECTS,
+    MAX_TRACKED_SUBJECTS, MemoryChangeset, MemoryScope, Origin, Visibility,
 };
 use crate::db::entity::memory_proposal::ProposalStatus;
 use crate::db::entity::{memory, memory_proposal, memory_subject, project};
@@ -218,7 +218,14 @@ pub async fn visible_user_memories(
     subject_scope_id: &str,
     ctx: &VisibilityCtx,
 ) -> Result<Vec<memory::Model>, DbErr> {
-    list_by_scopes(db, MemoryScope::OnebotUser, &[subject_scope_id.to_string()], ctx, None).await
+    list_by_scopes(
+        db,
+        MemoryScope::ExternalSubject,
+        &[subject_scope_id.to_string()],
+        ctx,
+        None,
+    )
+    .await
 }
 
 /// Live or in the trash; `None` once purged.
@@ -282,8 +289,8 @@ fn scope_quota(scope: MemoryScope) -> usize {
     match scope {
         MemoryScope::Project => MAX_MEMORIES_PER_PROJECT,
         MemoryScope::ClientGlobal => MAX_CLIENT_GLOBAL_MEMORIES,
-        MemoryScope::OnebotGlobal => MAX_ONEBOT_GLOBAL_MEMORIES,
-        MemoryScope::OnebotUser => MAX_MEMORIES_PER_SUBJECT,
+        MemoryScope::ChannelGlobal => MAX_CHANNEL_GLOBAL_MEMORIES,
+        MemoryScope::ExternalSubject => MAX_MEMORIES_PER_SUBJECT,
     }
 }
 
@@ -572,7 +579,7 @@ pub async fn forget_subject(
 ) -> Result<u64, DbErr> {
     let mut query = active().filter(
         Condition::any()
-            .add(in_scope(MemoryScope::OnebotUser, subject_scope_id))
+            .add(in_scope(MemoryScope::ExternalSubject, subject_scope_id))
             .add(memory::Column::SubjectScopeId.eq(subject_scope_id)),
     );
     if !include_owner_only {
@@ -593,7 +600,7 @@ fn holds_a_normal_memory() -> Condition {
         Query::select()
             .expr(Expr::val(1))
             .from(memory::Entity)
-            .and_where(memory::Column::ScopeType.eq(MemoryScope::OnebotUser))
+            .and_where(memory::Column::ScopeType.eq(MemoryScope::ExternalSubject))
             .and_where(
                 Expr::col((memory::Entity, memory::Column::ScopeId))
                     .equals((memory_subject::Entity, memory_subject::Column::ScopeId)),
@@ -644,7 +651,7 @@ pub async fn enforce_subject_lru(tx: &WriteTx, touched: Option<&str>, now: Epoch
     let mut trimmed = 0;
     if let Some(scope_id) = touched {
         let kept: Vec<String> = active()
-            .filter(in_scope(MemoryScope::OnebotUser, scope_id))
+            .filter(in_scope(MemoryScope::ExternalSubject, scope_id))
             .filter(memory::Column::Visibility.eq(Visibility::Normal))
             .order_by_desc(memory::Column::UpdatedAt)
             .order_by_asc(memory::Column::Id)
@@ -679,7 +686,7 @@ pub async fn sweep_untracked_subjects(tx: &WriteTx, now: EpochMs) -> Result<u64,
                     .add(Expr::col((memory::Entity, memory::Column::SubjectScopeId)).equals(subject))
                     .add(
                         Condition::all()
-                            .add(memory::Column::ScopeType.eq(MemoryScope::OnebotUser))
+                            .add(memory::Column::ScopeType.eq(MemoryScope::ExternalSubject))
                             .add(Expr::col((memory::Entity, memory::Column::ScopeId)).equals(subject)),
                     ),
             )
@@ -814,7 +821,11 @@ pub fn format_memory_section(memories: &[memory::Model], tag: &str, attrs: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::entity::memory::{GLOBAL_SCOPE_ID, MemoryType, onebot_user_scope_id};
+    use crate::db::entity::memory::{GLOBAL_SCOPE_ID, MemoryType, external_subject_scope_id};
+
+    fn test_subject_id(uid: i64) -> String {
+        external_subject_scope_id("channel", &uid.to_string())
+    }
     use crate::db::sea::cap::Db;
     use crate::db::sea::{execute_for_tests, sea_test_db};
 
@@ -826,7 +837,7 @@ mod tests {
             key: key.into(),
             content: "x".into(),
             memory_type: MemoryType::General,
-            subject_scope_id: (scope == MemoryScope::OnebotUser).then(|| scope_id.to_owned()),
+            subject_scope_id: (scope == MemoryScope::ExternalSubject).then(|| scope_id.to_owned()),
             origin,
             visibility: vis,
             source_session_id: None,
@@ -842,8 +853,8 @@ mod tests {
     }
 
     async fn mem(db: &Db, id: &str, subject: i64, origin: Origin, vis: Visibility) {
-        let scope_id = onebot_user_scope_id(subject);
-        write(db, row(id, MemoryScope::OnebotUser, &scope_id, id, origin, vis))
+        let scope_id = test_subject_id(subject);
+        write(db, row(id, MemoryScope::ExternalSubject, &scope_id, id, origin, vis))
             .await
             .unwrap();
     }
@@ -860,7 +871,7 @@ mod tests {
         mem(&db, "p", 1, Origin::Private, Visibility::Normal).await;
         mem(&db, "g", 1, Origin::Group, Visibility::Normal).await;
 
-        let scope = onebot_user_scope_id(1);
+        let scope = test_subject_id(1);
         let in_group = visible_user_memories(&db, &scope, &VisibilityCtx::group_injection())
             .await
             .unwrap();
@@ -879,7 +890,7 @@ mod tests {
         mem(&db, "note", 1, Origin::Admin, Visibility::OwnerOnly).await;
         mem(&db, "pref", 1, Origin::Group, Visibility::Normal).await;
 
-        let scope = onebot_user_scope_id(1);
+        let scope = test_subject_id(1);
         let seen = visible_user_memories(&db, &scope, &VisibilityCtx::self_view(true))
             .await
             .unwrap();
@@ -898,7 +909,7 @@ mod tests {
     async fn operator_written_person_memories_reach_groups() {
         let db = sea_test_db().await;
         mem(&db, "m1", 1, Origin::Admin, Visibility::Normal).await;
-        let seen = visible_user_memories(&db, &onebot_user_scope_id(1), &VisibilityCtx::group_injection())
+        let seen = visible_user_memories(&db, &test_subject_id(1), &VisibilityCtx::group_injection())
             .await
             .unwrap();
         assert_eq!(seen.len(), 1, "operator-written memory must survive group filtering");
@@ -908,13 +919,13 @@ mod tests {
     async fn soft_deleted_rows_disappear_then_come_back() {
         let db = sea_test_db().await;
         mem(&db, "a", 1, Origin::Group, Visibility::Normal).await;
-        let scope = onebot_user_scope_id(1);
+        let scope = test_subject_id(1);
 
         db.write(async |tx| soft_delete(tx, &["a".into()], DeletedBy::SelfRemoved, 10).await)
             .await
             .unwrap();
         assert!(
-            list_by_scope(&db, MemoryScope::OnebotUser, &scope)
+            list_by_scope(&db, MemoryScope::ExternalSubject, &scope)
                 .await
                 .unwrap()
                 .is_empty()
@@ -928,7 +939,7 @@ mod tests {
         db.write(async |tx| restore(tx, &["a".into()], 9_000).await)
             .await
             .unwrap();
-        let back = list_by_scope(&db, MemoryScope::OnebotUser, &scope).await.unwrap();
+        let back = list_by_scope(&db, MemoryScope::ExternalSubject, &scope).await.unwrap();
         assert_eq!((back.len(), back[0].updated_at, back[0].deleted_by), (1, 9_000, None));
     }
 
@@ -937,10 +948,10 @@ mod tests {
     #[tokio::test]
     async fn an_overwrite_keeps_the_live_row_and_the_trash_keeps_its_own() {
         let db = sea_test_db().await;
-        let scope = onebot_user_scope_id(1);
+        let scope = test_subject_id(1);
         let mut first = row(
             "m1",
-            MemoryScope::OnebotUser,
+            MemoryScope::ExternalSubject,
             &scope,
             "k",
             Origin::Group,
@@ -951,7 +962,7 @@ mod tests {
 
         let mut second = row(
             "m2",
-            MemoryScope::OnebotUser,
+            MemoryScope::ExternalSubject,
             &scope,
             "k",
             Origin::Admin,
@@ -981,7 +992,7 @@ mod tests {
             &db,
             row(
                 "m3",
-                MemoryScope::OnebotUser,
+                MemoryScope::ExternalSubject,
                 &scope,
                 "k",
                 Origin::Group,
@@ -1002,11 +1013,11 @@ mod tests {
         mem(&db, "normal", 7, Origin::Group, Visibility::Normal).await;
         mem(&db, "note", 7, Origin::Admin, Visibility::OwnerOnly).await;
 
-        let scope = onebot_user_scope_id(7);
+        let scope = test_subject_id(7);
         db.write(async |tx| forget_subject(tx, &scope, false, DeletedBy::Lru, 20).await)
             .await
             .unwrap();
-        let left = list_by_scope(&db, MemoryScope::OnebotUser, &scope).await.unwrap();
+        let left = list_by_scope(&db, MemoryScope::ExternalSubject, &scope).await.unwrap();
         assert_eq!(ids(&left), ["note"]);
     }
 
@@ -1018,9 +1029,9 @@ mod tests {
         let people = MAX_REMEMBERED_SUBJECTS as i64 + 1;
         db.write(async |tx| {
             for uid in 0..people + 2 {
-                touch_subject(tx, &onebot_user_scope_id(uid), None, uid == people, 100 + uid).await?;
+                touch_subject(tx, &test_subject_id(uid), None, uid == people, 100 + uid).await?;
             }
-            set_subject_flags(tx, &onebot_user_scope_id(people + 1), Some(true), None)
+            set_subject_flags(tx, &test_subject_id(people + 1), Some(true), None)
                 .await?
                 .unwrap();
             Ok::<_, DbErr>(())
@@ -1045,11 +1056,11 @@ mod tests {
     #[tokio::test]
     async fn tracked_sweep_drops_the_oldest_and_keeps_opted_out_rows() {
         let db = sea_test_db().await;
-        let quitter = onebot_user_scope_id(0); // oldest last_seen, first to go
+        let quitter = test_subject_id(0); // oldest last_seen, first to go
         let dropped = db
             .write(async |tx| {
                 for i in 0..(MAX_TRACKED_SUBJECTS as i64 + 5) {
-                    touch_subject(tx, &onebot_user_scope_id(i), None, false, i).await?;
+                    touch_subject(tx, &test_subject_id(i), None, false, i).await?;
                 }
                 set_subject_flags(tx, &quitter, None, Some(true)).await?.unwrap();
                 sweep_untracked_subjects(tx, 999_999).await
@@ -1062,8 +1073,8 @@ mod tests {
             is_opted_out(&db, &quitter).await.unwrap(),
             "opt-out row must survive the sweep"
         );
-        assert!(get_subject(&db, &onebot_user_scope_id(1)).await.unwrap().is_none());
-        assert!(get_subject(&db, &onebot_user_scope_id(5)).await.unwrap().is_some());
+        assert!(get_subject(&db, &test_subject_id(1)).await.unwrap().is_none());
+        assert!(get_subject(&db, &test_subject_id(5)).await.unwrap().is_some());
     }
 
     /// A write must only trim the person it wrote about. Sweeping every subject
@@ -1077,11 +1088,11 @@ mod tests {
         db.write(async |tx| {
             for uid in [1i64, 2] {
                 for i in 0..MAX_MEMORIES_PER_SUBJECT {
-                    let scope = onebot_user_scope_id(uid);
+                    let scope = test_subject_id(uid);
                     let id = format!("u{uid}m{i}");
                     let mut m = row(
                         &id,
-                        MemoryScope::OnebotUser,
+                        MemoryScope::ExternalSubject,
                         &scope,
                         &id,
                         Origin::Group,
@@ -1091,10 +1102,10 @@ mod tests {
                     upsert(tx, m).await?;
                 }
             }
-            let scope = onebot_user_scope_id(1);
+            let scope = test_subject_id(1);
             let mut extra = row(
                 "u1extra",
-                MemoryScope::OnebotUser,
+                MemoryScope::ExternalSubject,
                 &scope,
                 "extra",
                 Origin::Group,
@@ -1107,7 +1118,7 @@ mod tests {
         .await
         .unwrap();
 
-        let scope1 = onebot_user_scope_id(1);
+        let scope1 = test_subject_id(1);
         let (_, trimmed) = db
             .write(async |tx| enforce_subject_lru(tx, Some(&scope1), 500).await)
             .await
@@ -1115,7 +1126,7 @@ mod tests {
         assert_eq!(trimmed, 1);
         assert_eq!(ids(&list_trash(&db, 10).await.unwrap()), ["u1m0"], "the oldest one");
         for uid in [1, 2] {
-            let left = list_by_scope(&db, MemoryScope::OnebotUser, &onebot_user_scope_id(uid))
+            let left = list_by_scope(&db, MemoryScope::ExternalSubject, &test_subject_id(uid))
                 .await
                 .unwrap();
             assert_eq!(left.len(), MAX_MEMORIES_PER_SUBJECT, "person {uid}");
@@ -1125,11 +1136,11 @@ mod tests {
     #[tokio::test]
     async fn quota_and_length_are_enforced_for_every_writer() {
         let db = sea_test_db().await;
-        let scope = onebot_user_scope_id(3);
+        let scope = test_subject_id(3);
         let attempt = |key: &str, content: String| {
             let mut m = row(
                 key,
-                MemoryScope::OnebotUser,
+                MemoryScope::ExternalSubject,
                 &scope,
                 key,
                 Origin::Group,
@@ -1157,13 +1168,13 @@ mod tests {
     async fn racing_writers_cannot_overfill_a_scope() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::sea::file_test_db(dir.path()).await;
-        for i in 0..MAX_ONEBOT_GLOBAL_MEMORIES - 1 {
+        for i in 0..MAX_CHANNEL_GLOBAL_MEMORIES - 1 {
             let key = format!("k{i}");
             write(
                 &db,
                 row(
                     &key,
-                    MemoryScope::OnebotGlobal,
+                    MemoryScope::ChannelGlobal,
                     GLOBAL_SCOPE_ID,
                     &key,
                     Origin::Admin,
@@ -1181,7 +1192,7 @@ mod tests {
                     &db,
                     row(
                         &key,
-                        MemoryScope::OnebotGlobal,
+                        MemoryScope::ChannelGlobal,
                         GLOBAL_SCOPE_ID,
                         &key,
                         Origin::Admin,
@@ -1199,10 +1210,10 @@ mod tests {
             .count();
         assert_eq!(admitted, 1);
         assert_eq!(
-            count_by_scope(&db, MemoryScope::OnebotGlobal, GLOBAL_SCOPE_ID)
+            count_by_scope(&db, MemoryScope::ChannelGlobal, GLOBAL_SCOPE_ID)
                 .await
                 .unwrap() as usize,
-            MAX_ONEBOT_GLOBAL_MEMORIES
+            MAX_CHANNEL_GLOBAL_MEMORIES
         );
     }
 
@@ -1248,10 +1259,10 @@ mod tests {
         mem(&db, "b", 2, Origin::Group, Visibility::Normal).await;
         mem(&db, "a", 1, Origin::Group, Visibility::Normal).await;
 
-        let scope_ids = vec![onebot_user_scope_id(2), onebot_user_scope_id(1)];
+        let scope_ids = vec![test_subject_id(2), test_subject_id(1)];
         let rows = list_by_scopes(
             &db,
-            MemoryScope::OnebotUser,
+            MemoryScope::ExternalSubject,
             &scope_ids,
             &VisibilityCtx::group_injection(),
             None,
@@ -1316,7 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn a_touch_keeps_a_known_name() {
         let db = sea_test_db().await;
-        let scope = onebot_user_scope_id(9);
+        let scope = test_subject_id(9);
         db.write(async |tx| {
             touch_subject(tx, &scope, Some("Nova"), false, 1).await?;
             touch_subject(tx, &scope, Some("  "), true, 2).await
@@ -1338,14 +1349,14 @@ mod tests {
         let refused = db
             .write(async |tx| {
                 for uid in 0..=MAX_PINNED_SUBJECTS as i64 {
-                    touch_subject(tx, &onebot_user_scope_id(uid), None, false, uid).await?;
+                    touch_subject(tx, &test_subject_id(uid), None, false, uid).await?;
                 }
                 for uid in 0..MAX_PINNED_SUBJECTS as i64 {
-                    set_subject_flags(tx, &onebot_user_scope_id(uid), Some(true), None)
+                    set_subject_flags(tx, &test_subject_id(uid), Some(true), None)
                         .await?
                         .unwrap();
                 }
-                set_subject_flags(tx, &onebot_user_scope_id(MAX_PINNED_SUBJECTS as i64), Some(true), None).await
+                set_subject_flags(tx, &test_subject_id(MAX_PINNED_SUBJECTS as i64), Some(true), None).await
             })
             .await
             .unwrap();

@@ -3,7 +3,7 @@
 
 use sea_orm::entity::prelude::*;
 
-use super::memory::parse_onebot_user_scope_id;
+use super::memory::parse_external_subject_numeric_id;
 use crate::db::types::{EpochMs, SqlBool};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -14,7 +14,7 @@ pub struct Model {
     pub display_name: Option<String>,
     pub last_seen_at: EpochMs,
     pub created_at: EpochMs,
-    /// Mirrors the admin list so eviction never has to read config.
+    /// Mirrors the operator list so eviction never has to read config.
     pub is_protected: SqlBool,
     pub is_pinned: SqlBool,
     pub opted_out: SqlBool,
@@ -27,6 +27,6 @@ impl ActiveModelBehavior for ActiveModel {}
 
 impl Model {
     pub fn user_id(&self) -> Option<i64> {
-        parse_onebot_user_scope_id(&self.scope_id)
+        parse_external_subject_numeric_id(&self.scope_id)
     }
 }

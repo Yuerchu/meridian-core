@@ -106,14 +106,23 @@ impl GoogleInteractionsProvider {
                 }
             });
         }
+        let has_deferred = params.deferred_tool_mode == crate::DeferredToolMode::GeminiServerSearch
+            && tools.is_some_and(|items| items.iter().any(|tool| params.is_tool_deferred(&tool.name)));
+        if has_deferred {
+            wire_tools.push(json!({ "type": "tool_search" }));
+        }
         if let Some(tools) = tools.filter(|items| !items.is_empty()) {
             wire_tools.extend(tools.iter().map(|tool| {
-                json!({
+                let mut entry = json!({
                     "type": "function",
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
-                })
+                });
+                if has_deferred && params.is_tool_deferred(&tool.name) {
+                    entry["defer_loading"] = Value::Bool(true);
+                }
+                entry
             }));
         }
         if !wire_tools.is_empty() {
@@ -263,7 +272,7 @@ fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec
                         input.push(json!({
                             "type": "function_call",
                             "id": call.id,
-                            "name": call.name,
+                            "name": crate::wire_tool_call_name(&call.name),
                             "arguments": arguments,
                         }));
                     }
@@ -284,7 +293,7 @@ fn serialize_input(messages: &[ChatMessage], model: &str) -> Result<(String, Vec
                     input.push(json!({
                         "type": "function_result",
                         "call_id": call.id,
-                        "name": call.name,
+                        "name": crate::wire_tool_call_name(&call.name),
                         "result": result,
                     }));
                     consumed_results.insert(call.id.clone());
@@ -322,6 +331,12 @@ fn rendered_parts(content: &str) -> Result<Vec<Value>, ProviderError> {
 /// A `function_result.result`: the same content list a user input takes, so
 /// pictures a tool returned go back inside the result they belong to.
 fn function_result_content(message: &ChatMessage) -> Result<Vec<Value>, ProviderError> {
+    if message.origin == crate::MessageOrigin::ToolSearchResult {
+        return Ok(vec![json!({
+            "type": "text",
+            "text": crate::tool_result_summary_or_content(message),
+        })]);
+    }
     match crate::tool_result_parts(message).map_err(ProviderError::Parse)? {
         None => Ok(vec![json!({ "type": "text", "text": message.content })]),
         Some(parts) => parts
@@ -1873,5 +1888,40 @@ mod tests {
         let token = second_auth.access_token().await.unwrap();
         assert_eq!(token, "shared-oauth-token");
         crate::mixins::vertex_auth::remove_cached_token_for_test(first_auth.cache_key()).await;
+    }
+
+    #[test]
+    fn gemini_interactions_emits_tool_search_and_defer_loading() {
+        let provider = GoogleInteractionsProvider::new("https://generativelanguage.googleapis.com", "k");
+        let tools = vec![
+            ToolDefinition {
+                name: "read_file".into(),
+                description: "Read file".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "mcp__luckin__order_coffee".into(),
+                description: "Order coffee".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        ];
+        let params = ChatParams {
+            model: "gemini-3.8-flash".into(),
+            deferred_tool_mode: crate::DeferredToolMode::GeminiServerSearch,
+            deferred_tool_names: vec!["mcp__luckin__order_coffee".into()],
+            ..Default::default()
+        };
+        let req = provider
+            .build_request(&[ChatMessage::user("hi")], Some(&tools), &params, true)
+            .unwrap();
+        let RequestBody::Json(body) = req.body.unwrap() else {
+            panic!("json body");
+        };
+        let wire_tools = body["tools"].as_array().unwrap();
+        assert_eq!(wire_tools[0]["type"], "tool_search");
+        assert_eq!(wire_tools[1]["name"], "read_file");
+        assert!(wire_tools[1].get("defer_loading").is_none());
+        assert_eq!(wire_tools[2]["name"], "mcp__luckin__order_coffee");
+        assert_eq!(wire_tools[2]["defer_loading"], json!(true));
     }
 }

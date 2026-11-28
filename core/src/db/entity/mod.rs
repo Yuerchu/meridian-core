@@ -21,6 +21,8 @@ pub mod cached_model;
 pub mod composer_draft;
 pub mod conversation;
 pub mod custom_tool;
+pub mod dream_run;
+pub mod dream_watermark;
 pub mod emoji;
 pub mod emoji_embedding;
 pub mod emoji_pack;
@@ -127,6 +129,8 @@ pub fn registered() -> Vec<EntityShape> {
         shape_of::<composer_draft::Entity>(),
         shape_of::<conversation::Entity>(),
         shape_of::<custom_tool::Entity>(),
+        shape_of::<dream_run::Entity>(),
+        shape_of::<dream_watermark::Entity>(),
         shape_of::<emoji::Entity>(),
         shape_of::<emoji_embedding::Entity>(),
         shape_of::<emoji_pack::Entity>(),

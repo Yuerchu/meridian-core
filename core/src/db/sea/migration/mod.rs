@@ -28,6 +28,9 @@ pub mod m0012_many_to_many_models;
 pub mod m0013_media_generations;
 pub mod m0014_emoji_embeddings;
 pub mod m0015_cache_ttl_and_lifecycle;
+pub mod m0016_generalize_channel_sources;
+pub mod m0017_mcp_tool_policies;
+pub mod m0018_dream_memory;
 
 use sea_orm::sea_query::{
     ColumnDef, ConditionalStatement, Expr, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index,
@@ -57,6 +60,9 @@ impl MigratorTrait for Migrator {
             Box::new(M0013MediaGenerations),
             Box::new(M0014EmojiEmbeddings),
             Box::new(M0015CacheTtlAndLifecycle),
+            Box::new(M0016GeneralizeChannelSources),
+            Box::new(M0017McpToolPolicies),
+            Box::new(M0018DreamMemory),
         ]
     }
 }
@@ -118,6 +124,9 @@ pub fn sqlite_statements() -> Vec<String> {
     all.extend(m0013_media_generations::sqlite_statements());
     all.extend(m0014_emoji_embeddings::sqlite_statements());
     all.extend(m0015_cache_ttl_and_lifecycle::sqlite_statements());
+    all.extend(m0016_generalize_channel_sources::sqlite_statements());
+    all.extend(m0017_mcp_tool_policies::sqlite_statements());
+    all.extend(m0018_dream_memory::sqlite_statements());
     all
 }
 
@@ -483,6 +492,60 @@ impl MigrationTrait for M0015CacheTtlAndLifecycle {
     }
 }
 
+pub struct M0016GeneralizeChannelSources;
+
+impl MigrationName for M0016GeneralizeChannelSources {
+    fn name(&self) -> &str {
+        "m0016_generalize_channel_sources"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0016GeneralizeChannelSources {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "m0016_generalize_channel_sources requires SQLite".into(),
+            ));
+        }
+        for statement in m0016_generalize_channel_sources::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0017McpToolPolicies;
+
+impl MigrationName for M0017McpToolPolicies {
+    fn name(&self) -> &str {
+        "m0017_mcp_tool_policies"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0017McpToolPolicies {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration("m0017_mcp_tool_policies requires SQLite".into()));
+        }
+        for statement in m0017_mcp_tool_policies::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
 impl MigrationName for M0011CustomToolExecution {
     fn name(&self) -> &str {
         "m0011_custom_tool_execution"
@@ -587,6 +650,34 @@ impl MigrationTrait for M0004FrozenStickers {
             ));
         }
         for statement in m0004_frozen_stickers::sqlite_statements() {
+            conn.execute_unprepared(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct M0018DreamMemory;
+
+impl MigrationName for M0018DreamMemory {
+    fn name(&self) -> &str {
+        "m0018_dream_memory"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0018DreamMemory {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        if conn.get_database_backend() != DbBackend::Sqlite {
+            return Err(DbErr::Migration(
+                "m0018_dream_memory carries SQLite CHECK text; other backends are not shipped yet".into(),
+            ));
+        }
+        for statement in m0018_dream_memory::sqlite_statements() {
             conn.execute_unprepared(&statement).await?;
         }
         Ok(())

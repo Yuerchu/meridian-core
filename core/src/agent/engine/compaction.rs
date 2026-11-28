@@ -116,14 +116,14 @@ impl Compacting<'_> {
 }
 
 pub enum CompactionPolicy {
-    Desktop {
+    Attended {
         /// The assistant's `auto_compact_enabled`. Governs the threshold pass
         /// only — recovery from a refused request is not a preference, it is the
         /// alternative to giving up on the turn.
         enabled: bool,
         breaker: Arc<CompactCircuitBreaker>,
     },
-    OneBot,
+    Unattended,
 }
 
 impl CompactionPolicy {
@@ -136,13 +136,13 @@ impl CompactionPolicy {
         // Whatever the refused request was sized against.
         let before = c.budget.current_estimate;
         match self {
-            CompactionPolicy::OneBot => {
+            CompactionPolicy::Unattended => {
                 // The trim is the only recovery here: a summary would go to the
                 // same provider that just refused this request.
                 c.trim();
                 c.report("api_error", before, "trim");
             }
-            CompactionPolicy::Desktop { breaker, .. } => {
+            CompactionPolicy::Attended { breaker, .. } => {
                 if !(c.budget.needs_compact() && breaker.can_compact()) {
                     c.trim();
                     c.report("api_error", before, "trim");
@@ -183,20 +183,20 @@ impl CompactionPolicy {
         }
         let before = c.budget.current_estimate;
         match self {
-            CompactionPolicy::OneBot => {
+            CompactionPolicy::Unattended => {
                 let mut rung = "summary";
                 if c.try_remote_compact().await.is_ok() {
                     rung = "remote";
                 } else if let Err(e) = mid_turn_compact(c.messages, c.budget, c.provider, c.params, c.keep_recent).await
                 {
-                    tracing::warn!("OneBot mid-turn compact failed: {e}");
+                    tracing::warn!("Unattended mid-turn compact failed: {e}");
                     rung = "trim";
                     c.trim();
                 }
                 c.budget.update_estimate(c.messages);
                 c.report("threshold", before, rung);
             }
-            CompactionPolicy::Desktop { enabled, breaker } => {
+            CompactionPolicy::Attended { enabled, breaker } => {
                 if !(*enabled && breaker.can_compact()) {
                     return;
                 }
@@ -335,7 +335,7 @@ mod tests {
         budget.update_estimate(&messages);
         let was = budget.current_estimate;
 
-        CompactionPolicy::OneBot
+        CompactionPolicy::Unattended
             .on_overflow(compacting(
                 &mut messages,
                 &mut budget,
@@ -363,7 +363,7 @@ mod tests {
         let (before, mut budget) = (messages.len(), budget());
         budget.update_estimate(&messages);
 
-        CompactionPolicy::OneBot
+        CompactionPolicy::Unattended
             .on_overflow(compacting(
                 &mut messages,
                 &mut budget,
@@ -387,7 +387,7 @@ mod tests {
             let (mut messages, mut budget) = (messages, budget());
             budget.update_estimate(&messages);
 
-            CompactionPolicy::OneBot
+            CompactionPolicy::Unattended
                 .on_overflow(compacting(
                     &mut messages,
                     &mut budget,

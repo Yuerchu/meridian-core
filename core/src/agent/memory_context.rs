@@ -5,7 +5,9 @@
 //! privacy rules the way three hand-copied loaders would.
 
 use crate::db::entity::memory;
-use crate::db::entity::memory::{GLOBAL_SCOPE_ID, MemoryScope, Visibility, onebot_user_scope_id};
+use crate::db::entity::memory::{
+    GLOBAL_SCOPE_ID, MemoryScope, Visibility, external_subject_scope_id, parse_external_subject_numeric_id,
+};
 use crate::db::entity::message as message_entity;
 use crate::db::sea::DbErr;
 use crate::db::sea::cap::{Db, Snapshot};
@@ -69,13 +71,17 @@ pub struct MemorySubjectRef {
 }
 
 impl MemorySubjectRef {
-    pub fn from_user(user_id: i64, display_name: Option<String>) -> Self {
+    pub fn from_subject(scope_id: impl Into<String>, display_name: Option<String>) -> Self {
         Self {
-            scope_id: onebot_user_scope_id(user_id),
+            scope_id: scope_id.into(),
             display_name,
             role: None,
             title: None,
         }
+    }
+
+    pub fn from_channel_user(channel: &str, user_id: i64, display_name: Option<String>) -> Self {
+        Self::from_subject(external_subject_scope_id(channel, &user_id.to_string()), display_name)
     }
 
     pub fn with_standing(mut self, role: Option<String>, title: Option<String>) -> Self {
@@ -87,15 +93,16 @@ impl MemorySubjectRef {
 
 /// A declarative description of the memory a turn is entitled to.
 ///
-/// Built by the caller, which knows whether this is a group, a private chat or
-/// the desktop; resolved and rendered here so all three produce the same block
-/// for the same inputs.
+/// Built by the caller, which knows whether this is a group, a direct channel
+/// chat or the desktop; resolved and rendered here so all surfaces produce the
+/// same block for the same inputs.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryRequest {
     pub project_id: Option<String>,
-    /// The bot-wide layer. Sibling of `include_client_global`, not a superset:
-    /// what the bot learned over QQ is not background for a desktop chat.
-    pub include_onebot_global: bool,
+    /// The external-channel global layer. Sibling of `include_client_global`,
+    /// not a superset: what an assistant learned in external chat channels is
+    /// not background for a desktop chat.
+    pub include_channel_global: bool,
     /// The client-wide layer: what the user told Meridian directly, outside any
     /// project. Desktop turns read it because that is also where they write when
     /// the conversation has no project.
@@ -107,20 +114,20 @@ pub struct MemoryRequest {
     pub multi_speaker: bool,
     pub subjects: Vec<MemorySubjectRef>,
     /// Which origins may be shown for the subject layer. Groups pass the
-    /// group-visible set; private chats pass `None` and see everything.
+    /// group-visible set; direct chats pass `None` and see everything.
     pub subject_visibility: VisibilityCtx,
     pub budget_tokens: usize,
 }
 
 impl MemoryRequest {
     /// Desktop chat: the client-wide layer plus at most one project, nobody's
-    /// profile, and nothing from the OneBot side. The client layer is included
+    /// profile, and nothing from external channels. The client layer is included
     /// because a conversation with no project writes there — leaving it out meant
     /// those memories were stored and then never injected again.
     pub fn desktop(project_id: Option<String>, budget_tokens: usize) -> Self {
         Self {
             project_id,
-            include_onebot_global: false,
+            include_channel_global: false,
             include_client_global: true,
             multi_speaker: false,
             subjects: Vec::new(),
@@ -129,12 +136,13 @@ impl MemoryRequest {
         }
     }
 
-    /// A QQ group: the room's own memory plus profiles of whoever is talking,
-    /// filtered so nothing learned in a private chat can surface here.
-    pub fn onebot_group(project_id: Option<String>, subjects: Vec<MemorySubjectRef>, budget_tokens: usize) -> Self {
+    /// A multi-party channel room: the room's own memory plus profiles of
+    /// whoever is talking, filtered so nothing learned in a direct chat can
+    /// surface here.
+    pub fn channel_group(project_id: Option<String>, subjects: Vec<MemorySubjectRef>, budget_tokens: usize) -> Self {
         Self {
             project_id,
-            include_onebot_global: true,
+            include_channel_global: true,
             include_client_global: false,
             multi_speaker: true,
             subjects,
@@ -143,13 +151,13 @@ impl MemoryRequest {
         }
     }
 
-    /// A private chat: no room layer at all (private project memories are not
-    /// written any more — everything learned one-to-one belongs to the person),
-    /// and no origin filter, since the only subject is the person right here.
-    pub fn onebot_private(subject: MemorySubjectRef, budget_tokens: usize) -> Self {
+    /// A direct channel chat: no room layer at all (everything learned
+    /// one-to-one belongs to the person), and no origin filter, since the only
+    /// subject is the person right here.
+    pub fn channel_direct(subject: MemorySubjectRef, budget_tokens: usize) -> Self {
         Self {
             project_id: None,
-            include_onebot_global: true,
+            include_channel_global: true,
             include_client_global: false,
             // One person is present, but they are not the only person the bot
             // holds memories about, and those must not surface here either.
@@ -246,10 +254,10 @@ impl Accounting {
 /// only: their name and standing live on the roster, which is rebuilt every turn
 /// because both of those change while what is remembered does not.
 fn person_attrs(scope_id: &str) -> String {
-    let qq = crate::db::entity::memory::parse_onebot_user_scope_id(scope_id)
-        .map(|id| id.to_string())
+    let id = parse_external_subject_numeric_id(scope_id)
+        .map(|n| n.to_string())
         .unwrap_or_else(|| scope_id.to_string());
-    format!("qq=\"{}\"", escape_attr(&qq))
+    format!("id=\"{}\"", escape_attr(&id))
 }
 
 /// Who is in the room right now, rebuilt every turn and never persisted.
@@ -265,7 +273,7 @@ fn person_attrs(scope_id: &str) -> String {
 /// nicety — what identifies a speaker on the wire is a numeric id, and without a
 /// line tying that id to a name the model has someone it cannot address. Worst
 /// for the person who just arrived.
-pub(crate) fn roster_block(req: &MemoryRequest) -> Option<String> {
+pub fn roster_block(req: &MemoryRequest) -> Option<String> {
     if req.subjects.is_empty() {
         return None;
     }
@@ -549,8 +557,8 @@ pub(crate) async fn load_memory_block(
             budgets.global,
         )
     };
-    let (global, global_dropped) = if req.include_onebot_global {
-        load_global(MemoryScope::OnebotGlobal).await?
+    let (global, global_dropped) = if req.include_channel_global {
+        load_global(MemoryScope::ChannelGlobal).await?
     } else if req.include_client_global {
         load_global(MemoryScope::ClientGlobal).await?
     } else {
@@ -592,7 +600,14 @@ pub(crate) async fn load_memory_block(
         Vec::new()
     } else {
         layer_rows(
-            list_by_scopes(db, MemoryScope::OnebotUser, &scope_ids, &req.subject_visibility, None).await,
+            list_by_scopes(
+                db,
+                MemoryScope::ExternalSubject,
+                &scope_ids,
+                &req.subject_visibility,
+                None,
+            )
+            .await,
             "subject",
         )?
     };
@@ -763,8 +778,8 @@ pub fn trailing_with_memory(
 
 /// Which global layer this request reads, if any.
 fn global_scope(req: &MemoryRequest) -> Option<MemoryScope> {
-    if req.include_onebot_global {
-        Some(MemoryScope::OnebotGlobal)
+    if req.include_channel_global {
+        Some(MemoryScope::ChannelGlobal)
     } else if req.include_client_global {
         Some(MemoryScope::ClientGlobal)
     } else {
@@ -856,7 +871,7 @@ fn delete_layers(req: &MemoryRequest) -> Vec<(MemoryScope, Vec<String>, Visibili
     }
     let subjects = subject_scope_ids(req);
     if !subjects.is_empty() {
-        out.push((MemoryScope::OnebotUser, subjects, req.subject_visibility.clone()));
+        out.push((MemoryScope::ExternalSubject, subjects, req.subject_visibility.clone()));
     }
     out
 }
@@ -963,11 +978,18 @@ async fn delta_injection(
 
         let mut rows: Vec<memory::Model> = Vec::new();
         if !known.is_empty() {
-            rows.extend(changed(MemoryScope::OnebotUser, known, &req.subject_visibility).await?);
+            rows.extend(changed(MemoryScope::ExternalSubject, known, &req.subject_visibility).await?);
         }
         if !newcomers.is_empty() {
             rows.extend(layer_rows(
-                list_by_scopes(db, MemoryScope::OnebotUser, &newcomers, &req.subject_visibility, None).await,
+                list_by_scopes(
+                    db,
+                    MemoryScope::ExternalSubject,
+                    &newcomers,
+                    &req.subject_visibility,
+                    None,
+                )
+                .await,
                 "newcomers",
             )?);
         }
@@ -1068,7 +1090,7 @@ async fn forgotten_section(
     for (scope, ids, ctx) in delete_layers(req) {
         let label = match scope {
             MemoryScope::Project => "chat_memories".to_string(),
-            MemoryScope::OnebotUser => String::new(),
+            MemoryScope::ExternalSubject => String::new(),
             _ => "bot_memories".to_string(),
         };
         if let Ok(found) = list_deleted_by_scopes(db, scope, &ids, &ctx, &window).await {
@@ -1242,7 +1264,7 @@ mod tests {
             key: key.into(),
             content: content.into(),
             memory_type: MemoryType::General,
-            subject_scope_id: (scope == MemoryScope::OnebotUser).then(|| scope_id.to_owned()),
+            subject_scope_id: (scope == MemoryScope::ExternalSubject).then(|| scope_id.to_owned()),
             origin,
             visibility: vis,
             source_session_id: None,
@@ -1385,10 +1407,17 @@ mod tests {
         }
     }
 
+    fn test_subject_id(uid: i64) -> String {
+        external_subject_scope_id("channel", &uid.to_string())
+    }
+
     fn group_req(project: Option<&str>, subjects: &[i64], budget: usize) -> MemoryRequest {
-        MemoryRequest::onebot_group(
+        MemoryRequest::channel_group(
             project.map(str::to_string),
-            subjects.iter().map(|u| MemorySubjectRef::from_user(*u, None)).collect(),
+            subjects
+                .iter()
+                .map(|u| MemorySubjectRef::from_channel_user("channel", *u, None))
+                .collect(),
             budget,
         )
     }
@@ -1418,8 +1447,8 @@ mod tests {
         async fn an_unchanged_turn_injects_nothing() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100).await;
+            let alice = test_subject_id(1);
+            add_at(conn, "a", MemoryScope::ExternalSubject, &alice, "style", 100).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
@@ -1440,8 +1469,8 @@ mod tests {
         async fn an_old_row_deleted_today_is_still_reported() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
-            add_at(conn, "old", MemoryScope::OnebotUser, &alice, "coffee", 10).await;
+            let alice = test_subject_id(1);
+            add_at(conn, "old", MemoryScope::ExternalSubject, &alice, "coffee", 10).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
@@ -1465,7 +1494,7 @@ mod tests {
             assert!(text.contains("<memory_forgotten>"), "{text}");
             assert!(text.contains("coffee"), "{text}");
             // And it names the section, because a key is only unique inside one.
-            assert!(text.contains(r#"person qq="1""#), "{text}");
+            assert!(text.contains(r#"person id="1""#), "{text}");
         }
 
         /// Restoring used to leave no trace a reader could find: `deleted_at`
@@ -1476,8 +1505,8 @@ mod tests {
         async fn a_restored_memory_comes_back() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
-            add_at(conn, "old", MemoryScope::OnebotUser, &alice, "coffee", 10).await;
+            let alice = test_subject_id(1);
+            add_at(conn, "old", MemoryScope::ExternalSubject, &alice, "coffee", 10).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
@@ -1512,12 +1541,12 @@ mod tests {
         async fn rows_sharing_a_millisecond_all_get_through() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
+            let alice = test_subject_id(1);
             for i in 0..5 {
                 add_at(
                     conn,
                     &format!("m{i}"),
-                    MemoryScope::OnebotUser,
+                    MemoryScope::ExternalSubject,
                     &alice,
                     &format!("k{i}"),
                     100,
@@ -1551,11 +1580,11 @@ mod tests {
         async fn a_dropped_entry_is_not_stepped_over() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
+            let alice = test_subject_id(1);
             // `aaa` sorts first and is kept; `zzz` sorts last and is dropped —
             // and `zzz` is the older of the two.
-            add_at(conn, "z", MemoryScope::OnebotUser, &alice, "zzz", 50).await;
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "aaa", 200).await;
+            add_at(conn, "z", MemoryScope::ExternalSubject, &alice, "zzz", 50).await;
+            add_at(conn, "a", MemoryScope::ExternalSubject, &alice, "aaa", 200).await;
             let req = group_req(None, &[1], 40);
             let mut history = Vec::new();
 
@@ -1581,13 +1610,13 @@ mod tests {
         async fn a_history_with_no_full_row_starts_over() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100).await;
+            let alice = test_subject_id(1);
+            add_at(conn, "a", MemoryScope::ExternalSubject, &alice, "style", 100).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
             round(conn, &req, &mut history, 1_000).await;
-            add_at(conn, "b", MemoryScope::OnebotUser, &alice, "coffee", 1_200).await;
+            add_at(conn, "b", MemoryScope::ExternalSubject, &alice, "coffee", 1_200).await;
             round(conn, &req, &mut history, 2_000).await;
             assert_eq!(history.len(), 2);
 
@@ -1606,8 +1635,8 @@ mod tests {
         async fn a_cursor_past_the_retention_horizon_starts_over() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100).await;
+            let alice = test_subject_id(1);
+            add_at(conn, "a", MemoryScope::ExternalSubject, &alice, "style", 100).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
 
@@ -1626,14 +1655,14 @@ mod tests {
         async fn a_write_in_the_starting_millisecond_waits_for_the_next_round() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "style", 100).await;
+            let alice = test_subject_id(1);
+            add_at(conn, "a", MemoryScope::ExternalSubject, &alice, "style", 100).await;
             let req = group_req(None, &[1], 8_000);
             let mut history = Vec::new();
             round(conn, &req, &mut history, 1_000).await;
 
             // Written at exactly the next round's t0.
-            add_at(conn, "b", MemoryScope::OnebotUser, &alice, "coffee", 2_000).await;
+            add_at(conn, "b", MemoryScope::ExternalSubject, &alice, "coffee", 2_000).await;
             assert!(round(conn, &req, &mut history, 2_000).await.text.is_none());
 
             let text = round(conn, &req, &mut history, 3_000)
@@ -1660,10 +1689,10 @@ mod tests {
         async fn a_newcomer_left_half_delivered_is_not_stepped_over() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
-            let bob = onebot_user_scope_id(2);
+            let alice = test_subject_id(1);
+            let bob = test_subject_id(2);
             // Alice is established and her memory is recent.
-            add_at(conn, "a1", MemoryScope::OnebotUser, &alice, "alice_key", 900).await;
+            add_at(conn, "a1", MemoryScope::ExternalSubject, &alice, "alice_key", 900).await;
             let mut history = Vec::new();
             round(conn, &group_req(None, &[1], 8_000), &mut history, 1_000).await;
 
@@ -1677,7 +1706,7 @@ mod tests {
                 add_at(
                     conn,
                     &format!("b{i}"),
-                    MemoryScope::OnebotUser,
+                    MemoryScope::ExternalSubject,
                     &bob,
                     &format!("bob_{i}"),
                     100 - i * 10,
@@ -1686,7 +1715,7 @@ mod tests {
             }
             // Alice also changes, so the round has something recent to send too —
             // that recent row is what a naive cursor would resume from.
-            add_at(conn, "a1", MemoryScope::OnebotUser, &alice, "alice_key", 1_500).await;
+            add_at(conn, "a1", MemoryScope::ExternalSubject, &alice, "alice_key", 1_500).await;
 
             let req = group_req(None, &[1, 2], 90);
             let mut seen: Vec<String> = Vec::new();
@@ -1710,10 +1739,10 @@ mod tests {
         async fn a_newcomer_gets_their_whole_history_and_nobody_else_does() {
             let db = sea_test_db().await;
             let conn = &db;
-            let alice = onebot_user_scope_id(1);
-            let bob = onebot_user_scope_id(2);
-            add_at(conn, "a", MemoryScope::OnebotUser, &alice, "alice_key", 100).await;
-            add_at(conn, "b", MemoryScope::OnebotUser, &bob, "bob_key", 100).await;
+            let alice = test_subject_id(1);
+            let bob = test_subject_id(2);
+            add_at(conn, "a", MemoryScope::ExternalSubject, &alice, "alice_key", 100).await;
+            add_at(conn, "b", MemoryScope::ExternalSubject, &bob, "bob_key", 100).await;
 
             let mut history = Vec::new();
             round(conn, &group_req(None, &[1], 8_000), &mut history, 1_000).await;
@@ -1832,7 +1861,7 @@ mod tests {
         add(
             conn,
             "bot",
-            MemoryScope::OnebotGlobal,
+            MemoryScope::ChannelGlobal,
             GLOBAL_SCOPE_ID,
             "bot_rule",
             "群里少说话",
@@ -1862,7 +1891,7 @@ mod tests {
 
         let private = block(
             conn,
-            &MemoryRequest::onebot_private(MemorySubjectRef::from_user(1, None), 8_000),
+            &MemoryRequest::channel_direct(MemorySubjectRef::from_channel_user("channel", 1, None), 8_000),
         )
         .await
         .unwrap();
@@ -1875,11 +1904,11 @@ mod tests {
     async fn group_block_omits_private_memories() {
         let db = sea_test_db().await;
         let conn = &db;
-        let alice = onebot_user_scope_id(1);
+        let alice = test_subject_id(1);
         add(
             conn,
             "priv",
-            MemoryScope::OnebotUser,
+            MemoryScope::ExternalSubject,
             &alice,
             "secret",
             "told in DM",
@@ -1890,7 +1919,7 @@ mod tests {
         add(
             conn,
             "grp",
-            MemoryScope::OnebotUser,
+            MemoryScope::ExternalSubject,
             &alice,
             "style",
             "likes terse",
@@ -1901,7 +1930,11 @@ mod tests {
 
         let block = block(
             conn,
-            &MemoryRequest::onebot_group(None, vec![MemorySubjectRef::from_user(1, Some("Alice".into()))], 8_000),
+            &MemoryRequest::channel_group(
+                None,
+                vec![MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))],
+                8_000,
+            ),
         )
         .await
         .unwrap();
@@ -1910,7 +1943,7 @@ mod tests {
         assert!(!block.contains("told in DM"), "private memory leaked into a group");
         assert!(block.contains("<people>"));
         // Identity only. The name is on the roster, which is redrawn every turn.
-        assert!(block.contains(r#"<person qq="1">"#));
+        assert!(block.contains(r#"<person id="1">"#));
         assert!(!block.contains("Alice"), "a name here would freeze into the history");
     }
 
@@ -1918,11 +1951,11 @@ mod tests {
     async fn owner_notes_are_a_separate_section() {
         let db = sea_test_db().await;
         let conn = &db;
-        let alice = onebot_user_scope_id(1);
+        let alice = test_subject_id(1);
         add(
             conn,
             "note",
-            MemoryScope::OnebotUser,
+            MemoryScope::ExternalSubject,
             &alice,
             "debt",
             "owes money",
@@ -1933,7 +1966,7 @@ mod tests {
         add(
             conn,
             "pref",
-            MemoryScope::OnebotUser,
+            MemoryScope::ExternalSubject,
             &alice,
             "style",
             "likes terse",
@@ -1944,7 +1977,11 @@ mod tests {
 
         let block = block(
             conn,
-            &MemoryRequest::onebot_group(None, vec![MemorySubjectRef::from_user(1, Some("Alice".into()))], 8_000),
+            &MemoryRequest::channel_group(
+                None,
+                vec![MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))],
+                8_000,
+            ),
         )
         .await
         .unwrap();
@@ -1961,9 +1998,12 @@ mod tests {
     /// Nicknames routinely contain characters that would break the attribute.
     #[test]
     fn person_attributes_are_escaped() {
-        let roster = roster_block(&MemoryRequest::onebot_group(
+        let roster = roster_block(&MemoryRequest::channel_group(
             None,
-            vec![MemorySubjectRef::from_user(5, Some(r#"a"<b>"#.into())).with_standing(Some(r#"own"er"#.into()), None)],
+            vec![
+                MemorySubjectRef::from_channel_user("channel", 5, Some(r#"a"<b>"#.into()))
+                    .with_standing(Some(r#"own"er"#.into()), None),
+            ],
             8_000,
         ))
         .unwrap();
@@ -1979,11 +2019,11 @@ mod tests {
     async fn everyone_present_appears_even_without_memories() {
         let db = sea_test_db().await;
         let conn = &db;
-        let known = onebot_user_scope_id(1);
+        let known = test_subject_id(1);
         add(
             conn,
             "k",
-            MemoryScope::OnebotUser,
+            MemoryScope::ExternalSubject,
             &known,
             "style",
             "likes terse",
@@ -1994,11 +2034,11 @@ mod tests {
 
         let block = block(
             conn,
-            &MemoryRequest::onebot_group(
+            &MemoryRequest::channel_group(
                 None,
                 vec![
-                    MemorySubjectRef::from_user(1, Some("Alice".into())),
-                    MemorySubjectRef::from_user(2, Some("Bob".into())),
+                    MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into())),
+                    MemorySubjectRef::from_channel_user("channel", 2, Some("Bob".into())),
                 ],
                 8_000,
             ),
@@ -2006,8 +2046,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(block.contains(r#"<person qq="1">"#));
-        assert!(block.contains(r#"<person qq="2" first_time="true" />"#));
+        assert!(block.contains(r#"<person id="1">"#));
+        assert!(block.contains(r#"<person id="2" first_time="true" />"#));
     }
 
     /// Nothing is stored about anyone yet and the roster still ships: it alone
@@ -2018,17 +2058,21 @@ mod tests {
         let conn = &db;
         let req = group_req(None, &[7], 8_000);
         let req = MemoryRequest {
-            subjects: vec![MemorySubjectRef::from_user(7, Some("Newcomer".into()))],
+            subjects: vec![MemorySubjectRef::from_channel_user(
+                "channel",
+                7,
+                Some("Newcomer".into()),
+            )],
             ..req
         };
 
-        assert!(roster_block(&req).unwrap().contains(r#"qq="7" name="Newcomer""#));
+        assert!(roster_block(&req).unwrap().contains(r#"id="7" name="Newcomer""#));
         // And the frozen half still says it has met nobody.
         assert!(
             block(conn, &req)
                 .await
                 .unwrap()
-                .contains(r#"<person qq="7" first_time="true" />"#)
+                .contains(r#"<person id="7" first_time="true" />"#)
         );
     }
 
@@ -2038,10 +2082,10 @@ mod tests {
     /// person holding rank in one turn and not the next.
     #[test]
     fn standing_is_declared_on_the_roster() {
-        let roster = roster_block(&MemoryRequest::onebot_group(
+        let roster = roster_block(&MemoryRequest::channel_group(
             None,
             vec![
-                MemorySubjectRef::from_user(1, Some("Alice".into()))
+                MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))
                     .with_standing(Some("owner".into()), Some("摸鱼冠军".into())),
             ],
             8_000,
@@ -2056,10 +2100,11 @@ mod tests {
     /// attribute claiming the person holds one.
     #[test]
     fn blank_standing_is_left_out() {
-        let roster = roster_block(&MemoryRequest::onebot_group(
+        let roster = roster_block(&MemoryRequest::channel_group(
             None,
             vec![
-                MemorySubjectRef::from_user(1, Some("Alice".into())).with_standing(Some("".into()), Some("   ".into())),
+                MemorySubjectRef::from_channel_user("channel", 1, Some("Alice".into()))
+                    .with_standing(Some("".into()), Some("   ".into())),
             ],
             8_000,
         ))
@@ -2075,11 +2120,11 @@ mod tests {
         let db = sea_test_db().await;
         let conn = &db;
         for uid in [2i64, 1] {
-            let scope = onebot_user_scope_id(uid);
+            let scope = test_subject_id(uid);
             add(
                 conn,
                 &format!("m{uid}"),
-                MemoryScope::OnebotUser,
+                MemoryScope::ExternalSubject,
                 &scope,
                 "k",
                 &format!("about {uid}"),
@@ -2091,11 +2136,11 @@ mod tests {
 
         let a = block(
             conn,
-            &MemoryRequest::onebot_group(
+            &MemoryRequest::channel_group(
                 None,
                 vec![
-                    MemorySubjectRef::from_user(2, None),
-                    MemorySubjectRef::from_user(1, None),
+                    MemorySubjectRef::from_channel_user("channel", 2, None),
+                    MemorySubjectRef::from_channel_user("channel", 1, None),
                 ],
                 8_000,
             ),
@@ -2104,11 +2149,11 @@ mod tests {
         .unwrap();
         let b = block(
             conn,
-            &MemoryRequest::onebot_group(
+            &MemoryRequest::channel_group(
                 None,
                 vec![
-                    MemorySubjectRef::from_user(1, None),
-                    MemorySubjectRef::from_user(2, None),
+                    MemorySubjectRef::from_channel_user("channel", 1, None),
+                    MemorySubjectRef::from_channel_user("channel", 2, None),
                 ],
                 8_000,
             ),
@@ -2126,7 +2171,7 @@ mod tests {
             add(
                 conn,
                 &format!("g{i}"),
-                MemoryScope::OnebotGlobal,
+                MemoryScope::ChannelGlobal,
                 GLOBAL_SCOPE_ID,
                 &format!("k{i:02}"),
                 &"word ".repeat(60),
@@ -2136,7 +2181,7 @@ mod tests {
             .await;
         }
 
-        let block = block(conn, &MemoryRequest::onebot_group(None, vec![], 512))
+        let block = block(conn, &MemoryRequest::channel_group(None, vec![], 512))
             .await
             .unwrap();
 
@@ -2186,7 +2231,7 @@ mod tests {
         add(
             conn,
             "gnote",
-            MemoryScope::OnebotGlobal,
+            MemoryScope::ChannelGlobal,
             GLOBAL_SCOPE_ID,
             "quirk",
             "operator only",
@@ -2195,7 +2240,7 @@ mod tests {
         )
         .await;
 
-        let block = block(conn, &MemoryRequest::onebot_group(Some("p1".into()), vec![], 8_000))
+        let block = block(conn, &MemoryRequest::channel_group(Some("p1".into()), vec![], 8_000))
             .await
             .unwrap();
 
@@ -2255,7 +2300,7 @@ mod tests {
             .await;
         }
 
-        let block = block(conn, &MemoryRequest::onebot_group(Some("p1".into()), vec![], 512))
+        let block = block(conn, &MemoryRequest::channel_group(Some("p1".into()), vec![], 512))
             .await
             .unwrap();
 

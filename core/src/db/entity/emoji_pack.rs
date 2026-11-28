@@ -62,9 +62,9 @@ impl ActiveModelBehavior for ActiveModel {}
 pub enum EmojiPackKind {
     #[sea_orm(string_value = "manual")]
     Manual,
-    /// Filled by OneBot capture; see `onebot::stickers`.
-    #[sea_orm(string_value = "onebot")]
-    Onebot,
+    /// Filled by an external channel/plugin capture adapter.
+    #[sea_orm(string_value = "external")]
+    External,
 }
 
 impl EmojiPackKind {

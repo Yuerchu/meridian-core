@@ -233,7 +233,11 @@ fn serialize_contents(
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    text.push_str(&format!("[Historical tool call: {}({})]", call.name, call.arguments));
+                    text.push_str(&format!(
+                        "[Historical tool call: {}({})]",
+                        crate::wire_tool_call_name(&call.name),
+                        call.arguments
+                    ));
                     flattened_calls.insert(call.id.clone());
                 }
                 push_content(&mut out, "model", vec![serde_json::json!({ "text": text })]);
@@ -243,7 +247,7 @@ fn serialize_contents(
             let mut parts = assistant_text_parts(message, signatures);
             for (index, (call, args)) in tool_calls.iter().zip(parsed_arguments).enumerate() {
                 let mut part = serde_json::json!({
-                    "functionCall": { "name": call.name, "args": args }
+                    "functionCall": { "name": crate::wire_tool_call_name(&call.name), "args": args }
                 });
                 if !is_synthetic_call_id(&call.id) {
                     part["functionCall"]["id"] = serde_json::json!(call.id);
@@ -278,7 +282,11 @@ fn serialize_contents(
                     }
                     None => "Tool execution was interrupted before a result was recorded. It was not retried.".into(),
                 };
-                result_parts.push(function_response_part(&call.id, &call.name, &result));
+                result_parts.push(function_response_part(
+                    &call.id,
+                    crate::wire_tool_call_name(&call.name),
+                    &result,
+                ));
                 consumed_results.insert(call.id.clone());
             }
             // Pictures a tool returned follow every response of the batch, in
@@ -368,6 +376,9 @@ fn media_part(url: Option<&str>) -> Result<serde_json::Value, ProviderError> {
 /// A tool result as the text of its `functionResponse`, and the parts that
 /// carry its pictures: a caption naming the call, then each image inline.
 fn tool_result_wire(message: &ChatMessage) -> Result<(String, Vec<serde_json::Value>), ProviderError> {
+    if message.origin == crate::MessageOrigin::ToolSearchResult {
+        return Ok((crate::tool_result_summary_or_content(message), Vec::new()));
+    }
     let Some(parts) = crate::tool_result_parts(message).map_err(ProviderError::Parse)? else {
         return Ok((message.content.clone(), Vec::new()));
     };

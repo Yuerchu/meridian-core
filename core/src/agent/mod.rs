@@ -4,19 +4,24 @@ mod base_prompt;
 pub mod cache_lifecycle;
 pub mod cache_warmer;
 pub mod call_identity;
+pub mod character;
 pub mod codex_install;
 mod compact;
 mod context;
 pub mod conversation_excerpt;
+pub mod deferred_tools;
 pub mod denied;
 pub(crate) mod diagnostics;
+pub mod dream;
 pub mod engine;
 pub mod file_access;
+pub mod hooks;
 mod inline_tag;
 pub mod interrupted;
 mod loop_guard;
 pub(crate) mod manual;
 pub(crate) mod memory_context;
+pub mod mixins;
 pub mod model_config;
 pub mod modes;
 pub mod pricing;
@@ -26,6 +31,7 @@ pub mod queue;
 pub mod routing;
 pub mod skills;
 mod stream;
+pub mod sub_agent_runner;
 pub mod sub_agents;
 pub(crate) mod todo_context;
 pub(crate) mod tokenizer;
@@ -56,16 +62,16 @@ pub use context::SenderNames;
 pub use context::build_messages;
 pub(crate) use context::sender_ref;
 pub use context::{
-    build_messages_with_context_items, build_messages_with_senders, freeze_sticker_parts, load_sender_names,
-    persisted_user_message, resolve_file_uris_in_messages, resolve_sticker_parts_in_messages, trim_to_context_limit,
+    build_messages_with_context_items, build_messages_with_senders, load_sender_names, persisted_user_message,
+    resolve_file_uris_in_messages, resolve_sticker_parts_in_messages, trim_to_context_limit,
 };
 pub use file_access::{build_file_access, file_access_prompt};
 pub(crate) use inline_tag::{InlineHiddenTagParser, InlineTagSpec};
 pub(crate) use loop_guard::{LoopVerdict, ToolLoopGuard, loop_abort_message, loop_warning_message};
 pub use memory_context::{
-    MemoryRequest, memory_budget, persist_injection, plan_injection, plan_injection_async, trailing_with_memory,
+    MemoryRequest, MemorySubjectRef, memory_budget, persist_injection, plan_injection, plan_injection_async,
+    roster_block, trailing_with_memory,
 };
-pub(crate) use memory_context::{MemorySubjectRef, roster_block};
 pub use project_instructions::{instruction_budget, load_project_instructions};
 pub(crate) use provider_config::without_thinking;
 pub use provider_config::{

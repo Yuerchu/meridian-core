@@ -117,7 +117,7 @@ pub struct SenderRef {
 
 impl SenderRef {
     pub fn wire_token(&self) -> String {
-        format!("qq_{}", self.user_id)
+        format!("u_{}", self.user_id)
     }
 
     pub fn display(&self) -> String {
@@ -126,6 +126,127 @@ impl SenderRef {
             None => self.user_id.to_string(),
         }
     }
+}
+
+/// Sentinel `ToolCall::name` persisted for a Responses API native
+/// `tool_search_call` item so the Responses adapter replays it as
+/// `{"type":"tool_search_call"}` while other protocols cleanly replay it as a
+/// normal `search_tools` call on mid-conversation model switching.
+pub const TOOL_SEARCH_CALL_SENTINEL: &str = "__tool_search__";
+
+/// Native deferred tool loading / progressive disclosure mode supported by a
+/// model + wire protocol pair.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeferredToolMode {
+    /// Protocol or model does not support native deferred loading; core falls
+    /// back to the universal client dual-tool gateway (`search_tools` + `call_tool`).
+    #[default]
+    None,
+    /// Anthropic Messages API (`defer_loading: true` paired with either native
+    /// Anthropic server BM25/regex search or client `tool_reference` blocks).
+    AnthropicDeferred,
+    /// OpenAI / DeepSeek Responses API (`{"type":"tool_search","execution":"client"}`
+    /// paired with `tool_search_call` / `tool_search_output` items).
+    ResponsesClientSearch,
+    /// Google Gemini Interactions API (`{"type":"tool_search"}` + `defer_loading: true`).
+    GeminiServerSearch,
+}
+
+impl DeferredToolMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::AnthropicDeferred => "anthropic_deferred",
+            Self::ResponsesClientSearch => "responses_client_search",
+            Self::GeminiServerSearch => "gemini_server_search",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "anthropic_deferred" => Ok(Self::AnthropicDeferred),
+            "responses_client_search" => Ok(Self::ResponsesClientSearch),
+            "gemini_server_search" => Ok(Self::GeminiServerSearch),
+            other => Err(format!("unknown deferred tool mode `{other}`")),
+        }
+    }
+}
+
+/// Strategy used when `deferred_tool_mode == DeferredToolMode::AnthropicDeferred`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicToolSearchStrategy {
+    /// Anthropic's native server-side BM25 search (`tool_search_tool_bm25_20251119`).
+    #[default]
+    ServerBm25,
+    /// Anthropic's native server-side regex search (`tool_search_tool_regex_20251119`).
+    ServerRegex,
+    /// Client-side `search_tools` returning `{"type":"tool_reference","tool_name":"..."}`
+    /// blocks inside `tool_result` (used by DeepSeek Anthropic or strict client filtering).
+    ClientToolReference,
+}
+
+impl AnthropicToolSearchStrategy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerBm25 => "server_bm25",
+            Self::ServerRegex => "server_regex",
+            Self::ClientToolReference => "client_tool_reference",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "server_bm25" => Ok(Self::ServerBm25),
+            "server_regex" => Ok(Self::ServerRegex),
+            "client_tool_reference" => Ok(Self::ClientToolReference),
+            other => Err(format!("unknown anthropic tool search strategy `{other}`")),
+        }
+    }
+}
+
+/// Frozen snapshot of a client-executed tool search persisted in history.
+///
+/// Storing the exact discovered `ToolDefinition`s at discovery time keeps the
+/// Prompt Cache prefix byte-for-byte invariant across replays (never re-queried
+/// against live MCP state) and lets every protocol replay the same history row
+/// cleanly on mid-conversation model switching.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenToolSearchResult {
+    pub format: String,
+    pub tool_names: Vec<String>,
+    pub tools: Vec<ToolDefinition>,
+    pub summary: String,
+}
+
+pub fn encode_tool_search_result(result: &FrozenToolSearchResult) -> Result<String, String> {
+    serde_json::to_string(result).map_err(|error| format!("could not encode tool search result: {error}"))
+}
+
+pub fn decode_tool_search_result(content: &str) -> Result<FrozenToolSearchResult, String> {
+    serde_json::from_str(content).map_err(|error| format!("invalid persisted tool search result: {error}"))
+}
+
+/// Normalize a stored tool call name for non-Responses adapters.
+pub fn wire_tool_call_name(name: &str) -> &str {
+    if name == TOOL_SEARCH_CALL_SENTINEL {
+        "search_tools"
+    } else {
+        name
+    }
+}
+
+/// Human/model-readable text fallback for a tool result message across protocols.
+pub fn tool_result_summary_or_content(m: &ChatMessage) -> String {
+    if m.origin == MessageOrigin::ToolSearchResult
+        && let Ok(frozen) = decode_tool_search_result(&m.content)
+    {
+        return frozen.summary;
+    }
+    m.content.clone()
 }
 
 /// Where a message came from.
@@ -137,6 +258,8 @@ pub enum MessageOrigin {
     Assistant,
     Tool,
     ToolParts,
+    /// Frozen result of a client-executed deferred tool search (`FrozenToolSearchResult` JSON).
+    ToolSearchResult,
     SystemContext,
     UserProvidedContext,
     CompactSummary,
@@ -317,6 +440,13 @@ impl ChatMessage {
     pub fn tool_result_parts(tool_call_id: &str, content: &str) -> Self {
         Self {
             origin: MessageOrigin::ToolParts,
+            ..Self::tool_result(tool_call_id, content)
+        }
+    }
+
+    pub fn tool_search_result(tool_call_id: &str, content: &str) -> Self {
+        Self {
+            origin: MessageOrigin::ToolSearchResult,
             ..Self::tool_result(tool_call_id, content)
         }
     }
@@ -732,23 +862,79 @@ pub struct ChatParams {
     pub codex_turn: Option<codex_metadata::CodexTurnMetadata>,
     pub responses_lite: bool,
     pub context_limit: Option<i32>,
+    /// Native deferred tool disclosure protocol active for this request.
+    pub deferred_tool_mode: DeferredToolMode,
+    /// Strategy used when `deferred_tool_mode == DeferredToolMode::AnthropicDeferred`.
+    pub anthropic_tool_search_strategy: AnthropicToolSearchStrategy,
+    /// Exact tool names in `tools` that should be treated as deferred by native
+    /// adapters (`defer_loading: true` on Anthropic/Gemini; omitted from
+    /// top-level `tools` behind `tool_search` on Responses).
+    pub deferred_tool_names: Vec<String>,
+    /// Optional catalog hint attached to OpenAI/DeepSeek Responses client
+    /// `{"type":"tool_search","execution":"client"}`.
+    pub client_tool_search_description: Option<String>,
+}
+
+impl ChatParams {
+    pub fn is_tool_deferred(&self, name: &str) -> bool {
+        self.deferred_tool_names.iter().any(|candidate| candidate == name)
+    }
+
+    pub fn has_deferred_tools(&self) -> bool {
+        !self.deferred_tool_names.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    MessageStart { message_id: String },
-    Text { content: String },
-    Reasoning { content: String },
-    ProviderStateUpdate { update: state::ProviderStateUpdate },
-    ToolCallStart { index: usize, id: String, name: String },
-    ToolCallDelta { index: usize, arguments: String },
-    ToolCallDone { index: usize, arguments: String },
-    CompactionResult { encrypted_content: String },
+    MessageStart {
+        message_id: String,
+    },
+    Text {
+        content: String,
+    },
+    Reasoning {
+        content: String,
+    },
+    ProviderStateUpdate {
+        update: state::ProviderStateUpdate,
+    },
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        index: usize,
+        arguments: String,
+    },
+    ToolCallDone {
+        index: usize,
+        arguments: String,
+    },
+    /// Native client-executed tool search call emitted by OpenAI / DeepSeek Responses API.
+    ToolSearchCall {
+        id: String,
+        call_id: String,
+        arguments: String,
+    },
+    CompactionResult {
+        encrypted_content: String,
+    },
     ServerToolCall(ServerToolCall),
-    ResponseModel { model: String },
-    UsageUpdate { usage: TokenUsage },
-    Stop { reason: String, usage: Option<TokenUsage> },
-    Error { message: String },
+    ResponseModel {
+        model: String,
+    },
+    UsageUpdate {
+        usage: TokenUsage,
+    },
+    Stop {
+        reason: String,
+        usage: Option<TokenUsage>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -797,7 +983,7 @@ pub fn superseded_local_tool(server_tool: ServerToolKind) -> Option<&'static str
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -934,6 +1120,7 @@ pub struct ProviderCapabilities {
     pub supported_cache_ttls: Vec<PromptCacheTtl>,
     pub default_cache_ttl: Option<PromptCacheTtl>,
     pub default_cache_ttl_secs: Option<u32>,
+    pub deferred_tool_mode: DeferredToolMode,
 }
 
 impl ProviderCapabilities {
@@ -1045,7 +1232,7 @@ mod capability_contract_tests {
     fn provider_capabilities_are_a_closed_complete_wire_contract() {
         let value = serde_json::to_value(ProviderCapabilities::default()).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 22);
+        assert_eq!(object.len(), 23);
         assert!(object.get("readable_mime_types").is_some());
         assert!(object.get("supports_images").is_none());
         assert!(object.get("supports_pdf").is_none());
@@ -1098,7 +1285,7 @@ mod sender_tests {
 
         let named = render_message(&m, SenderRendering::NameField).unwrap();
         assert_eq!(named.content, expected);
-        assert_eq!(named.name.as_deref(), Some("qq_10001"));
+        assert_eq!(named.name.as_deref(), Some("u_10001"));
 
         let prefixed = render_message(&m, SenderRendering::Prefix).unwrap();
         assert_eq!(prefixed.content, expected);

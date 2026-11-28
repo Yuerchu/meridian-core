@@ -512,7 +512,7 @@ mod tests {
             start(&db, id, "c1", TurnOrigin::Desktop, 1000).await.unwrap();
             finish_as(&db, id, status, None, 1500).await;
         }
-        start(&db, "live", "c1", TurnOrigin::OneBot, 1000).await.unwrap();
+        start(&db, "live", "c1", TurnOrigin::Channel, 1000).await.unwrap();
 
         assert_eq!(reconcile(&db, 2000).await, 1);
         for (id, status) in ended {

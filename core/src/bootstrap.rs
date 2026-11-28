@@ -35,6 +35,70 @@ fn parse_tool_preset_names(preset_id: &str, json: &str) -> Result<Vec<String>, S
     serde_json::from_str(json).map_err(|error| format!("tool preset `{preset_id}` has invalid `tool_names`: {error}"))
 }
 
+type ExtensionInitializer = Box<dyn FnOnce(&crate::agent::hooks::ServicesExtensions) + Send>;
+
+/// Builder for composing [`Services`] with custom extensions, global plugin
+/// mixins, and lifecycle turn hooks before external servers or desktop shells
+/// start handling traffic.
+pub struct ServicesBuilder {
+    data_dir: PathBuf,
+    events: EventBus,
+    secrets: Option<Arc<SecretsManager>>,
+    extensions: Vec<ExtensionInitializer>,
+    plugin_mixins: Vec<Arc<dyn crate::agent::hooks::ToolMixin>>,
+    turn_hooks: Vec<Arc<dyn crate::agent::hooks::TurnHooks>>,
+}
+
+impl ServicesBuilder {
+    pub fn new(data_dir: PathBuf, events: EventBus) -> Self {
+        Self {
+            data_dir,
+            events,
+            secrets: None,
+            extensions: Vec::new(),
+            plugin_mixins: Vec::new(),
+            turn_hooks: Vec::new(),
+        }
+    }
+
+    pub fn with_secrets(mut self, secrets: Arc<SecretsManager>) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    pub fn with_extension<T: Send + Sync + 'static>(mut self, value: Arc<T>) -> Self {
+        self.extensions.push(Box::new(move |bag| bag.insert(value)));
+        self
+    }
+
+    pub fn with_plugin_mixin(mut self, mixin: Arc<dyn crate::agent::hooks::ToolMixin>) -> Self {
+        self.plugin_mixins.push(mixin);
+        self
+    }
+
+    pub fn with_turn_hook(mut self, hook: Arc<dyn crate::agent::hooks::TurnHooks>) -> Self {
+        self.turn_hooks.push(hook);
+        self
+    }
+
+    pub async fn build(self) -> Result<Services, String> {
+        let secrets = self
+            .secrets
+            .unwrap_or_else(|| Arc::new(SecretsManager::new(self.data_dir.clone())));
+        let services = bootstrap_with_secrets(self.data_dir, self.events, secrets).await?;
+        for register in self.extensions {
+            register(&services.extensions);
+        }
+        for mixin in self.plugin_mixins {
+            services.register_plugin_mixin(mixin);
+        }
+        for hook in self.turn_hooks {
+            services.register_turn_hook(hook);
+        }
+        Ok(services)
+    }
+}
+
 /// Open everything the app runs on, in the order it has to happen.
 ///
 /// The secrets manager is the OS keychain one, which is right wherever there is
@@ -247,10 +311,8 @@ pub async fn bootstrap_with_secrets(
         events.clone(),
         &data_dir,
     ));
-    let sticker_embed = tools::sticker_embed::StickerEmbedIndex::new(sea.clone(), data_dir.clone());
     let registry = tools::ToolRegistry::new(skills_root.clone(), data_dir.join("logs"), redaction.clone());
     registry.attach_media_runner(media_runner.clone());
-    registry.attach_sticker_embed(sticker_embed.clone());
     match db::sea::ops::custom_tool::list_enabled(&sea).await {
         Ok(custom_tools) => registry.set_custom_tools(
             custom_tools
@@ -293,6 +355,7 @@ pub async fn bootstrap_with_secrets(
         agent::skills::seed_builtin_bindings(&sea).await;
     }
 
+    let dream = Arc::new(crate::agent::dream::DreamScheduler::new(sea.clone(), mgr.clone()));
     let services = Services::new(ServicesInner {
         db: sea,
         secrets: mgr,
@@ -305,10 +368,6 @@ pub async fn bootstrap_with_secrets(
         compact_breakers: Mutex::new(HashMap::new()),
         cache_lifecycle: Arc::new(crate::agent::cache_lifecycle::CacheLifecycleManager::new()),
         voice: VoiceState::new(),
-        // 语料目录的锁在这里被拿到，或者拿不到。拿不到不是启动失败——它只是
-        // 让采集整个停用，而应用的其余部分与语料无关。
-        corpus: Arc::new(crate::voice_corpus::CorpusCoordinator::new(&data_dir)),
-        voice_limiter: Arc::new(crate::tts::limiter::VoiceLimiter::default()),
         sleep: AppSleepInhibitor::new(),
         events,
         alert_sinks: crate::notify::AlertSinks::new(),
@@ -327,10 +386,14 @@ pub async fn bootstrap_with_secrets(
         turn_starter: std::sync::OnceLock::new(),
         journal_shared: crate::journal::capture::JournalShared::new(),
         media_runner,
-        sticker_embed,
         redaction,
         redaction_mappings: crate::redaction::RedactionMappings::new(),
+        extensions: Arc::new(crate::agent::hooks::ServicesExtensions::new()),
+        plugin_mixins: std::sync::RwLock::new(Vec::new()),
+        turn_hooks: std::sync::RwLock::new(Vec::new()),
+        dream: dream.clone(),
     });
+    services.register_turn_hook(Arc::new(crate::agent::dream::DreamTurnHook::new(dream)));
     // Prices arrive from models.dev in the background; nothing above waits for
     // it and a failed fetch leaves every stored price alone.
     crate::provider::models_dev::spawn_sync_loop(services.db.clone(), services.models_dev.clone());

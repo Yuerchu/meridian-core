@@ -607,6 +607,8 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
         .or_else(|| model_config.as_ref().and_then(|mc| mc.cache_ttl))
         .or(caps.default_cache_ttl);
 
+    let anthropic_tool_search_strategy = crate::agent::deferred_tools::read_anthropic_search_strategy(db).await?;
+
     let mut params = ChatParams {
         model: model.to_string(),
         temperature: assistant.and_then(|a| a.temperature.map(|t| t as f64)),
@@ -618,6 +620,7 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
         fast,
         cache_ttl: requested_cache_ttl,
         server_tools,
+        anthropic_tool_search_strategy,
         // Assembled only for a row that asked for the Codex shape: an ordinary
         // OpenAI request must not grow a header describing this app's sandbox,
         // and an install that never turns the switch on never mints an
@@ -633,6 +636,14 @@ pub async fn resolve_turn_params(db: &Db, input: TurnParamsResolveRequest<'_>) -
         ..Default::default()
     };
     provider::capabilities::filter_params(&mut params, &caps)?;
+
+    // DeepSeek mutual exclusion: DeepSeek Responses API rejects combining
+    // `tool_search` with DeepSeek web_search / url_context server tools.
+    // Downgrade seamlessly to the universal client dual-tool gateway.
+    let is_deepseek = provider_type == "deepseek" || model.to_ascii_lowercase().starts_with("deepseek");
+    if is_deepseek && !params.server_tools.is_empty() {
+        params.deferred_tool_mode = provider::DeferredToolMode::None;
+    }
 
     let cache_ttl_duration = params.cache_ttl.map(provider::PromptCacheTtl::duration).or_else(|| {
         caps.default_cache_ttl_secs
@@ -1495,5 +1506,75 @@ mod tests {
         let utility = without_thinking(inherited.params);
         assert_eq!(utility.cache_ttl, None);
         assert!(!utility.cache_read_only_tail);
+    }
+
+    #[tokio::test]
+    async fn deepseek_web_search_disables_native_deferred_tool_search_to_avoid_400() {
+        let db = sea_test_db().await;
+        seed(
+            &db,
+            provider_row(
+                ProviderType::Deepseek,
+                "DeepSeek",
+                "https://api.deepseek.com",
+                ApiFormat::Responses,
+            ),
+            Some(FlatModelConfig {
+                model_id: "deepseek-v4-flash",
+                context_window: 128_000,
+                compact_threshold: 0,
+                max_output_tokens: Some(16_000),
+                server_tools: Some(r#"["web_search"]"#),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let assistant = assistant_with(None);
+
+        // Without server_tools (unconfigured provider_id): native ResponsesClientSearch is active.
+        let native = resolve_turn_params(
+            &db,
+            TurnParamsResolveRequest {
+                assistant: Some(&assistant),
+                provider_id: None,
+                provider_type: "deepseek",
+                api_format: "responses",
+                transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
+                model: "deepseek-v4-flash",
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            native.params.deferred_tool_mode,
+            provider::DeferredToolMode::ResponsesClientSearch
+        );
+
+        // With web_search server tool enabled on DeepSeek: must downgrade to None (client gateway).
+        let excluded = resolve_turn_params(
+            &db,
+            TurnParamsResolveRequest {
+                assistant: Some(&assistant),
+                provider_id: Some("p1"),
+                provider_type: "deepseek",
+                api_format: "responses",
+                transport_profile: "standard",
+                codex_request_shape: false,
+                codex_request_kind: provider::codex_metadata::CodexRequestKind::Turn,
+                codex_thread_source: provider::codex_metadata::CodexThreadSource::User,
+                model: "deepseek-v4-flash",
+                thinking_level: None,
+                fast: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(excluded.params.server_tools, vec![ServerToolKind::WebSearch]);
+        assert_eq!(excluded.params.deferred_tool_mode, provider::DeferredToolMode::None);
     }
 }

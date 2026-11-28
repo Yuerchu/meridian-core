@@ -1226,7 +1226,7 @@ mod tests {
         insert(
             db,
             audit_message::Model {
-                source_type: Some("onebot_group".into()),
+                source_type: Some("channel_group".into()),
                 source_id: Some("900".into()),
                 turn_origin: Some(origin.into()),
                 model_id: Some(model.into()),
@@ -2142,11 +2142,11 @@ mod tests {
     async fn origin_separates_bot_traffic_from_the_desktop() {
         let db = sea_test_db().await;
         reply(&db, "a", "m", 1_000, (10, 0, 0, 0), Some(("1", "1")), "desktop").await;
-        reply(&db, "b", "m", 2_000, (20, 0, 0, 0), Some(("1", "1")), "onebot").await;
-        reply(&db, "c", "m", 3_000, (30, 0, 0, 0), Some(("1", "1")), "onebot").await;
+        reply(&db, "b", "m", 2_000, (20, 0, 0, 0), Some(("1", "1")), "channel").await;
+        reply(&db, "c", "m", 3_000, (30, 0, 0, 0), Some(("1", "1")), "channel").await;
 
         let bots = UsageFilter {
-            origin: Some(TurnOrigin::OneBot),
+            origin: Some(TurnOrigin::Channel),
             ..Default::default()
         };
         assert_eq!(total(&db, &bots).await.messages, 2);
@@ -2168,8 +2168,8 @@ mod tests {
             "desktop",
         )
         .await;
-        reply(&db, "b", "small", 2_000, (300, 100, 0, 0), Some(("2", "6")), "onebot").await;
-        reply(&db, "c", "big", 3_000, (700, 200, 0, 0), Some(("10", "30")), "onebot").await;
+        reply(&db, "b", "small", 2_000, (300, 100, 0, 0), Some(("2", "6")), "channel").await;
+        reply(&db, "c", "big", 3_000, (700, 200, 0, 0), Some(("10", "30")), "channel").await;
 
         let all = total(&db, &UsageFilter::default()).await;
         let by_model = r!(db, report(UsageDimension::Model, &UsageFilter::default())).unwrap();
@@ -2233,10 +2233,10 @@ mod tests {
     #[tokio::test]
     async fn a_source_key_carries_its_kind() {
         let db = sea_test_db().await;
-        reply(&db, "a", "m", 1_000, (100, 0, 0, 0), Some(("10", "0")), "onebot").await;
+        reply(&db, "a", "m", 1_000, (100, 0, 0, 0), Some(("10", "0")), "channel").await;
 
         let sources = r!(db, report(UsageDimension::Source, &UsageFilter::default())).unwrap();
-        assert_eq!(sources[0].key, "onebot_group:900");
+        assert_eq!(sources[0].key, "channel_group:900");
     }
 
     #[tokio::test]

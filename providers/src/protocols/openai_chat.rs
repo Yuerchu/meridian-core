@@ -322,9 +322,13 @@ pub fn serialize_openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>,
 
 pub fn serialize_openai_message(m: &ChatMessage, carry: &mut ToolImageCarryMixin) -> Result<Value, ProviderError> {
     let rendered = crate::render_message(m, crate::SenderRendering::NameField).map_err(ProviderError::Parse)?;
-    let content = match carry.take(m).map_err(ProviderError::Parse)? {
-        Some(text) => Value::String(text),
-        None => content_value(&m.role, &rendered.content)?,
+    let content = if m.role == "tool" && m.origin == crate::MessageOrigin::ToolSearchResult {
+        Value::String(crate::tool_result_summary_or_content(m))
+    } else {
+        match carry.take(m).map_err(ProviderError::Parse)? {
+            Some(text) => Value::String(text),
+            None => content_value(&m.role, &rendered.content)?,
+        }
     };
     let mut msg = serde_json::json!({ "role": m.role, "content": content });
     if let Some(ref name) = rendered.name {
@@ -338,7 +342,7 @@ pub fn serialize_openai_message(m: &ChatMessage, carry: &mut ToolImageCarryMixin
                     serde_json::json!({
                         "id": tc.id,
                         "type": "function",
-                        "function": { "name": tc.name, "arguments": tc.arguments }
+                        "function": { "name": crate::wire_tool_call_name(&tc.name), "arguments": tc.arguments }
                     })
                 })
                 .collect::<Vec<_>>()

@@ -48,7 +48,7 @@ fn balanced_object_at(text: &str, start: usize) -> Option<String> {
 
 /// Pull the first balanced `{...}` out of a reply, tolerating fenced code blocks
 /// and the odd sentence of preamble.
-pub(crate) fn extract_json_object(text: &str) -> Option<String> {
+pub fn extract_json_object(text: &str) -> Option<String> {
     balanced_object_at(text, text.find('{')?)
 }
 

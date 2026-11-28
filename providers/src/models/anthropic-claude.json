@@ -22,7 +22,8 @@
         "max"
       ],
       "default_effort": "medium",
-      "supports_fast": true
+      "supports_fast": true,
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-fable-5-1",
@@ -39,7 +40,8 @@
         "xhigh",
         "max"
       ],
-      "default_effort": "high"
+      "default_effort": "high",
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-fable-5",
@@ -56,7 +58,8 @@
         "xhigh",
         "max"
       ],
-      "default_effort": "high"
+      "default_effort": "high",
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-opus-4-8",
@@ -74,7 +77,8 @@
         "max"
       ],
       "default_effort": "high",
-      "supports_fast": true
+      "supports_fast": true,
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-opus-4-7",
@@ -92,7 +96,8 @@
         "max"
       ],
       "default_effort": "high",
-      "supports_fast": true
+      "supports_fast": true,
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-opus-4-6",
@@ -106,7 +111,8 @@
         "high",
         "max"
       ],
-      "default_effort": "high"
+      "default_effort": "high",
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-opus-4-5",
@@ -119,7 +125,8 @@
         "medium",
         "high"
       ],
-      "default_effort": "high"
+      "default_effort": "high",
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-sonnet-5",
@@ -136,7 +143,8 @@
         "xhigh",
         "max"
       ],
-      "default_effort": "high"
+      "default_effort": "high",
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-sonnet-4-6",
@@ -150,7 +158,8 @@
         "high",
         "max"
       ],
-      "default_effort": "high"
+      "default_effort": "high",
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-haiku-4-5",
@@ -164,21 +173,24 @@
         "image/png",
         "image/gif",
         "image/webp"
-      ]
+      ],
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-opus-4",
       "supports_thinking": true,
       "max_context_tokens": 200000,
       "max_output_tokens": 64000,
-      "thinking_style": "budget"
+      "thinking_style": "budget",
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-sonnet-4",
       "supports_thinking": true,
       "max_context_tokens": 200000,
       "max_output_tokens": 64000,
-      "thinking_style": "budget"
+      "thinking_style": "budget",
+      "deferred_tool_mode": "anthropic_deferred"
     },
     {
       "prefix": "claude-3-7-sonnet",

@@ -170,6 +170,13 @@ fn check_size(mime: &str, len: u64) -> Result<(), String> {
 /// A stored tool row as text and media. Anything other than a version-3 row
 /// is text whatever it looks like.
 pub fn view(content: &str, schema_version: i32) -> Result<ToolRowView, String> {
+    if schema_version == crate::agent::deferred_tools::TOOL_SEARCH_RESULT_SCHEMA_VERSION {
+        let frozen = crate::provider::decode_tool_search_result(content)?;
+        return Ok(ToolRowView {
+            text: frozen.summary,
+            media: Vec::new(),
+        });
+    }
     if schema_version != TOOL_PARTS_SCHEMA_VERSION {
         return Ok(ToolRowView {
             text: content.to_owned(),

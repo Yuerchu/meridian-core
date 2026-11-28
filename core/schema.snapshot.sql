@@ -24,7 +24,7 @@ CREATE TABLE "custom_tools" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NU
 
 CREATE TABLE "tool_presets" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, "description" text, "icon" text, "tool_names" text NOT NULL, "is_builtin" integer NOT NULL DEFAULT 0, "sort_order" integer NOT NULL DEFAULT 0, "created_at" integer NOT NULL, "updated_at" integer NOT NULL );
 
-CREATE TABLE "projects" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, "path" text, "source_type" text NOT NULL DEFAULT 'local', "source_id" text, "assistant_id" text, "description" text, "created_at" integer NOT NULL, "updated_at" integer NOT NULL, FOREIGN KEY ("assistant_id") REFERENCES "assistants" ("id") ON DELETE SET NULL );
+CREATE TABLE "projects" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, "path" text, "source_type" text NOT NULL DEFAULT 'local', "source_id" text, "assistant_id" text, "description" text, "created_at" integer NOT NULL, "updated_at" integer NOT NULL, channel_kind TEXT, FOREIGN KEY ("assistant_id") REFERENCES "assistants" ("id") ON DELETE SET NULL );
 
 CREATE TABLE "cached_models" ( "id" integer PRIMARY KEY AUTOINCREMENT, "provider_id" text NOT NULL, "model_id" text NOT NULL, "model_name" text NOT NULL, "fetched_at" integer NOT NULL, suggested_canonical_id TEXT, suggested_protocol TEXT, FOREIGN KEY ("provider_id") REFERENCES "providers" ("id") ON DELETE CASCADE );
 
@@ -44,7 +44,7 @@ CREATE TABLE "memory_proposals" ( "id" integer PRIMARY KEY AUTOINCREMENT, "key" 
 
 CREATE TABLE "mode_artifacts" ( "id" text NOT NULL PRIMARY KEY, "conversation_id" text NOT NULL, "kind" text NOT NULL DEFAULT 'plan', "content" text NOT NULL, "status" text NOT NULL, "created_at" integer NOT NULL, "updated_at" integer NOT NULL, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE CASCADE );
 
-CREATE TABLE "mcp_servers" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, "transport_type" text NOT NULL DEFAULT 'stdio', "command" text, "args" text, "env" text, "url" text, "headers" text, "is_enabled" integer NOT NULL DEFAULT 0, "sort_order" integer NOT NULL DEFAULT 0, "created_at" integer NOT NULL, "updated_at" integer NOT NULL , disabled_tools TEXT NOT NULL DEFAULT '[]');
+CREATE TABLE "mcp_servers" ( "id" text NOT NULL PRIMARY KEY, "name" text NOT NULL, "transport_type" text NOT NULL DEFAULT 'stdio', "command" text, "args" text, "env" text, "url" text, "headers" text, "is_enabled" integer NOT NULL DEFAULT 0, "sort_order" integer NOT NULL DEFAULT 0, "created_at" integer NOT NULL, "updated_at" integer NOT NULL , disabled_tools TEXT NOT NULL DEFAULT '[]', default_policy_json TEXT, tool_policies_json TEXT, approved_always_tools_json TEXT);
 
 CREATE TABLE "turns" ( "id" text NOT NULL PRIMARY KEY, "conversation_id" text NOT NULL, "origin" text NOT NULL, "status" text NOT NULL, "phase" text, "phase_tool" text, "error" text, "started_at" integer NOT NULL, "updated_at" integer NOT NULL, "ended_at" integer, "reported_at" integer, "parent_reported_at" integer, "self_id" integer, "trigger" text NOT NULL DEFAULT 'user', "trigger_ref" text, FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("id") ON DELETE CASCADE, CHECK (trigger IN ('user', 'plan_continuation', 'task_completion', 'agent_autonomous')) );
 
@@ -420,4 +420,12 @@ CREATE INDEX "idx_media_generations_conversation" ON "media_generations" ("conve
 CREATE TABLE "emoji_embeddings" ( "emoji_id" text NOT NULL PRIMARY KEY, "model_fingerprint" text NOT NULL, "source_hash" text NOT NULL, "dims" integer NOT NULL, "vector" blob NOT NULL, "updated_at" integer NOT NULL, FOREIGN KEY ("emoji_id") REFERENCES "emojis" ("id") ON DELETE CASCADE, CHECK (dims > 0) );
 
 CREATE INDEX "idx_emoji_embeddings_model" ON "emoji_embeddings" ("model_fingerprint" ASC);
+
+CREATE TABLE dream_watermarks (scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, last_dream_at INTEGER, last_message_id TEXT, turns_since_dream INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (scope_type, scope_id));
+
+CREATE TABLE dream_runs (id TEXT PRIMARY KEY NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('running', 'done', 'failed', 'skipped')), trigger TEXT NOT NULL CHECK (trigger IN ('auto', 'manual')), model_id TEXT, started_at INTEGER NOT NULL, finished_at INTEGER, turns_reviewed INTEGER NOT NULL DEFAULT 0, memories_created INTEGER NOT NULL DEFAULT 0, memories_updated INTEGER NOT NULL DEFAULT 0, memories_pruned INTEGER NOT NULL DEFAULT 0, proposals_created INTEGER NOT NULL DEFAULT 0, pruned_memory_ids_json TEXT, summary TEXT, error TEXT);
+
+CREATE INDEX idx_dream_runs_scope_started ON dream_runs (scope_type, scope_id, started_at DESC);
+
+CREATE INDEX idx_dream_runs_started ON dream_runs (started_at DESC);
 

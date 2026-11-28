@@ -237,13 +237,19 @@ fn serialize_codex_input(
                     "content": [{"type": "input_text", "text": rendered.content}],
                 }));
             }
-            "assistant" => input.extend(replay_assistant_turn(m, model)),
+            "assistant" => input.extend(replay_assistant_turn_with_search(m, model, false)?),
             "tool" => {
                 if let Some(ref call_id) = m.tool_call_id {
+                    let output = if m.origin == crate::MessageOrigin::ToolSearchResult {
+                        let frozen = crate::decode_tool_search_result(&m.content).map_err(ProviderError::Parse)?;
+                        serde_json::json!(frozen.summary)
+                    } else {
+                        crate::openai_responses::responses_tool_output(m)?
+                    };
                     input.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": crate::openai_responses::responses_tool_output(m)?,
+                        "output": output,
                     }));
                 }
             }
@@ -260,7 +266,11 @@ fn serialize_codex_input(
 /// `CodexShape`, and two copies of it would be two copies of the ordering rule
 /// below — which has already been got wrong once, in exactly the way that does
 /// not fail loudly.
-pub(crate) fn replay_assistant_turn(m: &ChatMessage, model: &str) -> Vec<serde_json::Value> {
+pub(crate) fn replay_assistant_turn_with_search(
+    m: &ChatMessage,
+    model: &str,
+    native_tool_search: bool,
+) -> Result<Vec<serde_json::Value>, ProviderError> {
     let mut input = Vec::new();
 
     // The reasoning goes back interleaved where it originally stood, not merely
@@ -301,12 +311,23 @@ pub(crate) fn replay_assistant_turn(m: &ChatMessage, model: &str) -> Vec<serde_j
     }
     if let Some(ref tool_calls) = m.tool_calls {
         for tc in tool_calls {
-            others.push_back(serde_json::json!({
-                "type": "function_call",
-                "name": tc.name,
-                "arguments": tc.arguments,
-                "call_id": tc.id,
-            }));
+            if tc.name == crate::TOOL_SEARCH_CALL_SENTINEL && native_tool_search {
+                let arguments: serde_json::Value = serde_json::from_str(&tc.arguments)
+                    .map_err(|e| ProviderError::Parse(format!("invalid tool_search_call arguments JSON: {e}")))?;
+                others.push_back(serde_json::json!({
+                    "type": "tool_search_call",
+                    "call_id": tc.id,
+                    "execution": "client",
+                    "arguments": arguments,
+                }));
+            } else {
+                others.push_back(serde_json::json!({
+                    "type": "function_call",
+                    "name": crate::wire_tool_call_name(&tc.name),
+                    "arguments": tc.arguments,
+                    "call_id": tc.id,
+                }));
+            }
         }
     }
 
@@ -323,7 +344,7 @@ pub(crate) fn replay_assistant_turn(m: &ChatMessage, model: &str) -> Vec<serde_j
         }
     }
 
-    input
+    Ok(input)
 }
 
 /// Turn a completed `reasoning` output item into state to be stored.
@@ -445,6 +466,7 @@ async fn fold_stream(mut stream: ChatStream) -> Result<AgentResponse, ProviderEr
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut calls: std::collections::BTreeMap<usize, ToolCall> = std::collections::BTreeMap::new();
+    let mut search_calls: Vec<ToolCall> = Vec::new();
     let mut state = crate::state::ProviderStateAccumulator::default();
     let mut usage = None;
     let mut stopped = false;
@@ -473,6 +495,17 @@ async fn fold_stream(mut stream: ChatStream) -> Result<AgentResponse, ProviderEr
                     call.arguments = arguments;
                 }
             }
+            StreamEvent::ToolSearchCall {
+                id: _,
+                call_id,
+                arguments,
+            } => {
+                search_calls.push(ToolCall {
+                    id: call_id,
+                    name: meridian_provider_sdk::chat::TOOL_SEARCH_CALL_SENTINEL.to_string(),
+                    arguments,
+                });
+            }
             StreamEvent::ProviderStateUpdate { update } => state.apply(update).map_err(ProviderError::Parse)?,
             StreamEvent::UsageUpdate { usage: u } => usage = Some(u),
             StreamEvent::Stop { usage: u, .. } => {
@@ -495,10 +528,13 @@ async fn fold_stream(mut stream: ChatStream) -> Result<AgentResponse, ProviderEr
         ));
     }
 
+    let mut tool_calls: Vec<ToolCall> = calls.into_values().collect();
+    tool_calls.extend(search_calls);
+
     Ok(AgentResponse {
         text,
         reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
-        tool_calls: calls.into_values().collect(),
+        tool_calls,
         usage,
         provider_state: state.finish(),
     })

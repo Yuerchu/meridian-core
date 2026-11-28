@@ -70,10 +70,10 @@ impl ActiveModelBehavior for ActiveModel {}
 #[strum(serialize_all = "snake_case")]
 #[sea_orm(rs_type = "String", db_type = "Text")]
 pub enum VoiceCorpusSourceType {
-    #[sea_orm(string_value = "onebot_group")]
-    OnebotGroup,
-    #[sea_orm(string_value = "onebot_private")]
-    OnebotPrivate,
+    #[sea_orm(string_value = "channel_group")]
+    ChannelGroup,
+    #[sea_orm(string_value = "channel_direct")]
+    ChannelDirect,
 }
 
 impl VoiceCorpusSourceType {
@@ -183,10 +183,10 @@ mod tests {
         }
         assert_eq!(
             stored,
-            BTreeSet::from(["onebot_group".to_owned(), "onebot_private".to_owned()])
+            BTreeSet::from(["channel_group".to_owned(), "channel_direct".to_owned()])
         );
-        assert!(VoiceCorpusSourceType::try_from_value(&"onebot_channel".to_owned()).is_err());
-        let error = VoiceCorpusSourceType::parse("onebot_channel").unwrap_err();
+        assert!(VoiceCorpusSourceType::try_from_value(&"onebot_group".to_owned()).is_err());
+        let error = VoiceCorpusSourceType::parse("onebot_group").unwrap_err();
         assert!(error.contains("unknown voice corpus source_type"), "{error}");
     }
 }

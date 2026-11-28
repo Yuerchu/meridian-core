@@ -42,8 +42,7 @@ pub use transitions::{
     PlanReadResult, PlanReviewSubmitOutcome, PlanUpdateResult, SubmitPlanRequest, Transitions, UpdatePlanRequest,
 };
 pub use turn::{
-    ApprovalRule, ClearContextPlan, StickerRendering, TurnOutcome, TurnProgress, TurnServices, TurnSetup,
-    WithheldWording, run_turn,
+    ApprovalRule, ClearContextPlan, TurnOutcome, TurnProgress, TurnServices, TurnSetup, WithheldWording, run_turn,
 };
 
 /// Where a turn's progress goes while it is still happening.

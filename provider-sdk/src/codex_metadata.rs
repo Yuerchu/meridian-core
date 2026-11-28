@@ -20,7 +20,7 @@ pub enum CodexRequestKind {
 #[serde(rename_all = "snake_case")]
 pub enum CodexThreadSource {
     User,
-    Onebot,
+    Channel,
     Hook,
     SubAgent,
 }
@@ -144,7 +144,7 @@ mod tests {
             installation_id: "install-1".into(),
             turn_id: None,
             request_kind: CodexRequestKind::Compaction,
-            thread_source: CodexThreadSource::Onebot,
+            thread_source: CodexThreadSource::Channel,
             turn_started_at_unix_ms: None,
             sandbox: None,
             workspace_kind: None,
@@ -169,6 +169,6 @@ mod tests {
             assert!(json.get(absent).is_none(), "{absent} was invented: {json}");
         }
         assert_eq!(json["request_kind"], "compaction");
-        assert_eq!(json["thread_source"], "onebot");
+        assert_eq!(json["thread_source"], "channel");
     }
 }

@@ -19,6 +19,7 @@ pub struct Model {
     pub description: Option<String>,
     pub created_at: EpochMs,
     pub updated_at: EpochMs,
+    pub channel_kind: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -49,6 +50,7 @@ pub struct ProjectChangeset {
     pub assistant_id: Option<Option<String>>,
     pub description: Option<Option<String>>,
     pub updated_at: Option<EpochMs>,
+    pub channel_kind: Option<Option<String>>,
 }
 
 /// Where a project came from. The column has no `CHECK`, so this type is what
@@ -74,10 +76,10 @@ pub struct ProjectChangeset {
 pub enum ProjectSource {
     #[sea_orm(string_value = "local")]
     Local,
-    #[sea_orm(string_value = "onebot_private")]
-    OnebotPrivate,
-    #[sea_orm(string_value = "onebot_group")]
-    OnebotGroup,
+    #[sea_orm(string_value = "channel_direct")]
+    ChannelDirect,
+    #[sea_orm(string_value = "channel_group")]
+    ChannelGroup,
 }
 
 impl ProjectSource {

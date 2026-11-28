@@ -574,6 +574,8 @@ async fn run_turn(
         chat_messages,
         tool_defs: config.tool_defs,
         offered: config.offered,
+        deferred_tools: config.deferred_tools,
+        approval_policies: config.approval_policies,
         mode: crate::agent::modes::Modes::Fixed.spec(),
         tool_context,
         budget,
@@ -597,9 +599,8 @@ async fn run_turn(
             Ok(policy) => policy,
             Err(error) => return engine::TurnOutcome::failed(error),
         },
-        stickers: None,
         interrupted: None,
-        compaction: engine::CompactionPolicy::Desktop {
+        compaction: engine::CompactionPolicy::Attended {
             enabled: true,
             breaker: Arc::new(crate::agent::CompactCircuitBreaker::new()),
         },
@@ -613,12 +614,7 @@ async fn run_turn(
     let emitter = BestEffortEmit(state.services.events.clone());
     let ports = engine::TurnPorts {
         emit: Some(&emitter as &dyn engine::Emit),
-        approvals: &approvals,
-        interim: None,
-        surface_tools: None,
-        steering: None,
-        transitions: None,
-        sub_agents: None,
+        ..engine::TurnPorts::with_approvals(&approvals)
     };
 
     let services = engine::TurnServices {
@@ -674,25 +670,17 @@ async fn build_config(
     conversation_id: &str,
     params: &crate::agent::TurnParams,
 ) -> Result<crate::agent::turn_config::TurnConfig, String> {
+    // Reviewer character: strictly read-only workspace inspection — no shell,
+    // no web search, no memory, no MCP, no custom tools, no UI.
+    let character = crate::agent::character::CharacterBase::new(assistant.system_prompt.clone())
+        .with_builtin(crate::agent::mixins::BuiltinMixin::read_only_workspace_fs())
+        .with_supports_tools(params.caps.supports_tools)
+        .build();
     let input = crate::agent::turn_config::TurnConfigResolveRequest {
-        // The reviewer gets four read-only tools and no shell; searching
-        // the web is not among them, provider-side or otherwise.
-        server_tools: Vec::new(),
         assistant: Some(assistant.clone()),
         conversation_id: conversation_id.to_string(),
         project_id: None,
-        mode: crate::agent::modes::Modes::Fixed,
-        sub_agents: None,
-        // An explicit whitelist and nothing outside it. MCP tools ask
-        // unconditionally, and nobody is watching this run.
-        mcp_defs: Vec::new(),
-        exposure: crate::agent::turn_config::ToolExposure::when(params.caps.supports_tools),
-        persona: assistant.system_prompt.clone(),
-        context_blocks: Vec::new(),
-        session_tools: None,
-        // No shell either — see `hook-gates.md`.
-        command_shell: None,
-        forbidden_effects: &[],
+        character,
     };
     crate::agent::turn_config::resolve_on(&state.services.db, &state.services.tools, input).await
 }

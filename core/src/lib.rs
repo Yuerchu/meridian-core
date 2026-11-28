@@ -23,7 +23,6 @@ pub mod codex_auth;
 pub mod container;
 pub mod db;
 pub mod decimal;
-pub mod emoji;
 pub mod events;
 pub mod files;
 /// The endpoint another coding agent's hooks call into. Desktop only: it is a
@@ -40,8 +39,6 @@ pub mod media;
 /// somebody over a webhook. Not desktop-only: it is an HTTP client, not a
 /// server.
 pub mod notify;
-#[cfg(not(target_os = "android"))]
-pub mod onebot;
 pub mod plan_files;
 pub mod provider;
 pub mod redaction;
@@ -56,7 +53,6 @@ pub mod tts;
 pub mod turn;
 pub mod util;
 pub mod voice;
-pub mod voice_corpus;
 pub mod workspace;
 #[cfg(not(target_os = "android"))]
 pub mod worktree;

@@ -30,7 +30,8 @@
         "medium",
         "high"
       ],
-      "default_effort": "medium"
+      "default_effort": "medium",
+      "deferred_tool_mode": "gemini_server_search"
     },
     {
       "prefix": "gemini-3.7-flash",
@@ -39,7 +40,8 @@
         "medium",
         "high"
       ],
-      "default_effort": "medium"
+      "default_effort": "medium",
+      "deferred_tool_mode": "gemini_server_search"
     },
     {
       "prefix": "gemini-3.6-flash",
@@ -49,7 +51,8 @@
         "medium",
         "high"
       ],
-      "default_effort": "medium"
+      "default_effort": "medium",
+      "deferred_tool_mode": "gemini_server_search"
     },
     {
       "prefix": "gemini-3.5-flash-lite",

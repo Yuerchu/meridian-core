@@ -18,16 +18,20 @@ use crate::tools::command_shell::CommandShell;
 /// no command executor at all, in which case `run_command` is not in the set
 /// either.
 pub fn base_prompt(tool_defs: &[ToolDefinition], command_shell: Option<&CommandShell>) -> Option<String> {
+    base_prompt_with_sections(tool_defs, command_shell, &[])
+}
+
+/// Built-in agent baseline plus any static prompt sections contributed by
+/// active [`crate::agent::hooks::ToolMixin`]s or external plugins.
+pub fn base_prompt_with_sections(
+    tool_defs: &[ToolDefinition],
+    command_shell: Option<&CommandShell>,
+    extra_sections: &[String],
+) -> Option<String> {
     let has = |name: &str| tool_defs.iter().any(|t| t.name == name);
     let has_editing = has("write_file") || has("edit_file") || has("apply_patch");
     let has_todos = has("update_todos");
     let shell = command_shell.filter(|_| has("run_command"));
-    let has_stickers = has("send_sticker");
-    let has_silence = has("qq_stay_silent");
-
-    if !has_editing && !has_todos && shell.is_none() && !has_stickers && !has_silence {
-        return None;
-    }
 
     let mut sections: Vec<String> = Vec::new();
     if has_editing {
@@ -39,40 +43,19 @@ pub fn base_prompt(tool_defs: &[ToolDefinition], command_shell: Option<&CommandS
     if let Some(shell) = shell {
         sections.push(format!("# Shell\n\n{}", shell.summary()));
     }
-    if has_stickers {
-        sections.push(sticker_section());
+    for extra in extra_sections {
+        let trimmed = extra.trim();
+        if !trimmed.is_empty() {
+            sections.push(trimmed.to_string());
+        }
     }
-    if has_silence {
-        sections.push(qq_replies_section());
+    if sections.is_empty() {
+        return None;
     }
     Some(sections.join("\n\n"))
 }
 
-/// The one thing the sticker tools' own descriptions do not say: what *not* to
-/// do. Sending is a short query on `send_sticker`; the invented inline tag
-/// was the failure this line exists for.
-fn sticker_section() -> String {
-    [
-        "# Stickers",
-        "",
-        "Send a sticker with `send_sticker` and a short query (name, tag, or mood). The sticker \
-         is already in the chat; do not narrate that it was sent. Never write `[emoji:...]` tags \
-         or sticker names into your text.",
-    ]
-    .join("\n")
-}
-
-fn qq_replies_section() -> String {
-    [
-        "# QQ replies",
-        "",
-        "An empty final reply is not sent. After a sticker, poke, or voice, or when there is \
-         nothing to add, call `qq_stay_silent` rather than writing 好的 / 收到 / 已发送.",
-    ]
-    .join("\n")
-}
-
-fn file_editing_section(has: &dyn Fn(&str) -> bool) -> String {
+pub(crate) fn file_editing_section(has: &dyn Fn(&str) -> bool) -> String {
     let mut lines = vec![
         "# Agent guidelines".to_string(),
         String::new(),
@@ -119,7 +102,7 @@ fn file_editing_section(has: &dyn Fn(&str) -> bool) -> String {
 /// Discipline for `update_todos`. The checklist is only worth anything if it
 /// tracks reality as the work happens; a list written once and never touched
 /// again is worse than none, because the interface keeps showing it.
-fn checklist_section() -> String {
+pub(crate) fn checklist_section() -> String {
     [
         "# Task checklist",
         "",
@@ -210,25 +193,17 @@ mod tests {
         assert!(base_prompt(&[def("read_file")], Some(&shell)).is_none());
     }
 
-    /// Gated on the tool that sends, not the one that lists: a session that can
-    /// only look at the roster has nothing to be told not to do.
     #[test]
-    fn send_sticker_adds_the_sticker_guidance() {
-        let p = base_prompt(&[def("send_sticker")], None).unwrap();
-        assert!(p.contains("# Stickers"), "{p}");
-        assert!(p.contains("short query"), "{p}");
-        assert!(p.contains("`[emoji:...]`"), "{p}");
-        assert!(!p.contains("list_stickers"), "{p}");
-        assert!(base_prompt(&[def("list_stickers")], None).is_none());
-    }
-
-    #[test]
-    fn qq_stay_silent_adds_the_reply_guidance() {
-        let p = base_prompt(&[def("qq_stay_silent")], None).unwrap();
-        assert!(p.contains("# QQ replies"), "{p}");
-        assert!(p.contains("`qq_stay_silent`"), "{p}");
-        assert!(!p.contains("# Stickers"), "{p}");
-        assert!(base_prompt(&[def("qq_send_poke")], None).is_none());
+    fn extra_mixin_sections_append_in_order() {
+        let p = base_prompt_with_sections(
+            &[def("update_todos")],
+            None,
+            &["# Diagnostics\n\nFollow user instructions.".into()],
+        )
+        .unwrap();
+        assert!(p.contains("# Task checklist"), "{p}");
+        assert!(p.contains("# Diagnostics"), "{p}");
+        assert!(p.find("# Task checklist").unwrap() < p.find("# Diagnostics").unwrap());
     }
 
     #[test]
