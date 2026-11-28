@@ -191,10 +191,7 @@ impl LocalSecretsBackend {
             }
         }
     }
-}
-
-impl SecretsBackend for LocalSecretsBackend {
-    fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
+    fn set_sync(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
         anyhow::ensure!(!value.is_empty(), "secret value must not be empty");
         let canonical_key = scope.canonical_key(name);
         let mut file = self.load_file()?;
@@ -202,13 +199,13 @@ impl SecretsBackend for LocalSecretsBackend {
         self.save_file(&file)
     }
 
-    fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
+    fn get_sync(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
         let canonical_key = scope.canonical_key(name);
         let file = self.load_file()?;
         Ok(file.secrets.get(&canonical_key).cloned())
     }
 
-    fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
+    fn delete_sync(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
         let canonical_key = scope.canonical_key(name);
         let mut file = self.load_file()?;
         let removed = file.secrets.remove(&canonical_key).is_some();
@@ -218,7 +215,7 @@ impl SecretsBackend for LocalSecretsBackend {
         Ok(removed)
     }
 
-    fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
+    fn list_sync(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
         let file = self.load_file()?;
         let mut entries = Vec::new();
         for canonical_key in file.secrets.keys() {
@@ -234,6 +231,45 @@ impl SecretsBackend for LocalSecretsBackend {
             entries.push(entry);
         }
         Ok(entries)
+    }
+}
+
+#[async_trait::async_trait]
+impl SecretsBackend for LocalSecretsBackend {
+    async fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
+        let this = self.clone();
+        let scope = scope.clone();
+        let name = name.clone();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || this.set_sync(&scope, &name, &value))
+            .await
+            .context("local secrets set task failed")?
+    }
+
+    async fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
+        let this = self.clone();
+        let scope = scope.clone();
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || this.get_sync(&scope, &name))
+            .await
+            .context("local secrets get task failed")?
+    }
+
+    async fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
+        let this = self.clone();
+        let scope = scope.clone();
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || this.delete_sync(&scope, &name))
+            .await
+            .context("local secrets delete task failed")?
+    }
+
+    async fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
+        let this = self.clone();
+        let scope_filter = scope_filter.cloned();
+        tokio::task::spawn_blocking(move || this.list_sync(scope_filter.as_ref()))
+            .await
+            .context("local secrets list task failed")?
     }
 }
 
@@ -375,25 +411,25 @@ mod tests {
     /// age calibrates its scrypt work factor to take about a second on the
     /// machine that wrote the file. Decrypting per lookup made one turn pay it
     /// several times over — the provider key, then each tool credential.
-    #[test]
-    fn test_repeat_reads_decrypt_once() {
+    #[tokio::test]
+    async fn test_repeat_reads_decrypt_once() {
         let dir = tempfile::tempdir().unwrap();
         let (backend, keyring) = make_counting_backend(dir.path());
         let scope = SecretScope::Global;
         let name = SecretName::new("API_KEY").unwrap();
-        backend.set(&scope, &name, "value").unwrap();
+        backend.set(&scope, &name, "value").await.unwrap();
 
         let after_write = keyring.load_count();
         for _ in 0..5 {
-            assert_eq!(backend.get(&scope, &name).unwrap(), Some("value".into()));
+            assert_eq!(backend.get(&scope, &name).await.unwrap(), Some("value".into()));
         }
         assert_eq!(keyring.load_count(), after_write, "reads went back to disk");
     }
 
     /// The cache is stamped with the file it was built from, so a write that
     /// went around this backend is not served stale.
-    #[test]
-    fn test_external_write_invalidates_cache() {
+    #[tokio::test]
+    async fn test_external_write_invalidates_cache() {
         let dir = tempfile::tempdir().unwrap();
         let keyring = Arc::new(MockKeyringStore::new());
         let backend = LocalSecretsBackend::new(dir.path().to_path_buf(), keyring.clone());
@@ -403,52 +439,55 @@ mod tests {
         let scope = SecretScope::Global;
         let name = SecretName::new("API_KEY").unwrap();
 
-        backend.set(&scope, &name, "first").unwrap();
-        assert_eq!(backend.get(&scope, &name).unwrap(), Some("first".into()));
+        backend.set(&scope, &name, "first").await.unwrap();
+        assert_eq!(backend.get(&scope, &name).await.unwrap(), Some("first".into()));
 
         // Long enough that the ciphertext changes length: two writes in the same
         // filesystem timestamp tick would otherwise be told apart by size alone.
-        other.set(&scope, &name, "second-value-considerably-longer").unwrap();
+        other
+            .set(&scope, &name, "second-value-considerably-longer")
+            .await
+            .unwrap();
         assert_eq!(
-            backend.get(&scope, &name).unwrap(),
+            backend.get(&scope, &name).await.unwrap(),
             Some("second-value-considerably-longer".into()),
         );
     }
 
-    #[test]
-    fn test_set_get_round_trip() {
+    #[tokio::test]
+    async fn test_set_get_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let backend = make_backend(dir.path());
         let scope = SecretScope::Global;
         let name = SecretName::new("API_KEY").unwrap();
 
-        backend.set(&scope, &name, "secret_value_123").unwrap();
-        let got = backend.get(&scope, &name).unwrap();
+        backend.set(&scope, &name, "secret_value_123").await.unwrap();
+        let got = backend.get(&scope, &name).await.unwrap();
         assert_eq!(got, Some("secret_value_123".to_string()));
     }
 
-    #[test]
-    fn test_delete_secret() {
+    #[tokio::test]
+    async fn test_delete_secret() {
         let dir = tempfile::tempdir().unwrap();
         let backend = make_backend(dir.path());
         let scope = SecretScope::Global;
         let name = SecretName::new("TO_DELETE").unwrap();
 
-        backend.set(&scope, &name, "temp").unwrap();
-        assert!(backend.delete(&scope, &name).unwrap());
-        assert_eq!(backend.get(&scope, &name).unwrap(), None);
-        assert!(!backend.delete(&scope, &name).unwrap());
+        backend.set(&scope, &name, "temp").await.unwrap();
+        assert!(backend.delete(&scope, &name).await.unwrap());
+        assert_eq!(backend.get(&scope, &name).await.unwrap(), None);
+        assert!(!backend.delete(&scope, &name).await.unwrap());
     }
 
-    #[test]
-    fn test_no_temp_files_left() {
+    #[tokio::test]
+    async fn test_no_temp_files_left() {
         let dir = tempfile::tempdir().unwrap();
         let backend = make_backend(dir.path());
         let scope = SecretScope::Global;
         let name = SecretName::new("KEY_A").unwrap();
 
-        backend.set(&scope, &name, "val1").unwrap();
-        backend.set(&scope, &name, "val2").unwrap();
+        backend.set(&scope, &name, "val1").await.unwrap();
+        backend.set(&scope, &name, "val2").await.unwrap();
 
         let secrets_dir = dir.path().join("secrets");
         let entries: Vec<_> = fs::read_dir(&secrets_dir).unwrap().filter_map(|e| e.ok()).collect();
@@ -456,29 +495,35 @@ mod tests {
         assert_eq!(entries[0].file_name().to_str().unwrap(), LOCAL_SECRETS_FILENAME);
     }
 
-    #[test]
-    fn test_set_empty_value_fails() {
+    #[tokio::test]
+    async fn test_set_empty_value_fails() {
         let dir = tempfile::tempdir().unwrap();
         let backend = make_backend(dir.path());
         let scope = SecretScope::Global;
         let name = SecretName::new("EMPTY").unwrap();
-        assert!(backend.set(&scope, &name, "").is_err());
+        assert!(backend.set(&scope, &name, "").await.is_err());
     }
 
-    #[test]
-    fn test_list_secrets() {
+    #[tokio::test]
+    async fn test_list_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let backend = make_backend(dir.path());
         let global = SecretScope::Global;
         let env = SecretScope::Environment("test-env".into());
 
-        backend.set(&global, &SecretName::new("KEY_A").unwrap(), "a").unwrap();
-        backend.set(&env, &SecretName::new("KEY_B").unwrap(), "b").unwrap();
+        backend
+            .set(&global, &SecretName::new("KEY_A").unwrap(), "a")
+            .await
+            .unwrap();
+        backend
+            .set(&env, &SecretName::new("KEY_B").unwrap(), "b")
+            .await
+            .unwrap();
 
-        let all = backend.list(None).unwrap();
+        let all = backend.list(None).await.unwrap();
         assert_eq!(all.len(), 2);
 
-        let global_only = backend.list(Some(&global)).unwrap();
+        let global_only = backend.list(Some(&global)).await.unwrap();
         assert_eq!(global_only.len(), 1);
         assert_eq!(global_only[0].name.as_str(), "KEY_A");
     }

@@ -27,9 +27,9 @@ pub fn context_limit_for_turn(asked: Option<usize>, model_window: Option<usize>)
     }
 }
 
-pub fn get_provider_api_key(secrets: &SecretsManager, provider_id: &str) -> Option<String> {
+pub async fn get_provider_api_key(secrets: &SecretsManager, provider_id: &str) -> Option<String> {
     let key = provider_secret_name(provider_id);
-    match secrets.get(&SecretScope::Global, &SecretName::new(&key).unwrap()) {
+    match secrets.get(&SecretScope::Global, &SecretName::new(&key).unwrap()).await {
         Ok(value) => value,
         Err(e) => {
             // Callers turn a None into "API Key not set", which sends a user who
@@ -49,25 +49,17 @@ pub fn get_provider_api_key(secrets: &SecretsManager, provider_id: &str) -> Opti
 }
 
 /// Secrets exposed to tool executors (web_search provider selection + service
-/// API keys). Shared by the desktop chat loop and the OneBot headless agent.
-/// The keys come off the secret store on the blocking pool; a read that fails
-/// leaves its key out, as before.
+/// API keys). A read that fails leaves its key out, as before.
 pub async fn build_tool_secrets(secrets: &Arc<SecretsManager>, db: &Db) -> std::collections::HashMap<String, String> {
     let search_provider = preference::get(db, "search_provider").await.ok().flatten();
-    let secrets = secrets.clone();
-    let mut map = tokio::task::spawn_blocking(move || {
-        let mut map = std::collections::HashMap::new();
-        for key in ["SERVICE_TAVILY_KEY", "SERVICE_ZHIPU_SEARCH_KEY"] {
-            if let Ok(name) = SecretName::new(key)
-                && let Ok(Some(val)) = secrets.get(&SecretScope::Global, &name)
-            {
-                map.insert(key.to_string(), val);
-            }
+    let mut map = std::collections::HashMap::new();
+    for key in ["SERVICE_TAVILY_KEY", "SERVICE_ZHIPU_SEARCH_KEY"] {
+        if let Ok(name) = SecretName::new(key)
+            && let Ok(Some(val)) = secrets.get(&SecretScope::Global, &name).await
+        {
+            map.insert(key.to_string(), val);
         }
-        map
-    })
-    .await
-    .unwrap_or_default();
+    }
     if let Some(sp) = search_provider {
         map.insert("SEARCH_PROVIDER".to_string(), sp);
     }
@@ -75,7 +67,7 @@ pub async fn build_tool_secrets(secrets: &Arc<SecretsManager>, db: &Db) -> std::
 }
 
 /// A provider row and a model as a destination: the credential from the
-/// secret store (on the blocking pool) and the Codex version override.
+/// secret store and the Codex version override.
 async fn destination(
     secrets: &Arc<SecretsManager>,
     db: &Db,
@@ -95,13 +87,7 @@ async fn destination(
             && provider.api_format == provider::registry::ApiFormat::GeminiGenerateContent,
     )
     .await;
-    let credential = {
-        let secrets = secrets.clone();
-        let provider = provider.clone();
-        tokio::task::spawn_blocking(move || resolve_credential(&secrets, &provider))
-            .await
-            .map_err(|error| error.to_string())??
-    };
+    let credential = resolve_credential(secrets, &provider).await?;
     Ok(ResolvedProvider {
         base_url: provider.base_url.trim_end_matches('/').to_string(),
         provider_id: provider.id,
@@ -284,7 +270,7 @@ async fn google_include_thoughts_when_off(db: &Db, wanted: bool) -> bool {
 /// the bypass into each call site is how a login that needs no key ends up
 /// letting a misconfigured API-key provider through as an anonymous request.
 /// Blocking: the secret store reads a file.
-fn resolve_credential(
+async fn resolve_credential(
     secrets: &SecretsManager,
     provider: &provider_entity::Model,
 ) -> Result<provider::Credential, String> {
@@ -296,9 +282,11 @@ fn resolve_credential(
     )?;
     match provider.credential_kind {
         CredentialKind::ApiKey => get_provider_api_key(secrets, &provider.id)
+            .await
             .map(provider::Credential::ApiKey)
             .ok_or_else(|| format!("API Key not set for provider '{}'", provider.name)),
         CredentialKind::GoogleVertexServiceAccount => get_provider_api_key(secrets, &provider.id)
+            .await
             .map(provider::Credential::GoogleVertexServiceAccount)
             .ok_or_else(|| format!("Vertex Service Account JSON not set for provider '{}'", provider.name)),
         CredentialKind::CodexCli => {
@@ -1192,6 +1180,7 @@ mod tests {
                 &SecretName::new("PROVIDER_P1_KEY").unwrap(),
                 "sk-test",
             )
+            .await
             .unwrap();
 
         let resolved = resolve_with_overrides(&secrets, &db, None, Some("deepseek-v4-flash".into()), Some("p1"))
@@ -1258,6 +1247,7 @@ mod tests {
                 &SecretName::new("PROVIDER_P1_KEY").unwrap(),
                 "sk-test",
             )
+            .await
             .unwrap();
         let kind = provider::codex_metadata::CodexRequestKind::Compaction;
 

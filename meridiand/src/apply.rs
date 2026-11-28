@@ -212,6 +212,7 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
             .map_err(|_| "invalid credential name")?;
         secrets
             .set(&SecretScope::Global, &name, api_key)
+            .await
             .map_err(|_| "credential storage failed")?;
         report.providers_written += 1;
     }
@@ -297,6 +298,7 @@ pub async fn apply(sea: &Db, secrets: &SecretsManager, config: &DaemonConfig) ->
         .await
         .map_err(|_| "configuration database write failed")?;
         meridian_core::notify::write_webhook_secret(secrets, &webhook.id, secret.as_deref())
+            .await
             .map_err(|_| "credential storage failed")?;
         report.webhooks_written += 1;
     }
@@ -397,7 +399,9 @@ mod tests {
         assert_eq!(provider_count(&sea).await, 1);
         assert_eq!(notification_ops::list_webhooks(&sea).await.unwrap().len(), 1);
         assert_eq!(
-            meridian_core::agent::get_provider_api_key(&secrets, "ds").as_deref(),
+            meridian_core::agent::get_provider_api_key(&secrets, "ds")
+                .await
+                .as_deref(),
             Some("sk-test")
         );
     }

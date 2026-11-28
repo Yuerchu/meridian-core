@@ -84,13 +84,14 @@ pub struct SecretListEntry {
     pub name: SecretName,
 }
 
+#[async_trait::async_trait]
 pub trait SecretsBackend: Send + Sync {
-    fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()>;
-    fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>>;
-    fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool>;
+    async fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()>;
+    async fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>>;
+    async fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool>;
     /// No secrets-listing UI yet; ported store contract.
     #[allow(dead_code)]
-    fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>>;
+    async fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>>;
 }
 
 #[derive(Clone)]
@@ -111,21 +112,27 @@ impl SecretsManager {
         Self { backend }
     }
 
-    pub fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
-        self.backend.set(scope, name, value)
+    /// Construct a [`SecretsManager`] backed by a caller-supplied async backend
+    /// (for example, a database-backed encrypted store in a multi-tenant server).
+    pub fn with_backend(backend: Arc<dyn SecretsBackend>) -> Self {
+        Self { backend }
     }
 
-    pub fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
-        self.backend.get(scope, name)
+    pub async fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
+        self.backend.set(scope, name, value).await
     }
 
-    pub fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
-        self.backend.delete(scope, name)
+    pub async fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
+        self.backend.get(scope, name).await
+    }
+
+    pub async fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
+        self.backend.delete(scope, name).await
     }
 
     #[allow(dead_code)]
-    pub fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
-        self.backend.list(scope_filter)
+    pub async fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
+        self.backend.list(scope_filter).await
     }
 }
 
@@ -200,5 +207,65 @@ mod tests {
     #[test]
     fn test_keyring_service_is_meridian() {
         assert_eq!(keyring_service(), "meridian");
+    }
+
+    #[tokio::test]
+    async fn custom_async_backend_works_through_secrets_manager() {
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        #[derive(Default)]
+        struct InMemoryAsyncBackend {
+            entries: Mutex<HashMap<(SecretScope, SecretName), String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl SecretsBackend for InMemoryAsyncBackend {
+            async fn set(&self, scope: &SecretScope, name: &SecretName, value: &str) -> Result<()> {
+                self.entries
+                    .lock()
+                    .await
+                    .insert((scope.clone(), name.clone()), value.to_string());
+                Ok(())
+            }
+
+            async fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
+                Ok(self.entries.lock().await.get(&(scope.clone(), name.clone())).cloned())
+            }
+
+            async fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
+                Ok(self
+                    .entries
+                    .lock()
+                    .await
+                    .remove(&(scope.clone(), name.clone()))
+                    .is_some())
+            }
+
+            async fn list(&self, scope_filter: Option<&SecretScope>) -> Result<Vec<SecretListEntry>> {
+                Ok(self
+                    .entries
+                    .lock()
+                    .await
+                    .keys()
+                    .filter(|(scope, _)| scope_filter.is_none_or(|wanted| wanted == scope))
+                    .map(|(scope, name)| SecretListEntry {
+                        scope: scope.clone(),
+                        name: name.clone(),
+                    })
+                    .collect())
+            }
+        }
+
+        let manager = SecretsManager::with_backend(Arc::new(InMemoryAsyncBackend::default()));
+        let key = SecretName::new("PROVIDER_OPENAI_KEY").unwrap();
+        manager.set(&SecretScope::Global, &key, "sk-async").await.unwrap();
+        assert_eq!(
+            manager.get(&SecretScope::Global, &key).await.unwrap().as_deref(),
+            Some("sk-async")
+        );
+        assert_eq!(manager.list(Some(&SecretScope::Global)).await.unwrap().len(), 1);
+        assert!(manager.delete(&SecretScope::Global, &key).await.unwrap());
+        assert_eq!(manager.get(&SecretScope::Global, &key).await.unwrap(), None);
     }
 }
