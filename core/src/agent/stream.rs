@@ -165,7 +165,7 @@ fn status_in(err: &str) -> Option<u16> {
 }
 
 pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
-    if is_context_window_error(err) {
+    if err.starts_with(provider::METERING_REFUSED_PREFIX) || is_context_window_error(err) {
         return false;
     }
     // A status settles it on its own. The rule is Codex's
@@ -350,5 +350,14 @@ mod tests {
         // And still not the answers that would say the same thing every time.
         assert!(!is_retryable_stream_error("http 401: invalid api key"));
         assert!(!is_retryable_stream_error("http 404: no such model"));
+    }
+
+    #[test]
+    fn metering_refusals_are_never_retried_regardless_of_wording() {
+        let err = provider::ProviderError::MeteringRefused(
+            "insufficient credits (connection timeout wording must not trigger retry)".into(),
+        )
+        .to_string();
+        assert!(!is_retryable_stream_error(&err), "{err}");
     }
 }

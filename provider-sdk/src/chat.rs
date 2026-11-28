@@ -1144,6 +1144,12 @@ pub struct AgentResponse {
     pub provider_state: Option<state::ProviderState>,
 }
 
+/// Prefix emitted by [`ProviderError::MeteringRefused`]'s `Display` impl so
+/// downstream stream retry classifiers can unambiguously treat billing /
+/// quota refusals as terminal even if a custom refusal message mentions
+/// words like "timeout" or "connection".
+pub const METERING_REFUSED_PREFIX: &str = "metering refused: ";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("transport: {0}")]
@@ -1156,6 +1162,8 @@ pub enum ProviderError {
     Upstream(String),
     #[error("{0}")]
     InvalidRequest(String),
+    #[error("metering refused: {0}")]
+    MeteringRefused(String),
     #[allow(dead_code)]
     #[error("not implemented: {0}")]
     NotImplemented(String),
@@ -1216,6 +1224,112 @@ pub trait ChatProvider: Send + Sync {
         _params: &ChatParams,
     ) -> Result<RemoteCompactResult, ProviderError> {
         Err(ProviderError::NotImplemented("remote compaction".into()))
+    }
+}
+
+#[async_trait]
+impl<T: ChatProvider + ?Sized> ChatProvider for Box<T> {
+    fn adapter_name(&self) -> &'static str {
+        (**self).adapter_name()
+    }
+
+    fn local_backend_for_test(&self) -> Option<LocalInferenceBackend> {
+        (**self).local_backend_for_test()
+    }
+
+    fn switch_impact(&self) -> SwitchImpact {
+        (**self).switch_impact()
+    }
+
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        (**self).capabilities(model)
+    }
+
+    async fn stream_chat_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        params: ChatParams,
+    ) -> Result<ChatStream, ProviderError> {
+        (**self).stream_chat_with_tools(messages, tools, params).await
+    }
+
+    async fn stream_chat(&self, messages: Vec<ChatMessage>, params: ChatParams) -> Result<ChatStream, ProviderError> {
+        (**self).stream_chat(messages, params).await
+    }
+
+    async fn chat(&self, messages: Vec<ChatMessage>, params: ChatParams) -> Result<String, ProviderError> {
+        (**self).chat(messages, params).await
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        params: ChatParams,
+    ) -> Result<AgentResponse, ProviderError> {
+        (**self).chat_with_tools(messages, tools, params).await
+    }
+
+    async fn compact_remote(
+        &self,
+        messages: &[ChatMessage],
+        params: &ChatParams,
+    ) -> Result<RemoteCompactResult, ProviderError> {
+        (**self).compact_remote(messages, params).await
+    }
+}
+
+#[async_trait]
+impl<T: ChatProvider + ?Sized> ChatProvider for Arc<T> {
+    fn adapter_name(&self) -> &'static str {
+        (**self).adapter_name()
+    }
+
+    fn local_backend_for_test(&self) -> Option<LocalInferenceBackend> {
+        (**self).local_backend_for_test()
+    }
+
+    fn switch_impact(&self) -> SwitchImpact {
+        (**self).switch_impact()
+    }
+
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        (**self).capabilities(model)
+    }
+
+    async fn stream_chat_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        params: ChatParams,
+    ) -> Result<ChatStream, ProviderError> {
+        (**self).stream_chat_with_tools(messages, tools, params).await
+    }
+
+    async fn stream_chat(&self, messages: Vec<ChatMessage>, params: ChatParams) -> Result<ChatStream, ProviderError> {
+        (**self).stream_chat(messages, params).await
+    }
+
+    async fn chat(&self, messages: Vec<ChatMessage>, params: ChatParams) -> Result<String, ProviderError> {
+        (**self).chat(messages, params).await
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        params: ChatParams,
+    ) -> Result<AgentResponse, ProviderError> {
+        (**self).chat_with_tools(messages, tools, params).await
+    }
+
+    async fn compact_remote(
+        &self,
+        messages: &[ChatMessage],
+        params: &ChatParams,
+    ) -> Result<RemoteCompactResult, ProviderError> {
+        (**self).compact_remote(messages, params).await
     }
 }
 
