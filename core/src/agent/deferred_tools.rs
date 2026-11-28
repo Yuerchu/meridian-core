@@ -379,6 +379,7 @@ impl DeferredToolSession {
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
+            // domain-default: optional search_tools result page size when omitted by the caller
             .unwrap_or(DEFAULT_SEARCH_LIMIT);
 
         let matched = self.index.search(query, limit, allowed);

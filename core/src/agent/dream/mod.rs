@@ -775,7 +775,7 @@ impl DreamScheduler {
         let provider = crate::provider::registry::create_provider(resolved.wire())?;
         let mut params = without_thinking(turn.params);
         params.temperature = Some(0.0);
-        params.max_tokens = Some(params.max_tokens.unwrap_or(2_048).min(4_096));
+        params.max_tokens = Some(crate::agent::resolve_max_tokens(Some(4_096), turn.max_output));
         Ok((provider, resolved, params))
     }
 
