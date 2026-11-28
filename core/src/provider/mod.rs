@@ -5,6 +5,7 @@
 
 pub mod codex_metadata;
 pub mod local_model;
+pub mod metering;
 pub mod models;
 pub mod models_dev;
 
