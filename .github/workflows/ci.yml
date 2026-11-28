@@ -120,4 +120,5 @@ jobs:
         # After `--`, libtest accepts all four filters. In particular db::sql
         # owns the dialect and query-plan gates; omitting it would leave the
         # very tests this job exists for running on the SQLite leg only.
-        run: cargo test -p meridian-core --features postgres --lib -- db::sea::ops agent:: db::sql db::sea::migration::pg
+        run: |
+          cargo test -p meridian-core --features postgres --lib -- db::sea::ops agent:: db::sql db::sea::migration::pg
